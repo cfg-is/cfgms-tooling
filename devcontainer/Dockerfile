@@ -1,0 +1,85 @@
+# CFGMS Agent Dispatch Container
+# Provides isolated environment for headless Claude Code agent sessions.
+# Pre-caches Go modules and Trivy DB to minimize per-agent startup time.
+#
+# Build: docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
+# Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .devcontainer/Dockerfile .
+
+FROM golang:1.25-bookworm
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    jq \
+    make \
+    sudo \
+    iptables \
+    ca-certificates \
+    gnupg \
+    npm \
+    ripgrep \
+    dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Go-based security tools
+RUN go install github.com/securego/gosec/v2/cmd/gosec@latest \
+    && go install honnef.co/go/tools/cmd/staticcheck@latest \
+    && go install github.com/zricethezav/gitleaks/v8@latest
+
+# Trivy (apt repo for stable releases)
+RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
+      | gpg --dearmor -o /usr/share/keyrings/trivy.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb bookworm main" \
+      > /etc/apt/sources.list.d/trivy.list \
+    && apt-get update && apt-get install -y trivy \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nancy (Go dependency scanner)
+RUN GOPATH=$(go env GOPATH) \
+    && curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v1.0.51/nancy-v1.0.51-linux-amd64" \
+       -o "$GOPATH/bin/nancy" \
+    && chmod +x "$GOPATH/bin/nancy"
+
+# truffleHog (optional, best-effort secret scanning)
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin || true
+
+# Claude Code
+RUN npm install -g @anthropic-ai/claude-code
+
+# Non-root agent user with sudo for iptables only
+RUN useradd -m -s /bin/bash agent \
+    && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables" > /etc/sudoers.d/agent \
+    && mkdir -p /persist && chown agent:agent /persist
+
+# Pre-download Trivy vulnerability DB (avoids runtime download behind firewall)
+RUN trivy fs --download-db-only --cache-dir /home/agent/.cache/trivy 2>/dev/null || true
+RUN chown -R agent:agent /home/agent/.cache
+
+# Pre-cache Go modules from the project
+WORKDIR /tmp/modcache
+COPY go.mod go.sum ./
+RUN go mod download
+RUN rm go.mod go.sum
+WORKDIR /
+
+# Copy container scripts
+COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
+COPY .devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh
+
+# Agent environment — 4GB RAM is sufficient for go test/build + Claude API calls
+ENV CFGMS_AGENT_MODE=true
+ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy
+
+USER agent
+WORKDIR /workspace
+ENTRYPOINT ["entrypoint.sh"]
