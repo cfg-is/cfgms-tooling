@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     npm \
     ripgrep \
     dnsutils \
+    dnsmasq \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI
@@ -57,7 +58,7 @@ RUN npm install -g @anthropic-ai/claude-code
 
 # Non-root agent user with sudo for iptables only
 RUN useradd -m -s /bin/bash agent \
-    && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables" > /etc/sudoers.d/agent \
+    && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
     && mkdir -p /persist && chown agent:agent /persist
 
 # Pre-download Trivy vulnerability DB (avoids runtime download behind firewall)
@@ -71,9 +72,10 @@ RUN go mod download
 RUN rm go.mod go.sum
 WORKDIR /
 
-# Copy container scripts
+# Copy container scripts and DNS allowlist
 COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY .devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY .devcontainer/dnsmasq-allowlist.conf /etc/dnsmasq-allowlist.conf
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh
 
 # Agent environment — 4GB RAM is sufficient for go test/build + Claude API calls
