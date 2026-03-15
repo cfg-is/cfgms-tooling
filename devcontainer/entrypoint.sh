@@ -128,6 +128,13 @@ echo "Starting Claude agent for issue #${ISSUE_NUM}..."
 EXIT_CODE=0
 claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT" || EXIT_CODE=$?
 
+# Write back potentially refreshed OAuth credentials to the shared volume.
+# Claude Code may refresh the OAuth token during its session — persisting it
+# ensures the next container launch gets a valid token instead of a stale one.
+if [ -f ~/.claude/.credentials.json ]; then
+    cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || true
+fi
+
 # --- Phase 3: Cleanup and reporting ---
 
 # Extract PR URL if one was created
