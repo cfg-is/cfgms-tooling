@@ -17,10 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     ca-certificates \
     gnupg \
-    npm \
     ripgrep \
     dnsutils \
     dnsmasq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 (required by Claude Code — Debian Bookworm ships Node 18 which
+# lacks Array.with() and other APIs used since Claude Code 2.1.79)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI

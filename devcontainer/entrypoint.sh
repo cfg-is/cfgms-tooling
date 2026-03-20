@@ -66,7 +66,7 @@ else
     echo "Run: agent-setup to configure credentials"
     exit 1
 fi
-cat > ~/.claude/.claude.json <<'ONBOARD'
+cat > ~/.claude.json <<'ONBOARD'
 {"hasCompletedOnboarding":true,"installMethod":"native"}
 ONBOARD
 
@@ -74,6 +74,36 @@ ONBOARD
 git config --global user.name "cfg-agent"
 git config --global user.email "agent@cfg.is"
 git config --global push.autoSetupRemote true
+
+# --- Phase 0b: Validate OAuth token ---
+# Check if the access token is expired or expiring soon. If so, a lightweight
+# claude call triggers the SDK's built-in token refresh (using the refresh token).
+TOKEN_REMAINING=$(python3 -c "
+import json, time
+d = json.load(open('$HOME/.claude/.credentials.json'))
+exp_ms = d.get('claudeAiOauth', {}).get('expiresAt', 0)
+print(int((exp_ms / 1000) - time.time()))" 2>/dev/null || echo "0")
+
+if [ "$TOKEN_REMAINING" -lt 300 ] 2>/dev/null; then
+    echo "OAuth token expired or expiring in <5min (${TOKEN_REMAINING}s remaining), refreshing..."
+    if claude -p 'ping' --dangerously-skip-permissions --model haiku >/dev/null 2>&1; then
+        # Write back refreshed token to shared volume
+        if [ -f ~/.claude/.credentials.json ] && [ -f /persist/.credentials.json ]; then
+            new_exp=$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
+            old_exp=$(python3 -c "import json; d=json.load(open('/persist/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
+            if [ "$new_exp" -gt "$old_exp" ] 2>/dev/null; then
+                cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || true
+                echo "OAuth token refreshed (new expiry: $new_exp)"
+            fi
+        fi
+    else
+        echo "ERROR: OAuth token refresh failed — credentials may be expired"
+        echo "Run '/agent-setup creds' on the host to re-authenticate"
+        exit 1
+    fi
+else
+    echo "OAuth token valid (${TOKEN_REMAINING}s remaining)"
+fi
 
 # --- Phase 1: Compose prompt based on mode ---
 
@@ -88,11 +118,12 @@ compose_issue_prompt() {
     TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
     BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
 
-    PROMPT="$(cat <<PROMPT_EOF
-You are implementing GitHub issue #${ISSUE_NUM}: ${TITLE}
-
-${BODY}
-
+    # Build prompt in a temp file to avoid shell metacharacter corruption.
+    # Issue bodies often contain backticks, $ field numbers, etc.
+    PROMPT_FILE=$(mktemp)
+    printf 'You are implementing GitHub issue #%s: %s\n\n' "$ISSUE_NUM" "$TITLE" > "$PROMPT_FILE"
+    printf '%s\n\n' "$BODY" >> "$PROMPT_FILE"
+    cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
 You are running inside an isolated container with --dangerously-skip-permissions.
@@ -152,7 +183,6 @@ If \`make test-commit\` fails after 3 fix iterations:
 - Do NOT skip tests or create PRs targeting main
 - ALWAYS check central providers in pkg/ before creating new functionality
 PROMPT_EOF
-)"
 }
 
 compose_branch_prompt() {
@@ -194,10 +224,13 @@ ${BODY}
     - Include \`Fixes #${ISSUE_NUM}\` in the commit body"
     fi
 
-    PROMPT="$(cat <<PROMPT_EOF
-You are working on existing branch \`${BRANCH}\`.
-
-${issue_context}
+    # Build prompt in a temp file to avoid shell metacharacter corruption.
+    PROMPT_FILE=$(mktemp)
+    printf 'You are working on existing branch `%s`.\n\n' "$BRANCH" > "$PROMPT_FILE"
+    if [[ -n "$issue_context" ]]; then
+        printf '%s\n' "$issue_context" >> "$PROMPT_FILE"
+    fi
+    cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
 You are running inside an isolated container with --dangerously-skip-permissions.
@@ -257,7 +290,6 @@ If \`make test-commit\` fails after 3 fix iterations:
 - Do NOT skip tests or create PRs targeting main
 - ALWAYS check central providers in pkg/ before creating new functionality
 PROMPT_EOF
-)"
 }
 
 compose_pr_fix_prompt() {
@@ -305,21 +337,16 @@ compose_pr_fix_prompt() {
         issue_ref=" (Issue #${ISSUE_NUM})"
     fi
 
-    PROMPT="$(cat <<PROMPT_EOF
-You are fixing review comments on PR #${PR_NUM}: ${pr_title}${issue_ref}
-
-## PR Description
-
-${pr_body}
-
-## Review Comments to Fix
-
-### Review-Level Comments
-${REVIEWS:-No review-level comments.}
-
-### Inline Comments
-${INLINE_COMMENTS:-No inline comments.}
-
+    # Build prompt in a temp file to avoid shell metacharacter corruption.
+    # PR bodies and review comments often contain code with backticks and $.
+    PROMPT_FILE=$(mktemp)
+    printf 'You are fixing review comments on PR #%s: %s%s\n\n## PR Description\n\n' "$PR_NUM" "$pr_title" "$issue_ref" > "$PROMPT_FILE"
+    printf '%s\n\n' "$pr_body" >> "$PROMPT_FILE"
+    printf '## Review Comments to Fix\n\n### Review-Level Comments\n' >> "$PROMPT_FILE"
+    printf '%s\n\n' "${REVIEWS:-No review-level comments.}" >> "$PROMPT_FILE"
+    printf '### Inline Comments\n' >> "$PROMPT_FILE"
+    printf '%s\n\n' "${INLINE_COMMENTS:-No inline comments.}" >> "$PROMPT_FILE"
+    cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
 You are running inside an isolated container with --dangerously-skip-permissions.
@@ -360,7 +387,6 @@ Follow the CLAUDE.md file in the repository root. CFGMS_AGENT_MODE=true is set.
 - Do NOT add external dependencies without justification
 - Do NOT skip tests
 PROMPT_EOF
-)"
 }
 
 # Compose prompt based on mode
@@ -372,7 +398,8 @@ esac
 
 if [ "$DRY_RUN" = "true" ]; then
     echo "=== DRY RUN: Mode=${MODE} ==="
-    echo "$PROMPT"
+    cat "$PROMPT_FILE"
+    rm -f "$PROMPT_FILE"
     exit 0
 fi
 
@@ -386,12 +413,23 @@ fi
 
 echo "Starting Claude agent (mode=${MODE})..."
 EXIT_CODE=0
-claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT" || EXIT_CODE=$?
+# Read prompt from file to avoid shell metacharacter corruption.
+# Issue/PR bodies contain backticks and $ in code blocks which break heredoc expansion.
+PROMPT_CONTENT=$(cat "$PROMPT_FILE")
+claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT_CONTENT" || EXIT_CODE=$?
+rm -f "$PROMPT_FILE"
 
-# Write back potentially refreshed OAuth credentials to the shared volume.
-# Claude Code may refresh the OAuth token during its session — persisting it
-# ensures the next container launch gets a valid token instead of a stale one.
-if [ -f ~/.claude/.credentials.json ]; then
+# Write back credentials only if Claude refreshed the token (newer expiry).
+# Without this check, a failed agent with an expired token would overwrite
+# fresh credentials in the shared volume, breaking subsequent dispatches.
+if [ -f ~/.claude/.credentials.json ] && [ -f /persist/.credentials.json ]; then
+    new_exp=$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
+    old_exp=$(python3 -c "import json; d=json.load(open('/persist/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
+    if [ "$new_exp" -gt "$old_exp" ] 2>/dev/null; then
+        cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || echo "WARN: Failed to write back credentials to /persist volume"
+        echo "Credentials refreshed (new expiry: $new_exp)"
+    fi
+elif [ -f ~/.claude/.credentials.json ]; then
     cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || echo "WARN: Failed to write back credentials to /persist volume"
 fi
 
