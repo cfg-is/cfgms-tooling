@@ -54,26 +54,15 @@ esac
 
 # --- Phase 0: Environment setup ---
 
-# Initialize firewall
-init-firewall.sh
+# Shared setup: firewall, credential symlinks, git config (idempotent)
+setup-env.sh
 
-# Restore Claude credentials from mounted volume
-mkdir -p ~/.claude
-if [ -f /persist/.credentials.json ]; then
-    cp /persist/.credentials.json ~/.claude/.credentials.json
-else
+# Verify credentials are available (hard fail for headless dispatch)
+if [ ! -f ~/.claude/.credentials.json ]; then
     echo "ERROR: No Claude credentials found at /persist/.credentials.json"
-    echo "Run: agent-setup to configure credentials"
+    echo "Run: /agent-setup creds on host to configure"
     exit 1
 fi
-cat > ~/.claude.json <<'ONBOARD'
-{"hasCompletedOnboarding":true,"installMethod":"native"}
-ONBOARD
-
-# Git identity for agent commits
-git config --global user.name "cfg-agent"
-git config --global user.email "agent@cfg.is"
-git config --global push.autoSetupRemote true
 
 # --- Phase 0b: Validate OAuth token ---
 # Check if the access token is expired or expiring soon. If so, a lightweight
@@ -87,15 +76,7 @@ print(int((exp_ms / 1000) - time.time()))" 2>/dev/null || echo "0")
 if [ "$TOKEN_REMAINING" -lt 300 ] 2>/dev/null; then
     echo "OAuth token expired or expiring in <5min (${TOKEN_REMAINING}s remaining), refreshing..."
     if claude -p 'ping' --dangerously-skip-permissions --model haiku >/dev/null 2>&1; then
-        # Write back refreshed token to shared volume
-        if [ -f ~/.claude/.credentials.json ] && [ -f /persist/.credentials.json ]; then
-            new_exp=$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
-            old_exp=$(python3 -c "import json; d=json.load(open('/persist/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
-            if [ "$new_exp" -gt "$old_exp" ] 2>/dev/null; then
-                cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || true
-                echo "OAuth token refreshed (new expiry: $new_exp)"
-            fi
-        fi
+        echo "OAuth token refreshed (persisted via symlink)"
     else
         echo "ERROR: OAuth token refresh failed — credentials may be expired"
         echo "Run '/agent-setup creds' on the host to re-authenticate"
@@ -419,19 +400,7 @@ PROMPT_CONTENT=$(cat "$PROMPT_FILE")
 claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT_CONTENT" || EXIT_CODE=$?
 rm -f "$PROMPT_FILE"
 
-# Write back credentials only if Claude refreshed the token (newer expiry).
-# Without this check, a failed agent with an expired token would overwrite
-# fresh credentials in the shared volume, breaking subsequent dispatches.
-if [ -f ~/.claude/.credentials.json ] && [ -f /persist/.credentials.json ]; then
-    new_exp=$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
-    old_exp=$(python3 -c "import json; d=json.load(open('/persist/.credentials.json')); print(d.get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo "0")
-    if [ "$new_exp" -gt "$old_exp" ] 2>/dev/null; then
-        cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || echo "WARN: Failed to write back credentials to /persist volume"
-        echo "Credentials refreshed (new expiry: $new_exp)"
-    fi
-elif [ -f ~/.claude/.credentials.json ]; then
-    cp ~/.claude/.credentials.json /persist/.credentials.json 2>/dev/null || echo "WARN: Failed to write back credentials to /persist volume"
-fi
+# Credentials persist automatically via symlink to /persist volume — no writeback needed.
 
 # --- Phase 3: Cleanup and reporting ---
 

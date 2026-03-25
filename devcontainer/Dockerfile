@@ -37,26 +37,26 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # Go-based security tools
-RUN go install github.com/securego/gosec/v2/cmd/gosec@latest \
-    && go install honnef.co/go/tools/cmd/staticcheck@latest \
-    && go install github.com/zricethezav/gitleaks/v8@latest
+RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.25.0 \
+    && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
+    && go install github.com/zricethezav/gitleaks/v8@v8.30.1
 
 # Trivy (apt repo for stable releases)
 RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
       | gpg --dearmor -o /usr/share/keyrings/trivy.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb bookworm main" \
       > /etc/apt/sources.list.d/trivy.list \
-    && apt-get update && apt-get install -y trivy \
+    && apt-get update && apt-get install -y trivy=0.69.3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Nancy (Go dependency scanner)
 RUN GOPATH=$(go env GOPATH) \
-    && curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v1.0.51/nancy-v1.0.51-linux-amd64" \
+    && curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v1.2.0/nancy-v1.2.0-linux-amd64" \
        -o "$GOPATH/bin/nancy" \
     && chmod +x "$GOPATH/bin/nancy"
 
-# truffleHog (optional, best-effort secret scanning)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin || true
+# truffleHog (optional, best-effort secret scanning — pinned version, not @main)
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.94.0/scripts/install.sh | sh -s -- -b /usr/local/bin v3.94.0 || true
 
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code
@@ -64,24 +64,30 @@ RUN npm install -g @anthropic-ai/claude-code
 # Non-root agent user with sudo for iptables only
 RUN useradd -m -s /bin/bash agent \
     && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
-    && mkdir -p /persist && chown agent:agent /persist
+    && mkdir -p /persist && chown agent:agent /persist \
+    && mkdir -p /home/agent/.cache/go-build /home/agent/go/pkg/mod \
+    && chown -R agent:agent /home/agent/.cache /home/agent/go
 
 # Pre-download Trivy vulnerability DB (avoids runtime download behind firewall)
 RUN trivy fs --download-db-only --cache-dir /home/agent/.cache/trivy 2>/dev/null || true
 RUN chown -R agent:agent /home/agent/.cache
 
-# Pre-cache Go modules from the project
+# Pre-cache Go modules from the project — download as root, then copy to agent
+# user's GOPATH so modules are available without the named volume on first run.
 WORKDIR /tmp/modcache
 COPY go.mod go.sum ./
-RUN go mod download
-RUN rm go.mod go.sum
+RUN go mod download \
+    && cp -r /root/go/pkg/mod /home/agent/go/pkg/mod \
+    && chown -R agent:agent /home/agent/go/pkg/mod \
+    && rm go.mod go.sum
 WORKDIR /
 
 # Copy container scripts and DNS allowlist
 COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
+COPY .devcontainer/scripts/setup-env.sh /usr/local/bin/setup-env.sh
 COPY .devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY .devcontainer/dnsmasq-allowlist.conf /etc/dnsmasq-allowlist.conf
-RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/local/bin/entrypoint.sh
 
 # Agent environment — 4GB RAM is sufficient for go test/build + Claude API calls
 ENV CFGMS_AGENT_MODE=true

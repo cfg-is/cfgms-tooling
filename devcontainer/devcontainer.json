@@ -1,0 +1,52 @@
+{
+  "name": "CFGMS Agent",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // Features: additive for interactive/VS Code use. The Dockerfile is
+  // self-contained for headless `docker build`, so features that detect
+  // existing installs will be no-ops in that case.
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "remoteUser": "agent",
+  "capAdd": ["NET_ADMIN"],
+
+  "containerEnv": {
+    "CFGMS_AGENT_MODE": "true",
+    "TRIVY_CACHE_DIR": "/home/agent/.cache/trivy"
+  },
+
+  // Named volumes: persist credentials, Go caches across rebuilds.
+  // "Authenticate once, survives any number of rebuilds."
+  "mounts": [
+    "source=claude-creds,target=/persist,type=volume",
+    "source=cfgms-go-build-cache,target=/home/agent/.cache/go-build,type=volume",
+    "source=cfgms-go-mod-cache,target=/home/agent/go/pkg/mod,type=volume"
+  ],
+
+  // Lifecycle hooks — both delegate to the shared setup-env.sh script.
+  "postCreateCommand": ".devcontainer/scripts/post-create.sh",
+  "postStartCommand": ".devcontainer/scripts/post-start.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ],
+      "settings": {
+        "go.gopath": "/home/agent/go"
+      }
+    }
+  },
+
+  "runArgs": [
+    "--memory=4g",
+    "--cpus=4",
+    "--stop-timeout=3600"
+  ]
+}
