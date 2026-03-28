@@ -77,7 +77,7 @@ RUN chown -R agent:agent /home/agent/.cache
 WORKDIR /tmp/modcache
 COPY go.mod go.sum ./
 RUN go mod download \
-    && cp -r /root/go/pkg/mod /home/agent/go/pkg/mod \
+    && cp -r "$(go env GOPATH)/pkg/mod" /home/agent/go/pkg/mod \
     && chown -R agent:agent /home/agent/go/pkg/mod \
     && rm go.mod go.sum
 WORKDIR /
