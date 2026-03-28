@@ -36,10 +36,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Go-based security tools
+# Go-based security and quality tools
 RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.25.0 \
     && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
-    && go install github.com/zricethezav/gitleaks/v8@v8.30.1
+    && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
+    && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$(go env GOPATH)/bin"
 
 # Trivy (apt repo for stable releases)
 RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
