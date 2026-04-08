@@ -57,7 +57,7 @@ RUN GOPATH=$(go env GOPATH) \
     && chmod +x "$GOPATH/bin/nancy"
 
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.94.0/scripts/install.sh | sh -s -- -b /usr/local/bin v3.94.0 || true
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.94.2/scripts/install.sh | sh -s -- -b /usr/local/bin v3.94.2 || true
 
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code
