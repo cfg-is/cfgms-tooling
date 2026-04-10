@@ -16,6 +16,7 @@ Pipeline Helper — wraps gh CLI for subagent permission compatibility
 
 Story lifecycle:
   create-story <epic_num> <title> <body_file>   Create story issue, label, and link to epic
+  create-ready-story <epic_num> <title> <body_file>  Create story as agent:ready (skip draft)
   edit-body <issue_num> <body_file>              Replace issue body from file
   append-section <issue_num> <section> <file>    Append content after ## <section> heading
   promote <issue_num>                            pipeline:draft → agent:ready
@@ -67,6 +68,36 @@ case "$cmd" in
     story_url=$(gh issue create --repo "$REPO" \
       --title "$title" \
       --label "pipeline:story,pipeline:draft" \
+      --body-file "$body_file")
+
+    story_num=$(echo "$story_url" | grep -oP '\d+$')
+    echo "CREATED:${story_num}:${story_url}"
+
+    # Link as sub-issue of epic
+    epic_id=$(gh issue view "$epic_num" --repo "$REPO" --json id -q .id)
+    child_id=$(gh issue view "$story_num" --repo "$REPO" --json id -q .id)
+    gh api graphql \
+      -f query='mutation($parentId: ID!, $childId: ID!) { addSubIssue(input: {issueId: $parentId, subIssueId: $childId}) { issue { number } subIssue { number } } }' \
+      -f parentId="$epic_id" \
+      -f childId="$child_id" > /dev/null
+
+    echo "LINKED:${story_num}:epic-${epic_num}"
+    ;;
+
+  create-ready-story)
+    epic_num="${1:?Usage: create-ready-story <epic_num> <title> <body_file>}"
+    title="${2:?Usage: create-ready-story <epic_num> <title> <body_file>}"
+    body_file="${3:?Usage: create-ready-story <epic_num> <title> <body_file>}"
+
+    if [ ! -f "$body_file" ]; then
+      echo "ERROR: Body file not found: $body_file"
+      exit 1
+    fi
+
+    # Create the story issue with agent:ready (skip pipeline:draft)
+    story_url=$(gh issue create --repo "$REPO" \
+      --title "$title" \
+      --label "pipeline:story,agent:ready" \
       --body-file "$body_file")
 
     story_num=$(echo "$story_url" | grep -oP '\d+$')
