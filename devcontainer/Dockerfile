@@ -93,6 +93,8 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/lo
 # Agent environment — 4GB RAM is sufficient for go test/build + Claude API calls
 ENV CFGMS_AGENT_MODE=true
 ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy
+ENV GOMODCACHE=/home/agent/go/pkg/mod
+ENV GOFLAGS=-modcacherw
 
 USER agent
 WORKDIR /workspace

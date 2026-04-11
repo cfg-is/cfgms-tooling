@@ -15,17 +15,21 @@ fi
 # and out, we symlink so that token refreshes persist immediately to the volume.
 mkdir -p ~/.claude
 
-if [ -f /persist/.credentials.json ]; then
+if [ -f ~/.claude/.credentials.json ]; then
+    : # Credentials already present (e.g. host mount) — nothing to do
+elif [ -f /persist/.credentials.json ]; then
     ln -sf /persist/.credentials.json ~/.claude/.credentials.json
 else
-    echo "WARN: No Claude credentials found at /persist/.credentials.json"
+    echo "WARN: No Claude credentials found"
     echo "Run: /agent-setup creds on host to configure"
 fi
 
-# Onboarding config — symlink if saved by refresh-agent-creds.sh, else create
-if [ -f /persist/.claude-config.json ]; then
+# Onboarding config — skip if present (host mount), symlink from persist, or create
+if [ -f ~/.claude.json ]; then
+    : # Already present (e.g. host mount)
+elif [ -f /persist/.claude-config.json ]; then
     ln -sf /persist/.claude-config.json ~/.claude.json
-elif [ ! -f ~/.claude.json ]; then
+else
     cat > ~/.claude.json <<'ONBOARD'
 {"hasCompletedOnboarding":true,"installMethod":"native"}
 ONBOARD
@@ -36,7 +40,8 @@ if [ -d /persist/.claude-state ]; then
     cp -rn /persist/.claude-state/. ~/.claude/ 2>/dev/null || true
 fi
 
-# --- Git identity ---
+# --- Git identity and auth ---
 git config --global user.name "cfg-agent"
 git config --global user.email "agent@cfg.is"
 git config --global push.autoSetupRemote true
+gh auth setup-git 2>/dev/null || true
