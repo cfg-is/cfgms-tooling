@@ -37,18 +37,19 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # Go-based security and quality tools
+# Versions MUST match .github/workflows/dependency-pin-check.yml
 RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.25.0 \
     && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
-    && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$(go env GOPATH)/bin"
+    && go install github.com/google/go-licenses/v2@v2.0.1 \
+    && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+       | sh -s -- -b "$(go env GOPATH)/bin" v2.11.4
 
-# Trivy (apt repo for stable releases)
-RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
-      | gpg --dearmor -o /usr/share/keyrings/trivy.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb bookworm main" \
-      > /etc/apt/sources.list.d/trivy.list \
-    && apt-get update && apt-get install -y trivy=0.69.3 \
-    && rm -rf /var/lib/apt/lists/*
+# Trivy — pinned to v0.69.3 via install.sh because v0.69.4+ are compromised
+# (CVE-2026-33634). The apt repo no longer ships v0.69.3, so we use the
+# official install script against the still-available GitHub release.
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+    | sh -s -- -b /usr/local/bin v0.69.3
 
 # Nancy (Go dependency scanner)
 RUN GOPATH=$(go env GOPATH) \
