@@ -4,8 +4,8 @@
 # can invoke them without triggering manual-approval prompts.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKTREE_BASE="$(cd "$REPO_ROOT/.." && pwd)/worktrees"
+REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktrees}"
 
 # Ensure clone is based on latest remote develop, not stale local state.
 # Called inside fresh clones after setting the remote URL.
@@ -54,7 +54,10 @@ Commands:
   check-conflicts <NUM> [NUM...]            Check for existing containers/clones (issue mode)
   check-conflicts --branch <NAME>           Check for existing containers/clones (branch mode)
   check-conflicts --pr <NUM>                Check for existing containers/clones (PR-fix mode)
-  create-clone    <NUM>                     Clone repo and create feature branch (issue mode)
+  create-clone    <NUM> [--keep-remote]     Clone repo and create feature branch (issue mode)
+                                            If remote branch feature/story-<NUM>-agent already exists,
+                                            it is force-deleted before the fresh branch is created.
+                                            Pass --keep-remote to preserve the stale branch (forensics).
   create-clone-branch <BRANCH>              Clone repo and checkout/create branch
   create-clone-pr <PR_NUM>                  Clone repo and checkout PR branch
   launch          <NUM>                     Launch agent container (issue mode)
@@ -133,16 +136,39 @@ case "$cmd" in
     ;;
 
   create-clone)
+    keep_remote=false
+    while [[ $# -gt 0 && "$1" == --* ]]; do
+      case "$1" in
+        --keep-remote) keep_remote=true; shift ;;
+        *) echo "Unknown flag for create-clone: $1"; exit 1 ;;
+      esac
+    done
     [[ $# -eq 1 ]] || { echo "create-clone requires exactly one issue number"; exit 1; }
     num="$1"
+    branch_name="feature/story-${num}-agent"
     dest="${WORKTREE_BASE}/story-${num}"
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
+
+    # Check for stale remote branch before cloning. A stale branch causes history
+    # corruption when the new container pushes (git merges the two histories).
+    if git -C "$REPO_ROOT" ls-remote --heads origin "$branch_name" 2>/dev/null | grep -q .; then
+      if $keep_remote; then
+        echo "INFO: Stale remote branch exists: ${branch_name} (keeping due to --keep-remote)"
+      else
+        echo "Cleaning stale remote branch: ${branch_name}"
+        if ! git -C "$REPO_ROOT" push origin --delete "$branch_name" 2>&1; then
+          echo "ERROR: Failed to delete stale remote branch '${branch_name}'. Refusing to dispatch to prevent history corruption."
+          exit 1
+        fi
+      fi
+    fi
+
     trap "rm -rf '$dest'" ERR
     git clone --local --branch develop "$REPO_ROOT" "$dest"
     cd "$dest"
     git remote set-url origin "$github_url"
     sync_to_remote_develop
-    git checkout -b "feature/story-${num}-agent"
+    git checkout -b "$branch_name"
     trap - ERR
     echo "CLONE_OK:${num}:$(git branch --show-current)"
     ;;
