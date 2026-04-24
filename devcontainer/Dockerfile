@@ -88,6 +88,7 @@ WORKDIR /
 COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY .devcontainer/scripts/setup-env.sh /usr/local/bin/setup-env.sh
 COPY .devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY .devcontainer/agent-context.sh /usr/local/bin/agent-context.sh
 COPY .devcontainer/dnsmasq-allowlist.conf /etc/dnsmasq-allowlist.conf
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/local/bin/entrypoint.sh
 

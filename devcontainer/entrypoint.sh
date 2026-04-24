@@ -3,6 +3,10 @@
 # Supports three modes: issue (default), branch, and pr-fix.
 set -euo pipefail
 
+# Helper library for prompt context assembly (fetch_* / render_* / no-op detection).
+# shellcheck source=./agent-context.sh
+source "$(dirname "${BASH_SOURCE[0]}")/agent-context.sh"
+
 # --- Argument parsing ---
 MODE="issue"
 ISSUE_NUM=""
@@ -170,19 +174,23 @@ SCOPE_CONSTRAINTS_SECTION='## Scope Constraints
 
 compose_issue_prompt() {
     echo "Fetching issue #${ISSUE_NUM}..."
-    ISSUE_JSON=$(gh_api_with_retry "fetch issue #${ISSUE_NUM}" gh issue view "$ISSUE_NUM" --json title,body,labels) || {
+    ISSUE_JSON=$(gh_api_with_retry "fetch issue #${ISSUE_NUM}" gh issue view "$ISSUE_NUM" --json title,body,labels,comments) || {
         echo "ERROR: Cannot proceed without issue context"
         exit 1
     }
 
     TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
     BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
+    local issue_comments_json
+    issue_comments_json=$(echo "$ISSUE_JSON" | jq -c '.comments // []')
 
     # Build prompt in a temp file to avoid shell metacharacter corruption.
     # Issue bodies often contain backticks, $ field numbers, etc.
     PROMPT_FILE=$(mktemp)
     printf 'You are implementing GitHub issue #%s: %s\n\n' "$ISSUE_NUM" "$TITLE" > "$PROMPT_FILE"
     printf '%s\n\n' "$BODY" >> "$PROMPT_FILE"
+    ac_render_issue_comments "$issue_comments_json" >> "$PROMPT_FILE"
+    printf '\n' >> "$PROMPT_FILE"
     cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
@@ -246,9 +254,10 @@ compose_branch_prompt() {
     fi
 
     # Fetch issue context if available
+    local issue_comments_md=""
     if [[ -n "$ISSUE_NUM" ]]; then
         echo "Fetching issue #${ISSUE_NUM} for context..."
-        ISSUE_JSON=$(gh_api_with_retry "fetch issue #${ISSUE_NUM}" gh issue view "$ISSUE_NUM" --json title,body,labels) || {
+        ISSUE_JSON=$(gh_api_with_retry "fetch issue #${ISSUE_NUM}" gh issue view "$ISSUE_NUM" --json title,body,labels,comments) || {
             echo "ERROR: Cannot proceed without issue context"
             exit 1
         }
@@ -261,6 +270,9 @@ GitHub issue #${ISSUE_NUM}: ${TITLE}
 
 ${BODY}
 "
+            local _comments_json
+            _comments_json=$(echo "$ISSUE_JSON" | jq -c '.comments // []')
+            issue_comments_md=$(ac_render_issue_comments "$_comments_json")
         fi
     fi
 
@@ -284,6 +296,9 @@ ${BODY}
     printf 'You are working on existing branch `%s`.\n\n' "$BRANCH" > "$PROMPT_FILE"
     if [[ -n "$issue_context" ]]; then
         printf '%s\n' "$issue_context" >> "$PROMPT_FILE"
+    fi
+    if [[ -n "$issue_comments_md" ]]; then
+        printf '%s\n\n' "$issue_comments_md" >> "$PROMPT_FILE"
     fi
     cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
@@ -339,36 +354,44 @@ PROMPT_EOF
 
 compose_pr_fix_prompt() {
     echo "Fetching PR #${PR_NUM} metadata..."
-    PR_JSON=$(gh_api_with_retry "fetch PR #${PR_NUM}" gh pr view "$PR_NUM" --json number,title,body,headRefName,reviews) || {
+    PR_JSON=$(gh_api_with_retry "fetch PR #${PR_NUM}" ac_fetch_pr_metadata "$PR_NUM") || {
         echo "ERROR: Cannot proceed without PR context"
         exit 1
     }
 
-    local pr_title pr_body pr_branch
+    local pr_title pr_body pr_branch reviews_json
     pr_title=$(echo "$PR_JSON" | jq -r '.title')
     pr_body=$(echo "$PR_JSON" | jq -r '.body')
     pr_branch=$(echo "$PR_JSON" | jq -r '.headRefName')
+    reviews_json=$(echo "$PR_JSON" | jq -c '.reviews // []')
     BRANCH="$pr_branch"
 
-    # Fetch review comments — hard fail if fetch fails (agent needs these to do its job)
-    echo "Fetching review comments..."
     local owner repo
     owner=$(gh repo view --json owner -q '.owner.login' 2>/dev/null || echo "")
     repo=$(gh repo view --json name -q '.name' 2>/dev/null || echo "")
     if [[ -z "$owner" ]] || [[ -z "$repo" ]]; then
-        echo "ERROR: Could not determine repo owner/name — cannot fetch review comments"
+        echo "ERROR: Could not determine repo owner/name — cannot fetch PR comments"
         exit 1
     fi
-    REVIEW_COMMENTS=$(gh_api_with_retry "fetch review comments for PR #${PR_NUM}" gh api "repos/${owner}/${repo}/pulls/${PR_NUM}/comments") || {
-        echo "ERROR: Cannot proceed without review comments"
+
+    echo "Fetching PR inline review comments..."
+    local inline_json resolution_json conversation_json failing_checks_json
+    inline_json=$(gh_api_with_retry "fetch inline comments for PR #${PR_NUM}" ac_fetch_pr_inline_comments "$owner" "$repo" "$PR_NUM") || {
+        echo "ERROR: Cannot proceed without inline review comments"
         exit 1
     }
 
-    # Extract review body comments (top-level review comments, not inline)
-    REVIEWS=$(echo "$PR_JSON" | jq -r '.reviews[] | select(.body != "") | "**\(.author.login)** (\(.state)):\n\(.body)\n"' 2>/dev/null || echo "")
+    echo "Fetching PR conversation comments..."
+    conversation_json=$(ac_fetch_pr_conversation_comments "$owner" "$repo" "$PR_NUM" || echo '[]')
+    [[ -z "$conversation_json" ]] && conversation_json='[]'
 
-    # Format inline comments
-    INLINE_COMMENTS=$(echo "$REVIEW_COMMENTS" | jq -r '.[] | "**\(.user.login)** on `\(.path)` line \(.line // .original_line):\n\(.body)\n"' 2>/dev/null || echo "")
+    echo "Fetching review-thread resolution state..."
+    resolution_json=$(ac_fetch_review_thread_resolution "$owner" "$repo" "$PR_NUM" || echo '[]')
+    [[ -z "$resolution_json" ]] && resolution_json='[]'
+
+    echo "Fetching failing CI check context..."
+    failing_checks_json=$(ac_fetch_failing_checks "$PR_NUM" || echo '[]')
+    [[ -z "$failing_checks_json" ]] && failing_checks_json='[]'
 
     # Extract issue number from PR body or branch name
     if [[ -z "$ISSUE_NUM" ]]; then
@@ -379,19 +402,32 @@ compose_pr_fix_prompt() {
     fi
 
     local issue_ref=""
+    local linked_issue_json=""
     if [[ -n "$ISSUE_NUM" ]]; then
         issue_ref=" (Issue #${ISSUE_NUM})"
+        echo "Fetching linked issue #${ISSUE_NUM}..."
+        linked_issue_json=$(ac_fetch_issue_with_comments "$ISSUE_NUM" || echo "")
     fi
 
     # Build prompt in a temp file to avoid shell metacharacter corruption.
     # PR bodies and review comments often contain code with backticks and $.
     PROMPT_FILE=$(mktemp)
-    printf 'You are fixing review comments on PR #%s: %s%s\n\n## PR Description\n\n' "$PR_NUM" "$pr_title" "$issue_ref" > "$PROMPT_FILE"
+    printf 'You are fixing PR #%s: %s%s\n\n## PR Description\n\n' "$PR_NUM" "$pr_title" "$issue_ref" > "$PROMPT_FILE"
     printf '%s\n\n' "$pr_body" >> "$PROMPT_FILE"
-    printf '## Review Comments to Address\n\n### Review-Level Comments\n' >> "$PROMPT_FILE"
-    printf '%s\n\n' "${REVIEWS:-No review-level comments.}" >> "$PROMPT_FILE"
-    printf '### Inline Comments\n' >> "$PROMPT_FILE"
-    printf '%s\n\n' "${INLINE_COMMENTS:-No inline comments.}" >> "$PROMPT_FILE"
+    printf '## Review Comments to Address\n\n' >> "$PROMPT_FILE"
+    ac_render_review_comments "$reviews_json" >> "$PROMPT_FILE"
+    printf '\n' >> "$PROMPT_FILE"
+    ac_render_inline_comments "$inline_json" "$resolution_json" >> "$PROMPT_FILE"
+    printf '\n' >> "$PROMPT_FILE"
+    ac_render_conversation_comments "$conversation_json" >> "$PROMPT_FILE"
+    printf '\n' >> "$PROMPT_FILE"
+    printf '## CI Status\n\n' >> "$PROMPT_FILE"
+    ac_render_failing_checks "$failing_checks_json" >> "$PROMPT_FILE"
+    printf '\n' >> "$PROMPT_FILE"
+    if [[ -n "$linked_issue_json" ]] && echo "$linked_issue_json" | jq -e '.title' >/dev/null 2>&1; then
+        ac_render_linked_issue "$linked_issue_json" "$ISSUE_NUM" >> "$PROMPT_FILE"
+        printf '\n' >> "$PROMPT_FILE"
+    fi
     cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
@@ -401,13 +437,19 @@ Follow the CLAUDE.md file in the repository root. CFGMS_AGENT_MODE=true is set.
 
 ## Phase 1: Understand and Fix
 
-1. Read ALL review comments carefully — both review-level and inline comments above
+1. Read ALL context above in order:
+   - Review-Level Comments (formal review submissions)
+   - Inline Comments — prioritise \`[UNRESOLVED]\` threads; do NOT re-fix \`[RESOLVED]\` ones unless a newer comment explicitly reopens them
+   - PR Conversation Comments (the comment box at the bottom of the PR — this is where human operators most often post fix instructions)
+   - Failing CI Checks — if any, treat the log tail as a concrete task: reproduce the failure locally, write a test that exposes it, then fix
+   - Linked Issue body + comments — scope clarifications from PO frequently land here
 2. Read the code at the mentioned locations
-3. For each review comment:
+3. For each concern:
    - If it requests new tests: write tests FIRST (TDD), then implement the fix
-   - If it identifies a bug: write a test that reproduces it, then fix it
+   - If it identifies a bug or names a failing test: write a test that reproduces it, then fix it
    - If it requests a refactor: ensure existing tests still pass after the change
 4. If a comment is unclear, make your best judgment following CLAUDE.md conventions
+5. If after careful reading you find nothing actionable: stop, do not commit, and exit 0 — the entrypoint will detect that HEAD did not advance and mark the run as a no-op failure so an operator can investigate
 
 ## Phase 2: Validate (quick self-check before specialist review)
 
@@ -467,6 +509,9 @@ fi
 # Clean validation marker from any previous run
 rm -f /tmp/agent-validation-passed
 
+# Capture pre-run HEAD SHA so fix-pr mode can detect silent no-ops.
+PRE_FIX_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+
 echo "Starting Claude agent (mode=${MODE})..."
 EXIT_CODE=0
 # Read prompt from file to avoid shell metacharacter corruption.
@@ -477,11 +522,33 @@ rm -f "$PROMPT_FILE"
 
 # Credentials persist automatically via symlink to /persist volume — no writeback needed.
 
-# --- Phase 2b: Shell-level validation enforcement ---
-# The agent is instructed to have qa-test-runner write /tmp/agent-validation-passed
-# after make test-agent-complete passes. If the marker is missing, tests either
-# failed or were never run — both are failures.
-if [ "$EXIT_CODE" -eq 0 ] && [ ! -f /tmp/agent-validation-passed ]; then
+# Compute post-run HEAD + advancement state for fix-pr no-op detection + result JSON.
+POST_FIX_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+HEAD_ADVANCED="false"
+if ac_detect_no_op "$PRE_FIX_HEAD" "$POST_FIX_HEAD"; then
+    HEAD_ADVANCED="true"
+fi
+
+# --- Phase 2b: Silent no-op detection (fix-pr mode) + validation enforcement ---
+# In fix-pr mode, a run that exits 0 but never advanced HEAD is a silent no-op.
+# The make test-agent-complete fallback would pass trivially on unchanged code,
+# masking the failure. Detect the no-op first and skip the fallback entirely.
+if [[ "$MODE" == "fix-pr" ]] && [ "$EXIT_CODE" -eq 0 ] && [ "$HEAD_ADVANCED" != "true" ]; then
+    echo "ERROR: fix-pr agent ran but made no commits (HEAD unchanged at ${PRE_FIX_HEAD})"
+    echo "Skipping make test-agent-complete fallback (would pass trivially on unchanged code)."
+    EXIT_CODE=1
+    # Best-effort idempotent breadcrumb on the PR.
+    _fix_owner=$(gh repo view --json owner -q '.owner.login' 2>/dev/null || echo "")
+    _fix_repo=$(gh repo view --json name -q '.name' 2>/dev/null || echo "")
+    _container_name="${HOSTNAME:-cfg-agent-pr-fix-${PR_NUM}}"
+    if [[ -n "$_fix_owner" ]] && [[ -n "$_fix_repo" ]]; then
+        ac_post_no_op_comment "$_fix_owner" "$_fix_repo" "$PR_NUM" "$_container_name" || \
+            echo "WARN: failed to post no-op comment on PR #${PR_NUM}"
+    fi
+elif [ "$EXIT_CODE" -eq 0 ] && [ ! -f /tmp/agent-validation-passed ]; then
+    # The agent is instructed to have qa-test-runner write /tmp/agent-validation-passed
+    # after make test-agent-complete passes. If the marker is missing, tests either
+    # failed or were never run — both are failures.
     echo "ERROR: Agent exited 0 but validation marker not found"
     echo "The qa-test-runner specialist either failed or was not run."
     echo "Running make test-agent-complete as fallback enforcement..."
@@ -510,6 +577,9 @@ cat > /tmp/agent-result.json <<RESULT_EOF
   "pr_url": "${PR_URL}",
   "branch": "${CURRENT_BRANCH}",
   "validation_passed": $([ -f /tmp/agent-validation-passed ] && echo "true" || echo "false"),
+  "pre_head_sha": "${PRE_FIX_HEAD}",
+  "post_head_sha": "${POST_FIX_HEAD}",
+  "head_advanced": ${HEAD_ADVANCED},
   "timestamp": "$(date -Iseconds)"
 }
 RESULT_EOF
