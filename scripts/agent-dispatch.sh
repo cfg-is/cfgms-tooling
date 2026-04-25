@@ -28,6 +28,47 @@ sanitize_branch() {
   echo "$1" | sed 's|/|--|g'
 }
 
+# Emit OPEN_PR_EXISTS:<ISSUE>:<PR>:<TITLE> for each open PR that references
+# this issue. Uses two signals:
+#   1. GitHub's authoritative "closing PR" linkage (body Fixes/Closes/Resolves
+#      or manual UI link) via the issue.closedByPullRequestsReferences field
+#   2. Title-pattern fallback: "(Issue #<N>)" or "#<N>" in an open PR title,
+#      which catches agent PRs whose bodies omit the Fixes keyword
+check_existing_prs_for_issue() {
+  local issue_num="$1"
+  # Test hook: canned output for hermetic unit tests. Format is newline-separated
+  # OPEN_PR_EXISTS:<issue>:<pr>:<title> lines (empty = no conflicts).
+  if [[ -n "${CFGMS_TEST_MOCK_EXISTING_PRS:-}" ]]; then
+    printf '%s\n' "${CFGMS_TEST_MOCK_EXISTING_PRS}" | grep -E "^OPEN_PR_EXISTS:${issue_num}:" || true
+    return 0
+  fi
+  local graphql_out title_out
+  # Authoritative linkage via GraphQL (closing-PR references: body Fixes/Closes/Resolves or manual UI link).
+  # Non-existent issues return an error; we swallow it and produce no output.
+  graphql_out=$(gh api graphql -f query="
+      query(\$num: Int!) {
+        repository(owner: \"cfg-is\", name: \"cfgms\") {
+          issue(number: \$num) {
+            closedByPullRequestsReferences(first: 20, includeClosedPrs: false) {
+              nodes { number title state }
+            }
+          }
+        }
+      }" -F num="$issue_num" --jq '
+        .data.repository.issue.closedByPullRequestsReferences.nodes[]?
+        | select(.state == "OPEN")
+        | "OPEN_PR_EXISTS:'"$issue_num"':\(.number):\(.title | gsub(":"; " "))"
+      ' 2>/dev/null) || graphql_out=""
+  # Title-pattern fallback for PRs that reference the issue without Fixes keyword.
+  title_out=$(gh pr list --repo cfg-is/cfgms --state open --limit 50 \
+        --search "in:title #${issue_num}" \
+        --json number,title --jq '
+      .[] | "OPEN_PR_EXISTS:'"$issue_num"':\(.number):\(.title | gsub(":"; " "))"
+    ' 2>/dev/null || true)
+  printf '%s\n%s\n' "$graphql_out" "$title_out" | grep -v '^$' | sort -u || true
+  return 0
+}
+
 # Refresh agent credentials from the host's Claude session.
 # Copies ~/.claude/.credentials.json into the claude-creds Docker volume
 # so agents always start with a fresh token. No interactive OAuth needed.
@@ -54,10 +95,14 @@ Commands:
   check-conflicts <NUM> [NUM...]            Check for existing containers/clones (issue mode)
   check-conflicts --branch <NAME>           Check for existing containers/clones (branch mode)
   check-conflicts --pr <NUM>                Check for existing containers/clones (PR-fix mode)
-  create-clone    <NUM> [--keep-remote]     Clone repo and create feature branch (issue mode)
+  create-clone    <NUM> [--keep-remote] [--allow-duplicate-pr]
+                                            Clone repo and create feature branch (issue mode)
                                             If remote branch feature/story-<NUM>-agent already exists,
                                             it is force-deleted before the fresh branch is created.
                                             Pass --keep-remote to preserve the stale branch (forensics).
+                                            Refuses to dispatch if an open PR already references the
+                                            issue via Fixes/Closes/Resolves (exit 2). Pass
+                                            --allow-duplicate-pr to override for parallel-work cases.
   create-clone-branch <BRANCH>              Clone repo and checkout/create branch
   create-clone-pr <PR_NUM>                  Clone repo and checkout PR branch
   launch          <NUM>                     Launch agent container (issue mode)
@@ -129,6 +174,7 @@ case "$cmd" in
           if [[ -d "${WORKTREE_BASE}/story-${num}" ]]; then
             echo "CLONE_EXISTS:${num}:${WORKTREE_BASE}/story-${num}"
           fi
+          check_existing_prs_for_issue "$num"
         done
         echo "CHECK_DONE"
         ;;
@@ -137,9 +183,11 @@ case "$cmd" in
 
   create-clone)
     keep_remote=false
+    allow_duplicate_pr=false
     while [[ $# -gt 0 && "$1" == --* ]]; do
       case "$1" in
         --keep-remote) keep_remote=true; shift ;;
+        --allow-duplicate-pr) allow_duplicate_pr=true; shift ;;
         *) echo "Unknown flag for create-clone: $1"; exit 1 ;;
       esac
     done
@@ -148,6 +196,19 @@ case "$cmd" in
     branch_name="feature/story-${num}-agent"
     dest="${WORKTREE_BASE}/story-${num}"
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
+
+    # Refuse to dispatch if an open PR already references this issue via
+    # Fixes/Closes/Resolves. Override with --allow-duplicate-pr for genuine
+    # parallel-work cases. Prevents wasted agent cycles on already-solved bugs.
+    if ! $allow_duplicate_pr; then
+      existing_pr_lines=$(check_existing_prs_for_issue "$num")
+      if [[ -n "$existing_pr_lines" ]]; then
+        echo "$existing_pr_lines"
+        echo "ERROR: Open PR(s) already reference issue #${num}. Refusing to dispatch duplicate work."
+        echo "       Review and merge/close the existing PR, or re-run with --allow-duplicate-pr."
+        exit 2
+      fi
+    fi
 
     # Check for stale remote branch before cloning. A stale branch causes history
     # corruption when the new container pushes (git merges the two histories).
