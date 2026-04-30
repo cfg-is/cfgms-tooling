@@ -108,6 +108,7 @@ Commands:
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
+  po-live         [PO_ARGS...]               Drop into live Claude session pre-seeded with /po <args> (intent capture, planning team, etc.)
   launch-interactive <BRANCH>               Print docker run command for interactive session
   wait-for-auth   <NUM> [NUM...]            (deprecated, no-op) Legacy auth polling
   wait-for-auth   --container <NAME> [...]  (deprecated, no-op) Legacy auth polling
@@ -467,6 +468,106 @@ case "$cmd" in
       --entrypoint /bin/bash \
       cfg-agent:latest \
       -c "setup-env.sh && exec claude --dangerously-skip-permissions"
+    ;;
+
+  po-live)
+    # Launch an interactive PO session in a docker container, pre-seeded with
+    # /po <args> so the conversation is already in role. All args are joined
+    # and passed as the initial prompt; e.g. `po-live intent certificate
+    # rotation` opens a session with first message `/po intent certificate
+    # rotation`. With no args the session opens at `/po` (dashboard).
+    #
+    # Interactive shell required: docker run -it needs a real TTY.
+    # If invoked from inside tmux and POLIVE_INNER is unset, this command
+    # splits a new pane to the right and re-invokes itself there with
+    # POLIVE_INNER=1 set, so the docker run lands in the new pane.
+    # If invoked outside tmux, the script refuses (the slash command should
+    # have detected this upfront and fallen back to /po).
+    if [[ -n "$TMUX" && -z "${POLIVE_INNER:-}" ]]; then
+      # Build the re-invocation as a single quoted command. Use printf %q to
+      # safely escape each arg (handles spaces, quotes, slashes in topics).
+      escaped=""
+      for a in "$@"; do
+        escaped+=" $(printf '%q' "$a")"
+      done
+      exec tmux split-window -h "POLIVE_INNER=1 $0 po-live${escaped}"
+    fi
+
+    if [[ -z "$TMUX" && -z "${POLIVE_INNER:-}" ]]; then
+      echo "ERROR: po-live requires an interactive tmux session (docker run -it needs a real TTY)." >&2
+      echo "       Run this command from a tmux pane, OR use /po inline if you can't open one." >&2
+      exit 1
+    fi
+
+    args="$*"
+    container_name="cfg-agent-live-po"
+    clone_dir="${WORKTREE_BASE}/po-live"
+    github_url=$(git -C "$REPO_ROOT" remote get-url origin)
+
+    # Reuse or create the shared po-live clone (PO sessions don't edit code,
+    # so a single shared workspace on develop is fine).
+    if [[ -d "$clone_dir" ]]; then
+      echo "Clone already exists at ${clone_dir}, reusing"
+    else
+      trap "rm -rf '$clone_dir'" ERR
+      git clone --local --branch develop "$REPO_ROOT" "$clone_dir"
+      cd "$clone_dir"
+      git remote set-url origin "$github_url"
+      sync_to_remote_develop
+      trap - ERR
+    fi
+
+    real_path=$(realpath "$clone_dir")
+    refresh_creds_from_host
+    gh_token=$(gh auth token)
+
+    # Remove stale container with the same name (only one PO live at a time)
+    docker rm -f "$container_name" 2>/dev/null || true
+
+    # Build the initial prompt without trailing space when args are empty.
+    # Trailing space leaves Claude's input box mid-word and shows the slash-
+    # command autocomplete dropdown instead of submitting on Enter.
+    if [[ -n "$args" ]]; then
+      po_prompt="/po ${args}"
+      po_name="PO: ${args}"
+    else
+      po_prompt="/po"
+      po_name="PO"
+    fi
+
+    echo "================================================"
+    echo " CFGMS PO Live Session"
+    echo " Initial prompt: ${po_prompt}"
+    echo " Clone:          ${real_path}"
+    echo "================================================"
+
+    host_claude_dir="$HOME/.claude"
+    host_claude_json="$HOME/.claude.json"
+
+    # Pass $1 (display name) and $2 (initial prompt) via bash -c positional
+    # args to avoid shell-quote escaping pain when args contain special chars.
+    exec docker run -it --rm \
+      --name "$container_name" \
+      --label "cfg-agent=true" \
+      --label "mode=po-live" \
+      --memory=4g \
+      --cpus=4 \
+      -v "${real_path}:/workspace" \
+      -v "${host_claude_dir}:/home/agent/.claude" \
+      -v "${host_claude_json}:/home/agent/.claude.json" \
+      -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
+      -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
+      -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      -e "GH_TOKEN=${gh_token}" \
+      -e "GOMODCACHE=/home/agent/go/pkg/mod" \
+      -e "GOFLAGS=-modcacherw" \
+      --cap-add NET_ADMIN \
+      --entrypoint /bin/bash \
+      cfg-agent:latest \
+      -c 'setup-env.sh && exec claude --dangerously-skip-permissions --name "$1" "$2"' \
+      cfg-agent-live-po \
+      "$po_name" \
+      "$po_prompt"
     ;;
 
   launch-interactive)
