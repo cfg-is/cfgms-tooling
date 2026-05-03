@@ -45,11 +45,22 @@ RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.25.0 \
     && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
        | sh -s -- -b "$(go env GOPATH)/bin" v2.11.4
 
-# Trivy — pinned to v0.69.3 via install.sh because v0.69.4+ are compromised
-# (CVE-2026-33634). The apt repo no longer ships v0.69.3, so we use the
-# official install script against the still-available GitHub release.
-RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-    | sh -s -- -b /usr/local/bin v0.69.3
+# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.70.0 is the
+# post-incident clean release. We download the project's release archive and
+# verify its SHA-256 against a pinned value before extraction, rather than
+# piping the trivy main branch's install.sh through `sh` (whose contents are
+# fetched at install time and can be tampered with). See
+# docs/runbooks/trivy-rollback.md for rollback procedure.
+RUN set -eu; \
+    TRIVY_VERSION='v0.70.0'; \
+    TRIVY_SHA256='8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9'; \
+    ARCHIVE="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"; \
+    curl -sSfL -o "/tmp/${ARCHIVE}" \
+      "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/${ARCHIVE}"; \
+    printf '%s  /tmp/%s\n' "${TRIVY_SHA256}" "${ARCHIVE}" | sha256sum -c -; \
+    tar -xzf "/tmp/${ARCHIVE}" -C /tmp trivy; \
+    install -m 0755 /tmp/trivy /usr/local/bin/trivy; \
+    rm -f "/tmp/${ARCHIVE}" /tmp/trivy
 
 # Nancy (Go dependency scanner)
 RUN GOPATH=$(go env GOPATH) \
