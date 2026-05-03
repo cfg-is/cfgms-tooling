@@ -230,6 +230,7 @@ After all three specialists report PASS:
 11. Push branch: \`git push -u origin \$(git branch --show-current)\`
 12. Open PR targeting \`develop\` (NEVER \`main\`):
     \`gh pr create --base develop --title "<scope>: <title> (Issue #${ISSUE_NUM})"\`
+    The PR body MUST include \`Fixes #${ISSUE_NUM}\` on its own line — develop uses squash merge, so the PR body becomes the commit message; without this keyword GitHub will not auto-close the issue on merge.
     Include specialist review results (PASS/FAIL summaries) in the PR body.
 
 ## Failure Handling
@@ -288,7 +289,7 @@ ${BODY}
     local issue_ref=""
     if [[ -n "$ISSUE_NUM" ]]; then
         issue_ref="
-    - Include \`Fixes #${ISSUE_NUM}\` in the commit body"
+    - Include \`Fixes #${ISSUE_NUM}\` in BOTH the commit body AND the PR body (on its own line). develop uses squash merge, so the PR body becomes the merged commit message; without this keyword GitHub will not auto-close the issue."
     fi
 
     # Build prompt in a temp file to avoid shell metacharacter corruption.

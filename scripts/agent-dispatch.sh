@@ -105,6 +105,15 @@ Commands:
                                             --allow-duplicate-pr to override for parallel-work cases.
   create-clone-branch <BRANCH>              Clone repo and checkout/create branch
   create-clone-pr <PR_NUM>                  Clone repo and checkout PR branch
+  review-pr       <PR_NUM>                  Dispatch headless Acceptance Reviewer for an open PR.
+                                            Auto-detects story from "Fixes #N" or branch name;
+                                            applies pipeline:reviewing to gate re-dispatch;
+                                            spawns cfg-agent-review-pr-<NUM> in background.
+                                            Idempotent: refuses if container already exists or
+                                            label already set. Exit 3 on validation failure.
+  cleanup-stale-reviews                     Remove exited review containers and strip the
+                                            pipeline:reviewing label from their PRs so the
+                                            host PO can re-dispatch on the next cycle.
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
@@ -788,6 +797,233 @@ else:
     fi
 
     echo "HEALTH_DONE:warnings=${warnings}"
+    ;;
+
+  review-pr)
+    # Dispatch a headless Acceptance Reviewer for an open PR. Non-blocking:
+    # returns immediately after `docker run -d`; the container does the review
+    # and exits when done. Replaces the inline subagent spawn that was hanging
+    # on per-tool approval prompts in the host /po cron session.
+    [[ $# -eq 1 ]] || { echo "review-pr requires exactly one PR number"; exit 1; }
+    pr_num="$1"
+    if [[ ! "$pr_num" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: PR number must be numeric, got '${pr_num}'"
+      exit 1
+    fi
+
+    # Validate PR + auto-detect story number.
+    pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
+      --json state,headRefName,body,labels,headRepositoryOwner 2>/dev/null) || {
+      echo "REVIEW_REFUSED:${pr_num}:pr_not_found"
+      exit 3
+    }
+    state=$(echo "$pr_meta" | jq -r '.state')
+    pr_branch=$(echo "$pr_meta" | jq -r '.headRefName')
+    fork_owner=$(echo "$pr_meta" | jq -r '.headRepositoryOwner.login // empty')
+    pr_body=$(echo "$pr_meta" | jq -r '.body // ""')
+    pr_labels=$(echo "$pr_meta" | jq -r '.labels[].name')
+
+    if [[ "$state" != "OPEN" ]]; then
+      echo "REVIEW_REFUSED:${pr_num}:pr_state_${state}"
+      exit 3
+    fi
+    if [[ -n "$fork_owner" && "$fork_owner" != "cfg-is" ]]; then
+      echo "REVIEW_REFUSED:${pr_num}:fork_branch_${fork_owner}"
+      exit 3
+    fi
+    validate_branch "$pr_branch"
+
+    # In-flight gate: refuse if pipeline:reviewing already on the PR.
+    if echo "$pr_labels" | grep -qx "pipeline:reviewing"; then
+      echo "REVIEW_REFUSED:${pr_num}:already_in_flight"
+      exit 3
+    fi
+
+    # Auto-detect story number: first try "Fixes #N" in PR body, then branch.
+    story_num=$(echo "$pr_body" | grep -oP '(?:Fixes|Closes|Resolves)\s+#\K[0-9]+' | head -1 || true)
+    if [[ -z "$story_num" && "$pr_branch" =~ story-([0-9]+) ]]; then
+      story_num="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$story_num" ]]; then
+      echo "REVIEW_REFUSED:${pr_num}:no_story_link"
+      exit 3
+    fi
+
+    container_name="cfg-agent-review-pr-${pr_num}"
+    clone_dir="${WORKTREE_BASE}/review-pr-${pr_num}"
+
+    # Container conflict gate: refuse if the review container already exists.
+    if docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null | grep -qx "$container_name"; then
+      echo "REVIEW_REFUSED:${pr_num}:container_exists"
+      exit 3
+    fi
+
+    # Apply pipeline:reviewing label BEFORE spawning the container so the host
+    # gate is set even if launch fails. Use the REST API directly because
+    # `gh pr edit --add-label` queries pullRequest.projectCards, which emits a
+    # GraphQL deprecation warning and exits 1 even on success. The Issues
+    # labels endpoint applies cleanly (PRs and issues share label storage).
+    if ! gh api -X POST "/repos/cfg-is/cfgms/issues/${pr_num}/labels" \
+        -f "labels[]=pipeline:reviewing" >/dev/null 2>&1; then
+      echo "REVIEW_REFUSED:${pr_num}:label_apply_failed"
+      exit 1
+    fi
+
+    # Stale clone cleanup (previous run crashed before docker rm got the dir).
+    rm -rf "$clone_dir" 2>/dev/null || true
+
+    # Fresh clone at the PR branch.
+    github_url=$(git -C "$REPO_ROOT" remote get-url origin)
+    trap "rm -rf '$clone_dir'; gh api -X DELETE \"/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing\" >/dev/null 2>&1 || true" ERR
+    git clone --quiet --local --branch develop "$REPO_ROOT" "$clone_dir"
+    cd "$clone_dir"
+    git remote set-url origin "$github_url"
+    sync_to_remote_develop
+    git fetch --quiet origin "$pr_branch"
+    git checkout --quiet "$pr_branch"
+    cd "$REPO_ROOT"
+    trap - ERR
+
+    # Write the review prompt into the cloned worktree. The container's
+    # review-entrypoint.sh reads it and hands off to claude -p.
+    cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
+You are operating as the Acceptance Reviewer agent for CFGMS.
+
+Your assignment: pr:${pr_num} story:${story_num}
+
+Read \`.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
+workflow against the PR currently checked out in this workspace. Use real \`gh\`
+commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
+mode, so no approval prompts will block you.
+
+When the verdict is determined, post the structured review comment per the
+agent definition. Then take exactly ONE of these closing actions:
+
+- **PASS (zero findings)**: enqueue with \`gh pr merge ${pr_num} --repo cfg-is/cfgms --squash\`,
+  then run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
+  release the dev agent's container/worktree.
+- **FAIL on first review**: \`./scripts/pipeline-helper.sh label-add ${story_num} "pipeline:fix"\`.
+- **FAIL on second review (fix cycle)**: \`./scripts/pipeline-helper.sh label-swap ${story_num} "pipeline:fix" "pipeline:blocked"\`,
+  assign founder, and \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
+- **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
+  host PO will re-dispatch when CI completes.
+
+CRITICAL — final step regardless of verdict, run this exact command (uses
+the REST API to avoid a spurious GraphQL projectCards warning):
+
+  gh api -X DELETE "/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing"
+
+The host PO uses that label as the in-flight gate. If you exit without
+removing it, the PR will never be re-reviewed (the entrypoint has a failsafe
+strip, but the agent should do this itself so the gate state is correct
+even on graceful exit).
+PROMPT_EOF
+
+    real_path=$(realpath "$clone_dir")
+    refresh_creds_from_host
+    gh_token=$(gh auth token)
+
+    # Launch headless. Mount the review entrypoint at runtime — no image rebuild
+    # required when this script changes.
+    if container_id=$(docker run -d \
+      --name "$container_name" \
+      --label "cfg-agent=true" \
+      --label "mode=review" \
+      --label "pr=${pr_num}" \
+      --label "story=${story_num}" \
+      --memory=4g \
+      --cpus=4 \
+      --stop-timeout=1800 \
+      -v "${real_path}:/workspace" \
+      -v "claude-creds:/persist" \
+      -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
+      -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
+      -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
+      -e "GH_TOKEN=${gh_token}" \
+      -e "CFGMS_AGENT_MODE=true" \
+      --cap-add NET_ADMIN \
+      --entrypoint /usr/local/bin/review-entrypoint.sh \
+      cfg-agent:latest 2>&1); then
+      echo "REVIEW_DISPATCHED:${pr_num}:${story_num}:${container_id}"
+    else
+      # Launch failed — strip label so PR is re-eligible, then clean up.
+      echo "LAUNCH_FAILED:${container_name}:${container_id}"
+      gh api -X DELETE "/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing" >/dev/null 2>&1 || true
+      rm -rf "$clone_dir"
+      echo "CLEANED:clone:${clone_dir}"
+      exit 1
+    fi
+    ;;
+
+  cleanup-stale-reviews)
+    # Failsafe for review containers that exited without stripping
+    # pipeline:reviewing. Removes exited cfg-agent-review-pr-<N> containers
+    # older than 30 minutes, archives their result JSON, deletes the worktree,
+    # and strips the label from the corresponding PR so the host PO can
+    # re-dispatch on the next cycle.
+    cleaned=0
+    now_ts=$(date -u +%s)
+    threshold=$((now_ts - 1800))  # 30 minutes ago
+
+    while IFS=$'\t' read -r container_name finished_iso labels; do
+      [[ -z "$container_name" ]] && continue
+
+      # Convert the FinishedAt ISO timestamp to epoch (or 0 if unparseable).
+      finished_ts=$(date -u -d "$finished_iso" +%s 2>/dev/null || echo 0)
+      if [[ "$finished_ts" -gt "$threshold" ]]; then
+        # Too recent — leave it for now (the agent may still be wrapping up
+        # final calls or the comment may not be visible to the LLM yet).
+        continue
+      fi
+
+      # Extract PR number from labels (format: "pr=NNN,...,story=MMM").
+      pr_num=$(echo "$labels" | grep -oE 'pr=[0-9]+' | head -1 | cut -d= -f2)
+      if [[ -z "$pr_num" ]]; then
+        # Fall back to container name parse: cfg-agent-review-pr-<NNN>
+        if [[ "$container_name" =~ ^cfg-agent-review-pr-([0-9]+)$ ]]; then
+          pr_num="${BASH_REMATCH[1]}"
+        fi
+      fi
+
+      echo "STALE:${container_name}:finished=${finished_iso}:pr=${pr_num:-unknown}"
+
+      # Archive the result JSON for forensics.
+      docker cp "${container_name}:/tmp/agent-result.json" "/tmp/agent-result-review-${pr_num:-${container_name}}.json" 2>/dev/null || true
+
+      # Strip the in-flight label so the PO can re-dispatch.
+      if [[ -n "$pr_num" ]]; then
+        gh api -X DELETE "/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing" >/dev/null 2>&1 || true
+        echo "CLEANED:label:pipeline:reviewing:pr-${pr_num}"
+      fi
+
+      # Remove the container and clone.
+      if docker rm -f "$container_name" >/dev/null 2>&1; then
+        echo "CLEANED:container:${container_name}"
+      fi
+      if [[ -n "$pr_num" ]]; then
+        clone_dir="${WORKTREE_BASE}/review-pr-${pr_num}"
+        if [[ -d "$clone_dir" ]]; then
+          rm -rf "$clone_dir"
+          echo "CLEANED:clone:${clone_dir}"
+        fi
+      fi
+      cleaned=$((cleaned + 1))
+    done < <(
+      docker ps -a \
+        --filter "label=cfg-agent=true" \
+        --filter "label=mode=review" \
+        --filter "status=exited" \
+        --format '{{.Names}}' 2>/dev/null \
+        | while read -r name; do
+            [[ -z "$name" ]] && continue
+            finished=$(docker inspect --format '{{.State.FinishedAt}}' "$name" 2>/dev/null || echo "")
+            labels=$(docker inspect --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}},{{end}}' "$name" 2>/dev/null || echo "")
+            printf '%s\t%s\t%s\n' "$name" "$finished" "$labels"
+          done
+    )
+
+    echo "CLEANUP_STALE_REVIEWS_DONE:cleaned=${cleaned}"
     ;;
 
   cleanup-stale)
