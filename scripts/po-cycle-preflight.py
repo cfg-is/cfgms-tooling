@@ -130,7 +130,7 @@ def gh_pr_list_story_prs():
         "--repo", REPO,
         "--search", "head:feature/story-",
         "--state", "open",
-        "--json", "number,title,headRefName,labels,comments,statusCheckRollup,mergeStateStatus,mergeable,autoMergeRequest",
+        "--json", "number,title,body,isDraft,headRefName,labels,comments,statusCheckRollup,mergeStateStatus,mergeable,autoMergeRequest",
         "--limit", "50",
     )
 
@@ -506,6 +506,11 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     """Decide what to do with each open story PR.
 
     Action vocabulary:
+    - resume_failed_session: WIP draft PR pushed by entrypoint.sh after a
+              session truncation (token reauth, token limit). Dispatch
+              fix-pr to resume the work; the resumed agent marks the PR
+              ready on success. Takes top priority — these PRs should not
+              be reviewed, rebased, or enqueued in their current state.
     - rebase: PR's branch needs `rebase-pr.sh` to clear conflicts or stale base
               before any other action makes sense. Always takes precedence
               when mergeStateStatus is DIRTY (conflicts) or BEHIND (base advanced).
@@ -541,6 +546,20 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "story": pr["story_number"],
                 "action": "skip",
                 "reason": "fix-agent in flight (cfg-agent-pr-fix-<PR> running) — wait for it to exit before rebase or re-dispatch",
+            })
+            continue
+
+        # PRIORITY 0.5: WIP draft PR from a truncated agent session.
+        # The acceptance reviewer would falsely recommend enqueue (because
+        # CI is green on the partial work); the merge queue would refuse.
+        # Dispatch fix-pr to resume the work — the resumed agent marks the
+        # PR ready on success and the next cycle picks it up normally.
+        if pr.get("wip_session_failed"):
+            recs.append({
+                "pr": pr["pr"],
+                "story": pr["story_number"],
+                "action": "resume_failed_session",
+                "reason": "WIP draft PR from session truncation (token reauth/limit) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>` to resume; the fix-pr agent will mark the PR ready when it finishes",
             })
             continue
 
@@ -828,13 +847,25 @@ def main():
             "acceptance review" in (c.get("body") or "").lower()
             for c in comments
         )
+        body = pr.get("body") or ""
+        title = pr.get("title", "")
+        is_draft = bool(pr.get("isDraft"))
+        # Detect WIP draft PRs created by .devcontainer/entrypoint.sh on agent
+        # session failure (token reauth, token-limit truncation, etc.). The
+        # entrypoint pushes draft PRs with the literal markers below.
+        wip_session_failed = is_draft and (
+            body.startswith("Agent session failed with exit code")
+            or title.startswith("WIP:") and title.endswith("(agent failed)")
+        )
         pr_summaries.append({
             "pr": pr["number"],
-            "title": pr.get("title", ""),
+            "title": title,
             "head_ref": head,
             "story_number": story_number,
             "comment_count": len(comments),
             "has_acceptance_review_comment": has_review_comment,
+            "is_draft": is_draft,
+            "wip_session_failed": wip_session_failed,
             "merge_state_status": pr.get("mergeStateStatus"),
             "mergeable": pr.get("mergeable"),
             "auto_merge_enabled": pr.get("autoMergeRequest") is not None,
