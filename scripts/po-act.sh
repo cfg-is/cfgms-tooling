@@ -77,14 +77,29 @@ case "$cmd" in
 
   enqueue)
     pr="${1:?PR number required}"
-    gh pr merge "$pr" --repo "$REPO" --squash >/dev/null 2>&1 || {
-      # "already queued" is success for our purposes
-      gh pr merge "$pr" --repo "$REPO" --squash 2>&1 | grep -qi "already queued" && {
-        echo "ALREADY_QUEUED:$pr"; exit 0;
-      }
-      echo "ENQUEUE_FAILED:$pr" >&2; exit 1;
-    }
-    echo "ENQUEUED:$pr"
+    # Retry up to 3 times with 5s backoff; transient enqueue rejections happen
+    # when GitHub's gate sees CI re-runs, stale branch-protection cache, or
+    # queue saturation. After the call, verify the PR is actually in flight —
+    # `gh pr merge --squash` exiting 0 is necessary but not sufficient.
+    for attempt in 1 2 3; do
+      out=$(gh pr merge "$pr" --repo "$REPO" --squash 2>&1) && break
+      echo "$out" | grep -qi "already queued" && { echo "ALREADY_QUEUED:$pr"; exit 0; }
+      [ "$attempt" -lt 3 ] && sleep 5
+    done
+    # Verify-after: success state is "in merge queue" OR "auto-merge armed".
+    # Both are valid landing paths (queue picks up green PRs immediately;
+    # auto-merge waits for CI and then enqueues). Failure state is when
+    # neither is true after the retries — the merge call silently dropped.
+    in_queue=$(gh api graphql \
+      -f query='query { repository(owner: "cfg-is", name: "cfgms") { mergeQueue(branch: "develop") { entries(first: 50) { nodes { pullRequest { number } } } } } }' \
+      --jq "[.data.repository.mergeQueue.entries.nodes[].pullRequest.number] | any(. == $pr)" 2>/dev/null || echo "false")
+    auto_merge=$(gh pr view "$pr" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null || echo "false")
+    if [ "$in_queue" = "true" ] || [ "$auto_merge" = "true" ]; then
+      echo "ENQUEUED:$pr"
+    else
+      echo "ENQUEUE_FAILED:$pr (not in merge queue, no auto-merge after 3 attempts)" >&2
+      exit 1
+    fi
     ;;
 
   dequeue)
