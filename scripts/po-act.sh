@@ -8,7 +8,9 @@
 #   dispatch <STORY_NUM>            Fresh story: check-conflicts + clone + launch + label swap
 #   dispatch-fix <PR_NUM>           Fix cycle: remove stale container + clone-pr + launch
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
-#   enqueue <PR_NUM>                Add PR to merge queue (no strategy flag)
+#   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
+#                                   prepends "Fixes #STORY" to the PR body when
+#                                   missing so GitHub auto-closes the issue on merge.
 #   dequeue <PR_NUM>                Remove PR from merge queue
 #   diagnose <PR_NUM>               Extract FAIL/panic lines from PR's failed CI jobs
 #   rerun <PR_NUM> [comment_body]   Rerun failed CI jobs; optional audit comment
@@ -77,6 +79,20 @@ case "$cmd" in
 
   enqueue)
     pr="${1:?PR number required}"
+    story="${2:-}"
+    # If a story is provided, ensure the PR body contains a GitHub auto-close
+    # keyword for that issue. Dev agents miss this ~85% of the time, leaving
+    # orphan agent:success issues after the PR merges. Patching here is cheap
+    # (a body edit doesn't trigger CI) and runs at the last gate before the
+    # merge queue, so it's the right choke point.
+    if [ -n "$story" ]; then
+      body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body 2>/dev/null || echo "")
+      if ! grep -qE "(^|[[:space:]])(Fixes|Closes|Resolves) #${story}\b" <<< "$body"; then
+        printf 'Fixes #%s\n\n%s' "$story" "$body" \
+          | gh pr edit "$pr" --repo "$REPO" --body-file - >/dev/null
+        echo "PATCHED_FIXES:$pr (added Fixes #${story})"
+      fi
+    fi
     # Retry up to 3 times with 5s backoff; transient enqueue rejections happen
     # when GitHub's gate sees CI re-runs, stale branch-protection cache, or
     # queue saturation. After the call, verify the PR is actually in flight —
