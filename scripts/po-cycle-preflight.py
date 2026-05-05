@@ -656,6 +656,84 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     return recs
 
 
+def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=None, queued_pr_numbers=None):
+    """Decide what to do for each pipeline:fix-labeled story (Step 4 of pipeline cycle).
+
+    Each fix story should have a corresponding open PR that needs the fix-pr
+    agent to address review findings or CI failures. The PO calls
+    `./.claude/scripts/po-act.sh dispatch-fix <PR>` for each `dispatch_fix` rec.
+
+    Action vocabulary:
+    - dispatch_fix: open PR exists with CI red or pending — dispatch fix-pr now.
+    - clear_stale_label: open PR exists with CI green — fix already succeeded;
+                  remove pipeline:fix label and the next cycle will route to
+                  acceptance-review normally.
+    - skip: fix-agent already in flight, OR PR already in merge queue.
+    - no_open_pr: story has pipeline:fix label but no open PR — stale label;
+                  PO should investigate (likely a PR was closed/merged without
+                  the label being cleared).
+    """
+    if active_fix_pr_nums is None:
+        active_fix_pr_nums = set()
+    if queued_pr_numbers is None:
+        queued_pr_numbers = set()
+
+    pr_by_story = {}
+    for pr in pr_summaries:
+        sn = pr.get("story_number")
+        if sn is not None:
+            pr_by_story[sn] = pr
+
+    recs = []
+    for story in fix_stories:
+        story_num = story["number"]
+        pr = pr_by_story.get(story_num)
+        if pr is None:
+            recs.append({
+                "story": story_num,
+                "pr": None,
+                "action": "no_open_pr",
+                "reason": "story has pipeline:fix label but no open PR — stale label; investigate and clear with `./scripts/pipeline-helper.sh label-remove <STORY> pipeline:fix`",
+            })
+            continue
+        pr_num = pr["pr"]
+        if pr_num in active_fix_pr_nums:
+            recs.append({
+                "story": story_num,
+                "pr": pr_num,
+                "action": "skip",
+                "reason": "fix-agent already in flight (cfg-agent-pr-fix-<PR> running)",
+            })
+            continue
+        if pr_num in queued_pr_numbers:
+            recs.append({
+                "story": story_num,
+                "pr": pr_num,
+                "action": "skip",
+                "reason": "PR already in merge queue — fix may have been resolved; clear label if merge succeeds",
+            })
+            continue
+        overall = (pr.get("ci_summary") or {}).get("overall")
+        ms = (pr.get("merge_state_status") or "").upper()
+        # clear_stale_label only when CI green AND no merge-state blockers.
+        # DIRTY (conflicts) and BLOCKED still need fix-pr even with green CI.
+        if overall == "green" and ms not in ("DIRTY", "BLOCKED"):
+            recs.append({
+                "story": story_num,
+                "pr": pr_num,
+                "action": "clear_stale_label",
+                "reason": "pipeline:fix labeled but CI green and no merge-state blockers — fix already succeeded; remove label with `./scripts/pipeline-helper.sh label-remove <STORY> pipeline:fix`",
+            })
+            continue
+        recs.append({
+            "story": story_num,
+            "pr": pr_num,
+            "action": "dispatch_fix",
+            "reason": f"pipeline:fix labeled story with open PR (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
+        })
+    return recs
+
+
 def main():
     degraded_reasons = []
     out = {
@@ -888,6 +966,9 @@ def main():
     out["review_recommendations"] = compute_review_recommendations(
         pr_summaries, queued_pr_numbers, active_fix_pr_nums,
     )
+    out["fix_recommendations"] = compute_fix_recommendations(
+        label_results["pipeline:fix"], pr_summaries, active_fix_pr_nums, queued_pr_numbers,
+    )
 
     parse_warning_count = sum(
         len(s["parse_warnings"]) for s in ready_parsed + in_progress_parsed
@@ -943,6 +1024,7 @@ def write_output(out, mode):
             "running_containers": len(out.get("running_containers", [])),
             "failed": len(out.get("pipeline_state", {}).get("failed", [])),
             "blocked": len(out.get("pipeline_state", {}).get("blocked", [])),
+            "fix_cycle": len(out.get("pipeline_state", {}).get("fix_cycle", [])),
             "merge_queue": len(out.get("merge_queue", [])),
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
         },
@@ -950,6 +1032,7 @@ def write_output(out, mode):
         "merge_queue": out.get("merge_queue", []),
         "dispatch_recommendations": out.get("dispatch_recommendations", []),
         "review_recommendations": out.get("review_recommendations", []),
+        "fix_recommendations": out.get("fix_recommendations", []),
     }
     json.dump(summary, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
