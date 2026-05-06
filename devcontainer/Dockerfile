@@ -38,12 +38,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Go-based security and quality tools
 # Versions MUST match .github/workflows/dependency-pin-check.yml
-RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.25.0 \
+RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.26.1 \
     && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
     && go install github.com/google/go-licenses/v2@v2.0.1 \
     && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-       | sh -s -- -b "$(go env GOPATH)/bin" v2.11.4
+       | sh -s -- -b "$(go env GOPATH)/bin" v2.12.1
 
 # Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.70.0 is the
 # post-incident clean release. We download the project's release archive and
