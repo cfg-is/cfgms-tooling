@@ -5,7 +5,7 @@
 # Build: docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
 # Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .devcontainer/Dockerfile .
 
-FROM golang:1.25.9-bookworm
+FROM golang:1.26.3-bookworm
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
