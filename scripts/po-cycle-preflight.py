@@ -39,8 +39,6 @@ REPO = "cfg-is/cfgms"
 
 LABELS_TO_QUERY = [
     "pipeline:epic",
-    "pipeline:draft",
-    "agent:ready",
     "pipeline:fix",
     "agent:in-progress",
     "agent:failed",
@@ -171,6 +169,36 @@ def gh_graphql_merge_queue():
         }
         for n in (nodes or [])
         if n.get("pullRequest")
+    ]
+
+
+def is_trusted_review_comment(comment):
+    """Return True only for cfg-agent acceptance-review comments; rejects forgery attempts."""
+    return (
+        comment.get("author", {}).get("login") == "cfg-agent"
+        and "acceptance review" in (comment.get("body") or "").lower()
+    )
+
+
+def project_queue_list_by_status(status):
+    """Call project-queue.sh list-by-status; return [{number, title}] matching gh_issue_list format."""
+    script = Path(__file__).resolve().parent.parent.parent / "scripts" / "project-queue.sh"
+    result = subprocess.run(
+        ["bash", str(script), "list-by-status", status],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"project-queue.sh list-by-status {status} failed (rc={result.returncode}): "
+            f"{result.stderr.strip()[:500]}"
+        )
+    if not result.stdout.strip():
+        return []
+    items = json.loads(result.stdout)
+    return [
+        {"number": item["issue_num"], "title": item.get("title", "")}
+        for item in items
+        if item.get("issue_num") is not None
     ]
 
 
@@ -746,6 +774,8 @@ def main():
     # Phase 1: parallel top-level queries
     with ThreadPoolExecutor(max_workers=12) as ex:
         label_futures = {ex.submit(gh_issue_list, lbl): lbl for lbl in LABELS_TO_QUERY}
+        draft_future = ex.submit(project_queue_list_by_status, "Draft")
+        ready_future = ex.submit(project_queue_list_by_status, "Ready")
         pr_future = ex.submit(gh_pr_list_story_prs)
         epic_future = ex.submit(gh_graphql_epic_summary)
         queue_future = ex.submit(gh_graphql_merge_queue)
@@ -761,6 +791,18 @@ def main():
             except Exception as e:
                 degraded_reasons.append(f"gh issue list {lbl} failed: {e}")
                 label_results[lbl] = []
+
+        try:
+            draft_issues = draft_future.result() or []
+        except Exception as e:
+            degraded_reasons.append(f"project-queue list-by-status Draft failed: {e}")
+            draft_issues = []
+
+        try:
+            ready_issues = ready_future.result() or []
+        except Exception as e:
+            degraded_reasons.append(f"project-queue list-by-status Ready failed: {e}")
+            ready_issues = []
 
         try:
             prs = pr_future.result() or []
@@ -796,8 +838,8 @@ def main():
 
     out["pipeline_state"] = {
         "epics_open": label_results["pipeline:epic"],
-        "drafts": label_results["pipeline:draft"],
-        "ready": label_results["agent:ready"],
+        "drafts": draft_issues,
+        "ready": ready_issues,
         "fix_cycle": label_results["pipeline:fix"],
         "in_progress": label_results["agent:in-progress"],
         "failed": label_results["agent:failed"],
@@ -838,7 +880,7 @@ def main():
     # Phase 2: parallel fetch of story bodies relevant to conflict detection.
     # Conflict-detection set = agent:in-progress + stories with open PRs (files in flight
     # until merge). Ready stories are always fetched for gating.
-    ready_nums = [s["number"] for s in label_results["agent:ready"]]
+    ready_nums = [s["number"] for s in ready_issues]
     in_progress_nums = [s["number"] for s in label_results["agent:in-progress"]]
     pr_story_nums = []
     for pr in prs:
@@ -921,10 +963,7 @@ def main():
         m = BRANCH_STORY_RE.match(head)
         story_number = int(m.group(1)) if m else None
         comments = pr.get("comments") or []
-        has_review_comment = any(
-            "acceptance review" in (c.get("body") or "").lower()
-            for c in comments
-        )
+        has_review_comment = any(is_trusted_review_comment(c) for c in comments)
         body = pr.get("body") or ""
         title = pr.get("title", "")
         is_draft = bool(pr.get("isDraft"))

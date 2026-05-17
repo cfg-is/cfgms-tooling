@@ -48,8 +48,15 @@ case "$cmd" in
     "$DISPATCH" check-conflicts "$story" >/dev/null
     "$DISPATCH" create-clone "$story" | tail -1
     "$DISPATCH" launch "$story" | tail -1
+    PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
+    item_id=$(bash "$PROJECT_QUEUE" list-by-status Ready 2>/dev/null \
+      | jq -r --argjson num "$story" '.[] | select(.issue_num == $num) | .item_id' \
+      2>/dev/null || true)
     gh issue edit "$story" --repo "$REPO" \
       --remove-label "agent:ready" --add-label "agent:in-progress" >/dev/null
+    if [ -n "${item_id:-}" ]; then
+      bash "$PROJECT_QUEUE" update-field "$item_id" status "In Progress" >/dev/null 2>&1 || true
+    fi
     echo "DISPATCHED:$story"
     ;;
 
