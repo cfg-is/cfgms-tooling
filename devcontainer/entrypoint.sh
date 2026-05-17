@@ -7,6 +7,9 @@ set -euo pipefail
 # shellcheck source=./agent-context.sh
 source "$(dirname "${BASH_SOURCE[0]}")/agent-context.sh"
 
+# Path to the Projects V2 queue helper (configurable for testing).
+PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(dirname "${BASH_SOURCE[0]}")/../scripts/project-queue.sh}"
+
 # --- Argument parsing ---
 MODE="issue"
 ISSUE_NUM=""
@@ -173,24 +176,21 @@ SCOPE_CONSTRAINTS_SECTION='## Scope Constraints
 # --- Phase 1: Compose prompt based on mode ---
 
 compose_issue_prompt() {
-    echo "Fetching issue #${ISSUE_NUM}..."
-    ISSUE_JSON=$(gh_api_with_retry "fetch issue #${ISSUE_NUM}" gh issue view "$ISSUE_NUM" --json title,body,labels,comments) || {
-        echo "ERROR: Cannot proceed without issue context"
+    echo "Fetching project item ${CFGMS_PROJECT_ITEM_ID}..."
+    local item_json
+    item_json=$(bash "$PROJECT_QUEUE" get-item "$CFGMS_PROJECT_ITEM_ID") || {
+        echo "ERROR: Cannot fetch project item ${CFGMS_PROJECT_ITEM_ID}"
         exit 1
     }
 
-    TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
-    BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
-    local issue_comments_json
-    issue_comments_json=$(echo "$ISSUE_JSON" | jq -c '.comments // []')
+    TITLE=$(echo "$item_json" | jq -r '.title')
+    BODY=$(echo "$item_json" | jq -r '.body')
 
     # Build prompt in a temp file to avoid shell metacharacter corruption.
     # Issue bodies often contain backticks, $ field numbers, etc.
     PROMPT_FILE=$(mktemp)
     printf 'You are implementing GitHub issue #%s: %s\n\n' "$ISSUE_NUM" "$TITLE" > "$PROMPT_FILE"
     printf '%s\n\n' "$BODY" >> "$PROMPT_FILE"
-    ac_render_issue_comments "$issue_comments_json" >> "$PROMPT_FILE"
-    printf '\n' >> "$PROMPT_FILE"
     cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
@@ -254,27 +254,23 @@ compose_branch_prompt() {
         echo "Auto-detected issue #${ISSUE_NUM} from branch name"
     fi
 
-    # Fetch issue context if available
-    local issue_comments_md=""
+    # Fetch issue context from Projects V2 — never from gh issue view.
     if [[ -n "$ISSUE_NUM" ]]; then
-        echo "Fetching issue #${ISSUE_NUM} for context..."
-        ISSUE_JSON=$(gh_api_with_retry "fetch issue #${ISSUE_NUM}" gh issue view "$ISSUE_NUM" --json title,body,labels,comments) || {
-            echo "ERROR: Cannot proceed without issue context"
+        echo "Fetching project item ${CFGMS_PROJECT_ITEM_ID} for context..."
+        local item_json
+        item_json=$(bash "$PROJECT_QUEUE" get-item "$CFGMS_PROJECT_ITEM_ID") || {
+            echo "ERROR: Cannot fetch project item ${CFGMS_PROJECT_ITEM_ID}"
             exit 1
         }
-        if echo "$ISSUE_JSON" | jq -e '.title' >/dev/null 2>&1; then
-            TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
-            BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
-            issue_context="## Issue Context
+        local item_title item_body
+        item_title=$(echo "$item_json" | jq -r '.title')
+        item_body=$(echo "$item_json" | jq -r '.body')
+        issue_context="## Issue Context
 
-GitHub issue #${ISSUE_NUM}: ${TITLE}
+GitHub issue #${ISSUE_NUM}: ${item_title}
 
-${BODY}
+${item_body}
 "
-            local _comments_json
-            _comments_json=$(echo "$ISSUE_JSON" | jq -c '.comments // []')
-            issue_comments_md=$(ac_render_issue_comments "$_comments_json")
-        fi
     fi
 
     # Detect if a PR already exists for this branch
@@ -297,9 +293,6 @@ ${BODY}
     printf 'You are working on existing branch `%s`.\n\n' "$BRANCH" > "$PROMPT_FILE"
     if [[ -n "$issue_context" ]]; then
         printf '%s\n' "$issue_context" >> "$PROMPT_FILE"
-    fi
-    if [[ -n "$issue_comments_md" ]]; then
-        printf '%s\n\n' "$issue_comments_md" >> "$PROMPT_FILE"
     fi
     cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
@@ -484,6 +477,13 @@ If specialists report issues that cannot be fixed after 3 iterations:
 PROMPT_EOF
     printf '%s\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
 }
+
+# Hard refusal: issue and branch modes must source content from Projects V2.
+# fix-pr reads PR review comments gated by repo write access — a separate surface.
+if [[ "$MODE" != "fix-pr" ]] && [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
+    echo "ERROR: CFGMS_PROJECT_ITEM_ID must be set — no fallback to gh issue view" >&2
+    exit 1
+fi
 
 # Compose prompt based on mode
 case "$MODE" in

@@ -47,16 +47,62 @@ case "$cmd" in
     story="${1:?story number required}"
     "$DISPATCH" check-conflicts "$story" >/dev/null
     "$DISPATCH" create-clone "$story" | tail -1
-    "$DISPATCH" launch "$story" | tail -1
+
+    # Fetch item_id BEFORE launch so CFGMS_PROJECT_ITEM_ID can be passed to the
+    # container. The entrypoint refuses to run without this var — hard fail here
+    # if the story is not in the project queue at Ready status.
     PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
     item_id=$(bash "$PROJECT_QUEUE" list-by-status Ready 2>/dev/null \
       | jq -r --argjson num "$story" '.[] | select(.issue_num == $num) | .item_id' \
       2>/dev/null || true)
+    if [ -z "${item_id:-}" ]; then
+      echo "ERROR: story #${story} not found in project queue with Ready status" >&2
+      exit 1
+    fi
+
+    # Launch with CFGMS_PROJECT_ITEM_ID so entrypoint sources content from Projects V2.
+    # Inlined from agent-dispatch.sh launch to pass the extra env var without editing
+    # that file (avoids a file conflict with the parallel Story 7 branch).
+    clone_path="${WORKTREE_BASE}/story-${story}"
+    real_path=$(realpath "$clone_path")
+    # Refresh credentials from host session (mirrors refresh_creds_from_host in agent-dispatch.sh).
+    host_creds="$HOME/.claude/.credentials.json"
+    if [ -f "$host_creds" ]; then
+      docker run --rm --entrypoint bash \
+        -v claude-creds:/persist \
+        -v "${host_creds}:/host-creds.json:ro" \
+        cfg-agent:latest \
+        -c "cp /host-creds.json /persist/.credentials.json" 2>/dev/null || true
+    fi
+    gh_token=$(gh auth token)
+    if container_id=$(docker run -d \
+      --name "cfg-agent-${story}" \
+      --label "cfg-agent=true" \
+      --label "issue=${story}" \
+      --label "mode=issue" \
+      --memory=4g \
+      --cpus=4 \
+      --stop-timeout=3600 \
+      -v "${real_path}:/workspace" \
+      -v "claude-creds:/persist" \
+      -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
+      -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      -e "GH_TOKEN=${gh_token}" \
+      -e "CFGMS_PROJECT_ITEM_ID=${item_id}" \
+      --cap-add NET_ADMIN \
+      cfg-agent:latest \
+      "${story}" 2>&1); then
+      echo "LAUNCHED:${story}:${container_id}"
+    else
+      echo "LAUNCH_FAILED:${story}:${container_id}"
+      rm -rf "$clone_path"
+      echo "CLEANED:clone:${clone_path}"
+      exit 1
+    fi
+
     gh issue edit "$story" --repo "$REPO" \
       --remove-label "agent:ready" --add-label "agent:in-progress" >/dev/null
-    if [ -n "${item_id:-}" ]; then
-      bash "$PROJECT_QUEUE" update-field "$item_id" status "In Progress" >/dev/null 2>&1 || true
-    fi
+    bash "$PROJECT_QUEUE" update-field "$item_id" status "In Progress" >/dev/null 2>&1 || true
     echo "DISPATCHED:$story"
     ;;
 

@@ -405,6 +405,147 @@ test_13_review_level_comments_render() {
 }
 
 # ============================================================================
+# Entrypoint subprocess test helpers
+#
+# These helpers set up a self-contained temp directory with stubs for all
+# external dependencies, then invoke entrypoint.sh as a subprocess in
+# --dry-run mode so the prompt-assembly path can be tested without Docker,
+# Claude credentials, or a live GitHub token.
+# ============================================================================
+
+SENTINEL_INJECTION="NON_MEMBER_COMMENT_SENTINEL_XYZZY"
+SENTINEL_PROJECT_BODY="PROJECT_ITEM_BODY_SENTINEL_ABCDE"
+
+setup_entrypoint_stubs() {
+    TEST_ENTRY_DIR=$(mktemp -d)
+    export TEST_ENTRY_DIR
+
+    # Fake home: credentials file with far-future expiry (>>300s remaining)
+    # so the OAuth refresh code path is never triggered.
+    mkdir -p "$TEST_ENTRY_DIR/home/.claude"
+    printf '{"claudeAiOauth":{"expiresAt":9999999999000}}\n' \
+        > "$TEST_ENTRY_DIR/home/.claude/.credentials.json"
+
+    # setup-env.sh stub (no-op) — entrypoint calls this bare-name so PATH must include it.
+    cat > "$TEST_ENTRY_DIR/setup-env.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$TEST_ENTRY_DIR/setup-env.sh"
+
+    # project-queue.sh stub — returns a clean project item (no comments field).
+    cat > "$TEST_ENTRY_DIR/project-queue.sh" <<STUB
+#!/usr/bin/env bash
+printf '{"item_id":"pv2-test-item","title":"Test Story","body":"${SENTINEL_PROJECT_BODY}","issue_num":9999,"status":"Ready","fields":{}}\n'
+STUB
+    chmod +x "$TEST_ENTRY_DIR/project-queue.sh"
+
+    # gh stub — returns injected comments when called for "issue view".
+    # This is the payload that would appear if the entrypoint still called
+    # gh issue view instead of project-queue.sh get-item.
+    cat > "$TEST_ENTRY_DIR/gh" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+    *"issue view"*)
+        printf '{"title":"Test","body":"Issue body","labels":[],"comments":[{"author":{"login":"non-member"},"createdAt":"2026-01-01T00:00:00Z","body":"${SENTINEL_INJECTION}"}]}\n'
+        ;;
+    *"pr list"*)
+        printf '[]\n'
+        ;;
+    *)
+        printf '[]\n'
+        ;;
+esac
+STUB
+    chmod +x "$TEST_ENTRY_DIR/gh"
+
+    ORIG_PATH_ENTRY="$PATH"
+    export PATH="$TEST_ENTRY_DIR:$PATH"
+    export ORIG_PATH_ENTRY
+}
+
+teardown_entrypoint_stubs() {
+    export PATH="$ORIG_PATH_ENTRY"
+    rm -rf "$TEST_ENTRY_DIR"
+    unset TEST_ENTRY_DIR ORIG_PATH_ENTRY
+}
+
+# ============================================================================
+# TEST 14 — dry-run issue mode: injection sentinel absent, project body present
+# (AC1, AC2, AC6 — must fail against develop@HEAD, pass after this story)
+# ============================================================================
+test_14_dry_run_issue_mode_no_injection() {
+    setup_entrypoint_stubs
+
+    local output rc=0
+    output=$(CFGMS_PROJECT_ITEM_ID="pv2-test-item" \
+        CFGMS_TEST_PROJECT_QUEUE="$TEST_ENTRY_DIR/project-queue.sh" \
+        HOME="$TEST_ENTRY_DIR/home" \
+        bash "$SCRIPT_DIR/entrypoint.sh" 9999 --dry-run 2>&1) || rc=$?
+
+    if [[ "$rc" -ne 0 ]]; then
+        _fail "issue --dry-run exited $rc (expected 0)"
+        teardown_entrypoint_stubs
+        return
+    fi
+    assert_not_contains "$output" "$SENTINEL_INJECTION" \
+        "injection sentinel absent from issue-mode prompt"
+    assert_contains "$output" "$SENTINEL_PROJECT_BODY" \
+        "project item body present in issue-mode prompt"
+
+    teardown_entrypoint_stubs
+}
+
+# ============================================================================
+# TEST 15 — dry-run branch mode: injection sentinel absent, project body present
+# (AC1, AC3, AC6 — must fail against develop@HEAD, pass after this story)
+# ============================================================================
+test_15_dry_run_branch_mode_no_injection() {
+    setup_entrypoint_stubs
+
+    local output rc=0
+    output=$(CFGMS_PROJECT_ITEM_ID="pv2-test-item" \
+        CFGMS_TEST_PROJECT_QUEUE="$TEST_ENTRY_DIR/project-queue.sh" \
+        HOME="$TEST_ENTRY_DIR/home" \
+        bash "$SCRIPT_DIR/entrypoint.sh" --branch feature/story-9999-agent --dry-run 2>&1) || rc=$?
+
+    if [[ "$rc" -ne 0 ]]; then
+        _fail "branch --dry-run exited $rc (expected 0)"
+        teardown_entrypoint_stubs
+        return
+    fi
+    assert_not_contains "$output" "$SENTINEL_INJECTION" \
+        "injection sentinel absent from branch-mode prompt"
+    assert_contains "$output" "$SENTINEL_PROJECT_BODY" \
+        "project item body present in branch-mode prompt"
+
+    teardown_entrypoint_stubs
+}
+
+# ============================================================================
+# TEST 16 — hard refusal: CFGMS_PROJECT_ITEM_ID unset → exit non-zero
+# (AC5 — must fail against develop@HEAD, pass after this story)
+# ============================================================================
+test_16_hard_refusal_missing_project_item_id() {
+    setup_entrypoint_stubs
+
+    local output rc=0
+    output=$(HOME="$TEST_ENTRY_DIR/home" \
+        bash "$SCRIPT_DIR/entrypoint.sh" 9999 --dry-run 2>&1) || rc=$?
+
+    if [[ "$rc" -eq 0 ]]; then
+        _fail "entrypoint should exit non-zero when CFGMS_PROJECT_ITEM_ID is unset (got exit 0)"
+        teardown_entrypoint_stubs
+        return
+    fi
+    assert_contains "$output" "CFGMS_PROJECT_ITEM_ID" \
+        "error message names the required env var"
+    echo "    ✓ entrypoint exited $rc (non-zero) with correct message"
+
+    teardown_entrypoint_stubs
+}
+
+# ============================================================================
 # runner
 # ============================================================================
 
@@ -421,6 +562,9 @@ run_test "T10 — linked issue section" test_10_linked_issue_section
 run_test "T11 — empty inputs produce sentinels" test_11_empty_inputs
 run_test "T12 — no-op body shape" test_12_no_op_comment_body_shape
 run_test "T13 — review-level comments render" test_13_review_level_comments_render
+run_test "T14 — dry-run issue mode: no injection, project body present" test_14_dry_run_issue_mode_no_injection
+run_test "T15 — dry-run branch mode: no injection, project body present" test_15_dry_run_branch_mode_no_injection
+run_test "T16 — hard refusal when CFGMS_PROJECT_ITEM_ID unset" test_16_hard_refusal_missing_project_item_id
 
 echo ""
 echo "============================================================"
