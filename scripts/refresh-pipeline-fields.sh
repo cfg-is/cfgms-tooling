@@ -25,6 +25,7 @@ query($login: String!, $number: Int!) {
           ... on ProjectV2Field {
             id
             name
+            dataType
           }
           ... on ProjectV2SingleSelectField {
             id
@@ -80,6 +81,15 @@ lines = [
 for name in required_options:
     key = 'status_option_' + name.replace(' ', '_')
     lines.append(f"{key}: {option_map[name]}")
+
+# Capture all ProjectV2Field nodes (text/number/date fields — identified by dataType key)
+text_field_nodes = sorted(
+    [n for n in nodes if n and n.get('dataType') is not None and 'options' not in n],
+    key=lambda n: n['name']
+)
+for tf in text_field_nodes:
+    key = tf['name'].lower().replace(' ', '_') + '_field_id'
+    lines.append(f"{key}: {tf['id']}")
 
 content = '\n'.join(lines) + '\n'
 with open(out_file, 'w') as f:

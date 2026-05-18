@@ -23,6 +23,7 @@ Subcommands:
   update-field <item_id> <field> <value>          Update a field value
   add-issue <issue_num>                            Add a GitHub issue to the project
   add-pr <pr_num>                                 Add a GitHub PR to the project
+  set-pr <item_id> <pr_num>                       Record PR number against a project item
   delete-item <item_id>                           Remove an item from the project
 EOF
     exit 2
@@ -605,6 +606,62 @@ print(json.dumps({
 PYEOF
 }
 
+cmd_set_pr() {
+    [[ $# -ge 2 ]] || {
+        printf 'Usage: %s set-pr <item_id> <pr_num>\n' "$0" >&2
+        exit 2
+    }
+    local item_id="$1" pr_num="$2"
+    _require_yaml
+
+    local project_id pr_field_id
+    project_id=$(_yaml_get project_id)
+    pr_field_id=$(_yaml_get pr_field_id)
+
+    GQ_PROJECT_ID="$project_id" GQ_ITEM_ID="$item_id" \
+    GQ_FIELD_ID="$pr_field_id" GQ_PR_NUM="$pr_num" python3 - <<'PYEOF'
+import json, os, subprocess, sys
+
+
+def graphql(payload):
+    r = subprocess.run(
+        ['gh', 'api', 'graphql', '--input', '-'],
+        input=json.dumps(payload).encode(),
+        capture_output=True
+    )
+    if r.returncode != 0:
+        print(r.stderr.decode().strip(), file=sys.stderr)
+        sys.exit(1)
+    resp = json.loads(r.stdout)
+    if resp.get('errors'):
+        for e in resp['errors']:
+            print(e.get('message', str(e)), file=sys.stderr)
+        sys.exit(1)
+    return resp['data']
+
+
+project_id = os.environ['GQ_PROJECT_ID']
+item_id = os.environ['GQ_ITEM_ID']
+field_id = os.environ['GQ_FIELD_ID']
+pr_num = os.environ['GQ_PR_NUM']
+
+graphql({
+    'query': (
+        'mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){'
+        'updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,'
+        'value:{text:$v}}){projectV2Item{id}}}'
+    ),
+    'variables': {'p': project_id, 'i': item_id, 'f': field_id, 'v': pr_num}
+})
+
+print(json.dumps({
+    'updated': True,
+    'item_id': item_id,
+    'pr': pr_num
+}))
+PYEOF
+}
+
 cmd_delete_item() {
     [[ $# -ge 1 ]] || {
         printf 'Usage: %s delete-item <item_id>\n' "$0" >&2
@@ -667,6 +724,7 @@ case "$subcommand" in
     update-field)   cmd_update_field "$@" ;;
     add-issue)      cmd_add_issue "$@" ;;
     add-pr)         cmd_add_pr "$@" ;;
+    set-pr)         cmd_set_pr "$@" ;;
     delete-item)    cmd_delete_item "$@" ;;
     *)
         printf 'Error: unknown subcommand: %s\n' "$subcommand" >&2
