@@ -994,7 +994,7 @@ def main():
     )
 
     # Phase 2: parallel fetch of story bodies relevant to conflict detection.
-    # Conflict-detection set = agent:in-progress + stories with open PRs (files in flight
+    # Conflict-detection set = In Progress items + stories with open PRs (files in flight
     # until merge). Ready stories are always fetched for gating.
     # Issue-linked items use gh_issue_body; pure draft items use project-queue.sh get-item.
 

@@ -15,7 +15,7 @@ usage() {
 Pipeline Helper — wraps gh CLI for subagent permission compatibility
 
 Story lifecycle:
-  create-story <epic_num> <title> <body_file>   Create story issue with story label and link to epic
+  create-story <epic_num> <title> <body_file>   Create story as a project draft item (not a GitHub issue)
   edit-body <issue_num> <body_file>              Replace issue body from file
   append-section <issue_num> <section> <file>    Append content after ## <section> heading
 
@@ -54,24 +54,13 @@ case "$cmd" in
       exit 1
     fi
 
-    # Create the story issue
-    story_url=$(gh issue create --repo "$REPO" \
-      --title "$title" \
-      --label "story" \
-      --body-file "$body_file")
+    PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
 
-    story_num=$(echo "$story_url" | grep -oP '\d+$')
-    echo "CREATED:${story_num}:${story_url}"
-
-    # Link as sub-issue of epic
-    epic_id=$(gh issue view "$epic_num" --repo "$REPO" --json id -q .id)
-    child_id=$(gh issue view "$story_num" --repo "$REPO" --json id -q .id)
-    gh api graphql \
-      -f query='mutation($parentId: ID!, $childId: ID!) { addSubIssue(input: {issueId: $parentId, subIssueId: $childId}) { issue { number } subIssue { number } } }' \
-      -f parentId="$epic_id" \
-      -f childId="$child_id" > /dev/null
-
-    echo "LINKED:${story_num}:epic-${epic_num}"
+    # Create a project draft item (private; not a public GitHub issue).
+    # epic_num is passed as story_num — a traceability hint; 0 is acceptable too.
+    draft_json=$(bash "$PROJECT_QUEUE" create-draft "$epic_num" "$title" "$body_file")
+    item_id=$(echo "$draft_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['item_id'])")
+    echo "CREATED_DRAFT:${item_id}"
     ;;
 
   edit-body)
