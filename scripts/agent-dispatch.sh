@@ -95,6 +95,7 @@ Commands:
   check-conflicts <NUM> [NUM...]            Check for existing containers/clones (issue mode)
   check-conflicts --branch <NAME>           Check for existing containers/clones (branch mode)
   check-conflicts --pr <NUM>                Check for existing containers/clones (PR-fix mode)
+  create-clone-item <ITEM_ID>               Clone repo and create feature/item-<LAST12>-agent branch
   create-clone    <NUM> [--keep-remote] [--allow-duplicate-pr]
                                             Clone repo and create feature branch (issue mode)
                                             If remote branch feature/story-<NUM>-agent already exists,
@@ -240,6 +241,26 @@ case "$cmd" in
     git checkout -b "$branch_name"
     trap - ERR
     echo "CLONE_OK:${num}:$(git branch --show-current)"
+    ;;
+
+  create-clone-item)
+    [[ $# -eq 1 ]] || { echo "create-clone-item requires exactly one item_id"; exit 1; }
+    item_id="$1"
+    # Derive LAST12: last 12 alphanumeric chars of item_id (strip non-[a-zA-Z0-9])
+    LAST12=$(echo "$item_id" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
+    [[ -n "$LAST12" ]] || { echo "ERROR: item_id '${item_id}' has no alphanumeric chars — cannot derive LAST12"; exit 1; }
+    branch_name="feature/item-${LAST12}-agent"
+    dest="${WORKTREE_BASE}/item-${LAST12}"
+    github_url=$(git -C "$REPO_ROOT" remote get-url origin)
+
+    trap "rm -rf '$dest'" ERR
+    git clone --local --branch develop "$REPO_ROOT" "$dest"
+    cd "$dest"
+    git remote set-url origin "$github_url"
+    sync_to_remote_develop
+    git checkout -b "$branch_name"
+    trap - ERR
+    echo "CLONE_OK:item-${LAST12}:$(git branch --show-current)"
     ;;
 
   create-clone-branch)

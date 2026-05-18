@@ -46,7 +46,7 @@ BARE_PATH_RE = re.compile(
     r"(?:^|[\s(\[])"
     r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx))"
 )
-BRANCH_STORY_RE = re.compile(r"feature/story-(\d+)")
+BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)")
 
 
 def cache_dir():
@@ -118,7 +118,7 @@ def gh_pr_list_story_prs():
     return gh(
         "pr", "list",
         "--repo", REPO,
-        "--search", "head:feature/story-",
+        "--search", "head:feature/",
         "--state", "open",
         "--json", "number,title,body,isDraft,headRefName,labels,comments,statusCheckRollup,mergeStateStatus,mergeable,autoMergeRequest",
         "--limit", "50",
@@ -172,11 +172,23 @@ def is_trusted_review_comment(comment):
     )
 
 
+def _pq_script_path():
+    """Return the project-queue.sh path, honoring CFGMS_TEST_PROJECT_QUEUE override."""
+    override = os.environ.get("CFGMS_TEST_PROJECT_QUEUE")
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent.parent.parent / "scripts" / "project-queue.sh")
+
+
 def project_queue_list_by_status(status):
-    """Call project-queue.sh list-by-status; return [{number, title}] matching gh_issue_list format."""
-    script = Path(__file__).resolve().parent.parent.parent / "scripts" / "project-queue.sh"
+    """Call project-queue.sh list-by-status; return [{number, title, item_id}].
+
+    Pure draft items (issue_num == None) are included with number: null.
+    Honors CFGMS_TEST_PROJECT_QUEUE env var for hermetic tests.
+    """
+    script = _pq_script_path()
     result = subprocess.run(
-        ["bash", str(script), "list-by-status", status],
+        ["bash", script, "list-by-status", status],
         capture_output=True, text=True, check=False, timeout=60,
     )
     if result.returncode != 0:
@@ -188,10 +200,90 @@ def project_queue_list_by_status(status):
         return []
     items = json.loads(result.stdout)
     return [
-        {"number": item["issue_num"], "title": item.get("title", "")}
+        {
+            "number": item.get("issue_num"),
+            "title": item.get("title", ""),
+            "item_id": item.get("item_id", ""),
+        }
         for item in items
-        if item.get("issue_num") is not None
     ]
+
+
+def auto_close_merged_items(degraded_reasons=None):
+    """Scan In Progress items and mark Done if their linked PR has been merged.
+
+    Non-fatal: all subprocess failures are caught and appended to degraded_reasons.
+    Returns the count of items closed.
+    """
+    if degraded_reasons is None:
+        degraded_reasons = []
+    count = 0
+    script = _pq_script_path()
+
+    result = subprocess.run(
+        ["bash", script, "list-by-status", "In Progress"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if result.returncode != 0:
+        degraded_reasons.append(
+            f"auto_close_merged_items: list-by-status failed: {result.stderr.strip()[:200]}"
+        )
+        return count
+
+    if not result.stdout.strip():
+        return count
+
+    try:
+        items = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        degraded_reasons.append("auto_close_merged_items: list-by-status returned invalid JSON")
+        return count
+
+    for item in items:
+        item_id = item.get("item_id")
+        if not item_id:
+            continue
+        try:
+            get_result = subprocess.run(
+                ["bash", script, "get-item", item_id],
+                capture_output=True, text=True, check=False, timeout=60,
+            )
+            if get_result.returncode != 0:
+                degraded_reasons.append(
+                    f"auto_close_merged_items: get-item {item_id} failed: {get_result.stderr.strip()[:100]}"
+                )
+                continue
+            item_data = json.loads(get_result.stdout)
+            pr_num = (item_data.get("fields") or {}).get("PR")
+            if not pr_num:
+                continue
+            pr_result = subprocess.run(
+                ["gh", "pr", "view", str(pr_num), "--json", "state", "--jq", ".state"],
+                capture_output=True, text=True, check=False, timeout=60,
+            )
+            if pr_result.returncode != 0:
+                degraded_reasons.append(
+                    f"auto_close_merged_items: gh pr view {pr_num} failed: {pr_result.stderr.strip()[:100]}"
+                )
+                continue
+            state = pr_result.stdout.strip().strip('"')
+            if state != "MERGED":
+                continue
+            update_result = subprocess.run(
+                ["bash", script, "update-field", item_id, "status", "Done"],
+                capture_output=True, text=True, check=False, timeout=60,
+            )
+            if update_result.returncode != 0:
+                degraded_reasons.append(
+                    f"auto_close_merged_items: update-field {item_id} status Done failed: {update_result.stderr.strip()[:100]}"
+                )
+                continue
+            count += 1
+        except Exception as e:
+            degraded_reasons.append(f"auto_close_merged_items: error processing {item_id}: {e}")
+            continue
+
+    return count
 
 
 def running_containers():
@@ -360,7 +452,7 @@ def parse_story(issue):
     so the LLM can override if parsing missed something.
     """
     body = issue.get("body") or ""
-    number = issue["number"]
+    number = issue.get("number")  # may be None for pure draft items
     warnings = []
 
     deps_raw = extract_section(body, "Dependencies")
@@ -373,7 +465,7 @@ def parse_story(issue):
         pass
     else:
         deps_parsed = sorted(
-            {int(n) for n in ISSUE_NUM_RE.findall(deps_raw) if int(n) != number}
+            {int(n) for n in ISSUE_NUM_RE.findall(deps_raw) if number is None or int(n) != number}
         )
         if not deps_parsed:
             warnings.append("'## Dependencies' section had content but no #NNN references found")
@@ -388,7 +480,7 @@ def parse_story(issue):
         if not files_parsed:
             warnings.append("'## Files In Scope' section had content but no file paths detected")
 
-    all_nums = sorted({int(n) for n in ISSUE_NUM_RE.findall(body) if int(n) != number})
+    all_nums = sorted({int(n) for n in ISSUE_NUM_RE.findall(body) if number is None or int(n) != number})
     all_paths = sorted(set(BACKTICK_PATH_RE.findall(body)) | set(BARE_PATH_RE.findall(body)))
 
     return {
@@ -449,7 +541,7 @@ def ci_summary(checks):
 def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
     """Greedy conflict-free selection.
 
-    Order: ascending story number (stable, predictable).
+    Order: ascending story number (stable, predictable); pure drafts (number=None) last.
     Skip if any dep is not CLOSED.
     Skip if files overlap with an active story (status In Progress or open PR) or a
     story already picked this cycle.
@@ -461,8 +553,9 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
     recommendations = []
     picked_file_sets = []
 
-    for s in sorted(ready_stories, key=lambda x: x["number"]):
+    for s in sorted(ready_stories, key=lambda x: (x.get("number") is None, x.get("number") or 0)):
         num = s["number"]
+        item_id = s.get("item_id", "")
         open_deps = [d for d in s["deps_parsed"] if dep_states.get(d) != "CLOSED"]
         if open_deps:
             dep_desc = ", ".join(
@@ -470,6 +563,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
             )
             recommendations.append({
                 "number": num,
+                "item_id": item_id,
                 "action": "hold",
                 "reason": f"deps not closed: {dep_desc}",
             })
@@ -479,6 +573,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
         if not my_files:
             recommendations.append({
                 "number": num,
+                "item_id": item_id,
                 "action": "dispatch",
                 "reason": "deps clear; no files parsed from Files In Scope",
                 "caveat": "no_files_parsed_cannot_check_conflicts — LLM should verify manually",
@@ -494,6 +589,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
             n, shared = active_hit
             recommendations.append({
                 "number": num,
+                "item_id": item_id,
                 "action": "hold",
                 "reason": f"file-conflict with active #{n} (in-progress or open PR) on: {', '.join(sorted(shared))}",
             })
@@ -507,6 +603,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
             n, shared = picked_hit
             recommendations.append({
                 "number": num,
+                "item_id": item_id,
                 "action": "hold",
                 "reason": f"file-conflict with dispatch-candidate #{n} on: {', '.join(sorted(shared))}",
             })
@@ -514,6 +611,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
 
         recommendations.append({
             "number": num,
+            "item_id": item_id,
             "action": "dispatch",
             "reason": "deps clear; no file overlap with in-progress or dispatch set",
         })
@@ -847,6 +945,9 @@ def main():
                 "checks": {},
             }
 
+    # Auto-close project items whose linked PRs have been merged (done-on-merge).
+    done_on_merge_count = auto_close_merged_items(degraded_reasons)
+
     out["pipeline_state"] = {
         "drafts": draft_issues,
         "ready": ready_issues,
@@ -858,6 +959,7 @@ def main():
     out["running_containers"] = containers
     out["merge_queue"] = merge_queue
     out["code_health"] = code_health
+    out["done_on_merge_count"] = done_on_merge_count
     if not code_health.get("ok"):
         if code_health.get("skipped"):
             degraded_reasons.append(
@@ -894,12 +996,36 @@ def main():
     # Phase 2: parallel fetch of story bodies relevant to conflict detection.
     # Conflict-detection set = agent:in-progress + stories with open PRs (files in flight
     # until merge). Ready stories are always fetched for gating.
-    ready_nums = [s["number"] for s in ready_issues]
-    in_progress_nums = [s["number"] for s in in_progress_issues]
+    # Issue-linked items use gh_issue_body; pure draft items use project-queue.sh get-item.
+
+    # Separate issue-linked items from pure draft items for each queue bucket.
+    ready_item_id_by_num = {}
+    ready_draft_items = []
+    for item in ready_issues:
+        n = item.get("number")
+        iid = item.get("item_id", "")
+        if n is not None:
+            ready_item_id_by_num[n] = iid
+        elif iid:
+            ready_draft_items.append(item)
+
+    in_progress_item_id_by_num = {}
+    in_progress_draft_items = []
+    for item in in_progress_issues:
+        n = item.get("number")
+        iid = item.get("item_id", "")
+        if n is not None:
+            in_progress_item_id_by_num[n] = iid
+        elif iid:
+            in_progress_draft_items.append(item)
+
+    ready_nums = list(ready_item_id_by_num.keys())
+    in_progress_nums = list(in_progress_item_id_by_num.keys())
+
     pr_story_nums = []
     for pr in prs:
         m = BRANCH_STORY_RE.match(pr.get("headRefName", ""))
-        if m:
+        if m and m.group(1) and m.group(1).isdigit():
             pr_story_nums.append(int(m.group(1)))
     active_story_nums = sorted(set(in_progress_nums + pr_story_nums))
     all_story_nums = sorted(set(ready_nums + active_story_nums))
@@ -915,15 +1041,77 @@ def main():
                 except Exception as e:
                     degraded_reasons.append(f"gh issue view #{n} failed: {e}")
 
-    ready_parsed = [
-        parse_story(story_bodies[n]) for n in ready_nums if n in story_bodies
-    ]
-    in_progress_parsed = [
-        parse_story(story_bodies[n]) for n in in_progress_nums if n in story_bodies
-    ]
-    active_parsed = [
-        parse_story(story_bodies[n]) for n in active_story_nums if n in story_bodies
-    ]
+    # Fetch bodies for pure draft items via project-queue.sh get-item.
+    _pq = _pq_script_path()
+
+    def _fetch_draft_body(item):
+        try:
+            res = subprocess.run(
+                ["bash", _pq, "get-item", item["item_id"]],
+                capture_output=True, text=True, check=False, timeout=60,
+            )
+            if res.returncode != 0:
+                return item["item_id"], None
+            data = json.loads(res.stdout)
+            return item["item_id"], {
+                "number": None,
+                "title": item.get("title", ""),
+                "body": data.get("body", ""),
+                "state": "OPEN",
+                "labels": [],
+            }
+        except Exception:
+            return item["item_id"], None
+
+    draft_bodies = {}
+    all_draft_items = ready_draft_items + in_progress_draft_items
+    if all_draft_items:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futures = {ex.submit(_fetch_draft_body, itm): itm for itm in all_draft_items}
+            for fut in as_completed(futures):
+                itm = futures[fut]
+                try:
+                    item_id, body_data = fut.result()
+                    if body_data is not None:
+                        draft_bodies[item_id] = body_data
+                    else:
+                        degraded_reasons.append(f"get-item {itm['item_id']} failed for draft body")
+                except Exception as e:
+                    degraded_reasons.append(f"draft body fetch failed for {itm.get('item_id')}: {e}")
+
+    # Build parsed story lists with item_id attached.
+    ready_parsed = []
+    for n in ready_nums:
+        if n in story_bodies:
+            parsed = parse_story(story_bodies[n])
+            parsed["item_id"] = ready_item_id_by_num.get(n, "")
+            ready_parsed.append(parsed)
+    for item in ready_draft_items:
+        iid = item["item_id"]
+        if iid in draft_bodies:
+            parsed = parse_story(draft_bodies[iid])
+            parsed["item_id"] = iid
+            ready_parsed.append(parsed)
+
+    in_progress_parsed = []
+    for n in in_progress_nums:
+        if n in story_bodies:
+            parsed = parse_story(story_bodies[n])
+            parsed["item_id"] = in_progress_item_id_by_num.get(n, "")
+            in_progress_parsed.append(parsed)
+    for item in in_progress_draft_items:
+        iid = item["item_id"]
+        if iid in draft_bodies:
+            parsed = parse_story(draft_bodies[iid])
+            parsed["item_id"] = iid
+            in_progress_parsed.append(parsed)
+
+    active_parsed = list(in_progress_parsed)
+    for n in pr_story_nums:
+        if n in story_bodies and n not in in_progress_nums:
+            p = parse_story(story_bodies[n])
+            p["item_id"] = ""
+            active_parsed.append(p)
 
     # Phase 3: fetch states for every unique dep referenced across ready stories
     dep_nums = set()
@@ -954,7 +1142,7 @@ def main():
             "files_parsed": s["files_parsed"],
             "parse_warnings": s["parse_warnings"],
             "source": "status:In Progress" + (
-                " + open-pr" if s["number"] in pr_story_nums else ""
+                " + open-pr" if s.get("number") is not None and s["number"] in pr_story_nums else ""
             ),
         }
         for s in in_progress_parsed
@@ -967,7 +1155,7 @@ def main():
             "parse_warnings": s["parse_warnings"],
         }
         for s in active_parsed
-        if s["number"] in pr_story_nums and s["number"] not in in_progress_nums
+        if s.get("number") is not None and s["number"] in pr_story_nums and s["number"] not in in_progress_nums
     ]
 
     # Phase 4: PR summaries
@@ -975,7 +1163,10 @@ def main():
     for pr in prs:
         head = pr.get("headRefName", "")
         m = BRANCH_STORY_RE.match(head)
-        story_number = int(m.group(1)) if m else None
+        if m and m.group(1) and m.group(1).isdigit():
+            story_number = int(m.group(1))
+        else:
+            story_number = None
         comments = pr.get("comments") or []
         has_review_comment = any(is_trusted_review_comment(c) for c in comments)
         body = pr.get("body") or ""
@@ -1070,6 +1261,7 @@ def write_output(out, mode):
             ],
         },
         "dispatch_blocked": not code_health.get("ok", False) and not code_health.get("skipped", False),
+        "done_on_merge_count": out.get("done_on_merge_count", 0),
         "counts": {
             "ready": len(out.get("ready_stories", [])),
             "in_progress": len(out.get("in_progress_stories", [])),
