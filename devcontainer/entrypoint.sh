@@ -13,6 +13,8 @@ PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(dirname "${BASH_SOURCE[0]}")/../scr
 # --- Argument parsing ---
 MODE="issue"
 ISSUE_NUM=""
+ITEM_ID_SHORT=""
+ITEM_MODE="false"
 BRANCH=""
 PR_NUM=""
 DRY_RUN=""
@@ -26,9 +28,14 @@ while [[ $# -gt 0 ]]; do
         *)
             if [[ "$1" =~ ^[0-9]+$ ]]; then
                 ISSUE_NUM="$1"; shift
+            elif [[ "$1" =~ ^[a-zA-Z0-9_]+$ ]]; then
+                # Non-numeric positional arg: signals item_id mode.
+                # ITEM_ID_SHORT is derived from CFGMS_PROJECT_ITEM_ID env var.
+                ITEM_MODE="true"; shift
             else
                 echo "ERROR: Unknown argument: $1"
                 echo "Usage: entrypoint.sh <ISSUE_NUM> [--dry-run]"
+                echo "       entrypoint.sh <ITEM_ID> [--dry-run]  (sets item mode)"
                 echo "       entrypoint.sh --branch <BRANCH> [--issue <NUM>] [--dry-run]"
                 echo "       entrypoint.sh --fix-pr <PR_NUM> [--dry-run]"
                 exit 1
@@ -41,8 +48,13 @@ done
 case "$MODE" in
     issue)
         if [[ -z "$ISSUE_NUM" ]]; then
-            echo "ERROR: Issue mode requires an issue number"
-            exit 1
+            if [[ "$ITEM_MODE" == "true" && -n "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
+                # Item mode: derive ITEM_ID_SHORT from CFGMS_PROJECT_ITEM_ID
+                ITEM_ID_SHORT=$(echo "$CFGMS_PROJECT_ITEM_ID" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
+            else
+                echo "ERROR: Issue mode requires an issue number"
+                exit 1
+            fi
         fi
         ;;
     branch)
@@ -189,9 +201,12 @@ compose_issue_prompt() {
     # Build prompt in a temp file to avoid shell metacharacter corruption.
     # Issue bodies often contain backticks, $ field numbers, etc.
     PROMPT_FILE=$(mktemp)
-    printf 'You are implementing GitHub issue #%s: %s\n\n' "$ISSUE_NUM" "$TITLE" > "$PROMPT_FILE"
-    printf '%s\n\n' "$BODY" >> "$PROMPT_FILE"
-    cat >> "$PROMPT_FILE" <<PROMPT_EOF
+
+    if [[ -n "$ISSUE_NUM" ]]; then
+        # Issue mode: standard GitHub issue prompt
+        printf 'You are implementing GitHub issue #%s: %s\n\n' "$ISSUE_NUM" "$TITLE" > "$PROMPT_FILE"
+        printf '%s\n\n' "$BODY" >> "$PROMPT_FILE"
+        cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Instructions
 
 You are running inside an isolated container with --dangerously-skip-permissions.
@@ -213,10 +228,10 @@ architecture rules, and coding standards. CFGMS_AGENT_MODE=true is set.
 7. Fix any compilation or test errors before proceeding to review phase
 
 PROMPT_EOF
-    # Append shared sections (contain backticks — must not be inside unquoted heredoc)
-    printf '%s\n\n' "$SELF_REVIEW_SECTION" >> "$PROMPT_FILE"
-    printf '%s\n\n' "$ADVERSARIAL_REVIEW_SECTION" >> "$PROMPT_FILE"
-    cat >> "$PROMPT_FILE" <<PROMPT_EOF
+        # Append shared sections (contain backticks — must not be inside unquoted heredoc)
+        printf '%s\n\n' "$SELF_REVIEW_SECTION" >> "$PROMPT_FILE"
+        printf '%s\n\n' "$ADVERSARIAL_REVIEW_SECTION" >> "$PROMPT_FILE"
+        cat >> "$PROMPT_FILE" <<PROMPT_EOF
 ## Phase 5: Commit and PR
 
 After all three specialists report PASS:
@@ -242,16 +257,72 @@ If specialists report issues that cannot be fixed after 3 iterations:
 - Exit non-zero
 
 PROMPT_EOF
+    else
+        # Item mode: project item prompt (no linked GitHub issue to close)
+        printf 'You are implementing project item %s: %s\n\n' "$ITEM_ID_SHORT" "$TITLE" > "$PROMPT_FILE"
+        printf '%s\n\n' "$BODY" >> "$PROMPT_FILE"
+        cat >> "$PROMPT_FILE" <<PROMPT_EOF
+## Instructions
+
+You are running inside an isolated container with --dangerously-skip-permissions.
+Your branch \`feature/item-${ITEM_ID_SHORT}-agent\` is already checked out from \`develop\`.
+Follow the CLAUDE.md file in the repository root — it contains all project conventions,
+architecture rules, and coding standards. CFGMS_AGENT_MODE=true is set.
+
+## Phase 1: Implement
+
+1. Read and understand the full item description including acceptance criteria
+2. Read CLAUDE.md for project conventions (central providers, storage architecture, etc.)
+3. If the item mentions reference files or patterns, read them first
+4. Write tests FIRST for the expected behavior (TDD — tests must fail before implementation)
+5. Implement the change to make the tests pass, following existing patterns
+
+## Phase 2: Validate (quick self-check before specialist review)
+
+6. Run \`go test ./path/to/changed/packages/...\` to verify your tests pass locally
+7. Fix any compilation or test errors before proceeding to review phase
+
+PROMPT_EOF
+        printf '%s\n\n' "$SELF_REVIEW_SECTION" >> "$PROMPT_FILE"
+        printf '%s\n\n' "$ADVERSARIAL_REVIEW_SECTION" >> "$PROMPT_FILE"
+        cat >> "$PROMPT_FILE" <<PROMPT_EOF
+## Phase 5: Commit and PR
+
+After all three specialists report PASS:
+
+8. Run \`go mod tidy\` if dependencies changed
+9. Stage all changes with \`git add <specific files>\` (never git add . or git add -A)
+10. Commit with message: \`<scope>: <description> (Item #${ITEM_ID_SHORT})\`
+    - Follow commit message format in CLAUDE.md (15-25 lines, WHY + WHAT)
+    - Include \`Co-Authored-By: Claude <noreply@anthropic.com>\`
+11. Push branch: \`git push -u origin \$(git branch --show-current)\`
+12. Open PR targeting \`develop\` (NEVER \`main\`):
+    \`gh pr create --base develop --title "<scope>: <title> (Item #${ITEM_ID_SHORT})"\`
+    Include specialist review results (PASS/FAIL summaries) in the PR body.
+
+## Failure Handling
+
+If specialists report issues that cannot be fixed after 3 iterations:
+- Stage all changes and commit with message describing what was attempted
+- Push the branch
+- Open a DRAFT PR with failure details and specialist reports in the description body
+- Exit non-zero
+
+PROMPT_EOF
+    fi
     printf '%s\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
 }
 
 compose_branch_prompt() {
     local issue_context=""
 
-    # Auto-detect issue from branch name if not provided
+    # Auto-detect issue or item from branch name if not provided
     if [[ -z "$ISSUE_NUM" ]] && [[ "$BRANCH" =~ story-([0-9]+) ]]; then
         ISSUE_NUM="${BASH_REMATCH[1]}"
         echo "Auto-detected issue #${ISSUE_NUM} from branch name"
+    elif [[ -z "$ISSUE_NUM" ]] && [[ "$BRANCH" =~ item-([a-zA-Z0-9]+) ]]; then
+        ITEM_ID_SHORT="${BASH_REMATCH[1]}"
+        echo "Auto-detected item ${ITEM_ID_SHORT} from branch name"
     fi
 
     # Fetch issue context from Projects V2 — never from gh issue view.
@@ -564,6 +635,16 @@ fi
 # Extract PR URL if one was created
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 PR_URL=$(gh pr list --head "$CURRENT_BRANCH" --json url -q '.[0].url' 2>/dev/null || echo "")
+
+# Update project item with the PR number so the pipeline can track it.
+# Non-fatal: a failed set-pr never affects the agent's exit code.
+if [[ -n "${CFGMS_PROJECT_ITEM_ID:-}" ]] && [[ -n "$PR_URL" ]] && [[ "$MODE" != "fix-pr" ]]; then
+    _pr_num=$(echo "$PR_URL" | grep -oE '[0-9]+$' || true)
+    if [[ -n "$_pr_num" ]]; then
+        bash "$PROJECT_QUEUE" set-pr "$CFGMS_PROJECT_ITEM_ID" "$_pr_num" \
+            || echo "WARN: set-pr failed — continuing"
+    fi
+fi
 
 # Write result summary
 cat > /tmp/agent-result.json <<RESULT_EOF

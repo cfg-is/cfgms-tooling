@@ -253,6 +253,15 @@ case "$cmd" in
     dest="${WORKTREE_BASE}/item-${LAST12}"
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
+    # Check for stale remote branch before cloning — same logic as create-clone.
+    if git -C "$REPO_ROOT" ls-remote --heads origin "$branch_name" 2>/dev/null | grep -q .; then
+      echo "Cleaning stale remote branch: ${branch_name}"
+      if ! git -C "$REPO_ROOT" push origin --delete "$branch_name" 2>&1; then
+        echo "ERROR: Failed to delete stale remote branch '${branch_name}'. Refusing to dispatch to prevent history corruption."
+        exit 1
+      fi
+    fi
+
     trap "rm -rf '$dest'" ERR
     git clone --local --branch develop "$REPO_ROOT" "$dest"
     cd "$dest"
@@ -698,23 +707,39 @@ else:
     ;;
 
   cleanup-issue)
-    [[ $# -eq 1 ]] || { echo "cleanup-issue requires exactly one issue number"; exit 1; }
+    [[ $# -eq 1 ]] || { echo "cleanup-issue requires exactly one issue number or item_id"; exit 1; }
     num="$1"
-    # Copy result file (best-effort)
-    docker cp "cfg-agent-${num}:/tmp/agent-result.json" "/tmp/agent-result-${num}.json" 2>/dev/null || true
-    # Remove container (works for both running and exited)
-    if docker rm -f "cfg-agent-${num}" >/dev/null 2>&1; then
-      echo "CLEANED:container:cfg-agent-${num}"
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      # Issue mode (numeric): existing behavior
+      docker cp "cfg-agent-${num}:/tmp/agent-result.json" "/tmp/agent-result-${num}.json" 2>/dev/null || true
+      if docker rm -f "cfg-agent-${num}" >/dev/null 2>&1; then
+        echo "CLEANED:container:cfg-agent-${num}"
+      else
+        echo "SKIP:container:cfg-agent-${num} not found"
+      fi
+      clone_dir="${WORKTREE_BASE}/story-${num}"
+      if [[ -d "$clone_dir" ]]; then
+        rm -rf "$clone_dir"
+        echo "CLEANED:clone:${clone_dir}"
+      else
+        echo "SKIP:clone:${clone_dir} not found"
+      fi
     else
-      echo "SKIP:container:cfg-agent-${num} not found"
-    fi
-    # Remove clone directory
-    clone_dir="${WORKTREE_BASE}/story-${num}"
-    if [[ -d "$clone_dir" ]]; then
-      rm -rf "$clone_dir"
-      echo "CLEANED:clone:${clone_dir}"
-    else
-      echo "SKIP:clone:${clone_dir} not found"
+      # Item mode (non-numeric item_id): derive LAST12 and clean item resources
+      item_last12=$(echo "$num" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
+      item_container="cfg-agent-item-${item_last12}"
+      if docker rm -f "$item_container" >/dev/null 2>&1; then
+        echo "CLEANED:container:${item_container}"
+      else
+        echo "SKIP:container:${item_container} not found"
+      fi
+      clone_dir="${WORKTREE_BASE}/item-${item_last12}"
+      if [[ -d "$clone_dir" ]]; then
+        rm -rf "$clone_dir"
+        echo "CLEANED:clone:${clone_dir}"
+      else
+        echo "SKIP:clone:${clone_dir} not found"
+      fi
     fi
     echo "CLEANUP_DONE:${num}"
     ;;
@@ -852,14 +877,21 @@ else:
     fi
     validate_branch "$pr_branch"
 
-    # Auto-detect story number: first try "Fixes #N" in PR body, then branch.
+    # Auto-detect story number or item_id: first try "Fixes #N" in PR body, then branch.
     story_num=$(echo "$pr_body" | grep -oP '(?:Fixes|Closes|Resolves)\s+#\K[0-9]+' | head -1 || true)
-    if [[ -z "$story_num" && "$pr_branch" =~ story-([0-9]+) ]]; then
-      story_num="${BASH_REMATCH[1]}"
-    fi
+    is_item_branch=false
+    item_last12=""
+
     if [[ -z "$story_num" ]]; then
-      echo "REVIEW_REFUSED:${pr_num}:no_story_link"
-      exit 3
+      if [[ "$pr_branch" =~ feature/story-([0-9]+) ]]; then
+        story_num="${BASH_REMATCH[1]}"
+      elif [[ "$pr_branch" =~ feature/item-([a-zA-Z0-9]+) ]]; then
+        is_item_branch=true
+        item_last12="${BASH_REMATCH[1]}"
+      else
+        echo "REVIEW_REFUSED:${pr_num}:no_story_link"
+        exit 3
+      fi
     fi
 
     container_name="cfg-agent-review-pr-${pr_num}"
@@ -871,11 +903,61 @@ else:
       exit 3
     fi
 
-    # Look up project item_id for the story so the reviewer can update status.
     PROJECT_QUEUE="${REPO_ROOT}/scripts/project-queue.sh"
-    item_id=$(bash "$PROJECT_QUEUE" add-issue "$story_num" 2>/dev/null \
-      | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" \
-      2>/dev/null || true)
+    item_id=""
+
+    if $is_item_branch; then
+      # Item-branch PR: find item_id via PR-field scan, then item_id-suffix scan.
+      # PR-field scan: iterate In Progress items, check if .fields.PR == pr_num.
+      in_progress_ids=$(bash "$PROJECT_QUEUE" list-by-status "In Progress" 2>/dev/null | \
+        python3 -c "import json,sys; [print(i['item_id']) for i in json.load(sys.stdin)]" \
+        2>/dev/null || true)
+      for candidate_id in $in_progress_ids; do
+        candidate_json=$(bash "$PROJECT_QUEUE" get-item "$candidate_id" 2>/dev/null || echo "")
+        candidate_pr=$(echo "$candidate_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get('fields', {}).get('PR', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+        if [[ "$candidate_pr" == "$pr_num" ]]; then
+          item_id="$candidate_id"
+          break
+        fi
+      done
+      # Item_id-suffix scan fallback: check all status buckets for item_id ending with LAST12.
+      if [[ -z "$item_id" ]]; then
+        for scan_status in "Draft" "Ready" "In Progress" "Fix" "Done" "Blocked" "Failed"; do
+          scan_result=$(bash "$PROJECT_QUEUE" list-by-status "$scan_status" 2>/dev/null | \
+            python3 -c "
+import json, sys
+suffix = '${item_last12}'
+items = json.load(sys.stdin)
+for i in items:
+    iid = i.get('item_id', '')
+    alphanumeric = ''.join(c for c in iid if c.isalnum())
+    if alphanumeric[-len(suffix):] == suffix and len(suffix) > 0:
+        print(iid)
+        break
+" 2>/dev/null || true)
+          if [[ -n "$scan_result" ]]; then
+            item_id="$scan_result"
+            break
+          fi
+        done
+      fi
+      if [[ -z "$item_id" ]]; then
+        echo "REVIEW_REFUSED:${pr_num}:no_story_link"
+        exit 3
+      fi
+    else
+      # Story PR: look up project item_id via add-issue.
+      item_id=$(bash "$PROJECT_QUEUE" add-issue "$story_num" 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" \
+        2>/dev/null || true)
+    fi
 
     # Stale clone cleanup (previous run crashed before docker rm got the dir).
     rm -rf "$clone_dir" 2>/dev/null || true
@@ -894,7 +976,35 @@ else:
 
     # Write the review prompt into the cloned worktree. The container's
     # review-entrypoint.sh reads it and hands off to claude -p.
-    cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
+    if $is_item_branch; then
+      # Item-branch prompt: story:0, cleanup via item_id (no linked issue to close).
+      cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
+You are operating as the Acceptance Reviewer agent for CFGMS.
+
+Your assignment: pr:${pr_num} story:0 --project-item ${item_id}
+
+Read \`.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
+workflow against the PR currently checked out in this workspace. Use real \`gh\`
+commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
+mode, so no approval prompts will block you.
+
+When the verdict is determined, post the structured review comment per the
+agent definition. Then take exactly ONE of these closing actions:
+
+- **PASS (zero findings)**:
+  mark item Done with \`./scripts/project-queue.sh update-field ${item_id} status Done\`,
+  then run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${item_id}\` to
+  release the dev agent's container/worktree.
+- **FAIL on first review**: \`./scripts/project-queue.sh update-field ${item_id} status Fix\`.
+- **FAIL on second review (fix cycle)**:
+  \`./scripts/project-queue.sh update-field ${item_id} status Blocked\`,
+  and run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${item_id}\`.
+- **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
+  host PO will re-dispatch when CI completes.
+PROMPT_EOF
+    else
+      # Story-branch prompt: includes issue closing and story cleanup.
+      cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
 You are operating as the Acceptance Reviewer agent for CFGMS.
 
 Your assignment: pr:${pr_num} story:${story_num} --project-item ${item_id}
@@ -919,10 +1029,17 @@ agent definition. Then take exactly ONE of these closing actions:
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
+    fi
 
     real_path=$(realpath "$clone_dir")
     refresh_creds_from_host
     gh_token=$(gh auth token)
+
+    # Determine story label: 0 for item-branch PRs (no linked issue).
+    review_story_label="${story_num:-0}"
+    if $is_item_branch; then
+      review_story_label="0"
+    fi
 
     # Launch headless. Mount the review entrypoint at runtime — no image rebuild
     # required when this script changes.
@@ -931,7 +1048,7 @@ PROMPT_EOF
       --label "cfg-agent=true" \
       --label "mode=review" \
       --label "pr=${pr_num}" \
-      --label "story=${story_num}" \
+      --label "story=${review_story_label}" \
       --memory=4g \
       --cpus=4 \
       --stop-timeout=1800 \
@@ -946,7 +1063,7 @@ PROMPT_EOF
       --cap-add NET_ADMIN \
       --entrypoint /usr/local/bin/review-entrypoint.sh \
       cfg-agent:latest 2>&1); then
-      echo "REVIEW_DISPATCHED:${pr_num}:${story_num}:${container_id}"
+      echo "REVIEW_DISPATCHED:${pr_num}:${review_story_label}:${container_id}"
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
       rm -rf "$clone_dir"
