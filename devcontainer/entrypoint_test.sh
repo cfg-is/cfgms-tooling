@@ -340,12 +340,12 @@ DISP
 # TEST 10 — linked issue section renders (AC2)
 # ============================================================================
 test_10_linked_issue_section() {
-    local json='{"title":"Fix flaky test","body":"The test is flaky under load.","labels":[{"name":"bug"},{"name":"pipeline:fix"}],"comments":[{"author":{"login":"po"},"createdAt":"2026-04-22T10:00:00Z","body":"Blocking release"}]}'
+    local json='{"title":"Fix flaky test","body":"The test is flaky under load.","labels":[{"name":"bug"},{"name":"high-priority"}],"comments":[{"author":{"login":"po"},"createdAt":"2026-04-22T10:00:00Z","body":"Blocking release"}]}'
     local output
     output=$(ac_render_linked_issue "$json" "999")
     assert_contains "$output" "## Linked Issue #999: Fix flaky test" "title header"
     assert_contains "$output" "The test is flaky under load" "body"
-    assert_contains "$output" "**Labels:** bug, pipeline:fix" "labels line"
+    assert_contains "$output" "**Labels:** bug, high-priority" "labels line"
     assert_contains "$output" "### Linked Issue Comments" "comments sub-header"
     assert_contains "$output" "Blocking release" "comment body"
     assert_contains "$output" "**po**" "comment author"

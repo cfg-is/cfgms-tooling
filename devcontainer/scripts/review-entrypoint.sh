@@ -59,24 +59,25 @@ fi
 
 PR_NUM=$(grep -oP 'pr:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 STORY_NUM=$(grep -oP 'story:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
-echo "Starting Acceptance Reviewer (pr=${PR_NUM} story=${STORY_NUM})..."
+ITEM_ID=$(grep -oP -- '--project-item \K\S+' "$PROMPT_FILE" | head -1 || echo "")
+PROJECT_QUEUE="/workspace/scripts/project-queue.sh"
+echo "Starting Acceptance Reviewer (pr=${PR_NUM} story=${STORY_NUM} item=${ITEM_ID})..."
 
 EXIT_CODE=0
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
 claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT_CONTENT" || EXIT_CODE=$?
 
-# --- Phase 2: Failsafe label cleanup ---
-# The agent is instructed to remove pipeline:reviewing before exiting.
-# If it didn't (crash, OOM, validation gap), strip it here so the host PO
-# can re-dispatch on the next cycle. Without this, a single crashed review
-# wedges the PR forever.
-if [ -n "$PR_NUM" ]; then
-    if gh pr view "$PR_NUM" --repo cfg-is/cfgms --json labels \
-        --jq '[.labels[].name] | index("pipeline:reviewing")' 2>/dev/null | grep -q '^[0-9]'; then
-        echo "WARN: pipeline:reviewing still on PR #${PR_NUM} after review — stripping (failsafe)"
-        # Use REST API: gh pr edit triggers a GraphQL projectCards deprecation
-        # warning that exits non-zero even on success.
-        gh api -X DELETE "/repos/cfg-is/cfgms/issues/${PR_NUM}/labels/pipeline:reviewing" >/dev/null 2>&1 || true
+# --- Phase 2: Failsafe project status reset ---
+# The agent is instructed to update project status before exiting.
+# If it didn't (crash, OOM, validation gap), the PO's cleanup-stale-reviews
+# step handles detection via container-existence check. No label to strip —
+# pipeline:reviewing label was decommissioned (Story #1482).
+if [ -n "${ITEM_ID:-}" ] && [ -f "$PROJECT_QUEUE" ]; then
+    # Ensure status is not left as "Reviewing" if review container exits without updating
+    current_status=$(bash "$PROJECT_QUEUE" get-item "$ITEM_ID" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+    if [ "${current_status:-}" = "Reviewing" ]; then
+        echo "WARN: project status still Reviewing after review exit — resetting to In Progress (failsafe)"
+        bash "$PROJECT_QUEUE" update-field "$ITEM_ID" status "In Progress" >/dev/null 2>&1 || true
     fi
 fi
 

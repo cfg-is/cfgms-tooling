@@ -5,7 +5,7 @@
 # All actions target the cfg-is/cfgms repo and the develop branch queue.
 #
 # Subcommands:
-#   dispatch <STORY_NUM>            Fresh story: check-conflicts + clone + launch + label swap
+#   dispatch <STORY_NUM>            Fresh story: check-conflicts + clone + launch + status update
 #   dispatch-fix <PR_NUM>           Fix cycle: remove stale container + clone-pr + launch
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
 #   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
@@ -16,8 +16,8 @@
 #   rerun <PR_NUM> [comment_body]   Rerun failed CI jobs; optional audit comment
 #   log <ISSUE_OR_EPIC> <text>      Post timestamped session log (reads stdin if text is -)
 #   merge-queue                     Emit current queue state as JSON
-#   block <ISSUE> <reason>          Apply pipeline:blocked, clear other labels, post escalation
-#   unblock <ISSUE> <reason> [--as-fix]  Remove pipeline:blocked, optionally add pipeline:fix
+#   block <ISSUE> <reason>          Set project status Blocked, post escalation comment
+#   unblock <ISSUE> <reason> [--as-fix]  Set project status Ready (or Fix), post unblock comment
 #   preflight                       Run preflight (writes ~/.cache/cfgms-po/preflight.json, prints summary)
 #   state [jq_filter]               Read cached preflight and apply optional jq filter
 
@@ -28,6 +28,7 @@ WORKTREE_BASE="$(cd "$(dirname "$0")/../.." && pwd)/../worktrees"
 WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
 DISPATCH="$(dirname "$0")/agent-dispatch.sh"
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
+PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
 
 # Cache path (matches po-cycle-preflight.py defaults). No /tmp writes.
 if [ -n "${PO_CACHE_DIR:-}" ]; then
@@ -100,8 +101,6 @@ case "$cmd" in
       exit 1
     fi
 
-    gh issue edit "$story" --repo "$REPO" \
-      --remove-label "agent:ready" --add-label "agent:in-progress" >/dev/null
     bash "$PROJECT_QUEUE" update-field "$item_id" status "In Progress" >/dev/null 2>&1 || true
     echo "DISPATCHED:$story"
     ;;
@@ -123,10 +122,6 @@ case "$cmd" in
     pr="${2:?PR number required}"
     msg="Closed by merged PR #${pr}. PR body was missing the \`Fixes #${issue}\` keyword so GitHub did not auto-close."
     gh issue close "$issue" --repo "$REPO" --comment "$msg" >/dev/null
-    # Remove stale agent labels if present; ignore failures
-    for lbl in "agent:failed" "agent:success" "agent:in-progress"; do
-      gh issue edit "$issue" --repo "$REPO" --remove-label "$lbl" >/dev/null 2>&1 || true
-    done
     echo "CLOSED:$issue via PR #$pr"
     ;;
 
@@ -254,8 +249,7 @@ case "$cmd" in
 
   block)
     # Usage: po-act.sh block <ISSUE_NUM> <reason>
-    # Applies pipeline:blocked label, assigns to founder, posts escalation comment.
-    # Removes pipeline:fix and agent:* labels to clear the state.
+    # Sets project status to Blocked, assigns to founder, posts escalation comment.
     issue="${1:?issue number required}"
     reason="${2:?reason required (use - to read stdin)}"
     ts=$(date -u +"%Y-%m-%d %H:%MZ")
@@ -263,18 +257,18 @@ case "$cmd" in
       reason=$(cat)
     fi
     body=$(printf '## Pipeline blocked — %s\n\n%s\n\n_Escalated to founder by PO cycle._\n' "$ts" "$reason")
-    # Clear contradicting labels
-    for lbl in "pipeline:fix" "agent:failed" "agent:in-progress" "agent:success"; do
-      gh issue edit "$issue" --repo "$REPO" --remove-label "$lbl" >/dev/null 2>&1 || true
-    done
-    gh issue edit "$issue" --repo "$REPO" --add-label "pipeline:blocked" >/dev/null
+    # Update project status to Blocked (idempotently add issue to project first)
+    item_id=$(bash "$PROJECT_QUEUE" add-issue "$issue" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" 2>/dev/null || true)
+    if [ -n "${item_id:-}" ]; then
+      bash "$PROJECT_QUEUE" update-field "$item_id" status "Blocked" >/dev/null 2>&1 || true
+    fi
     printf '%s\n' "$body" | gh issue comment "$issue" --repo "$REPO" --body-file - >/dev/null
     echo "BLOCKED:$issue"
     ;;
 
   unblock)
     # Usage: po-act.sh unblock <ISSUE_NUM> <reason> [--as-fix]
-    # Removes pipeline:blocked, optionally re-applies pipeline:fix, posts resolution comment.
+    # Sets project status to Ready (or Fix with --as-fix), posts resolution comment.
     issue="${1:?issue number required}"
     reason="${2:?reason required (use - to read stdin)}"
     mode="${3:-}"
@@ -283,9 +277,14 @@ case "$cmd" in
       reason=$(cat)
     fi
     body=$(printf '## Pipeline unblocked — %s\n\n%s\n' "$ts" "$reason")
-    gh issue edit "$issue" --repo "$REPO" --remove-label "pipeline:blocked" >/dev/null 2>&1 || true
-    if [ "$mode" = "--as-fix" ]; then
-      gh issue edit "$issue" --repo "$REPO" --add-label "pipeline:fix" >/dev/null
+    # Update project status (idempotently add issue to project first)
+    item_id=$(bash "$PROJECT_QUEUE" add-issue "$issue" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" 2>/dev/null || true)
+    if [ -n "${item_id:-}" ]; then
+      new_status="Ready"
+      if [ "$mode" = "--as-fix" ]; then
+        new_status="Fix"
+      fi
+      bash "$PROJECT_QUEUE" update-field "$item_id" status "$new_status" >/dev/null 2>&1 || true
     fi
     printf '%s\n' "$body" | gh issue comment "$issue" --repo "$REPO" --body-file - >/dev/null
     echo "UNBLOCKED:$issue${mode:+ ($mode)}"

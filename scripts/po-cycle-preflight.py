@@ -37,14 +37,6 @@ from pathlib import Path
 
 REPO = "cfg-is/cfgms"
 
-LABELS_TO_QUERY = [
-    "pipeline:epic",
-    "pipeline:fix",
-    "agent:in-progress",
-    "agent:failed",
-    "pipeline:blocked",
-]
-
 SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
 ISSUE_NUM_RE = re.compile(r"#(\d+)")
 BACKTICK_PATH_RE = re.compile(
@@ -136,7 +128,7 @@ def gh_pr_list_story_prs():
 def gh_graphql_epic_summary():
     query = (
         "query { repository(owner: \"cfg-is\", name: \"cfgms\") { "
-        "issues(first: 100, labels: [\"pipeline:epic\"], states: OPEN) { "
+        "issues(first: 100, labels: [\"epic\"], states: OPEN) { "
         "nodes { number title subIssuesSummary { total completed } } } } }"
     )
     data = gh("api", "graphql", "-f", f"query={query}")
@@ -459,7 +451,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
 
     Order: ascending story number (stable, predictable).
     Skip if any dep is not CLOSED.
-    Skip if files overlap with an active story (agent:in-progress or open PR) or a
+    Skip if files overlap with an active story (status In Progress or open PR) or a
     story already picked this cycle.
     """
     active_file_sets = [
@@ -685,21 +677,21 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
 
 
 def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=None, queued_pr_numbers=None):
-    """Decide what to do for each pipeline:fix-labeled story (Step 4 of pipeline cycle).
+    """Decide what to do for each Fix-status story (Step 4 of pipeline cycle).
 
-    Each fix story should have a corresponding open PR that needs the fix-pr
+    Each Fix story should have a corresponding open PR that needs the fix-pr
     agent to address review findings or CI failures. The PO calls
     `./.claude/scripts/po-act.sh dispatch-fix <PR>` for each `dispatch_fix` rec.
 
     Action vocabulary:
     - dispatch_fix: open PR exists with CI red or pending — dispatch fix-pr now.
-    - clear_stale_label: open PR exists with CI green — fix already succeeded;
-                  remove pipeline:fix label and the next cycle will route to
+    - clear_stale_status: open PR exists with CI green — fix already succeeded;
+                  set status back to Ready and the next cycle will route to
                   acceptance-review normally.
     - skip: fix-agent already in flight, OR PR already in merge queue.
-    - no_open_pr: story has pipeline:fix label but no open PR — stale label;
+    - no_open_pr: story has Fix status but no open PR — stale status;
                   PO should investigate (likely a PR was closed/merged without
-                  the label being cleared).
+                  the status being updated).
     """
     if active_fix_pr_nums is None:
         active_fix_pr_nums = set()
@@ -721,7 +713,7 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
                 "story": story_num,
                 "pr": None,
                 "action": "no_open_pr",
-                "reason": "story has pipeline:fix label but no open PR — stale label; investigate and clear with `./scripts/pipeline-helper.sh label-remove <STORY> pipeline:fix`",
+                "reason": "story has Fix status but no open PR — stale status; investigate and update via `./scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
             })
             continue
         pr_num = pr["pr"]
@@ -743,21 +735,21 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
             continue
         overall = (pr.get("ci_summary") or {}).get("overall")
         ms = (pr.get("merge_state_status") or "").upper()
-        # clear_stale_label only when CI green AND no merge-state blockers.
+        # clear_stale_status only when CI green AND no merge-state blockers.
         # DIRTY (conflicts) and BLOCKED still need fix-pr even with green CI.
         if overall == "green" and ms not in ("DIRTY", "BLOCKED"):
             recs.append({
                 "story": story_num,
                 "pr": pr_num,
-                "action": "clear_stale_label",
-                "reason": "pipeline:fix labeled but CI green and no merge-state blockers — fix already succeeded; remove label with `./scripts/pipeline-helper.sh label-remove <STORY> pipeline:fix`",
+                "action": "clear_stale_status",
+                "reason": "Fix status but CI green and no merge-state blockers — fix already succeeded; update status via `./scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
             })
             continue
         recs.append({
             "story": story_num,
             "pr": pr_num,
             "action": "dispatch_fix",
-            "reason": f"pipeline:fix labeled story with open PR (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
+            "reason": f"Fix-status story with open PR (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
         })
     return recs
 
@@ -773,9 +765,12 @@ def main():
 
     # Phase 1: parallel top-level queries
     with ThreadPoolExecutor(max_workers=12) as ex:
-        label_futures = {ex.submit(gh_issue_list, lbl): lbl for lbl in LABELS_TO_QUERY}
         draft_future = ex.submit(project_queue_list_by_status, "Draft")
         ready_future = ex.submit(project_queue_list_by_status, "Ready")
+        fix_future = ex.submit(project_queue_list_by_status, "Fix")
+        in_progress_future = ex.submit(project_queue_list_by_status, "In Progress")
+        failed_future = ex.submit(project_queue_list_by_status, "Failed")
+        blocked_future = ex.submit(project_queue_list_by_status, "Blocked")
         pr_future = ex.submit(gh_pr_list_story_prs)
         epic_future = ex.submit(gh_graphql_epic_summary)
         queue_future = ex.submit(gh_graphql_merge_queue)
@@ -783,14 +778,6 @@ def main():
         # Code health gates dispatch — runs in parallel with gh queries so the
         # critical-path delay is min(gh, build) not gh+build.
         code_health_future = ex.submit(code_health_check)
-
-        label_results = {}
-        for fut, lbl in list(label_futures.items()):
-            try:
-                label_results[lbl] = fut.result() or []
-            except Exception as e:
-                degraded_reasons.append(f"gh issue list {lbl} failed: {e}")
-                label_results[lbl] = []
 
         try:
             draft_issues = draft_future.result() or []
@@ -803,6 +790,30 @@ def main():
         except Exception as e:
             degraded_reasons.append(f"project-queue list-by-status Ready failed: {e}")
             ready_issues = []
+
+        try:
+            fix_issues = fix_future.result() or []
+        except Exception as e:
+            degraded_reasons.append(f"project-queue list-by-status Fix failed: {e}")
+            fix_issues = []
+
+        try:
+            in_progress_issues = in_progress_future.result() or []
+        except Exception as e:
+            degraded_reasons.append(f"project-queue list-by-status In Progress failed: {e}")
+            in_progress_issues = []
+
+        try:
+            failed_issues = failed_future.result() or []
+        except Exception as e:
+            degraded_reasons.append(f"project-queue list-by-status Failed failed: {e}")
+            failed_issues = []
+
+        try:
+            blocked_issues = blocked_future.result() or []
+        except Exception as e:
+            degraded_reasons.append(f"project-queue list-by-status Blocked failed: {e}")
+            blocked_issues = []
 
         try:
             prs = pr_future.result() or []
@@ -837,13 +848,12 @@ def main():
             }
 
     out["pipeline_state"] = {
-        "epics_open": label_results["pipeline:epic"],
         "drafts": draft_issues,
         "ready": ready_issues,
-        "fix_cycle": label_results["pipeline:fix"],
-        "in_progress": label_results["agent:in-progress"],
-        "failed": label_results["agent:failed"],
-        "blocked": label_results["pipeline:blocked"],
+        "fix_cycle": fix_issues,
+        "in_progress": in_progress_issues,
+        "failed": failed_issues,
+        "blocked": blocked_issues,
     }
     out["running_containers"] = containers
     out["merge_queue"] = merge_queue
@@ -861,6 +871,10 @@ def main():
             )
     queued_pr_numbers = {e["pr_number"] for e in merge_queue}
 
+    out["epics_open"] = [
+        {"number": e["number"], "title": e["title"]}
+        for e in epics_summary
+    ]
     out["epics"] = [
         {
             "number": e["number"],
@@ -881,7 +895,7 @@ def main():
     # Conflict-detection set = agent:in-progress + stories with open PRs (files in flight
     # until merge). Ready stories are always fetched for gating.
     ready_nums = [s["number"] for s in ready_issues]
-    in_progress_nums = [s["number"] for s in label_results["agent:in-progress"]]
+    in_progress_nums = [s["number"] for s in in_progress_issues]
     pr_story_nums = []
     for pr in prs:
         m = BRANCH_STORY_RE.match(pr.get("headRefName", ""))
@@ -939,7 +953,7 @@ def main():
             "title": s["title"],
             "files_parsed": s["files_parsed"],
             "parse_warnings": s["parse_warnings"],
-            "source": "agent:in-progress" + (
+            "source": "status:In Progress" + (
                 " + open-pr" if s["number"] in pr_story_nums else ""
             ),
         }
@@ -1006,7 +1020,7 @@ def main():
         pr_summaries, queued_pr_numbers, active_fix_pr_nums,
     )
     out["fix_recommendations"] = compute_fix_recommendations(
-        label_results["pipeline:fix"], pr_summaries, active_fix_pr_nums, queued_pr_numbers,
+        fix_issues, pr_summaries, active_fix_pr_nums, queued_pr_numbers,
     )
 
     parse_warning_count = sum(

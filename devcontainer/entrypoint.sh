@@ -501,11 +501,8 @@ fi
 
 # --- Phase 2: Run Claude ---
 
-# Update issue labels if we have an issue number
-if [[ -n "$ISSUE_NUM" ]]; then
-    gh issue edit "$ISSUE_NUM" --remove-label "agent:ready" 2>/dev/null || true
-    gh issue edit "$ISSUE_NUM" --add-label "agent:in-progress" 2>/dev/null || true
-fi
+# Project queue status (Ready → In Progress) is managed by po-act.sh dispatch,
+# not by the entrypoint — decommissioned with pipeline label substrate (Story #1482).
 
 # Clean validation marker from any previous run
 rm -f /tmp/agent-validation-passed
@@ -585,15 +582,8 @@ cat > /tmp/agent-result.json <<RESULT_EOF
 }
 RESULT_EOF
 
-# Update issue labels based on outcome (only if we have an issue number)
-if [[ -n "$ISSUE_NUM" ]]; then
-    gh issue edit "$ISSUE_NUM" --remove-label "agent:in-progress" 2>/dev/null || true
-    if [ "$EXIT_CODE" -eq 0 ]; then
-        gh issue edit "$ISSUE_NUM" --add-label "agent:success" 2>/dev/null || true
-    else
-        gh issue edit "$ISSUE_NUM" --add-label "agent:failed" 2>/dev/null || true
-    fi
-fi
+# Project queue status (In Progress → Done/Failed) is managed by acceptance-reviewer
+# and po-act.sh — decommissioned with pipeline label substrate (Story #1482).
 
 if [ "$EXIT_CODE" -eq 0 ]; then
     echo "Agent completed successfully. PR: ${PR_URL}"

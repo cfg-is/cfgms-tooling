@@ -107,13 +107,11 @@ Commands:
   create-clone-pr <PR_NUM>                  Clone repo and checkout PR branch
   review-pr       <PR_NUM>                  Dispatch headless Acceptance Reviewer for an open PR.
                                             Auto-detects story from "Fixes #N" or branch name;
-                                            applies pipeline:reviewing to gate re-dispatch;
                                             spawns cfg-agent-review-pr-<NUM> in background.
-                                            Idempotent: refuses if container already exists or
-                                            label already set. Exit 3 on validation failure.
-  cleanup-stale-reviews                     Remove exited review containers and strip the
-                                            pipeline:reviewing label from their PRs so the
-                                            host PO can re-dispatch on the next cycle.
+                                            Idempotent: refuses if container already exists.
+                                            Exit 3 on validation failure.
+  cleanup-stale-reviews                     Remove exited review containers that did not clean up
+                                            their clone directory on exit.
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
@@ -833,12 +831,6 @@ else:
     fi
     validate_branch "$pr_branch"
 
-    # In-flight gate: refuse if pipeline:reviewing already on the PR.
-    if echo "$pr_labels" | grep -qx "pipeline:reviewing"; then
-      echo "REVIEW_REFUSED:${pr_num}:already_in_flight"
-      exit 3
-    fi
-
     # Auto-detect story number: first try "Fixes #N" in PR body, then branch.
     story_num=$(echo "$pr_body" | grep -oP '(?:Fixes|Closes|Resolves)\s+#\K[0-9]+' | head -1 || true)
     if [[ -z "$story_num" && "$pr_branch" =~ story-([0-9]+) ]]; then
@@ -858,23 +850,18 @@ else:
       exit 3
     fi
 
-    # Apply pipeline:reviewing label BEFORE spawning the container so the host
-    # gate is set even if launch fails. Use the REST API directly because
-    # `gh pr edit --add-label` queries pullRequest.projectCards, which emits a
-    # GraphQL deprecation warning and exits 1 even on success. The Issues
-    # labels endpoint applies cleanly (PRs and issues share label storage).
-    if ! gh api -X POST "/repos/cfg-is/cfgms/issues/${pr_num}/labels" \
-        -f "labels[]=pipeline:reviewing" >/dev/null 2>&1; then
-      echo "REVIEW_REFUSED:${pr_num}:label_apply_failed"
-      exit 1
-    fi
+    # Look up project item_id for the story so the reviewer can update status.
+    PROJECT_QUEUE="${REPO_ROOT}/scripts/project-queue.sh"
+    item_id=$(bash "$PROJECT_QUEUE" add-issue "$story_num" 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" \
+      2>/dev/null || true)
 
     # Stale clone cleanup (previous run crashed before docker rm got the dir).
     rm -rf "$clone_dir" 2>/dev/null || true
 
     # Fresh clone at the PR branch.
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
-    trap "rm -rf '$clone_dir'; gh api -X DELETE \"/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing\" >/dev/null 2>&1 || true" ERR
+    trap "rm -rf '$clone_dir'" ERR
     git clone --quiet --local --branch develop "$REPO_ROOT" "$clone_dir"
     cd "$clone_dir"
     git remote set-url origin "$github_url"
@@ -889,7 +876,7 @@ else:
     cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
 You are operating as the Acceptance Reviewer agent for CFGMS.
 
-Your assignment: pr:${pr_num} story:${story_num}
+Your assignment: pr:${pr_num} story:${story_num} --project-item ${item_id}
 
 Read \`.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
 workflow against the PR currently checked out in this workspace. Use real \`gh\`
@@ -899,24 +886,17 @@ mode, so no approval prompts will block you.
 When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
-- **PASS (zero findings)**: enqueue with \`gh pr merge ${pr_num} --repo cfg-is/cfgms --squash\`,
+- **PASS (zero findings)**: enqueue with \`./.claude/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
+  mark story Done with \`./scripts/project-queue.sh update-field ${item_id} status Done\`,
   then run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
   release the dev agent's container/worktree.
-- **FAIL on first review**: \`./scripts/pipeline-helper.sh label-add ${story_num} "pipeline:fix"\`.
-- **FAIL on second review (fix cycle)**: \`./scripts/pipeline-helper.sh label-swap ${story_num} "pipeline:fix" "pipeline:blocked"\`,
-  assign founder, and \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
+- **FAIL on first review**: \`./scripts/project-queue.sh update-field ${item_id} status Fix\`.
+- **FAIL on second review (fix cycle)**:
+  \`./scripts/project-queue.sh update-field ${item_id} status Blocked\`,
+  assign founder via \`gh issue edit ${story_num} --repo cfg-is/cfgms --add-assignee jrdnr\`,
+  and run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
-
-CRITICAL — final step regardless of verdict, run this exact command (uses
-the REST API to avoid a spurious GraphQL projectCards warning):
-
-  gh api -X DELETE "/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing"
-
-The host PO uses that label as the in-flight gate. If you exit without
-removing it, the PR will never be re-reviewed (the entrypoint has a failsafe
-strip, but the agent should do this itself so the gate state is correct
-even on graceful exit).
 PROMPT_EOF
 
     real_path=$(realpath "$clone_dir")
@@ -947,9 +927,7 @@ PROMPT_EOF
       cfg-agent:latest 2>&1); then
       echo "REVIEW_DISPATCHED:${pr_num}:${story_num}:${container_id}"
     else
-      # Launch failed — strip label so PR is re-eligible, then clean up.
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
-      gh api -X DELETE "/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing" >/dev/null 2>&1 || true
       rm -rf "$clone_dir"
       echo "CLEANED:clone:${clone_dir}"
       exit 1
@@ -957,11 +935,10 @@ PROMPT_EOF
     ;;
 
   cleanup-stale-reviews)
-    # Failsafe for review containers that exited without stripping
-    # pipeline:reviewing. Removes exited cfg-agent-review-pr-<N> containers
-    # older than 30 minutes, archives their result JSON, deletes the worktree,
-    # and strips the label from the corresponding PR so the host PO can
-    # re-dispatch on the next cycle.
+    # Failsafe for review containers that exited without cleaning up their clone
+    # directory. Removes exited cfg-agent-review-pr-<N> containers older than
+    # 30 minutes, archives their result JSON, and deletes the worktree so the
+    # host PO can re-dispatch on the next cycle.
     cleaned=0
     now_ts=$(date -u +%s)
     threshold=$((now_ts - 1800))  # 30 minutes ago
@@ -990,12 +967,6 @@ PROMPT_EOF
 
       # Archive the result JSON for forensics.
       docker cp "${container_name}:/tmp/agent-result.json" "/tmp/agent-result-review-${pr_num:-${container_name}}.json" 2>/dev/null || true
-
-      # Strip the in-flight label so the PO can re-dispatch.
-      if [[ -n "$pr_num" ]]; then
-        gh api -X DELETE "/repos/cfg-is/cfgms/issues/${pr_num}/labels/pipeline:reviewing" >/dev/null 2>&1 || true
-        echo "CLEANED:label:pipeline:reviewing:pr-${pr_num}"
-      fi
 
       # Remove the container and clone.
       if docker rm -f "$container_name" >/dev/null 2>&1; then
@@ -1028,8 +999,17 @@ PROMPT_EOF
 
   cleanup-stale)
     # Find agent containers (running or exited) whose stories no longer need them.
-    # A container is stale if its story issue is CLOSED or has label agent:failed or pipeline:blocked.
+    # A container is stale if its story issue is CLOSED or has project status Failed or Blocked.
     cleaned=0
+    PROJECT_QUEUE="${REPO_ROOT}/scripts/project-queue.sh"
+
+    # Pre-fetch Failed and Blocked issue numbers from project (one query each vs per-container).
+    failed_nums=$(bash "$PROJECT_QUEUE" list-by-status "Failed" 2>/dev/null \
+      | python3 -c "import json,sys; [print(i['issue_num']) for i in json.load(sys.stdin) if i.get('issue_num')]" \
+      2>/dev/null | sort -u || true)
+    blocked_nums=$(bash "$PROJECT_QUEUE" list-by-status "Blocked" 2>/dev/null \
+      | python3 -c "import json,sys; [print(i['issue_num']) for i in json.load(sys.stdin) if i.get('issue_num')]" \
+      2>/dev/null | sort -u || true)
 
     # Get all cfg-agent-<NUM> containers (running + exited)
     containers=$(docker ps -a --filter "label=cfg-agent=true" --format "{{.Names}}" 2>/dev/null || true)
@@ -1043,10 +1023,9 @@ PROMPT_EOF
         continue
       fi
 
-      # Check issue state and labels
-      issue_json=$(gh issue view "$num" --repo cfg-is/cfgms --json state,labels 2>/dev/null || echo '{"state":"UNKNOWN","labels":[]}')
+      # Check issue state
+      issue_json=$(gh issue view "$num" --repo cfg-is/cfgms --json state 2>/dev/null || echo '{"state":"UNKNOWN"}')
       state=$(echo "$issue_json" | grep -oP '"state"\s*:\s*"\K[^"]+' || echo "UNKNOWN")
-      labels=$(echo "$issue_json" | grep -oP '"name"\s*:\s*"\K[^"]+' || true)
 
       should_clean=false
 
@@ -1057,13 +1036,13 @@ PROMPT_EOF
       fi
 
       # Clean if story is failed or blocked (agent is done, needs human intervention)
-      if echo "$labels" | grep -q "agent:failed"; then
+      if echo "$failed_nums" | grep -qxF "$num" 2>/dev/null; then
         should_clean=true
-        reason="agent:failed"
+        reason="project status: Failed"
       fi
-      if echo "$labels" | grep -q "pipeline:blocked"; then
+      if echo "$blocked_nums" | grep -qxF "$num" 2>/dev/null; then
         should_clean=true
-        reason="pipeline:blocked"
+        reason="project status: Blocked"
       fi
 
       if $should_clean; then
