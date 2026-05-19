@@ -754,6 +754,29 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                     "action": "enqueue_merge",
                     "reason": "reviewed + CI green + mergeable but not in merge queue — run `gh pr merge <N> --squash`",
                 })
+            elif (
+                ms == "BLOCKED"
+                and pr.get("auto_merge_enabled")
+                and pr.get("mergeable") == "MERGEABLE"
+                and not in_queue
+                and overall != "red"
+            ):
+                # Workflow-drift case: review passed + auto-merge armed, but
+                # mergeStateStatus is BLOCKED and CI isn't actually red. This
+                # signals missing required-check status (the PR's CI ran with a
+                # check set that diverged from develop's current required set —
+                # e.g., a new required check landed on develop after the PR
+                # branched and didn't retroactively trigger on this branch).
+                # Surfaced 2026-05-19 on #1537/#1538 (two audit PRs that sat in
+                # BLOCKED for hours with only one required check reported).
+                # A rebase triggers fresh CI with the current check set; once
+                # those report, auto-merge completes automatically.
+                recs.append({
+                    "pr": pr["pr"],
+                    "story": pr["story_number"],
+                    "action": "rebase",
+                    "reason": "reviewed + auto-merge armed but mergeStateStatus=BLOCKED with CI not red — likely missing required-check status (workflow drift between PR branch and current develop required set). Preemptive rebase via `./.claude/scripts/rebase-pr.sh <PR>` triggers fresh CI with the current check set; auto-merge completes when checks report green.",
+                })
             else:
                 reason = "acceptance review comment already present"
                 if in_queue:
