@@ -637,12 +637,25 @@ rm -f /tmp/agent-validation-passed
 # Capture pre-run HEAD SHA so fix-pr mode can detect silent no-ops.
 PRE_FIX_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-echo "Starting Claude agent (mode=${MODE})..."
+# fix-pr mode runs the iterative fix loop on reviewer findings + CI red. It
+# needs stronger reasoning to synthesize a fix that addresses the finding
+# without regressing — we've observed multi-attempt fix-pr loops on CodeQL
+# patterns (#1542, #1539, #1527) where the dev agent's first fix didn't move
+# the needle. Opus 4.7 on the fix loop compresses the attempt count.
+# Other modes (issue, branch) stay on Sonnet — they're greenfield work where
+# Sonnet is sufficient and cheaper.
+if [[ "$MODE" == "fix-pr" ]]; then
+    AGENT_MODEL="claude-opus-4-7"
+else
+    AGENT_MODEL="claude-sonnet-4-6"
+fi
+
+echo "Starting Claude agent (mode=${MODE}, model=${AGENT_MODEL})..."
 EXIT_CODE=0
 # Read prompt from file to avoid shell metacharacter corruption.
 # Issue/PR bodies contain backticks and $ in code blocks which break heredoc expansion.
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
-claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT_CONTENT" || EXIT_CODE=$?
+claude --dangerously-skip-permissions --model "$AGENT_MODEL" -p "$PROMPT_CONTENT" || EXIT_CODE=$?
 rm -f "$PROMPT_FILE"
 
 # Credentials persist automatically via symlink to /persist volume — no writeback needed.
