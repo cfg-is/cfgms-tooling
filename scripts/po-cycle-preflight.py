@@ -138,6 +138,38 @@ def gh_graphql_epic_summary():
         return []
 
 
+PARENT_EPIC_RE = re.compile(r"Parent epic:\s*#(\d+)", re.IGNORECASE)
+
+
+def gh_body_referenced_epics():
+    """Return {epic_num: count of open issues with 'Parent epic: #NNN' body refs}.
+
+    Catches issue-based decompositions that didn't call addSubIssue (a common
+    failure mode — surfaced on epic #1500 / 2026-05-18). Does NOT catch pure
+    project-draft decompositions; those need a different signal (e.g., a
+    decomposition-complete marker comment on the epic).
+    """
+    issues = gh(
+        "issue", "list",
+        "--repo", REPO,
+        "--search", "Parent epic in:body",
+        "--state", "open",
+        "--json", "number,body",
+        "--limit", "200",
+        check=False,
+    ) or []
+    counts = {}
+    for issue in issues:
+        seen = set()
+        for m in PARENT_EPIC_RE.finditer(issue.get("body") or ""):
+            epic_num = int(m.group(1))
+            if epic_num in seen:
+                continue
+            seen.add(epic_num)
+            counts[epic_num] = counts.get(epic_num, 0) + 1
+    return counts
+
+
 def gh_graphql_merge_queue():
     """Return list of {pr_number, position, state, enqueued_at} for PRs in develop's merge queue."""
     query = (
@@ -977,20 +1009,28 @@ def main():
         {"number": e["number"], "title": e["title"]}
         for e in epics_summary
     ]
+    body_refs = gh_body_referenced_epics()
     out["epics"] = [
         {
             "number": e["number"],
             "title": e["title"],
             "sub_issues_total": (e.get("subIssuesSummary") or {}).get("total", 0),
             "sub_issues_completed": (e.get("subIssuesSummary") or {}).get("completed", 0),
+            "body_referencing_issues": body_refs.get(e["number"], 0),
         }
         for e in epics_summary
     ]
-    out["epics_undecomposed"] = [e for e in out["epics"] if e["sub_issues_total"] == 0]
+    out["epics_undecomposed"] = [
+        e for e in out["epics"]
+        if e["sub_issues_total"] == 0 and e["body_referencing_issues"] == 0
+    ]
     out["epics_caveat"] = (
-        "sub_issues_total is GitHub sub-issue link count. Stories that reference "
-        "an epic via body-only '## Parent Epic' text will not be counted here. "
-        "Before decomposing, LLM should check story bodies for Parent Epic references."
+        "Two decomposition signals are checked: (1) GitHub sub-issue links "
+        "(sub_issues_total), (2) open issues with 'Parent epic: #NNN' body refs "
+        "(body_referencing_issues — catches issue-based decompositions that "
+        "skipped addSubIssue). Pure project-draft decompositions are NOT "
+        "detected by either signal; those need a manual decomposition-complete "
+        "marker on the epic (or close the epic when stories ship)."
     )
 
     # Phase 2: parallel fetch of story bodies relevant to conflict detection.

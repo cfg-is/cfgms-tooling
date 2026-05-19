@@ -7,8 +7,13 @@ set -euo pipefail
 # shellcheck source=./agent-context.sh
 source "$(dirname "${BASH_SOURCE[0]}")/agent-context.sh"
 
-# Path to the Projects V2 queue helper (configurable for testing).
-PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(dirname "${BASH_SOURCE[0]}")/../scripts/project-queue.sh}"
+# Path to the Projects V2 queue helper. The default is the workspace bind-mount
+# (every dev container mounts the repo at /workspace, and Dockerfile sets
+# WORKDIR /workspace). `dirname "${BASH_SOURCE[0]}")/../scripts/...` would
+# resolve to /usr/local/scripts/... — which doesn't exist; entrypoint.sh lives
+# at /usr/local/bin/ with no sibling scripts/ dir. Test harness overrides via
+# CFGMS_TEST_PROJECT_QUEUE to point at the host repo.
+PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-/workspace/scripts/project-queue.sh}"
 
 # --- Argument parsing ---
 MODE="issue"
@@ -185,6 +190,54 @@ SCOPE_CONSTRAINTS_SECTION='## Scope Constraints
 - Do NOT skip tests or create PRs targeting main
 - ALWAYS check central providers in pkg/ before creating new functionality'
 
+# Filing follow-up issues — added to every mode prompt so any dev agent that
+# needs to file a new issue (audit gap, follow-up work, deferred task, etc.)
+# makes it visible to the pipeline. A bare `gh issue create` produces an issue
+# with no project item, no status, and no sub-issue link — the dispatcher
+# cannot see it. Caught 2026-05-18 on epic #1500: 13 audit stories were filed
+# this way and sat orphaned from the pipeline until manual cleanup.
+FOLLOW_UP_ISSUES_SECTION='## Filing follow-up issues (when the story tells you to)
+
+If your story asks you to file a follow-up issue (e.g., a docs audit asks you
+to file a code-fix issue for each gap found, or a Deferred annotation needs a
+tracking issue), DO NOT just call `gh issue create`. A bare `gh issue create`
+produces an issue that is invisible to the pipeline — no project item, no
+status, no sub-issue link to the parent epic — and the work sits orphaned
+until a human cleans it up.
+
+For each follow-up issue, run all FOUR calls in this order. Omit step 2 only
+if there is genuinely no parent epic (rare — usually the epic your current
+story belongs to is the right parent).
+
+```bash
+# 1. Create the public GH issue
+issue_num=$(gh issue create --repo cfg-is/cfgms \
+  --title "<scope>: <title>" \
+  --label story \
+  --body-file /path/to/body.md \
+  | grep -oE "[0-9]+$")
+
+# 2. Link as sub-issue of the parent epic (so the epic tracks completion)
+./scripts/pipeline-helper.sh link-child <PARENT_EPIC_NUM> "$issue_num"
+
+# 3. Add the issue to the project queue (so the dispatcher can see it)
+item_id=$(./scripts/project-queue.sh add-issue "$issue_num" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)[\"item_id\"])")
+
+# 4. Set initial status. Use `Draft` if the body needs Tech Lead validation
+#    before dispatch (the safe default for new gap-fix work, since you wrote
+#    the body without the BA+Tech Lead planning loop). Only use `Ready` if
+#    you are certain the body is parser-compliant (`## Dependencies` section
+#    is bare `None` or lists only `#NNN` refs to CLOSED issues, and
+#    `## Files In Scope` lists concrete file paths).
+./scripts/project-queue.sh update-field "$item_id" status "Draft"
+```
+
+If any step fails, fix it before moving on — a half-filed issue is worse than
+no issue at all because it hides the problem. Story-body conventions the
+follow-up issue body must satisfy live in `.claude/agents/po.md` under
+"Reference: Story Body Conventions".'
+
 # --- Phase 1: Compose prompt based on mode ---
 
 compose_issue_prompt() {
@@ -310,7 +363,8 @@ If specialists report issues that cannot be fixed after 3 iterations:
 
 PROMPT_EOF
     fi
-    printf '%s\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+    printf '%s\n\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+    printf '%s\n' "$FOLLOW_UP_ISSUES_SECTION" >> "$PROMPT_FILE"
 }
 
 compose_branch_prompt() {
@@ -414,7 +468,8 @@ If specialists report issues that cannot be fixed after 3 iterations:
 - Exit non-zero
 
 PROMPT_EOF
-    printf '%s\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+    printf '%s\n\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+    printf '%s\n' "$FOLLOW_UP_ISSUES_SECTION" >> "$PROMPT_FILE"
 }
 
 compose_pr_fix_prompt() {
@@ -546,7 +601,8 @@ If specialists report issues that cannot be fixed after 3 iterations:
 - Exit non-zero
 
 PROMPT_EOF
-    printf '%s\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+    printf '%s\n\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+    printf '%s\n' "$FOLLOW_UP_ISSUES_SECTION" >> "$PROMPT_FILE"
 }
 
 # Hard refusal: issue and branch modes must source content from Projects V2.
