@@ -62,9 +62,39 @@ def cache_dir():
 
 CACHE_FILE_NAME = "preflight.json"
 
+# Counter for direct `gh` subprocess invocations made by this module. Tested
+# (Issue #1581) to enforce ≤3 per cycle — the GraphQL-batched design must not
+# regress back to per-issue / per-PR fan-out.
+_GH_CALL_COUNT = 0
+
+
+def gh_graphql_tolerant(query):
+    """Run a GraphQL query that may produce partial errors (e.g. mixed-type
+    aliased lookups where some aliases resolve to null). gh exits 1 when the
+    response contains an `errors` array, which our default gh() wrapper would
+    treat as a fatal failure, discarding the otherwise-valid `data` payload.
+
+    Returns the parsed response dict (with both `data` and possibly `errors`),
+    or None if the request was unrecoverable (network failure, no JSON, etc.).
+    """
+    global _GH_CALL_COUNT
+    _GH_CALL_COUNT += 1
+    result = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if not result.stdout.strip():
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
 
 def gh(*args, check=True):
     """Run gh and return parsed JSON. Raises RuntimeError on failure when check=True."""
+    global _GH_CALL_COUNT
+    _GH_CALL_COUNT += 1
     result = subprocess.run(
         ["gh", *args], capture_output=True, text=True, check=False, timeout=60
     )
@@ -83,83 +113,144 @@ def gh(*args, check=True):
         return result.stdout
 
 
-def gh_issue_list(label):
-    return gh(
-        "issue", "list",
-        "--repo", REPO,
-        "--label", label,
-        "--state", "open",
-        "--json", "number,title",
-        "--limit", "200",
-    )
-
-
-def gh_issue_body(number):
-    return gh(
-        "issue", "view", str(number),
-        "--repo", REPO,
-        "--json", "number,title,body,state,labels",
-    )
-
-
-def gh_issue_state(number):
-    data = gh(
-        "issue", "view", str(number),
-        "--repo", REPO,
-        "--json", "state",
-        check=False,
-    )
-    if data is None:
-        return None
-    return data.get("state")
-
-
-def gh_pr_list_story_prs():
-    return gh(
-        "pr", "list",
-        "--repo", REPO,
-        "--search", "head:feature/",
-        "--state", "open",
-        "--json", "number,title,body,isDraft,headRefName,labels,comments,statusCheckRollup,mergeStateStatus,mergeable,autoMergeRequest",
-        "--limit", "50",
-    )
-
-
-def gh_graphql_epic_summary():
-    query = (
-        "query { repository(owner: \"cfg-is\", name: \"cfgms\") { "
-        "issues(first: 100, labels: [\"epic\"], states: OPEN) { "
-        "nodes { number title subIssuesSummary { total completed } } } } }"
-    )
-    data = gh("api", "graphql", "-f", f"query={query}")
-    try:
-        return data["data"]["repository"]["issues"]["nodes"]
-    except (KeyError, TypeError):
-        return []
-
-
 PARENT_EPIC_RE = re.compile(r"Parent epic:\s*#(\d+)", re.IGNORECASE)
 
 
-def gh_body_referenced_epics():
-    """Return {epic_num: count of open issues with 'Parent epic: #NNN' body refs}.
+def _normalize_status_check_rollup(rollup):
+    """Flatten GraphQL statusCheckRollup.contexts into the REST-shaped list
+    that ci_summary() expects: [{name, status, conclusion}, ...].
 
-    Catches issue-based decompositions that didn't call addSubIssue (a common
-    failure mode — surfaced on epic #1500 / 2026-05-18). Does NOT catch pure
-    project-draft decompositions; those need a different signal (e.g., a
-    decomposition-complete marker comment on the epic).
+    StatusContext entries (legacy commit-status API) only carry {context,state},
+    so we map state→conclusion and treat status as COMPLETED (those endpoints
+    don't have a separate pending-vs-complete signal — state is terminal).
     """
-    issues = gh(
-        "issue", "list",
-        "--repo", REPO,
-        "--search", "Parent epic in:body",
-        "--state", "open",
-        "--json", "number,body",
-        "--limit", "200",
-        check=False,
-    ) or []
+    if not rollup:
+        return []
+    nodes = ((rollup or {}).get("contexts") or {}).get("nodes") or []
+    out = []
+    for n in nodes:
+        if "name" in n:
+            out.append({
+                "name": n.get("name"),
+                "status": n.get("status"),
+                "conclusion": n.get("conclusion"),
+            })
+        elif "context" in n:
+            out.append({
+                "name": n.get("context"),
+                "status": "COMPLETED",
+                "conclusion": n.get("state"),
+            })
+    return out
+
+
+def gh_graphql_pipeline_overview():
+    """One GraphQL round-trip that replaces four prior gh calls (Issue #1581):
+    epic summary, merge queue, open story PRs (head:feature/*), and the
+    'Parent epic in:body' search for epics that lack sub-issue links.
+
+    Returns dict: {epics: [...], merge_queue: [...], prs: [...], body_refs: {...}}.
+    On failure, returns the same shape with empty lists/dicts so callers can
+    treat partial failure as degraded rather than fatal.
+    """
+    query = """
+query {
+  repository(owner: "cfg-is", name: "cfgms") {
+    issues(first: 100, labels: ["epic"], states: OPEN) {
+      nodes { number title subIssuesSummary { total completed } }
+    }
+    mergeQueue(branch: "develop") {
+      entries(first: 50) {
+        nodes { position state enqueuedAt pullRequest { number } }
+      }
+    }
+  }
+  storyPRs: search(query: "repo:cfg-is/cfgms is:pr is:open head:feature/", type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        body
+        isDraft
+        headRefName
+        mergeable
+        mergeStateStatus
+        autoMergeRequest { enabledAt }
+        comments(first: 30) { nodes { author { login } body } }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+                contexts(first: 100) {
+                  nodes {
+                    __typename
+                    ... on CheckRun { name status conclusion }
+                    ... on StatusContext { context state }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  bodyRefs: search(query: "repo:cfg-is/cfgms is:issue is:open Parent epic in:body", type: ISSUE, first: 100) {
+    nodes { ... on Issue { number body } }
+  }
+}
+"""
+    empty = {"epics": [], "merge_queue": [], "prs": [], "body_refs": {}}
+    data = gh("api", "graphql", "-f", f"query={query}", check=False)
+    if not data:
+        return empty
+    try:
+        repo = data["data"]["repository"] or {}
+    except (KeyError, TypeError):
+        return empty
+
+    epics = (repo.get("issues") or {}).get("nodes") or []
+
+    mq_entries = (((repo.get("mergeQueue") or {}).get("entries") or {}).get("nodes")) or []
+    merge_queue = [
+        {
+            "pr_number": n["pullRequest"]["number"],
+            "position": n["position"],
+            "state": n["state"],
+            "enqueued_at": n["enqueuedAt"],
+        }
+        for n in mq_entries
+        if n and n.get("pullRequest")
+    ]
+
+    story_pr_nodes = ((data.get("data") or {}).get("storyPRs") or {}).get("nodes") or []
+    prs = []
+    for n in story_pr_nodes:
+        if not n:
+            continue
+        commits_nodes = ((n.get("commits") or {}).get("nodes")) or []
+        rollup = None
+        if commits_nodes:
+            rollup = ((commits_nodes[0] or {}).get("commit") or {}).get("statusCheckRollup")
+        prs.append({
+            "number": n.get("number"),
+            "title": n.get("title", ""),
+            "body": n.get("body") or "",
+            "isDraft": bool(n.get("isDraft")),
+            "headRefName": n.get("headRefName", ""),
+            "mergeable": n.get("mergeable"),
+            "mergeStateStatus": n.get("mergeStateStatus"),
+            "autoMergeRequest": n.get("autoMergeRequest"),
+            "comments": ((n.get("comments") or {}).get("nodes")) or [],
+            "statusCheckRollup": _normalize_status_check_rollup(rollup),
+        })
+
+    body_ref_nodes = ((data.get("data") or {}).get("bodyRefs") or {}).get("nodes") or []
     counts = {}
-    for issue in issues:
+    for issue in body_ref_nodes:
+        if not issue:
+            continue
         seen = set()
         for m in PARENT_EPIC_RE.finditer(issue.get("body") or ""):
             epic_num = int(m.group(1))
@@ -167,33 +258,104 @@ def gh_body_referenced_epics():
                 continue
             seen.add(epic_num)
             counts[epic_num] = counts.get(epic_num, 0) + 1
-    return counts
+
+    return {"epics": epics, "merge_queue": merge_queue, "prs": prs, "body_refs": counts}
 
 
-def gh_graphql_merge_queue():
-    """Return list of {pr_number, position, state, enqueued_at} for PRs in develop's merge queue."""
-    query = (
-        "query { repository(owner: \"cfg-is\", name: \"cfgms\") { "
-        "mergeQueue(branch: \"develop\") { entries(first: 50) { "
-        "nodes { position state enqueuedAt pullRequest { number } } } } } }"
+def gh_graphql_issues_batch(numbers):
+    """Fetch bodies + state + labels for a set of numbers in ONE round-trip.
+
+    Each number is queried as both issue() and pullRequest() because GitHub's
+    issue/PR namespace is shared — the old `gh issue view N` worked
+    transparently for both (PRs report state=MERGED which we'd lose if we
+    only queried issue()). The non-null result wins. Replaces per-number
+    gh_issue_view / gh_issue_state fan-out (Issue #1581).
+
+    GitHub's GraphQL returns a partial-error response (HTTP 200 with both
+    `data` and `errors`) when an alias resolves to null — `gh api graphql`
+    exits 1 in that case, so we use gh_graphql_tolerant() to keep the data.
+
+    Returns dict mapping int(number) → {number, title, body, state, labels: [...]}.
+    """
+    nums = sorted({int(n) for n in numbers if n is not None})
+    if not nums:
+        return {}
+    out = {}
+    CHUNK = 50  # 50 numbers × 2 aliased lookups = 100 fields/query
+    for offset in range(0, len(nums), CHUNK):
+        chunk = nums[offset:offset + CHUNK]
+        alias_lines = []
+        for n in chunk:
+            alias_lines.append(
+                f'    i{n}: issue(number: {n}) '
+                f'{{ number title body state labels(first: 20) {{ nodes {{ name }} }} }}'
+            )
+            alias_lines.append(
+                f'    p{n}: pullRequest(number: {n}) '
+                f'{{ number title body state labels(first: 20) {{ nodes {{ name }} }} }}'
+            )
+        query = (
+            "query { repository(owner: \"cfg-is\", name: \"cfgms\") {\n"
+            + "\n".join(alias_lines)
+            + "\n} }"
+        )
+        resp = gh_graphql_tolerant(query)
+        if not resp:
+            continue
+        repo = ((resp.get("data") or {}).get("repository")) or {}
+        for key, node in repo.items():
+            if node is None or len(key) < 2 or key[0] not in ("i", "p"):
+                continue
+            try:
+                n = int(key[1:])
+            except ValueError:
+                continue
+            normalized = {
+                "number": node.get("number"),
+                "title": node.get("title", ""),
+                "body": node.get("body") or "",
+                "state": node.get("state"),
+                "labels": ((node.get("labels") or {}).get("nodes")) or [],
+            }
+            # Prefer pullRequest (state=MERGED is more specific than CLOSED).
+            if key[0] == "p" or n not in out:
+                out[n] = normalized
+    return out
+
+
+def gh_graphql_pr_states(numbers):
+    """Fetch {state} for a list of PR numbers in one aliased GraphQL call.
+    Used by auto_close_merged_items() to detect MERGED PRs without paying
+    one gh-invocation per item.
+    """
+    nums = sorted({int(n) for n in numbers if n is not None})
+    if not nums:
+        return {}
+    aliases = "\n".join(
+        f'    p{n}: pullRequest(number: {n}) {{ number state }}' for n in nums
     )
-    data = gh("api", "graphql", "-f", f"query={query}", check=False)
-    if not data:
-        return []
-    try:
-        nodes = data["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
-    except (KeyError, TypeError):
-        return []
-    return [
-        {
-            "pr_number": n["pullRequest"]["number"],
-            "position": n["position"],
-            "state": n["state"],
-            "enqueued_at": n["enqueuedAt"],
-        }
-        for n in (nodes or [])
-        if n.get("pullRequest")
-    ]
+    query = (
+        "query { repository(owner: \"cfg-is\", name: \"cfgms\") {\n"
+        + aliases
+        + "\n} }"
+    )
+    # Use tolerant wrapper because a number passed here might no longer be a
+    # PR (e.g. project-queue PR field staleness) — partial errors must not
+    # discard the data for the other aliases.
+    resp = gh_graphql_tolerant(query)
+    if not resp:
+        return {}
+    repo = ((resp.get("data") or {}).get("repository")) or {}
+    out = {}
+    for key, pr in repo.items():
+        if not key.startswith("p") or pr is None:
+            continue
+        try:
+            n = int(key[1:])
+        except ValueError:
+            continue
+        out[n] = pr.get("state")
+    return out
 
 
 def is_trusted_review_comment(comment):
@@ -271,6 +433,8 @@ def auto_close_merged_items(degraded_reasons=None):
         degraded_reasons.append("auto_close_merged_items: list-by-status returned invalid JSON")
         return count
 
+    # Phase 1: resolve item_id → PR number via project-queue (no gh calls).
+    item_pr_map = {}
     for item in items:
         item_id = item.get("item_id")
         if not item_id:
@@ -287,20 +451,42 @@ def auto_close_merged_items(degraded_reasons=None):
                 continue
             item_data = json.loads(get_result.stdout)
             pr_num = (item_data.get("fields") or {}).get("PR")
-            if not pr_num:
-                continue
-            pr_result = subprocess.run(
-                ["gh", "pr", "view", str(pr_num), "--json", "state", "--jq", ".state"],
-                capture_output=True, text=True, check=False, timeout=60,
-            )
-            if pr_result.returncode != 0:
-                degraded_reasons.append(
-                    f"auto_close_merged_items: gh pr view {pr_num} failed: {pr_result.stderr.strip()[:100]}"
-                )
-                continue
-            state = pr_result.stdout.strip().strip('"')
-            if state != "MERGED":
-                continue
+            if pr_num:
+                try:
+                    item_pr_map[item_id] = int(pr_num)
+                except (TypeError, ValueError):
+                    degraded_reasons.append(
+                        f"auto_close_merged_items: item {item_id} PR field {pr_num!r} not an integer"
+                    )
+        except Exception as e:
+            degraded_reasons.append(f"auto_close_merged_items: error resolving {item_id}: {e}")
+
+    if not item_pr_map:
+        return count
+
+    # Phase 2: one batched GraphQL query for all PR states (Issue #1581).
+    try:
+        pr_states = gh_graphql_pr_states(list(item_pr_map.values()))
+    except Exception as e:
+        degraded_reasons.append(f"auto_close_merged_items: batched PR state query failed: {e}")
+        return count
+    # gh_graphql_pr_states returns {} on a transient network/JSON failure
+    # rather than raising — surface that explicitly so a silent zero-count
+    # cycle doesn't look like "nothing to do" when it was actually a fetch
+    # miss. Caught by qa-code-reviewer on PR #1581.
+    if not pr_states and item_pr_map:
+        degraded_reasons.append(
+            f"auto_close_merged_items: batched PR state query returned no results "
+            f"for {len(item_pr_map)} item(s) — likely transient gh/network failure"
+        )
+        return count
+
+    # Phase 3: update items whose PR is MERGED.
+    for item_id, pr_num in item_pr_map.items():
+        state = pr_states.get(pr_num)
+        if state != "MERGED":
+            continue
+        try:
             update_result = subprocess.run(
                 ["bash", script, "update-field", item_id, "status", "Done"],
                 capture_output=True, text=True, check=False, timeout=60,
@@ -312,7 +498,7 @@ def auto_close_merged_items(degraded_reasons=None):
                 continue
             count += 1
         except Exception as e:
-            degraded_reasons.append(f"auto_close_merged_items: error processing {item_id}: {e}")
+            degraded_reasons.append(f"auto_close_merged_items: error updating {item_id}: {e}")
             continue
 
     return count
@@ -916,7 +1102,11 @@ def main():
         "degraded_reasons": degraded_reasons,
     }
 
-    # Phase 1: parallel top-level queries
+    # Phase 1: parallel top-level queries.
+    # The six project-queue.sh status calls are local-script + 1 graphql each
+    # (hidden inside project-queue.sh); the single gh_graphql_pipeline_overview
+    # collapses the four prior top-level gh calls (epic summary, merge queue,
+    # PR list, body-refs search) into one round-trip (Issue #1581).
     with ThreadPoolExecutor(max_workers=12) as ex:
         draft_future = ex.submit(project_queue_list_by_status, "Draft")
         ready_future = ex.submit(project_queue_list_by_status, "Ready")
@@ -924,9 +1114,7 @@ def main():
         in_progress_future = ex.submit(project_queue_list_by_status, "In Progress")
         failed_future = ex.submit(project_queue_list_by_status, "Failed")
         blocked_future = ex.submit(project_queue_list_by_status, "Blocked")
-        pr_future = ex.submit(gh_pr_list_story_prs)
-        epic_future = ex.submit(gh_graphql_epic_summary)
-        queue_future = ex.submit(gh_graphql_merge_queue)
+        overview_future = ex.submit(gh_graphql_pipeline_overview)
         container_future = ex.submit(running_containers)
         # Code health gates dispatch — runs in parallel with gh queries so the
         # critical-path delay is min(gh, build) not gh+build.
@@ -969,22 +1157,14 @@ def main():
             blocked_issues = []
 
         try:
-            prs = pr_future.result() or []
+            overview = overview_future.result() or {}
         except Exception as e:
-            degraded_reasons.append(f"gh pr list failed: {e}")
-            prs = []
-
-        try:
-            epics_summary = epic_future.result() or []
-        except Exception as e:
-            degraded_reasons.append(f"graphql epic summary failed: {e}")
-            epics_summary = []
-
-        try:
-            merge_queue = queue_future.result() or []
-        except Exception as e:
-            degraded_reasons.append(f"graphql merge queue query failed: {e}")
-            merge_queue = []
+            degraded_reasons.append(f"graphql pipeline overview failed: {e}")
+            overview = {}
+        prs = overview.get("prs") or []
+        epics_summary = overview.get("epics") or []
+        merge_queue = overview.get("merge_queue") or []
+        body_refs = overview.get("body_refs") or {}
 
         containers = container_future.result()
         if containers is None:
@@ -1032,7 +1212,6 @@ def main():
         {"number": e["number"], "title": e["title"]}
         for e in epics_summary
     ]
-    body_refs = gh_body_referenced_epics()
     out["epics"] = [
         {
             "number": e["number"],
@@ -1056,10 +1235,11 @@ def main():
         "marker on the epic (or close the epic when stories ship)."
     )
 
-    # Phase 2: parallel fetch of story bodies relevant to conflict detection.
+    # Phase 2: fetch story bodies relevant to conflict detection.
     # Conflict-detection set = In Progress items + stories with open PRs (files in flight
     # until merge). Ready stories are always fetched for gating.
-    # Issue-linked items use gh_issue_body; pure draft items use project-queue.sh get-item.
+    # Issue-linked items use gh_graphql_issues_batch (one round-trip for all
+    # numbers); pure draft items use project-queue.sh get-item (no gh).
 
     # Separate issue-linked items from pure draft items for each queue bucket.
     ready_item_id_by_num = {}
@@ -1093,16 +1273,21 @@ def main():
     active_story_nums = sorted(set(in_progress_nums + pr_story_nums))
     all_story_nums = sorted(set(ready_nums + active_story_nums))
 
+    # Phase 2 — batched issue fetch (Issue #1581). One aliased GraphQL query
+    # replaces the per-number fan-out that used to dominate cycle latency and
+    # quota usage.
     story_bodies = {}
     if all_story_nums:
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(gh_issue_body, n): n for n in all_story_nums}
-            for fut in as_completed(futures):
-                n = futures[fut]
-                try:
-                    story_bodies[n] = fut.result()
-                except Exception as e:
-                    degraded_reasons.append(f"gh issue view #{n} failed: {e}")
+        try:
+            story_bodies = gh_graphql_issues_batch(all_story_nums)
+        except Exception as e:
+            degraded_reasons.append(f"graphql issues batch failed: {e}")
+        missing = [n for n in all_story_nums if n not in story_bodies]
+        if missing:
+            degraded_reasons.append(
+                f"graphql issues batch missing {len(missing)} entries: {missing[:5]}"
+                + ("..." if len(missing) > 5 else "")
+            )
 
     # Fetch bodies for pure draft items via project-queue.sh get-item.
     _pq = _pq_script_path()
@@ -1176,23 +1361,30 @@ def main():
             p["item_id"] = ""
             active_parsed.append(p)
 
-    # Phase 3: fetch states for every unique dep referenced across ready stories
+    # Phase 3: fetch states for every unique dep referenced across ready stories.
+    # Reuse story_bodies first (deps often overlap with already-fetched stories);
+    # then issue a single batched GraphQL call for the residual numbers.
     dep_nums = set()
     for s in ready_parsed:
         dep_nums.update(s["deps_parsed"])
 
     dep_states = {}
-    if dep_nums:
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(gh_issue_state, n): n for n in dep_nums}
-            for fut in as_completed(futures):
-                n = futures[fut]
-                try:
-                    state = fut.result()
-                    dep_states[n] = state if state else "UNKNOWN"
-                except Exception as e:
-                    dep_states[n] = "UNKNOWN"
-                    degraded_reasons.append(f"gh issue view #{n} state failed: {e}")
+    residual_deps = []
+    for n in dep_nums:
+        body = story_bodies.get(n)
+        if body and body.get("state"):
+            dep_states[n] = body["state"]
+        else:
+            residual_deps.append(n)
+
+    if residual_deps:
+        try:
+            extra = gh_graphql_issues_batch(residual_deps)
+        except Exception as e:
+            extra = {}
+            degraded_reasons.append(f"graphql dep state batch failed: {e}")
+        for n in residual_deps:
+            dep_states[n] = (extra.get(n) or {}).get("state") or "UNKNOWN"
 
     for s in ready_parsed:
         s["deps_states"] = {str(d): dep_states.get(d, "UNKNOWN") for d in s["deps_parsed"]}
