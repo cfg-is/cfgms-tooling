@@ -87,6 +87,30 @@ refresh_creds_from_host() {
     || echo "WARN: Failed to refresh credentials from host"
 }
 
+# Gate on credential validity before launching any agent container.
+# Threshold: 30 minutes (raised from 15; a 401 was observed at 27 min remaining).
+# Sets CFGMS_TEST_CREDS_STATUS to inject a synthetic result in hermetic tests.
+# Exits 10 with DISPATCH_DEFERRED:creds_low:<result> if creds are insufficient.
+gate_credentials_for_launch() {
+  local creds_status
+  if [[ -n "${CFGMS_TEST_CREDS_STATUS:-}" ]]; then
+    creds_status="$CFGMS_TEST_CREDS_STATUS"
+  else
+    creds_status=$(bash "$0" check-creds 2>/dev/null)
+  fi
+  case "$creds_status" in
+    CREDS_OK:*) ;;
+    CREDS_LOW:*|CREDS_EXPIRED:*|CREDS_MISSING:*|CREDS_ERROR:*)
+      echo "DISPATCH_DEFERRED:creds_low:${creds_status}"
+      exit 10
+      ;;
+    *)
+      echo "DISPATCH_DEFERRED:creds_low:check_creds_unknown:${creds_status}"
+      exit 10
+      ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 Usage: agent-dispatch.sh <command> [args...]
@@ -339,9 +363,9 @@ case "$cmd" in
   launch)
     [[ $# -eq 1 ]] || { echo "launch requires exactly one issue number"; exit 1; }
     num="$1"
+    gate_credentials_for_launch
     clone_path="${WORKTREE_BASE}/story-${num}"
     real_path=$(realpath "$clone_path")
-    refresh_creds_from_host
     gh_token=$(gh auth token)
     if container_id=$(docker run -d \
       --name "cfg-agent-${num}" \
@@ -375,8 +399,8 @@ case "$cmd" in
     clone_dir="$1"; shift
     entrypoint_args=("$@")
 
+    gate_credentials_for_launch
     real_path=$(realpath "$clone_dir")
-    refresh_creds_from_host
     gh_token=$(gh auth token)
 
     # Derive mode and metadata labels from entrypoint args
@@ -697,7 +721,7 @@ now = time.time()
 remaining_min = int((exp_s - now) / 60)
 if remaining_min < 0:
     print(f'CREDS_EXPIRED:{remaining_min}')
-elif remaining_min < 15:
+elif remaining_min < 30:
     print(f'CREDS_LOW:{remaining_min}')
 else:
     print(f'CREDS_OK:{remaining_min}')
@@ -854,6 +878,8 @@ else:
       echo "ERROR: PR number must be numeric, got '${pr_num}'"
       exit 1
     fi
+
+    gate_credentials_for_launch
 
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
@@ -1032,7 +1058,6 @@ PROMPT_EOF
     fi
 
     real_path=$(realpath "$clone_dir")
-    refresh_creds_from_host
     gh_token=$(gh auth token)
 
     # Determine story label: 0 for item-branch PRs (no linked issue).

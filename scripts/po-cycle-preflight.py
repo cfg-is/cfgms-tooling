@@ -358,12 +358,26 @@ def gh_graphql_pr_states(numbers):
     return out
 
 
+_ACCEPTANCE_REVIEW_SENTINEL = "<!-- cfgms-acceptance-review -->"
+_ACCEPTANCE_REVIEW_HEADING = "## acceptance review"
+
+
 def is_trusted_review_comment(comment):
-    """Return True only for cfg-agent acceptance-review comments; rejects forgery attempts."""
-    return (
-        comment.get("author", {}).get("login") == "cfg-agent"
-        and "acceptance review" in (comment.get("body") or "").lower()
-    )
+    """Return True for genuine acceptance-review comments.
+
+    Matches by machine sentinel or structural heading:
+    1. Machine sentinel <!-- cfgms-acceptance-review --> — emitted by the
+       acceptance-reviewer agent in every comment (added in item #BX5ezzgtQqQA).
+    2. Structural heading '## Acceptance Review' — backward-compatible with
+       existing comments that predate the sentinel (e.g. PR #1589 authored by
+       jrdnr via the host gh token before the sentinel was introduced).
+
+    Author-login matching was removed because review comments are posted via
+    the host gh token (identity: jrdnr), not a dedicated cfg-agent bot account.
+    Forgery resistance is an accepted tradeoff documented in item #BX5ezzgtQqQA.
+    """
+    body = (comment.get("body") or "").lower()
+    return _ACCEPTANCE_REVIEW_SENTINEL in body or _ACCEPTANCE_REVIEW_HEADING in body
 
 
 def _pq_script_path():
