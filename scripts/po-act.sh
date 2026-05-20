@@ -18,6 +18,7 @@
 #   merge-queue                     Emit current queue state as JSON
 #   block <ISSUE> <reason>          Set project status Blocked, post escalation comment
 #   unblock <ISSUE> <reason> [--as-fix]  Set project status Ready (or Fix), post unblock comment
+#   sync                            Fast-forward local develop checkout (keeps cron scripts current)
 #   preflight                       Run preflight (writes ~/.cache/cfgms-po/preflight.json, prints summary)
 #   state [jq_filter]               Read cached preflight and apply optional jq filter
 
@@ -244,6 +245,31 @@ case "$cmd" in
     gh api graphql \
       -f query='query { repository(owner: "cfg-is", name: "cfgms") { mergeQueue(branch: "develop") { entries(first: 50) { nodes { position state enqueuedAt pullRequest { number title } } } } } }' \
       -q '.data.repository.mergeQueue.entries.nodes'
+    ;;
+
+  sync)
+    # Fast-forward the local develop checkout so the cycle runs current
+    # pipeline scripts. Refuses on a dirty tree or a non-develop branch, and
+    # never creates a merge commit. Must run BEFORE preflight as its own
+    # process — never inside preflight, since the script must not rewrite
+    # itself mid-run.
+    repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+    branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ "$branch" != "develop" ]; then
+      echo "SYNC_SKIP:on branch ${branch:-unknown} (not develop)"
+      exit 0
+    fi
+    if ! git -C "$repo_root" diff --quiet --ignore-submodules HEAD 2>/dev/null; then
+      echo "SYNC_SKIP:working tree dirty — not pulling"
+      exit 0
+    fi
+    if out=$(git -C "$repo_root" pull --ff-only origin develop 2>&1); then
+      echo "$out" | tail -1
+      echo "SYNC_OK"
+    else
+      echo "SYNC_FAILED:$out" >&2
+      exit 1
+    fi
     ;;
 
   preflight)
