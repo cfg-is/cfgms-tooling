@@ -762,20 +762,61 @@ if [ "$EXIT_CODE" -eq 0 ]; then
 else
     echo "Agent failed with exit code ${EXIT_CODE}"
 
-    # Create draft PR if none exists and there are tracked changes (issue and branch modes only)
-    if [[ "$MODE" != "fix-pr" ]] && [ -z "$PR_URL" ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-        git add --update
-        local_issue_ref=""
-        if [[ -n "$ISSUE_NUM" ]]; then
-            local_issue_ref=" for issue #${ISSUE_NUM}"
+    if [[ "$MODE" != "fix-pr" ]] && [ -z "$PR_URL" ]; then
+        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            # Agent produced work but failed — capture it as a draft PR so the
+            # cron's resume_failed_session path can pick it up.
+            git add --update
+            local_issue_ref=""
+            if [[ -n "$ISSUE_NUM" ]]; then
+                local_issue_ref=" for issue #${ISSUE_NUM}"
+            fi
+            git commit -m "WIP: agent attempt${local_issue_ref} (failed validation)" \
+                2>/dev/null || true
+            git push -u origin "$CURRENT_BRANCH" 2>/dev/null || true
+            gh pr create --base develop --draft \
+                --title "WIP: ${CURRENT_BRANCH} (agent failed)" \
+                --body "Agent session failed with exit code ${EXIT_CODE}. Review container logs for details." \
+                2>/dev/null || true
+        else
+            # Zero-work failure: the agent produced no changes — it never got
+            # going (usage limit, token reauth, early crash). There is nothing
+            # to capture as a draft PR, and leaving the item at In Progress
+            # strands it forever (the cron won't re-dispatch In Progress work).
+            # Reset it to Ready so the next cron cycle re-dispatches it, capped
+            # so a persistent failure escalates instead of looping. The retry
+            # count is the number of marker comments on the story issue.
+            if [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
+                echo "Zero-work failure: no project item id — cannot route for re-dispatch"
+            elif [[ -z "$ISSUE_NUM" ]]; then
+                # No issue to track retries on — escalate rather than risk an
+                # unbounded re-dispatch loop.
+                bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+                    2>/dev/null || echo "WARN: failed to set status Blocked"
+                echo "Zero-work failure (no issue for retry tracking) — set to Blocked"
+            else
+                zw_marker="<!-- cfgms-zero-work-retry -->"
+                zw_count=$(gh issue view "$ISSUE_NUM" --json comments \
+                    --jq "[.comments[] | select(.body | contains(\"$zw_marker\"))] | length" \
+                    2>/dev/null || echo 0)
+                zw_count=${zw_count:-0}
+                if [ "$zw_count" -lt 3 ]; then
+                    bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Ready" \
+                        2>/dev/null || echo "WARN: failed to reset status Ready"
+                    gh issue comment "$ISSUE_NUM" --body \
+                        "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — no changes produced (likely usage limit / token reauth / early crash). Status reset to Ready for re-dispatch (retry $((zw_count + 1))/3)." \
+                        2>/dev/null || true
+                    echo "Zero-work failure: reset to Ready for re-dispatch (retry $((zw_count + 1))/3)"
+                else
+                    bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+                        2>/dev/null || echo "WARN: failed to set status Blocked"
+                    gh issue comment "$ISSUE_NUM" --body \
+                        "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — 3 re-dispatch retries exhausted with no progress. Status set to Blocked for operator review." \
+                        2>/dev/null || true
+                    echo "Zero-work failure: retry cap reached — set to Blocked for operator review"
+                fi
+            fi
         fi
-        git commit -m "WIP: agent attempt${local_issue_ref} (failed validation)" \
-            2>/dev/null || true
-        git push -u origin "$CURRENT_BRANCH" 2>/dev/null || true
-        gh pr create --base develop --draft \
-            --title "WIP: ${CURRENT_BRANCH} (agent failed)" \
-            --body "Agent session failed with exit code ${EXIT_CODE}. Review container logs for details." \
-            2>/dev/null || true
     fi
 fi
 
