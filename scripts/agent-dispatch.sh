@@ -405,10 +405,11 @@ case "$cmd" in
 
     # Derive mode and metadata labels from entrypoint args
     mode_label="branch"
+    fix_pr_num=""
     extra_labels=()
     for i in "${!entrypoint_args[@]}"; do
       case "${entrypoint_args[$i]}" in
-        --fix-pr) mode_label="fix-pr"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
+        --fix-pr) mode_label="fix-pr"; fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
         --branch) extra_labels+=(--label "branch=${entrypoint_args[$((i+1))]}") ;;
         --issue)  extra_labels+=(--label "issue=${entrypoint_args[$((i+1))]}") ;;
       esac
@@ -431,6 +432,12 @@ case "$cmd" in
       cfg-agent:latest \
       "${entrypoint_args[@]}" 2>&1); then
       echo "LAUNCHED:${container_name}:${container_id}"
+      # Best-effort PR dashboard label — fix-agent marks the PR while the fix
+      # agent is in flight. Display only: the cron never reads it (work-queue
+      # state stays in the project queue). cleanup-stale reconciles it off.
+      if [[ "$mode_label" == "fix-pr" && -n "$fix_pr_num" ]]; then
+        gh pr edit "$fix_pr_num" --repo cfg-is/cfgms --add-label fix-agent >/dev/null 2>&1 || true
+      fi
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
       rm -rf "$clone_dir"
@@ -1089,6 +1096,8 @@ PROMPT_EOF
       --entrypoint /usr/local/bin/review-entrypoint.sh \
       cfg-agent:latest 2>&1); then
       echo "REVIEW_DISPATCHED:${pr_num}:${review_story_label}:${container_id}"
+      # Best-effort PR dashboard label (see launch-generic note above).
+      gh pr edit "$pr_num" --repo cfg-is/cfgms --add-label review-agent >/dev/null 2>&1 || true
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
       rm -rf "$clone_dir"
@@ -1222,6 +1231,24 @@ PROMPT_EOF
         fi
         cleaned=$((cleaned + 1))
       fi
+    done
+
+    # --- PR agent-status label reconcile ---
+    # fix-agent / review-agent are display-only PR labels the dispatcher adds
+    # when it launches an agent against a PR. Remove them once the agent's
+    # container is gone, so `gh pr list` reflects live agent activity. The cron
+    # never reads these labels for decisions — best-effort throughout.
+    for _lbl in fix-agent review-agent; do
+      case "$_lbl" in
+        fix-agent)    _cprefix="cfg-agent-pr-fix-" ;;
+        review-agent) _cprefix="cfg-agent-review-pr-" ;;
+      esac
+      for _pr in $(gh pr list --repo cfg-is/cfgms --label "$_lbl" --state open --json number --jq '.[].number' 2>/dev/null || true); do
+        if ! docker ps --filter "name=^${_cprefix}${_pr}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+          gh pr edit "$_pr" --repo cfg-is/cfgms --remove-label "$_lbl" >/dev/null 2>&1 || true
+          echo "LABEL_CLEARED:${_lbl}:${_pr}"
+        fi
+      done
     done
 
     echo "CLEANUP_STALE_DONE:cleaned=${cleaned}"
