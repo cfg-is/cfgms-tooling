@@ -637,25 +637,22 @@ rm -f /tmp/agent-validation-passed
 # Capture pre-run HEAD SHA so fix-pr mode can detect silent no-ops.
 PRE_FIX_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-# fix-pr mode runs the iterative fix loop on reviewer findings + CI red. It
-# needs stronger reasoning to synthesize a fix that addresses the finding
-# without regressing — we've observed multi-attempt fix-pr loops on CodeQL
-# patterns (#1542, #1539, #1527) where the dev agent's first fix didn't move
-# the needle. Opus 4.7 on the fix loop compresses the attempt count.
-# Other modes (issue, branch) stay on Sonnet — they're greenfield work where
-# Sonnet is sufficient and cheaper.
-if [[ "$MODE" == "fix-pr" ]]; then
-    AGENT_MODEL="claude-opus-4-7"
-else
-    AGENT_MODEL="claude-sonnet-4-6"
-fi
+# All agent modes run on Sonnet 4.6. fix-pr briefly ran on Opus 4.7 (#1580) on
+# the hypothesis that stronger reasoning would compress multi-attempt fix loops,
+# but multi-round fix loops were already rare (~8% of fix-loop PRs) and the Opus
+# token cost was not justified once the pipeline was kept full ahead of the
+# cron. agent-result.json now records model + duration so this trade can be
+# revisited with real data rather than a hypothesis.
+AGENT_MODEL="claude-sonnet-4-6"
 
 echo "Starting Claude agent (mode=${MODE}, model=${AGENT_MODEL})..."
 EXIT_CODE=0
 # Read prompt from file to avoid shell metacharacter corruption.
 # Issue/PR bodies contain backticks and $ in code blocks which break heredoc expansion.
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
+AGENT_RUN_START=$(date +%s)
 claude --dangerously-skip-permissions --model "$AGENT_MODEL" -p "$PROMPT_CONTENT" || EXIT_CODE=$?
+AGENT_DURATION_SECONDS=$(( $(date +%s) - AGENT_RUN_START ))
 rm -f "$PROMPT_FILE"
 
 # Credentials persist automatically via symlink to /persist volume — no writeback needed.
@@ -722,6 +719,8 @@ cat > /tmp/agent-result.json <<RESULT_EOF
   "issue": ${ISSUE_NUM:-null},
   "pr_num": ${PR_NUM:-null},
   "exit_code": ${EXIT_CODE},
+  "model": "${AGENT_MODEL}",
+  "agent_duration_seconds": ${AGENT_DURATION_SECONDS:-null},
   "pr_url": "${PR_URL}",
   "branch": "${CURRENT_BRANCH}",
   "validation_passed": $([ -f /tmp/agent-validation-passed ] && echo "true" || echo "false"),
