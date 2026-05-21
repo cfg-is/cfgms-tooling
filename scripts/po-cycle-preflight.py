@@ -380,6 +380,39 @@ def is_trusted_review_comment(comment):
     return _ACCEPTANCE_REVIEW_SENTINEL in body or _ACCEPTANCE_REVIEW_HEADING in body
 
 
+# Matches the verdict heading `## Acceptance Review — PASS|FAIL` emitted by the
+# acceptance-reviewer agent. The dash may be em-dash, en-dash, or hyphen.
+_REVIEW_VERDICT_RE = re.compile(r"acceptance review\s*[—–-]\s*(pass|fail)", re.IGNORECASE)
+
+
+def review_verdict(comment):
+    """Return 'pass', 'fail', or None for a single review comment."""
+    m = _REVIEW_VERDICT_RE.search(comment.get("body") or "")
+    return m.group(1).lower() if m else None
+
+
+def latest_review_verdict(comments):
+    """Verdict of the most recent trusted acceptance-review comment.
+
+    GitHub returns issue comments oldest-first, so the last trusted comment
+    with a parseable verdict is the latest review. Returns 'pass', 'fail',
+    or None (no review comment, or none with a parseable verdict).
+
+    Distinguishing the verdict matters: a `Fix` status (or the mere presence
+    of a review comment) does not say whether the review passed. A FAIL review
+    with green CI must NOT be treated as merge-ready — green CI proves the code
+    compiles, not that the reviewer's acceptance-criteria findings were
+    addressed. Only a passing re-review resolves a FAIL.
+    """
+    verdict = None
+    for c in comments:
+        if is_trusted_review_comment(c):
+            v = review_verdict(c)
+            if v is not None:
+                verdict = v
+    return verdict
+
+
 def _pq_script_path():
     """Return the project-queue.sh path, honoring CFGMS_TEST_PROJECT_QUEUE override."""
     override = os.environ.get("CFGMS_TEST_PROJECT_QUEUE")
@@ -869,7 +902,10 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     - skip: in-flight (in queue, auto-merge armed, OR has active fix-agent
               container — fix-agent and rebase-pr.sh would race on the same
               branch); leave alone.
-    - spawn_acceptance_reviewer: needs first-time review (CI green, no comment).
+    - spawn_acceptance_reviewer: needs review — either a first review (CI green,
+              no review comment) or a re-review (latest review verdict was FAIL,
+              the fix landed, CI is green again). A FAIL is never enqueued; it
+              must pass a re-review first.
     - defer: CI still pending.
     - investigate: CI red and not stale-base; needs diagnose + dispatch-fix.
 
@@ -939,9 +975,39 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
             })
             continue
 
+        verdict = pr.get("latest_review_verdict")
+
+        # Review FAILED. Green CI proves only that the code compiles, NOT that
+        # the reviewer's acceptance-criteria findings were addressed — never
+        # enqueue a FAIL. (fix-agent-in-flight is already handled above.)
+        if pr["has_acceptance_review_comment"] and verdict == "fail":
+            if overall == "green":
+                recs.append({
+                    "pr": pr["pr"],
+                    "story": pr["story_number"],
+                    "action": "spawn_acceptance_reviewer",
+                    "reason": "acceptance review FAILED, fix landed (CI green) — re-review required before this PR can merge",
+                })
+            elif overall == "pending":
+                pending = pr["ci_summary"]["pending_checks"][:3]
+                recs.append({
+                    "pr": pr["pr"],
+                    "story": pr["story_number"],
+                    "action": "defer",
+                    "reason": f"acceptance review FAILED; fix in progress, CI pending: {', '.join(pending)}",
+                })
+            else:
+                recs.append({
+                    "pr": pr["pr"],
+                    "story": pr["story_number"],
+                    "action": "skip",
+                    "reason": "acceptance review FAILED and CI red — fix cycle owns this (see fix_recommendations / dispatch-fix)",
+                })
+            continue
+
         if pr["has_acceptance_review_comment"]:
-            # Review done. Flag as stuck if CI green + mergeable but not in queue
-            # and not already auto-merge-enabled (the two "enqueued" signals).
+            # Review passed (or verdict unparseable). Flag as stuck if CI green
+            # + mergeable but not in queue and not already auto-merge-enabled.
             if (
                 overall == "green"
                 and pr.get("mergeable") == "MERGEABLE"
@@ -1038,9 +1104,12 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
 
     Action vocabulary:
     - dispatch_fix: open PR exists with CI red or pending — dispatch fix-pr now.
-    - clear_stale_status: open PR exists with CI green — fix already succeeded;
-                  set status back to Ready and the next cycle will route to
-                  acceptance-review normally.
+    - clear_stale_status: open PR exists with CI green and the Fix was NOT a
+                  review FAIL — the CI-driven fix succeeded; set status back to
+                  Ready and the next cycle routes to acceptance-review normally.
+                  A Fix from a review FAIL never clears on green CI alone — it
+                  routes to a re-review instead (skip here; the review
+                  recommender emits spawn_acceptance_reviewer).
     - skip: fix-agent already in flight, OR PR already in merge queue.
     - no_open_pr: story has Fix status but no open PR — stale status;
                   PO should investigate (likely a PR was closed/merged without
@@ -1088,14 +1157,38 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
             continue
         overall = (pr.get("ci_summary") or {}).get("overall")
         ms = (pr.get("merge_state_status") or "").upper()
-        # clear_stale_status only when CI green AND no merge-state blockers.
-        # DIRTY (conflicts) and BLOCKED still need fix-pr even with green CI.
+        verdict = pr.get("latest_review_verdict")
+        # A Fix that originated from an acceptance-review FAIL is NOT resolved
+        # by green CI — only a passing re-review resolves it. Never
+        # clear_stale_status for those: green CI means the fix code landed,
+        # so the next step is the re-review (compute_review_recommendations
+        # emits spawn_acceptance_reviewer for review-FAIL + green CI), not a
+        # status clear or an enqueue.
+        if verdict == "fail":
+            if overall == "green" and ms not in ("DIRTY", "BLOCKED"):
+                recs.append({
+                    "story": story_num,
+                    "pr": pr_num,
+                    "action": "skip",
+                    "reason": "review FAIL fix landed (CI green) — re-review pending (review_recommendations emits spawn_acceptance_reviewer); do NOT clear status or enqueue",
+                })
+            else:
+                recs.append({
+                    "story": story_num,
+                    "pr": pr_num,
+                    "action": "dispatch_fix",
+                    "reason": f"review FAIL not yet resolved (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
+                })
+            continue
+        # CI-driven Fix (no review FAIL): green CI genuinely means the fix
+        # succeeded. clear_stale_status only when CI green AND no merge-state
+        # blockers. DIRTY (conflicts) and BLOCKED still need fix-pr.
         if overall == "green" and ms not in ("DIRTY", "BLOCKED"):
             recs.append({
                 "story": story_num,
                 "pr": pr_num,
                 "action": "clear_stale_status",
-                "reason": "Fix status but CI green and no merge-state blockers — fix already succeeded; update status via `./scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
+                "reason": "Fix status but CI green, no review FAIL, no merge-state blockers — fix already succeeded; update status via `./scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
             })
             continue
         recs.append({
@@ -1438,6 +1531,7 @@ def main():
             story_number = None
         comments = pr.get("comments") or []
         has_review_comment = any(is_trusted_review_comment(c) for c in comments)
+        review_verdict_val = latest_review_verdict(comments)
         body = pr.get("body") or ""
         title = pr.get("title", "")
         is_draft = bool(pr.get("isDraft"))
@@ -1455,6 +1549,7 @@ def main():
             "story_number": story_number,
             "comment_count": len(comments),
             "has_acceptance_review_comment": has_review_comment,
+            "latest_review_verdict": review_verdict_val,
             "is_draft": is_draft,
             "wip_session_failed": wip_session_failed,
             "merge_state_status": pr.get("mergeStateStatus"),
