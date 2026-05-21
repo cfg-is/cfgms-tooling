@@ -49,6 +49,26 @@ case "$cmd" in
     arg="${1:?story number or item_id required}"
     PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
 
+    # If arg is an item_id (non-numeric), resolve it to the underlying GitHub
+    # issue number. A project item linked to a public issue carries `issue_num`;
+    # when present we MUST dispatch via the issue-number path so the branch is
+    # named feature/story-<issue>-agent. The review sweep (head:feature/story-)
+    # and the preflight's branch->issue linkage both depend on that name — an
+    # item-id branch is invisible to both (Issue #1700). Only genuine issueless
+    # project drafts fall through to the item-id path below.
+    resolved_item_id=""
+    if [[ ! "$arg" =~ ^[0-9]+$ ]]; then
+      resolved_item_id="$arg"
+      resolved_issue=$(bash "$PROJECT_QUEUE" get-item "$arg" 2>/dev/null \
+        | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('issue_num') or '')
+except Exception: print('')" 2>/dev/null || echo "")
+      if [[ -n "$resolved_issue" ]]; then
+        echo "RESOLVED_ITEM:${arg}:#${resolved_issue}"
+        arg="$resolved_issue"
+      fi
+    fi
+
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
       # Issue number path: existing create-clone flow
       story="$arg"
@@ -56,20 +76,26 @@ case "$cmd" in
       "$DISPATCH" create-clone "$story" | tail -1
 
       # Fetch item_id BEFORE launch so CFGMS_PROJECT_ITEM_ID can be passed to the
-      # container. The entrypoint refuses to run without this var.
-      item_id=$(bash "$PROJECT_QUEUE" list-by-status Ready 2>/dev/null \
-        | jq -r --argjson num "$story" '.[] | select(.issue_num == $num) | .item_id' \
-        2>/dev/null || true)
-      if [ -z "${item_id:-}" ]; then
-        echo "ERROR: story #${story} not found in project queue with Ready status" >&2
-        exit 1
+      # container. The entrypoint refuses to run without this var. When we
+      # resolved from an item_id arg we already have it; otherwise look it up.
+      if [[ -n "$resolved_item_id" ]]; then
+        item_id="$resolved_item_id"
+      else
+        item_id=$(bash "$PROJECT_QUEUE" list-by-status Ready 2>/dev/null \
+          | jq -r --argjson num "$story" '.[] | select(.issue_num == $num) | .item_id' \
+          2>/dev/null || true)
+        if [ -z "${item_id:-}" ]; then
+          echo "ERROR: story #${story} not found in project queue with Ready status" >&2
+          exit 1
+        fi
       fi
 
       clone_path="${WORKTREE_BASE}/story-${story}"
       container_name="cfg-agent-${story}"
       first_arg="${story}"
     else
-      # Item ID path (non-numeric, e.g., PVTI_-prefixed pure draft items)
+      # Item ID path: genuine issueless project drafts only (non-numeric arg
+      # that did not resolve to an issue number above).
       item_id="$arg"
       LAST12=$(echo "$item_id" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
       "$DISPATCH" create-clone-item "$item_id" | tail -1
