@@ -176,10 +176,11 @@ query {
         mergeable
         mergeStateStatus
         autoMergeRequest { enabledAt }
-        comments(first: 30) { nodes { author { login } body } }
+        comments(first: 30) { nodes { author { login } body createdAt } }
         commits(last: 1) {
           nodes {
             commit {
+              committedDate
               statusCheckRollup {
                 state
                 contexts(first: 100) {
@@ -231,8 +232,11 @@ query {
             continue
         commits_nodes = ((n.get("commits") or {}).get("nodes")) or []
         rollup = None
+        latest_commit_date = None
         if commits_nodes:
-            rollup = ((commits_nodes[0] or {}).get("commit") or {}).get("statusCheckRollup")
+            latest_commit = (commits_nodes[0] or {}).get("commit") or {}
+            rollup = latest_commit.get("statusCheckRollup")
+            latest_commit_date = latest_commit.get("committedDate")
         prs.append({
             "number": n.get("number"),
             "title": n.get("title", ""),
@@ -244,6 +248,7 @@ query {
             "autoMergeRequest": n.get("autoMergeRequest"),
             "comments": ((n.get("comments") or {}).get("nodes")) or [],
             "statusCheckRollup": _normalize_status_check_rollup(rollup),
+            "latest_commit_date": latest_commit_date,
         })
 
     body_ref_nodes = ((data.get("data") or {}).get("bodyRefs") or {}).get("nodes") or []
@@ -391,26 +396,68 @@ def review_verdict(comment):
     return m.group(1).lower() if m else None
 
 
-def latest_review_verdict(comments):
-    """Verdict of the most recent trusted acceptance-review comment.
+def latest_review(comments):
+    """Return (verdict, created_at) of the most recent trusted acceptance-review
+    comment that carries a parseable verdict.
 
     GitHub returns issue comments oldest-first, so the last trusted comment
-    with a parseable verdict is the latest review. Returns 'pass', 'fail',
-    or None (no review comment, or none with a parseable verdict).
+    with a parseable verdict is the latest review. `verdict` is 'pass', 'fail',
+    or None; `created_at` is that comment's ISO-8601 timestamp, or None.
 
     Distinguishing the verdict matters: a `Fix` status (or the mere presence
     of a review comment) does not say whether the review passed. A FAIL review
     with green CI must NOT be treated as merge-ready — green CI proves the code
     compiles, not that the reviewer's acceptance-criteria findings were
-    addressed. Only a passing re-review resolves a FAIL.
+    addressed. Only a passing re-review resolves a FAIL. The `created_at`
+    timestamp lets callers check whether a fix commit actually landed *after*
+    the review (see `fix_landed_after_review`) rather than inferring it from CI.
     """
-    verdict = None
+    verdict, created_at = None, None
     for c in comments:
         if is_trusted_review_comment(c):
             v = review_verdict(c)
             if v is not None:
                 verdict = v
-    return verdict
+                created_at = c.get("createdAt")
+    return verdict, created_at
+
+
+def latest_review_verdict(comments):
+    """Verdict ('pass'/'fail'/None) of the most recent trusted review comment."""
+    return latest_review(comments)[0]
+
+
+def _parse_iso8601(value):
+    """Parse a GitHub ISO-8601 timestamp into an aware datetime, or None."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def fix_landed_after_review(pr):
+    """True if the PR's latest commit is newer than its latest acceptance-review
+    comment — i.e. a fix genuinely landed *after* the review.
+
+    This replaces the unreliable "CI is green ⇒ a fix landed" inference.
+    Acceptance-review findings are frequently code-quality / acceptance-criteria
+    issues that do not break CI (an uninitialized field, a missing test, an AC
+    gap) — CI stays green the whole time even when no fix commit was made after
+    the review FAIL. Comparing the latest commit's `committedDate` against the
+    latest review comment's `createdAt` is the reliable signal (issue #1731).
+
+    Fails safe: when either timestamp is missing, returns False ("no fix landed")
+    so the PR is routed to the fix cycle rather than to a premature re-review —
+    a wrongly-dispatched re-review of unfixed code FAILs again and can escalate
+    a false Blocked to the founder.
+    """
+    commit_dt = _parse_iso8601(pr.get("latest_commit_date"))
+    review_dt = _parse_iso8601(pr.get("latest_review_comment_date"))
+    if commit_dt is None or review_dt is None:
+        return False
+    return commit_dt > review_dt
 
 
 def _pq_script_path():
@@ -903,9 +950,10 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
               container — fix-agent and rebase-pr.sh would race on the same
               branch); leave alone.
     - spawn_acceptance_reviewer: needs review — either a first review (CI green,
-              no review comment) or a re-review (latest review verdict was FAIL,
-              the fix landed, CI is green again). A FAIL is never enqueued; it
-              must pass a re-review first.
+              no review comment) or a re-review (latest verdict was FAIL and a
+              fix commit landed *after* the review — see fix_landed_after_review
+              — with CI now green). A FAIL is never enqueued; it must pass a
+              re-review first.
     - defer: CI still pending.
     - investigate: CI red and not stale-base; needs diagnose + dispatch-fix.
 
@@ -979,14 +1027,27 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
 
         # Review FAILED. Green CI proves only that the code compiles, NOT that
         # the reviewer's acceptance-criteria findings were addressed — never
-        # enqueue a FAIL. (fix-agent-in-flight is already handled above.)
+        # enqueue a FAIL. Whether a fix actually landed is decided by comparing
+        # the latest commit against the review-comment timestamp (issue #1731),
+        # NOT by inferring it from green CI.
+        # (fix-agent-in-flight is already handled above.)
         if pr["has_acceptance_review_comment"] and verdict == "fail":
-            if overall == "green":
+            if not fix_landed_after_review(pr):
+                # No commit since the review FAIL — green CI here only proves
+                # the OLD code compiles. Re-reviewing now would FAIL again and
+                # could escalate a false Blocked. The fix cycle owns this.
+                recs.append({
+                    "pr": pr["pr"],
+                    "story": pr["story_number"],
+                    "action": "skip",
+                    "reason": "acceptance review FAILED and no fix commit has landed since (latest commit predates the review comment) — fix cycle owns this (see fix_recommendations / dispatch-fix)",
+                })
+            elif overall == "green":
                 recs.append({
                     "pr": pr["pr"],
                     "story": pr["story_number"],
                     "action": "spawn_acceptance_reviewer",
-                    "reason": "acceptance review FAILED, fix landed (CI green) — re-review required before this PR can merge",
+                    "reason": "acceptance review FAILED; a fix commit landed after the review and CI is green — re-review required before this PR can merge",
                 })
             elif overall == "pending":
                 pending = pr["ci_summary"]["pending_checks"][:3]
@@ -994,14 +1055,14 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                     "pr": pr["pr"],
                     "story": pr["story_number"],
                     "action": "defer",
-                    "reason": f"acceptance review FAILED; fix in progress, CI pending: {', '.join(pending)}",
+                    "reason": f"acceptance review FAILED; a fix landed, CI re-running: {', '.join(pending)}",
                 })
             else:
                 recs.append({
                     "pr": pr["pr"],
                     "story": pr["story_number"],
                     "action": "skip",
-                    "reason": "acceptance review FAILED and CI red — fix cycle owns this (see fix_recommendations / dispatch-fix)",
+                    "reason": "acceptance review FAILED; a fix commit landed but CI is red — fix cycle owns this (see fix_recommendations / dispatch-fix)",
                 })
             continue
 
@@ -1103,14 +1164,16 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
     `./.claude/scripts/po-act.sh dispatch-fix <PR>` for each `dispatch_fix` rec.
 
     Action vocabulary:
-    - dispatch_fix: open PR exists with CI red or pending — dispatch fix-pr now.
+    - dispatch_fix: a fix is genuinely needed — open PR with CI red/pending and
+                  no review FAIL, or a review FAIL with no fix commit landed
+                  since (commit predates the review comment — issue #1731).
     - clear_stale_status: open PR exists with CI green and the Fix was NOT a
                   review FAIL — the CI-driven fix succeeded; set status back to
                   Ready and the next cycle routes to acceptance-review normally.
-                  A Fix from a review FAIL never clears on green CI alone — it
-                  routes to a re-review instead (skip here; the review
-                  recommender emits spawn_acceptance_reviewer).
-    - skip: fix-agent already in flight, OR PR already in merge queue.
+                  A Fix from a review FAIL never clears on green CI alone.
+    - skip: fix-agent already in flight; PR already in merge queue; or a review
+                  FAIL whose fix commit has landed after the review (re-review
+                  pending, or CI re-running) — re-dispatching would be redundant.
     - no_open_pr: story has Fix status but no open PR — stale status;
                   PO should investigate (likely a PR was closed/merged without
                   the status being updated).
@@ -1158,26 +1221,40 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
         overall = (pr.get("ci_summary") or {}).get("overall")
         ms = (pr.get("merge_state_status") or "").upper()
         verdict = pr.get("latest_review_verdict")
-        # A Fix that originated from an acceptance-review FAIL is NOT resolved
-        # by green CI — only a passing re-review resolves it. Never
-        # clear_stale_status for those: green CI means the fix code landed,
-        # so the next step is the re-review (compute_review_recommendations
-        # emits spawn_acceptance_reviewer for review-FAIL + green CI), not a
-        # status clear or an enqueue.
+        # A Fix that originated from an acceptance-review FAIL is resolved only
+        # by a fix commit landing after the review followed by a passing
+        # re-review. Whether a fix commit landed is decided by the commit-vs-
+        # review timestamp comparison (issue #1731) — NOT by green CI, since
+        # acceptance-review findings frequently do not break CI at all.
         if verdict == "fail":
-            if overall == "green" and ms not in ("DIRTY", "BLOCKED"):
+            fix_landed = fix_landed_after_review(pr)
+            if fix_landed and overall == "green" and ms not in ("DIRTY", "BLOCKED"):
+                # Fix commit landed after the review FAIL and CI is green — the
+                # re-review owns it (compute_review_recommendations emits
+                # spawn_acceptance_reviewer). Do not clear status or enqueue.
                 recs.append({
                     "story": story_num,
                     "pr": pr_num,
                     "action": "skip",
-                    "reason": "review FAIL fix landed (CI green) — re-review pending (review_recommendations emits spawn_acceptance_reviewer); do NOT clear status or enqueue",
+                    "reason": "review FAIL fix landed (commit newer than the review comment) + CI green — re-review pending (review_recommendations emits spawn_acceptance_reviewer); do NOT clear status, enqueue, or re-dispatch",
+                })
+            elif fix_landed and overall == "pending":
+                # Fix landed, CI mid-rerun — dispatching fix-pr now would spawn
+                # a redundant fix agent against a PR already being handled.
+                recs.append({
+                    "story": story_num,
+                    "pr": pr_num,
+                    "action": "skip",
+                    "reason": "review FAIL fix landed (commit newer than the review comment); CI re-running — wait for the re-review, do NOT re-dispatch",
                 })
             else:
+                # No fix commit since the review FAIL (latest commit predates
+                # the review comment), or a landed fix is CI-red / merge-blocked.
                 recs.append({
                     "story": story_num,
                     "pr": pr_num,
                     "action": "dispatch_fix",
-                    "reason": f"review FAIL not yet resolved (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
+                    "reason": f"review FAIL not resolved (fix_landed={fix_landed}, CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
                 })
             continue
         # CI-driven Fix (no review FAIL): green CI genuinely means the fix
@@ -1531,7 +1608,7 @@ def main():
             story_number = None
         comments = pr.get("comments") or []
         has_review_comment = any(is_trusted_review_comment(c) for c in comments)
-        review_verdict_val = latest_review_verdict(comments)
+        review_verdict_val, review_comment_date = latest_review(comments)
         body = pr.get("body") or ""
         title = pr.get("title", "")
         is_draft = bool(pr.get("isDraft"))
@@ -1550,6 +1627,8 @@ def main():
             "comment_count": len(comments),
             "has_acceptance_review_comment": has_review_comment,
             "latest_review_verdict": review_verdict_val,
+            "latest_review_comment_date": review_comment_date,
+            "latest_commit_date": pr.get("latest_commit_date"),
             "is_draft": is_draft,
             "wip_session_failed": wip_session_failed,
             "merge_state_status": pr.get("mergeStateStatus"),
