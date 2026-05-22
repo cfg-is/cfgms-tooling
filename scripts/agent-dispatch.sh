@@ -435,8 +435,12 @@ case "$cmd" in
       # Best-effort PR dashboard label — fix-agent marks the PR while the fix
       # agent is in flight. Display only: the cron never reads it (work-queue
       # state stays in the project queue). cleanup-stale reconciles it off.
+      # Uses the REST API, not `gh pr edit --add-label`: the latter also queries
+      # the deprecated Projects-classic `projectCards` GraphQL field and exits
+      # non-zero on this repo, so it would silently never apply the label.
       if [[ "$mode_label" == "fix-pr" && -n "$fix_pr_num" ]]; then
-        gh pr edit "$fix_pr_num" --repo cfg-is/cfgms --add-label fix-agent >/dev/null 2>&1 || true
+        gh api --method POST "repos/cfg-is/cfgms/issues/${fix_pr_num}/labels" \
+          -f "labels[]=fix-agent" >/dev/null 2>&1 || true
       fi
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
@@ -1096,8 +1100,9 @@ PROMPT_EOF
       --entrypoint /usr/local/bin/review-entrypoint.sh \
       cfg-agent:latest 2>&1); then
       echo "REVIEW_DISPATCHED:${pr_num}:${review_story_label}:${container_id}"
-      # Best-effort PR dashboard label (see launch-generic note above).
-      gh pr edit "$pr_num" --repo cfg-is/cfgms --add-label review-agent >/dev/null 2>&1 || true
+      # Best-effort PR dashboard label via REST API (see launch-generic note above).
+      gh api --method POST "repos/cfg-is/cfgms/issues/${pr_num}/labels" \
+        -f "labels[]=review-agent" >/dev/null 2>&1 || true
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
       rm -rf "$clone_dir"
@@ -1245,7 +1250,7 @@ PROMPT_EOF
       esac
       for _pr in $(gh pr list --repo cfg-is/cfgms --label "$_lbl" --state open --json number --jq '.[].number' 2>/dev/null || true); do
         if ! docker ps --filter "name=^${_cprefix}${_pr}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-          gh pr edit "$_pr" --repo cfg-is/cfgms --remove-label "$_lbl" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/cfg-is/cfgms/issues/${_pr}/labels/${_lbl}" >/dev/null 2>&1 || true
           echo "LABEL_CLEARED:${_lbl}:${_pr}"
         fi
       done
