@@ -141,7 +141,12 @@ Review your own changes for quality issues before proceeding:
 - Check for mocks, t.Skip(), empty assertions, hacky workarounds
 - Check for hardcoded secrets, SQL injection, information disclosure
 - Check for central provider violations (see CLAUDE.md Central Provider System)
-- Check for unsanitized user input in logs (use logging.SanitizeLogValue())
+- **Log Sanitization Checklist (catches the recurring CodeQL "Log entries created from user input" class):**
+  - For every `*.logger.{Debug,Info,Warn,Error}(...)` call you added or touched, identify whether ANY value-side argument comes from the HTTP request.
+  - Sources that are tainted: `mux.Vars(r)[...]`, `r.URL.Query().Get(...)`, `r.Header.Get(...)`, `r.FormValue(...)`, `r.URL.Path`, request body fields after `json.NewDecoder(r.Body).Decode(&req)` (i.e. `req.<Field>`), or any local variable assigned from those.
+  - Required fix: wrap each tainted value with `logging.SanitizeLogValue(...)`. Example: `s.logger.Info("...", "id", logging.SanitizeLogValue(stewardID))`.
+  - Verify by running `make lint-log-injection` — it must exit 0 with no findings.
+  - If you intentionally need to log a raw value (rare; almost never correct), document why in a comment on the line above.
 - Verify every new .go file has a corresponding _test.go file with functional tests
 - Verify tests exercise error paths, not just happy paths
 - Fix any issues found'
