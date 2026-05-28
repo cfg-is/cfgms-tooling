@@ -28,6 +28,41 @@ sanitize_branch() {
   echo "$1" | sed 's|/|--|g'
 }
 
+# Resolve which story or project item a PR belongs to from its branch name
+# and body. Branch name is authoritative; body extraction is a legacy fallback
+# only used when the branch follows neither the story- nor item- convention.
+#
+# Args: <pr_branch> <pr_body>
+# Stdout: one of three forms, terminated by newline:
+#   ITEM:<item_last12>     — feature/item-XXX-agent branch
+#   STORY:<story_num>      — feature/story-NNN branch or legacy body match
+#   REFUSED:no_story_link  — no match anywhere
+#
+# Pulling the detection out into a function keeps it unit-testable without
+# spinning up docker or hitting the GitHub API. See
+# .claude/scripts/tests/test-review-pr-detection.sh for the fixture set
+# (regression coverage for issue #1806 / PR #1804).
+resolve_pr_story_or_item() {
+  local pr_branch="$1"
+  local pr_body="$2"
+  if [[ "$pr_branch" =~ feature/item-([a-zA-Z0-9]+)-agent ]]; then
+    echo "ITEM:${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$pr_branch" =~ feature/story-([0-9]+) ]]; then
+    echo "STORY:${BASH_REMATCH[1]}"
+    return 0
+  fi
+  local body_num
+  body_num=$(echo "$pr_body" | grep -oP '(?:Fixes|Closes|Resolves)\s+#\K[0-9]+' | head -1 || true)
+  if [[ -n "$body_num" ]]; then
+    echo "STORY:${body_num}"
+    return 0
+  fi
+  echo "REFUSED:no_story_link"
+  return 0
+}
+
 # Emit OPEN_PR_EXISTS:<ISSUE>:<PR>:<TITLE> for each open PR that references
 # this issue. Uses two signals:
 #   1. GitHub's authoritative "closing PR" linkage (body Fixes/Closes/Resolves
@@ -914,22 +949,26 @@ else:
     fi
     validate_branch "$pr_branch"
 
-    # Auto-detect story number or item_id: first try "Fixes #N" in PR body, then branch.
-    story_num=$(echo "$pr_body" | grep -oP '(?:Fixes|Closes|Resolves)\s+#\K[0-9]+' | head -1 || true)
+    # Resolve story/item from the branch (authoritative) or, for legacy
+    # branches, the body. See resolve_pr_story_or_item() comment header for
+    # the full rationale and #1806 regression context.
     is_item_branch=false
     item_last12=""
-
-    if [[ -z "$story_num" ]]; then
-      if [[ "$pr_branch" =~ feature/story-([0-9]+) ]]; then
-        story_num="${BASH_REMATCH[1]}"
-      elif [[ "$pr_branch" =~ feature/item-([a-zA-Z0-9]+) ]]; then
+    story_num=""
+    resolution=$(resolve_pr_story_or_item "$pr_branch" "$pr_body")
+    case "$resolution" in
+      ITEM:*)
         is_item_branch=true
-        item_last12="${BASH_REMATCH[1]}"
-      else
-        echo "REVIEW_REFUSED:${pr_num}:no_story_link"
+        item_last12="${resolution#ITEM:}"
+        ;;
+      STORY:*)
+        story_num="${resolution#STORY:}"
+        ;;
+      REFUSED:*)
+        echo "REVIEW_REFUSED:${pr_num}:${resolution#REFUSED:}"
         exit 3
-      fi
-    fi
+        ;;
+    esac
 
     container_name="cfg-agent-review-pr-${pr_num}"
     clone_dir="${WORKTREE_BASE}/review-pr-${pr_num}"
@@ -994,6 +1033,13 @@ for i in items:
       item_id=$(bash "$PROJECT_QUEUE" add-issue "$story_num" 2>/dev/null \
         | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" \
         2>/dev/null || true)
+      # Fail-closed if we can't resolve a project item. Launching with empty
+      # item_id leaves the reviewer reading some other item's body and
+      # potentially mutating the wrong status (see issue #1806).
+      if [[ -z "$item_id" ]]; then
+        echo "REVIEW_REFUSED:${pr_num}:no_project_item_for_story_${story_num}"
+        exit 3
+      fi
     fi
 
     # Stale clone cleanup (previous run crashed before docker rm got the dir).
@@ -1257,6 +1303,14 @@ PROMPT_EOF
     done
 
     echo "CLEANUP_STALE_DONE:cleaned=${cleaned}"
+    ;;
+
+  _test-resolve-pr)
+    # Hidden test hook for .claude/scripts/tests/test-review-pr-detection.sh.
+    # Not user-facing; calls resolve_pr_story_or_item() with the supplied
+    # branch + body and prints its result. Safe (no docker, no gh, no writes).
+    [[ $# -eq 2 ]] || { echo "_test-resolve-pr requires <branch> <body>"; exit 1; }
+    resolve_pr_story_or_item "$1" "$2"
     ;;
 
   *)
