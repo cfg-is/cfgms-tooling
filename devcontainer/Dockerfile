@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Node.js 22 (required by Claude Code — Debian Bookworm ships Node 18 which
 # lacks Array.with() and other APIs used since Claude Code 2.1.79)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI
@@ -33,7 +33,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y gh \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Go-based security and quality tools
@@ -108,6 +108,10 @@ ENV CFGMS_AGENT_MODE=true
 ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy
 ENV GOMODCACHE=/home/agent/go/pkg/mod
 ENV GOFLAGS=-modcacherw
+
+# Not a long-running service; health checks are not applicable for on-demand
+# agent containers. HEALTHCHECK NONE suppresses the Trivy DS-0026 advisory.
+HEALTHCHECK NONE
 
 USER agent
 WORKDIR /workspace
