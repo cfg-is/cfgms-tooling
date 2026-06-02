@@ -40,11 +40,12 @@ REPO = "cfg-is/cfgms"
 SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
 ISSUE_NUM_RE = re.compile(r"#(\d+)")
 BACKTICK_PATH_RE = re.compile(
-    r"`([^`\n]+?\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx))`"
+    r"`((?:[^`\n]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py))"
+    r"|(?:[a-zA-Z0-9_./-]*/)?(?:Makefile|Dockerfile(?:\.[\w-]+)?))`"
 )
 BARE_PATH_RE = re.compile(
     r"(?:^|[\s(\[])"
-    r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx))"
+    r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py))"
 )
 BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)")
 
