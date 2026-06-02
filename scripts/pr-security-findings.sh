@@ -45,13 +45,22 @@ REPO="${CFGMS_REPO:-cfg-is/cfgms}"
 # line that starts with `## ` (the CodeQL comment template). The rule name
 # itself is a closed set (~50 CodeQL rules) and known to be free of newlines
 # in normal use, but we still strip control characters defensively.
+#
+# Outdated-comment filter: GitHub sets `.line` to null when the diff hunk a
+# comment was anchored to no longer exists in the current PR head (i.e., the
+# code that triggered the finding has been changed). When `.line` is null,
+# the CodeQL bot comment refers to code that is no longer present — if the
+# underlying issue persists, CodeQL re-analysis posts a fresh comment on the
+# current line. Filtering on `.line != null` drops these stale anchors so a
+# fix in a later commit is not reported as an unresolved finding.
 
 gh api "repos/${REPO}/pulls/${PR}/comments" --paginate --jq '
     .[]
     | select(.user.login == "github-advanced-security[bot]")
+    | select(.line != null)
     | {
         path: .path,
-        line: (.line // .original_line // 0),
+        line: .line,
         rule: (
             .body
             | split("\n")[]
