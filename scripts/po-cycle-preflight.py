@@ -933,7 +933,8 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
     return recommendations
 
 
-def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_pr_nums=None):
+def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_pr_nums=None,
+                                   blocked_story_nums=None):
     """Decide what to do with each open story PR.
 
     Action vocabulary:
@@ -942,6 +943,12 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
               fix-pr to resume the work; the resumed agent marks the PR
               ready on success. Takes top priority — these PRs should not
               be reviewed, rebased, or enqueued in their current state.
+    - skip (founder-managed): a draft PR (other than a wip_session_failed
+              resume) or a PR whose linked story has project status Blocked.
+              These are manual / fenced-off work — e.g. #1887's Hyper-V branch
+              that requires a real Windows host and was explicitly removed
+              from the autonomous pipeline. The cron must never rebase,
+              review, fix, or enqueue them, or it would clobber manual work.
     - rebase: PR's branch needs `rebase-pr.sh` to clear conflicts or stale base
               before any other action makes sense. Always takes precedence
               when mergeStateStatus is DIRTY (conflicts) or BEHIND (base advanced).
@@ -966,6 +973,8 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     """
     if active_fix_pr_nums is None:
         active_fix_pr_nums = set()
+    if blocked_story_nums is None:
+        blocked_story_nums = set()
     recs = []
     for pr in pr_summaries:
         overall = pr["ci_summary"]["overall"]
@@ -995,6 +1004,29 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "story": pr["story_number"],
                 "action": "resume_failed_session",
                 "reason": "WIP draft PR from session truncation (token reauth/limit) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>` to resume; the fix-pr agent will mark the PR ready when it finishes",
+            })
+            continue
+
+        # PRIORITY 0.6: founder-managed / fenced-off PRs. A draft PR that is NOT
+        # a wip_session_failed resume is manual work in progress; a PR whose
+        # linked story has project status Blocked was deliberately removed from
+        # the autonomous pipeline (e.g. #1887's Hyper-V branch needing a real
+        # Windows host). The cron must leave both entirely alone — rebasing or
+        # dispatch-fixing them would clobber manual work pushed to the branch.
+        if pr.get("is_draft"):
+            recs.append({
+                "pr": pr["pr"],
+                "story": pr["story_number"],
+                "action": "skip",
+                "reason": "draft PR — not pipeline-managed (manual work in progress); cron leaves it untouched",
+            })
+            continue
+        if pr.get("story_number") in blocked_story_nums:
+            recs.append({
+                "pr": pr["pr"],
+                "story": pr["story_number"],
+                "action": "skip",
+                "reason": "linked story has project status Blocked — fenced off from the autonomous pipeline; cron will not rebase/review/fix/enqueue it",
             })
             continue
 
@@ -1651,8 +1683,16 @@ def main():
             tail = name.removeprefix("cfg-agent-pr-fix-")
             if tail.isdigit():
                 active_fix_pr_nums.add(int(tail))
+    # Story numbers with project status Blocked — their PRs are fenced off from
+    # the autonomous pipeline (founder-managed / manual work). The review
+    # recommender skips them so the cron never clobbers manual branches.
+    blocked_story_nums = {
+        item.get("issue_num")
+        for item in blocked_issues
+        if item.get("issue_num") is not None
+    }
     out["review_recommendations"] = compute_review_recommendations(
-        pr_summaries, queued_pr_numbers, active_fix_pr_nums,
+        pr_summaries, queued_pr_numbers, active_fix_pr_nums, blocked_story_nums,
     )
     out["fix_recommendations"] = compute_fix_recommendations(
         fix_issues, pr_summaries, active_fix_pr_nums, queued_pr_numbers,
