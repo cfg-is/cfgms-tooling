@@ -5,7 +5,8 @@
 # All actions target the cfg-is/cfgms repo and the develop branch queue.
 #
 # Subcommands:
-#   dispatch <STORY_NUM>            Fresh story: check-conflicts + clone + launch + status update
+#   dispatch <STORY_NUM>            Fresh story: claim (Ready->In Progress) + check-conflicts + clone + launch
+#   claim <ITEM_ID>                 Claim a Ready story (Ready->In Progress) for in-session work; CLAIMED/CLAIM_LOST
 #   dispatch-fix <PR_NUM>           Fix cycle: remove stale container + clone-pr + launch
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
 #   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
@@ -41,6 +42,70 @@ else
 fi
 CACHE_FILE="$CACHE_DIR/preflight.json"
 
+# ── Shared claim / routing helpers ──────────────────────────────────────────
+# The pipeline can run on more than one host (e.g. a Linux orchestrator dispatching
+# docker agents + a Windows host self-dispatching its tagged stories in-session).
+# Hosts work disjoint slices by execution environment, so no distributed lock is
+# needed — but each host MUST claim a story (set status away from Ready) BEFORE it
+# starts any work, so two out-of-phase loops can't both pick the same item.
+
+# _claim_item <item_id>
+#   Atomically-ish claim: re-read status; proceed only if still Ready; set it to
+#   In Progress. Prints CLAIMED:<item> (rc 0) or CLAIM_LOST:<item> (rc 1). The
+#   read-then-set is last-writer-wins (Projects V2 has no CAS), but combined with
+#   disjoint per-host env slices it is sufficient to prevent cross-host collisions.
+_claim_item() {
+  local item_id="$1" cur
+  cur=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
+    | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('status') or '')
+except Exception: print('')" 2>/dev/null || echo "")
+  if [ "$cur" != "Ready" ]; then
+    echo "CLAIM_LOST:${item_id} (status=${cur:-unknown})"
+    return 1
+  fi
+  if ! bash "$PROJECT_QUEUE" update-field "$item_id" status "In Progress" >/dev/null 2>&1; then
+    echo "CLAIM_LOST:${item_id} (status update failed)"
+    return 1
+  fi
+  echo "CLAIMED:${item_id}"
+  return 0
+}
+
+# _requires_env <item_id> [<issue_num>]
+#   Resolve the story's required execution environment, reusing the preflight's
+#   single-sourced detection (## Environment body section + needs-<env> labels).
+#   Always prints one of: linux | windows | macos.
+_requires_env() {
+  local item_id="$1" issue="${2:-}" body labels_json="[]"
+  body=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
+    | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('body') or '')
+except Exception: print('')" 2>/dev/null || echo "")
+  if [ -n "$issue" ]; then
+    labels_json=$(gh issue view "$issue" --repo "$REPO" --json labels --jq '.labels' 2>/dev/null || echo "[]")
+  fi
+  STORY_BODY="$body" STORY_LABELS="$labels_json" PF="$PREFLIGHT" python3 - <<'PY' 2>/dev/null || echo "linux"
+import importlib.util, json, os
+spec = importlib.util.spec_from_file_location("preflight", os.environ["PF"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+try:
+    labels = json.loads(os.environ.get("STORY_LABELS", "[]"))
+except Exception:
+    labels = []
+print(m.detect_required_env(m.extract_section(os.environ.get("STORY_BODY", ""), "Environment"), labels))
+PY
+}
+
+# _host_serves_env <env>
+#   True if CFGMS_PO_HOST_CAPS (comma-separated, default "linux") includes <env>.
+_host_serves_env() {
+  local env caps
+  env="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  caps=",$(printf '%s' "${CFGMS_PO_HOST_CAPS:-linux}" | tr -d ' ' | tr '[:upper:]' '[:lower:]'),"
+  [[ "$caps" == *",${env},"* ]]
+}
+
 cmd="${1:-}"
 shift || true
 
@@ -69,15 +134,15 @@ except Exception: print('')" 2>/dev/null || echo "")
       fi
     fi
 
+    # Phase 1 — resolve identifiers WITHOUT side effects (no clone yet). We must
+    # know the item_id so we can claim the story (status -> In Progress) BEFORE
+    # any clone/launch work; otherwise a second host's out-of-phase cycle could
+    # clone+launch the same Ready story before this one records the claim.
+    story=""
+    issue_for_env=""
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
-      # Issue number path: existing create-clone flow
       story="$arg"
-      "$DISPATCH" check-conflicts "$story" >/dev/null
-      "$DISPATCH" create-clone "$story" | tail -1
-
-      # Fetch item_id BEFORE launch so CFGMS_PROJECT_ITEM_ID can be passed to the
-      # container. The entrypoint refuses to run without this var. When we
-      # resolved from an item_id arg we already have it; otherwise look it up.
+      issue_for_env="$story"
       if [[ -n "$resolved_item_id" ]]; then
         item_id="$resolved_item_id"
       else
@@ -89,7 +154,6 @@ except Exception: print('')" 2>/dev/null || echo "")
           exit 1
         fi
       fi
-
       clone_path="${WORKTREE_BASE}/story-${story}"
       container_name="cfg-agent-${story}"
       first_arg="${story}"
@@ -98,11 +162,40 @@ except Exception: print('')" 2>/dev/null || echo "")
       # that did not resolve to an issue number above).
       item_id="$arg"
       LAST12=$(echo "$item_id" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
-      "$DISPATCH" create-clone-item "$item_id" | tail -1
-
       clone_path="${WORKTREE_BASE}/item-${LAST12}"
       container_name="cfg-agent-item-${LAST12}"
       first_arg="${item_id}"
+    fi
+
+    # Phase 2 — capability guard (defense in depth; the preflight already filters
+    # by host caps). Refuse to dispatch a story whose required execution env this
+    # host cannot serve — e.g. a windows-tagged story on the linux orchestrator
+    # must not land in a Linux container.
+    req_env=$(_requires_env "$item_id" "$issue_for_env")
+    req_env="${req_env:-linux}"
+    if ! _host_serves_env "$req_env"; then
+      echo "DISPATCH_REFUSED:${first_arg}:requires ${req_env} env; host caps=${CFGMS_PO_HOST_CAPS:-linux}"
+      exit 0
+    fi
+
+    # Phase 3 — claim before work. Only the host that flips Ready -> In Progress
+    # proceeds; a loser exits cleanly without touching the clone or container.
+    if ! _claim_item "$item_id"; then
+      exit 0
+    fi
+
+    # Phase 4 — now do the work. Roll the claim back to Ready on any failure so a
+    # later cycle (or another host) can retry. The ERR trap covers the steps that
+    # run under `set -e` (check-conflicts, create-clone); without it a clone/conflict
+    # failure would exit with the story stuck In Progress. The docker-run failure is
+    # handled explicitly in the LAUNCH_FAILED branch below (it runs inside an `if`
+    # condition, which `set -e`/ERR does not trap).
+    trap 'rc=$?; bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true; echo "ROLLED_BACK:${item_id} -> Ready (dispatch failed before launch, rc=$rc)"; exit "$rc"' ERR
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+      "$DISPATCH" check-conflicts "$story" >/dev/null
+      "$DISPATCH" create-clone "$story" | tail -1
+    else
+      "$DISPATCH" create-clone-item "$item_id" | tail -1
     fi
 
     # Launch with CFGMS_PROJECT_ITEM_ID so entrypoint sources content from Projects V2.
@@ -136,16 +229,29 @@ except Exception: print('')" 2>/dev/null || echo "")
       --cap-add NET_ADMIN \
       cfg-agent:latest \
       "${first_arg}" 2>&1); then
+      trap - ERR
       echo "LAUNCHED:${first_arg}:${container_id}"
     else
+      trap - ERR
       echo "LAUNCH_FAILED:${first_arg}:${container_id}"
       rm -rf "$clone_path"
       echo "CLEANED:clone:${clone_path}"
+      # Release the claim: launch never happened, so return the story to Ready.
+      bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true
+      echo "ROLLED_BACK:${item_id} -> Ready"
       exit 1
     fi
 
-    bash "$PROJECT_QUEUE" update-field "$item_id" status "In Progress" >/dev/null 2>&1 || true
+    # Status is already In Progress from the claim in Phase 3.
     echo "DISPATCHED:${first_arg}"
+    ;;
+
+  claim)
+    # Standalone claim primitive for self-dispatch (no-docker, in-session) mode:
+    # a host claims a Ready story before working it locally. Same Ready->In
+    # Progress guard the docker dispatch path uses. Exit 0 = CLAIMED, 1 = lost.
+    item_id="${1:?item_id required}"
+    _claim_item "$item_id"
     ;;
 
   dispatch-fix)

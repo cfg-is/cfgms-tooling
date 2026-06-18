@@ -49,6 +49,44 @@ BARE_PATH_RE = re.compile(
 )
 BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)")
 
+# Execution-environment routing. A story declares the environment it must run in
+# via a `## Environment` body section and/or a `needs-<env>` GitHub label; a host
+# declares the environments it can serve via CFGMS_PO_HOST_CAPS. The default for
+# both is "linux". A host only works stories whose required env is in its caps —
+# this is how the Linux orchestrator and a Windows self-dispatch host stay on
+# disjoint slices without a shared lock.
+DEFAULT_ENV = "linux"
+
+
+def host_caps():
+    """Environments this host can serve. Comma-separated CFGMS_PO_HOST_CAPS,
+    lowercased; defaults to {"linux"}."""
+    raw = os.environ.get("CFGMS_PO_HOST_CAPS", DEFAULT_ENV)
+    caps = {c.strip().lower() for c in raw.split(",") if c.strip()}
+    return caps or {DEFAULT_ENV}
+
+
+def detect_required_env(env_section, labels):
+    """Resolve a story's required execution environment from its `## Environment`
+    section text and its GitHub labels. Label wins (explicit founder/Planning
+    signal); body marker is the fallback that also works for label-less project
+    drafts. Defaults to "linux"."""
+    label_names = {
+        ((l.get("name") if isinstance(l, dict) else l) or "").lower()
+        for l in (labels or [])
+    }
+    if "needs-windows" in label_names:
+        return "windows"
+    if "needs-macos" in label_names:
+        return "macos"
+    if env_section:
+        t = env_section.strip().lower()
+        if "windows" in t:
+            return "windows"
+        if "macos" in t or "darwin" in t:
+            return "macos"
+    return DEFAULT_ENV
+
 
 def cache_dir():
     """Auto-discover a cache directory under $HOME so we don't hit /tmp."""
@@ -770,6 +808,8 @@ def parse_story(issue):
 
     deps_raw = extract_section(body, "Dependencies")
     files_raw = extract_section(body, "Files In Scope")
+    env_raw = extract_section(body, "Environment")
+    requires_env = detect_required_env(env_raw, issue.get("labels"))
 
     deps_parsed = []
     if deps_raw is None:
@@ -805,6 +845,8 @@ def parse_story(issue):
         "deps_raw": deps_raw,
         "files_parsed": files_parsed,
         "files_raw": files_raw,
+        "requires_env": requires_env,
+        "env_raw": env_raw,
         "all_issue_numbers_in_body": all_nums,
         "all_paths_in_body": all_paths,
     }
@@ -851,14 +893,17 @@ def ci_summary(checks):
     }
 
 
-def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
+def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, caps=None):
     """Greedy conflict-free selection.
 
     Order: ascending story number (stable, predictable); pure drafts (number=None) last.
+    Hold if the story's required execution env is not in this host's caps (routing
+    to another host — e.g. windows stories on the linux orchestrator).
     Skip if any dep is not CLOSED.
     Skip if files overlap with an active story (status In Progress or open PR) or a
     story already picked this cycle.
     """
+    caps = caps or {DEFAULT_ENV}
     active_file_sets = [
         (s["number"], set(s["files_parsed"])) for s in active_stories
     ]
@@ -869,6 +914,17 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states):
     for s in sorted(ready_stories, key=lambda x: (x.get("number") is None, x.get("number") or 0)):
         num = s["number"]
         item_id = s.get("item_id", "")
+        req_env = s.get("requires_env", DEFAULT_ENV)
+        if req_env not in caps:
+            recommendations.append({
+                "number": num,
+                "item_id": item_id,
+                "action": "hold",
+                "reason": f"requires {req_env} execution env; host caps={','.join(sorted(caps))}",
+                "route": req_env,
+            })
+            continue
+
         open_deps = [d for d in s["deps_parsed"] if dep_states.get(d) != "CLOSED"]
         if open_deps:
             dep_desc = ", ".join(
@@ -1671,8 +1727,20 @@ def main():
         })
     out["prs_open"] = pr_summaries
 
+    caps = host_caps()
+    out["host_caps"] = sorted(caps)
+    # Ready stories whose required env this host cannot serve — surfaced so the
+    # dashboard can show the cross-host backlog (e.g. the Windows queue) and so a
+    # self-dispatch host can pick up exactly its slice. Intentionally windows-only
+    # for now (macos routing is reserved — see the needs-macos label); add a
+    # parallel macos_queue here if/when a macOS host comes online.
+    out["windows_queue"] = [
+        {"number": s["number"], "item_id": s.get("item_id", ""), "title": s["title"]}
+        for s in ready_parsed
+        if s.get("requires_env", DEFAULT_ENV) == "windows"
+    ]
     out["dispatch_recommendations"] = compute_dispatch_recommendations(
-        ready_parsed, active_parsed, dep_states,
+        ready_parsed, active_parsed, dep_states, caps,
     )
     # Pull the active fix-agent set out of running_containers so the review
     # recommender can skip rebase/dispatch-fix work for any PR with an
@@ -1757,6 +1825,8 @@ def write_output(out, mode):
             "merge_queue": len(out.get("merge_queue", [])),
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
         },
+        "host_caps": out.get("host_caps", [DEFAULT_ENV]),
+        "windows_queue": out.get("windows_queue", []),
         "running_containers": out.get("running_containers", []),
         "merge_queue": out.get("merge_queue", []),
         "dispatch_recommendations": out.get("dispatch_recommendations", []),
