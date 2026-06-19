@@ -29,6 +29,7 @@ that would inherit the broken base.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -120,7 +121,7 @@ def gh_graphql_tolerant(query):
     _GH_CALL_COUNT += 1
     result = subprocess.run(
         ["gh", "api", "graphql", "-f", f"query={query}"],
-        capture_output=True, text=True, check=False, timeout=60,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
     )
     if not result.stdout.strip():
         return None
@@ -135,7 +136,7 @@ def gh(*args, check=True):
     global _GH_CALL_COUNT
     _GH_CALL_COUNT += 1
     result = subprocess.run(
-        ["gh", *args], capture_output=True, text=True, check=False, timeout=60
+        ["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60
     )
     if result.returncode != 0:
         if check:
@@ -499,6 +500,67 @@ def fix_landed_after_review(pr):
     return commit_dt > review_dt
 
 
+def resolve_bash(platform=None, environ=None, exists=None, which=None):
+    """Resolve a usable ``bash`` executable for running project-queue.sh.
+
+    On Linux/macOS a bare ``bash`` resolves correctly via PATH, so we return it
+    unchanged. On a Windows self-dispatch host (#2039) Python resolves a bare
+    ``bash`` against the *Windows* PATH, which finds the WSL launcher
+    (``System32\\bash.exe``) or the Store alias (``WindowsApps\\bash.exe``)
+    before Git Bash. WSL is typically not functional on the Hyper-V host, so
+    those stubs fail with ``execvpe(/bin/bash) failed`` and degrade the whole
+    preflight (Issue #2054). Prefer an explicit ``CFGMS_BASH`` override, then
+    Git Bash (including the path derived from the ``git`` executable), and reject
+    the WSL/Store stubs outright.
+
+    All inputs are injectable so the Windows branch is testable on a Linux CI
+    runner without a real Windows host.
+    """
+    if platform is None:
+        platform = sys.platform
+    if environ is None:
+        environ = os.environ
+    if exists is None:
+        exists = os.path.exists
+    if which is None:
+        which = shutil.which
+
+    override = environ.get("CFGMS_BASH")
+    if override and exists(override):
+        return override
+
+    is_windows = platform.startswith("win") or platform == "cygwin"
+    if not is_windows:
+        return "bash"
+
+    candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ]
+    git = which("git")
+    if git:
+        # ...\Git\cmd\git.exe -> ...\Git ; append bin/ and usr/bin/ bash.
+        git_root = os.path.dirname(os.path.dirname(git))
+        candidates.append(os.path.join(git_root, "bin", "bash.exe"))
+        candidates.append(os.path.join(git_root, "usr", "bin", "bash.exe"))
+    for cand in candidates:
+        if exists(cand):
+            return cand
+
+    # Last resort: a PATH bash that is NOT the WSL launcher or Store alias.
+    found = which("bash")
+    if found:
+        low = found.lower()
+        if "system32" not in low and "windowsapps" not in low:
+            return found
+
+    raise RuntimeError(
+        "no usable bash found on Windows (the WSL/Store 'bash' stub is rejected); "
+        "set CFGMS_BASH to a Git Bash bash.exe (Issue #2054)"
+    )
+
+
 def _pq_script_path():
     """Return the project-queue.sh path, honoring CFGMS_TEST_PROJECT_QUEUE override."""
     override = os.environ.get("CFGMS_TEST_PROJECT_QUEUE")
@@ -515,8 +577,8 @@ def project_queue_list_by_status(status):
     """
     script = _pq_script_path()
     result = subprocess.run(
-        ["bash", script, "list-by-status", status],
-        capture_output=True, text=True, check=False, timeout=60,
+        [resolve_bash(), script, "list-by-status", status],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -548,8 +610,8 @@ def auto_close_merged_items(degraded_reasons=None):
     script = _pq_script_path()
 
     result = subprocess.run(
-        ["bash", script, "list-by-status", "In Progress"],
-        capture_output=True, text=True, check=False, timeout=60,
+        [resolve_bash(), script, "list-by-status", "In Progress"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
     )
     if result.returncode != 0:
         degraded_reasons.append(
@@ -574,8 +636,8 @@ def auto_close_merged_items(degraded_reasons=None):
             continue
         try:
             get_result = subprocess.run(
-                ["bash", script, "get-item", item_id],
-                capture_output=True, text=True, check=False, timeout=60,
+                [resolve_bash(), script, "get-item", item_id],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
             )
             if get_result.returncode != 0:
                 degraded_reasons.append(
@@ -621,8 +683,8 @@ def auto_close_merged_items(degraded_reasons=None):
             continue
         try:
             update_result = subprocess.run(
-                ["bash", script, "update-field", item_id, "status", "Done"],
-                capture_output=True, text=True, check=False, timeout=60,
+                [resolve_bash(), script, "update-field", item_id, "status", "Done"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
             )
             if update_result.returncode != 0:
                 degraded_reasons.append(
@@ -642,7 +704,7 @@ def running_containers():
     try:
         result = subprocess.run(
             ["docker", "ps", "--filter", "name=cfg-agent-", "--format", "{{.Names}}"],
-            capture_output=True, text=True, check=True, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=10,
         )
         return [n for n in result.stdout.splitlines() if n.strip()]
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
@@ -690,17 +752,17 @@ def code_health_check():
     try:
         sha_proc = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "origin/develop"],
-            capture_output=True, text=True, check=False, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=10,
         )
         if sha_proc.returncode != 0:
             # Try fetching first
             subprocess.run(
                 ["git", "-C", str(repo_root), "fetch", "--quiet", "origin", "develop"],
-                capture_output=True, text=True, check=False, timeout=30,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
             )
             sha_proc = subprocess.run(
                 ["git", "-C", str(repo_root), "rev-parse", "origin/develop"],
-                capture_output=True, text=True, check=False, timeout=10,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=10,
             )
         if sha_proc.returncode != 0:
             result["skipped"] = True
@@ -723,7 +785,7 @@ def code_health_check():
         # Stale from a previous crash — remove via git so refs stay clean.
         subprocess.run(
             ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(worktree)],
-            capture_output=True, text=True, check=False, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=15,
         )
         if worktree.exists():
             # Filesystem leftover (worktree metadata already gone)
@@ -733,7 +795,7 @@ def code_health_check():
     add_proc = subprocess.run(
         ["git", "-C", str(repo_root), "worktree", "add", "--quiet", "--detach",
          str(worktree), develop_sha],
-        capture_output=True, text=True, check=False, timeout=30,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
     )
     if add_proc.returncode != 0:
         result["skipped"] = True
@@ -746,7 +808,7 @@ def code_health_check():
         arch = subprocess.run(
             ["make", "check-architecture"],
             cwd=str(worktree),
-            capture_output=True, text=True, check=False, timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=120,
         )
         result["checks"]["architecture"] = {
             "ok": arch.returncode == 0,
@@ -759,7 +821,7 @@ def code_health_check():
         build = subprocess.run(
             ["go", "build", "./..."],
             cwd=str(worktree),
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=300,
         )
         result["checks"]["build"] = {
             "ok": build.returncode == 0,
@@ -777,7 +839,7 @@ def code_health_check():
     finally:
         subprocess.run(
             ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(worktree)],
-            capture_output=True, text=True, check=False, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=15,
         )
 
     return result
@@ -1568,8 +1630,8 @@ def main():
     def _fetch_draft_body(item):
         try:
             res = subprocess.run(
-                ["bash", _pq, "get-item", item["item_id"]],
-                capture_output=True, text=True, check=False, timeout=60,
+                [resolve_bash(), _pq, "get-item", item["item_id"]],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
             )
             if res.returncode != 0:
                 return item["item_id"], None
