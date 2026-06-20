@@ -955,6 +955,53 @@ def ci_summary(checks):
     }
 
 
+def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries):
+    """Detect In-Progress stories with no running agent container and no open PR.
+
+    A story is stalled when:
+    - Its project status is `In Progress`
+    - No container named `cfg-agent-<N>` is currently running
+    - No open PR (including WIP drafts) references this story number
+
+    Draft PRs count as "open PR" — they should go through dispatch-fix, not
+    re-dispatch. Only pure container deaths with no PR artifact trigger this.
+
+    Returns a list of:
+      {"number": N, "item_id": "...", "title": "...", "reason": "..."}
+
+    Pure draft items (number=None) are skipped — they have no container or
+    branch naming convention to cross-reference.
+    """
+    running_story_nums = set()
+    for name in containers or []:
+        tail = name.removeprefix("cfg-agent-")
+        if tail != name and tail.isdigit():
+            running_story_nums.add(int(tail))
+
+    pr_story_nums = {
+        s["story_number"]
+        for s in pr_summaries
+        if s.get("story_number") is not None
+    }
+
+    stalled = []
+    for item in in_progress_issues:
+        n = item.get("number")
+        if n is None:
+            continue
+        if n in running_story_nums:
+            continue
+        if n in pr_story_nums:
+            continue
+        stalled.append({
+            "number": n,
+            "item_id": item.get("item_id", ""),
+            "title": item.get("title", ""),
+            "reason": f"no container cfg-agent-{n} running and no open PR",
+        })
+    return stalled
+
+
 def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, caps=None):
     """Greedy conflict-free selection.
 
@@ -1826,6 +1873,9 @@ def main():
     )
     out["fix_recommendations"] = compute_fix_recommendations(
         fix_issues, pr_summaries, active_fix_pr_nums, queued_pr_numbers,
+    )
+    out["stalled_dispatches"] = compute_stalled_dispatches(
+        in_progress_issues, containers, pr_summaries,
     )
 
     parse_warning_count = sum(
