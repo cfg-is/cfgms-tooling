@@ -7,6 +7,209 @@ set -euo pipefail
 REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktrees}"
 
+# Base directory for per-agent API key tmpfs files.
+# Override CFGMS_TEST_CRED_BASE in hermetic tests.
+AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
+
+# ---------------------------------------------------------------------------
+# Tier 1 credential lifecycle helpers (Issue #2124)
+# ---------------------------------------------------------------------------
+
+# _tier1_curl <method> <path> [curl-args...]
+# Authenticated curl call to the Tier 1 controller REST API.
+# Auth: uses CFGMS_TIER1_ADMIN_KEY (Bearer token) when set, otherwise extracts
+# mTLS cert+key from CFGMS_ADMIN_BUNDLE and uses --cert/--key.
+# Returns: curl output on stdout; curl exit code propagated.
+#
+# Test hook: set CFGMS_TEST_MOCK_TIER1_DIR to a directory containing mock
+# response files named <METHOD>_<sanitized-path> (e.g. POST__api_v1_tenants).
+# Non-alphanumeric chars in path are replaced with underscores. If a matching
+# file exists, its content is echoed and the function returns 0 — no real HTTP.
+_tier1_curl() {
+  local method="$1"; shift
+  local path="$1"; shift
+  local tier1_url="${CFGMS_TIER1_URL:-}"
+
+  # Test hook: file-based mock responses avoid bash variable-name constraints.
+  if [[ -n "${CFGMS_TEST_MOCK_TIER1_DIR:-}" && -d "${CFGMS_TEST_MOCK_TIER1_DIR}" ]]; then
+    local safe_path
+    safe_path=$(echo "$path" | tr -c 'a-zA-Z0-9' '_')
+    local mock_file="${CFGMS_TEST_MOCK_TIER1_DIR}/${method}_${safe_path}"
+    if [[ -f "$mock_file" ]]; then
+      cat "$mock_file"
+      return 0
+    fi
+    # No matching mock file → simulate connection error (controller unreachable).
+    echo "mock:no_response_for:${method}:${path}" >&2
+    return 1
+  fi
+
+  if [[ -z "$tier1_url" ]]; then
+    echo "CFGMS_TIER1_URL not set" >&2
+    return 1
+  fi
+
+  local curl_auth=()
+  local admin_key="${CFGMS_TIER1_ADMIN_KEY:-}"
+  if [[ -n "$admin_key" ]]; then
+    curl_auth=(-H "Authorization: Bearer ${admin_key}")
+  elif [[ -n "${CFGMS_ADMIN_BUNDLE:-}" ]] && [[ -f "${CFGMS_ADMIN_BUNDLE}" ]]; then
+    # Extract cert, key, CA from the bundle YAML into temp files.
+    local tmp_cert tmp_key tmp_ca
+    tmp_cert=$(mktemp /tmp/cfgms-dispatch-cert-XXXXXX.pem)
+    tmp_key=$(mktemp /tmp/cfgms-dispatch-key-XXXXXX.pem)
+    tmp_ca=$(mktemp /tmp/cfgms-dispatch-ca-XXXXXX.pem)
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp_cert' '$tmp_key' '$tmp_ca'" RETURN
+    python3 - "${CFGMS_ADMIN_BUNDLE}" "$tmp_cert" "$tmp_key" "$tmp_ca" <<'PY'
+import sys, re
+bundle_path, cert_out, key_out, ca_out = sys.argv[1:]
+text = open(bundle_path).read()
+def extract(name):
+    m = re.search(r'(?m)^' + name + r':\s*\|\s*\n((?:  .+\n?)*)', text)
+    if not m:
+        raise SystemExit(f"field {name} not found in bundle")
+    return re.sub(r'(?m)^  ', '', m.group(1))
+open(cert_out, 'w').write(extract('cert_pem'))
+open(key_out, 'w').write(extract('key_pem'))
+open(ca_out, 'w').write(extract('ca_pem'))
+PY
+    curl_auth=(--cert "$tmp_cert" --key "$tmp_key" --cacert "$tmp_ca")
+  else
+    echo "no auth available — set CFGMS_TIER1_ADMIN_KEY or CFGMS_ADMIN_BUNDLE" >&2
+    return 1
+  fi
+
+  curl -sf -X "$method" \
+    "${tier1_url}${path}" \
+    -H "Content-Type: application/json" \
+    "${curl_auth[@]}" \
+    "$@"
+}
+
+# mint_agent_creds <num>
+# Creates agent-test/<num> sub-tenant (idempotent) and issues an agent.dev-scoped
+# API key. Writes key value to ${AGENT_CRED_BASE}/<num>/api.key (0600) and the
+# key ID to ${AGENT_CRED_BASE}/<num>/api.key.id (0600).
+# On failure: emits CRED_MINT_FAILED:<reason> and returns non-zero.
+mint_agent_creds() {
+  local num="$1"
+  local cred_dir="${AGENT_CRED_BASE}/${num}"
+  local tenant_id="agent-test/${num}"
+
+  # Create and secure the per-agent cred dir.
+  mkdir -p "$cred_dir"
+  chmod 700 "$cred_dir"
+
+  # 1. Create agent-test sub-tenant (idempotent — 409 is success).
+  local create_resp http_code
+  create_resp=$(_tier1_curl POST /api/v1/tenants \
+    -d "{\"id\":\"${num}\",\"name\":\"Agent Test ${num}\",\"parent_id\":\"agent-test\"}" 2>&1) || {
+    # Check if it was a 409 conflict — tenant already exists, continue.
+    if echo "$create_resp" | grep -q "TENANT_EXISTS\|409\|already exists"; then
+      : # idempotent
+    else
+      rm -rf "$cred_dir"
+      echo "CRED_MINT_FAILED:tenant_create:${create_resp}"
+      return 1
+    fi
+  }
+
+  # 2. Issue agent.dev-scoped API key bound to agent-test/<num>.
+  local key_resp key_value key_id
+  key_resp=$(_tier1_curl POST /api/v1/api-keys \
+    -d "{\"name\":\"agent-${num}\",\"role_id\":\"agent.dev\",\"tenant_id\":\"${tenant_id}\"}" 2>&1) || {
+    rm -rf "$cred_dir"
+    echo "CRED_MINT_FAILED:apikey_create:${key_resp}"
+    return 1
+  }
+
+  # Extract key value and ID from the response envelope.
+  key_value=$(echo "$key_resp" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('data', {}).get('key', '') or d.get('key', ''))
+" 2>/dev/null || true)
+  key_id=$(echo "$key_resp" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('data', {}).get('id', '') or d.get('id', ''))
+" 2>/dev/null || true)
+
+  if [[ -z "$key_value" || -z "$key_id" ]]; then
+    rm -rf "$cred_dir"
+    local missing_fields=""
+    [[ -z "$key_value" ]] && missing_fields+="key,"
+    [[ -z "$key_id" ]] && missing_fields+="id,"
+    echo "CRED_MINT_FAILED:apikey_parse:missing=${missing_fields%,}"
+    return 1
+  fi
+
+  # 3. Write credential files (600 — no world or group read).
+  printf '%s' "$key_value" > "${cred_dir}/api.key"
+  chmod 600 "${cred_dir}/api.key"
+  printf '%s' "$key_id" > "${cred_dir}/api.key.id"
+  chmod 600 "${cred_dir}/api.key.id"
+
+  echo "CRED_MINTED:${num}:${key_id}"
+}
+
+# revoke_agent_creds <num>
+# Deletes the API key and suspends the agent-test/<num> sub-tenant.
+# Idempotent: missing cred dir emits INFO:no_cred_to_revoke:<num> and returns 0.
+# Controller-unreachable: records failure to revoke-failed.txt (0600); never blocks cleanup.
+revoke_agent_creds() {
+  local num="$1"
+  local cred_dir="${AGENT_CRED_BASE}/${num}"
+  local tenant_id="agent-test/${num}"
+
+  if [[ ! -d "$cred_dir" ]]; then
+    echo "INFO:no_cred_to_revoke:${num}"
+    return 0
+  fi
+
+  local key_id_file="${cred_dir}/api.key.id"
+  local revoke_failed_file="${cred_dir}/revoke-failed.txt"
+  local errors=()
+
+  # 1. Delete the API key (key lookup miss → immediate 401, no cache flush needed).
+  if [[ -f "$key_id_file" ]]; then
+    local key_id
+    key_id=$(cat "$key_id_file")
+    local del_resp
+    del_resp=$(_tier1_curl DELETE "/api/v1/api-keys/${key_id}" 2>&1) || {
+      local ts
+      ts=$(date -u +%s 2>/dev/null || echo "unknown")
+      errors+=("${key_id} ${ts} apikey_delete:${del_resp}")
+    }
+    if [[ ${#errors[@]} -eq 0 ]]; then
+      echo "CRED_REVOKED:apikey:${key_id}"
+    fi
+  else
+    echo "INFO:no_key_id_file:${num}"
+  fi
+
+  # 2. Suspend the agent sub-tenant.
+  local susp_resp
+  susp_resp=$(_tier1_curl POST "/api/v1/tenants/${tenant_id}/suspend" 2>&1) || {
+    local ts
+    ts=$(date -u +%s 2>/dev/null || echo "unknown")
+    errors+=("${tenant_id} ${ts} tenant_suspend:${susp_resp}")
+  }
+  if [[ ${#errors[@]} -eq 0 || ( ${#errors[@]} -eq 1 && "${errors[0]}" != *"tenant_suspend"* ) ]]; then
+    echo "CRED_REVOKED:tenant:${tenant_id}"
+  fi
+
+  # Record any revocation failures for manual follow-up (never block cleanup).
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    printf '%s\n' "${errors[@]}" >> "$revoke_failed_file"
+    chmod 600 "$revoke_failed_file"
+    for err in "${errors[@]}"; do
+      echo "WARN:revoke_failed:${num}:${err}"
+    done
+  fi
+}
+
 # Ensure clone is based on latest remote develop, not stale local state.
 # Called inside fresh clones after setting the remote URL.
 sync_to_remote_develop() {
@@ -398,10 +601,25 @@ case "$cmd" in
   launch)
     [[ $# -eq 1 ]] || { echo "launch requires exactly one issue number"; exit 1; }
     num="$1"
+    [[ "$num" =~ ^[0-9]+$ ]] || { echo "launch requires a numeric issue number"; exit 1; }
     gate_credentials_for_launch
     clone_path="${WORKTREE_BASE}/story-${num}"
     real_path=$(realpath "$clone_path")
     gh_token=$(gh auth token)
+
+    # Mint sub-tenant + scoped API key; write to per-agent tmpfs dir (Issue #2124).
+    # On mint failure: emit CRED_MINT_FAILED, clean up, exit non-zero — never start the container.
+    cred_dir="${AGENT_CRED_BASE}/${num}"
+    if ! mint_out=$(mint_agent_creds "$num" 2>&1); then
+      echo "$mint_out"
+      rm -rf "$clone_path"
+      echo "CLEANED:clone:${clone_path}"
+      exit 1
+    fi
+    echo "$mint_out"
+
+    tier1_url="${CFGMS_TIER1_URL:-}"
+
     if container_id=$(docker run -d \
       --name "cfg-agent-${num}" \
       --label "cfg-agent=true" \
@@ -414,14 +632,21 @@ case "$cmd" in
       -v "claude-creds:/persist" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
       -e "GH_TOKEN=${gh_token}" \
+      -e "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key" \
+      -e "CFGMS_TENANT=agent-test/${num}" \
+      -e "CFGMS_TIER1_URL=${tier1_url}" \
+      -e "CFGMS_ADMIN_BUNDLE=" \
       --cap-add NET_ADMIN \
       cfg-agent:latest \
       "${num}" 2>&1); then
       echo "LAUNCHED:${num}:${container_id}"
     else
-      # Launch failed — clean up orphaned clone to prevent blocking future dispatches
+      # Launch failed — revoke creds and clean up to prevent orphaned resources.
       echo "LAUNCH_FAILED:${num}:${container_id}"
+      revoke_agent_creds "$num" || true
+      rm -rf "${cred_dir}" 2>/dev/null || true
       rm -rf "$clone_path"
       echo "CLEANED:clone:${clone_path}"
       exit 1
@@ -780,7 +1005,9 @@ else:
     [[ $# -eq 1 ]] || { echo "cleanup-issue requires exactly one issue number or item_id"; exit 1; }
     num="$1"
     if [[ "$num" =~ ^[0-9]+$ ]]; then
-      # Issue mode (numeric): existing behavior
+      # Issue mode (numeric): revoke API key + suspend tenant, then remove container + clone.
+      revoke_agent_creds "$num" || true
+      rm -rf "${AGENT_CRED_BASE}/${num}" 2>/dev/null || true
       docker cp "cfg-agent-${num}:/tmp/agent-result.json" "/tmp/agent-result-${num}.json" 2>/dev/null || true
       if docker rm -f "cfg-agent-${num}" >/dev/null 2>&1; then
         echo "CLEANED:container:cfg-agent-${num}"
@@ -1197,6 +1424,13 @@ PROMPT_EOF
 
       echo "STALE:${container_name}:finished=${finished_iso}:pr=${pr_num:-unknown}"
 
+      # Revoke any agent.dev API key associated with this review agent (Issue #2124).
+      # Review agents use the same cred dir layout as issue agents when pr_num is known.
+      if [[ -n "$pr_num" ]]; then
+        revoke_agent_creds "review-pr-${pr_num}" || true
+        rm -rf "${AGENT_CRED_BASE}/review-pr-${pr_num}" 2>/dev/null || true
+      fi
+
       # Archive the result JSON for forensics.
       docker cp "${container_name}:/tmp/agent-result.json" "/tmp/agent-result-review-${pr_num:-${container_name}}.json" 2>/dev/null || true
 
@@ -1279,7 +1513,9 @@ PROMPT_EOF
 
       if $should_clean; then
         echo "STALE:${num}:${reason}"
-        # Reuse cleanup-issue logic
+        # Revoke API key + suspend tenant before removing container/clone (Issue #2124).
+        revoke_agent_creds "$num" || true
+        rm -rf "${AGENT_CRED_BASE}/${num}" 2>/dev/null || true
         docker cp "cfg-agent-${num}:/tmp/agent-result.json" "/tmp/agent-result-${num}.json" 2>/dev/null || true
         if docker rm -f "cfg-agent-${num}" >/dev/null 2>&1; then
           echo "CLEANED:container:cfg-agent-${num}"
@@ -1320,6 +1556,22 @@ PROMPT_EOF
     # branch + body and prints its result. Safe (no docker, no gh, no writes).
     [[ $# -eq 2 ]] || { echo "_test-resolve-pr requires <branch> <body>"; exit 1; }
     resolve_pr_story_or_item "$1" "$2"
+    ;;
+
+  _test-mint-creds)
+    # Hidden test hook for agent-apikey-injection.test.sh (Issue #2124).
+    # Calls mint_agent_creds with the supplied issue number.
+    # Env overrides: CFGMS_TEST_CRED_BASE, CFGMS_TEST_MOCK_TIER1_DIR, CFGMS_TIER1_URL.
+    [[ $# -eq 1 ]] || { echo "_test-mint-creds requires exactly one issue number"; exit 1; }
+    mint_agent_creds "$1"
+    ;;
+
+  _test-revoke-creds)
+    # Hidden test hook for agent-apikey-injection.test.sh (Issue #2124).
+    # Calls revoke_agent_creds with the supplied issue number.
+    # Env overrides: CFGMS_TEST_CRED_BASE, CFGMS_TEST_MOCK_TIER1_DIR, CFGMS_TIER1_URL.
+    [[ $# -eq 1 ]] || { echo "_test-revoke-creds requires exactly one issue number"; exit 1; }
+    revoke_agent_creds "$1"
     ;;
 
   *)
