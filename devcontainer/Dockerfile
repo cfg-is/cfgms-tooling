@@ -5,6 +5,27 @@
 # Build: docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
 # Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .devcontainer/Dockerfile .
 
+# Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
+# and .git history are never baked into the final image's layers.
+# CLI_BINARY=cfg  Entry point: ./cmd/cfg
+FROM golang:1.26.4-bookworm AS cfg-builder
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN set -eu; \
+    VERSION=$(git describe --tags --always 2>/dev/null || echo "dev"); \
+    COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown"); \
+    BUILDDATE=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+    GOVERS=$(go version | awk '{print $3}'); \
+    go build \
+       -ldflags "-X github.com/cfgis/cfgms/pkg/version.Version=${VERSION} -X github.com/cfgis/cfgms/pkg/version.GitCommit=${COMMIT} -X github.com/cfgis/cfgms/pkg/version.BuildDate=${BUILDDATE} -X github.com/cfgis/cfgms/pkg/version.GoVersion=${GOVERS}" \
+       -o /usr/local/bin/cfg \
+       ./cmd/cfg
+
+# Stage 1 (runtime): main agent container with full tooling
 FROM golang:1.26.4-bookworm
 
 # System dependencies
@@ -94,6 +115,10 @@ RUN go mod download \
     && chown -R agent:agent /home/agent/go/pkg/mod \
     && rm go.mod go.sum
 WORKDIR /
+
+# CLI_BINARY=cfg — install cfg CLI built in the builder stage above.
+# The builder stage is discarded; only the binary is copied to this layer.
+COPY --from=cfg-builder /usr/local/bin/cfg /usr/local/bin/cfg
 
 # Copy container scripts and DNS allowlist
 COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh

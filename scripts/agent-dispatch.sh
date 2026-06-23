@@ -902,6 +902,15 @@ else:
       warnings=$((warnings + 1))
     fi
 
+    # cfg CLI version check
+    cfg_version=$(docker run --rm --entrypoint cfg cfg-agent:latest version 2>/dev/null \
+      | grep -oP '(?<=Version: )\S+(?=,)' || echo "unknown")
+    echo "INFO:cfg_version:${cfg_version}"
+    if [[ "$cfg_version" == "unknown" ]]; then
+      echo "WARN:cfg_version:cfg binary missing or version check failed — run /agent-setup rebuild"
+      warnings=$((warnings + 1))
+    fi
+
     # Credentials check
     if docker run --rm -v claude-creds:/persist --entrypoint test cfg-agent:latest -f /persist/.credentials.json 2>/dev/null; then
       echo "INFO:creds:Credentials present in claude-creds volume"
