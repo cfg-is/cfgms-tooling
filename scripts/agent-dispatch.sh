@@ -391,7 +391,11 @@ Commands:
   inspect-exit    <NUM>                     Print exit code of container
   inspect-detail  <NUM>                     Print stats + last 30 log lines
   inspect-container <NAME>                  Print stats + last 30 log lines for named container
-  health-check                              Check image age, Claude version, creds staleness
+  smoke-test      <N>                       Run cfg config list against Tier 1 as agent-test/<N>
+                                            Emits SMOKE_OK:<N> (exit 0) or SMOKE_FAILED:<N>:<error> (non-zero)
+                                            Requires CFGMS_TIER1_URL and a credential (CFGMS_API_KEY_FILE,
+                                            CFGMS_API_KEY, or the per-agent cred at AGENT_CRED_BASE/<N>/api.key)
+  health-check                              Check image age, Claude version, creds staleness, Tier 1 reachability
 EOF
   exit 1
 }
@@ -1104,6 +1108,67 @@ else:
     docker logs --tail 30 "$1" 2>/dev/null || echo "(no logs available)"
     ;;
 
+  smoke-test)
+    [[ $# -eq 1 ]] || { echo "smoke-test requires exactly one issue number"; exit 1; }
+    num="$1"
+    [[ "$num" =~ ^[0-9]+$ ]] || { echo "SMOKE_FAILED:${num}:invalid_issue_num"; exit 1; }
+
+    tier1_url="${CFGMS_TIER1_URL:-}"
+    if [[ -z "$tier1_url" ]]; then
+      echo "SMOKE_FAILED:${num}:no_tier1_url"
+      exit 1
+    fi
+
+    # Determine credential source before launching — missing cred exits without starting a container.
+    # Priority: CFGMS_API_KEY_FILE env → per-agent tmpfs cred → CFGMS_API_KEY env.
+    api_key_file="${CFGMS_API_KEY_FILE:-}"
+    api_key_env="${CFGMS_API_KEY:-}"
+    agent_cred_file="${AGENT_CRED_BASE}/${num}/api.key"
+
+    use_cred_file=""
+    use_cred_env=""
+
+    if [[ -n "$api_key_file" && -f "$api_key_file" ]]; then
+      use_cred_file="$api_key_file"
+    elif [[ -f "$agent_cred_file" ]]; then
+      use_cred_file="$agent_cred_file"
+    elif [[ -n "$api_key_env" ]]; then
+      use_cred_env="$api_key_env"
+    else
+      echo "SMOKE_FAILED:${num}:no_cred"
+      exit 1
+    fi
+
+    # Build docker env args for credential injection.
+    smoke_docker_env=("-e" "CFGMS_TIER1_URL=${tier1_url}")
+    if [[ -n "$use_cred_file" ]]; then
+      smoke_docker_env+=("-v" "${use_cred_file}:/run/cfgms/smoke.key:ro"
+                         "-e" "CFGMS_API_KEY_FILE=/run/cfgms/smoke.key")
+    else
+      smoke_docker_env+=("-e" "CFGMS_API_KEY=${use_cred_env}")
+    fi
+
+    # Run smoke test. --rm ensures the container is always removed on exit.
+    # Test hook: CFGMS_TEST_SMOKE_RUN_CMD replaces docker run for hermetic tests.
+    smoke_exit=0
+    if [[ -n "${CFGMS_TEST_SMOKE_RUN_CMD:-}" ]]; then
+      smoke_out=$(bash -c "${CFGMS_TEST_SMOKE_RUN_CMD}" 2>&1) || smoke_exit=$?
+    else
+      smoke_out=$(docker run --rm \
+        "${smoke_docker_env[@]}" \
+        cfg-agent:latest \
+        cfg config list --tenant="agent-test/${num}" --no-bundle 2>&1) || smoke_exit=$?
+    fi
+
+    if [[ $smoke_exit -eq 0 ]]; then
+      echo "SMOKE_OK:${num}"
+    else
+      err_msg=$(echo "$smoke_out" | head -1)
+      echo "SMOKE_FAILED:${num}:${err_msg}"
+      exit 1
+    fi
+    ;;
+
   health-check)
     warnings=0
 
@@ -1147,6 +1212,22 @@ else:
     else
       echo "WARN:creds:No credentials found — run /agent-setup creds"
       warnings=$((warnings + 1))
+    fi
+
+    # Tier 1 reachability probe
+    tier1_url="${CFGMS_TIER1_URL:-}"
+    if [[ -z "$tier1_url" ]]; then
+      echo "WARN:tier1_url_not_set"
+      warnings=$((warnings + 1))
+    else
+      http_code=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+        "${tier1_url}/api/v1/health" 2>/dev/null || echo "000")
+      if [[ "$http_code" =~ ^2[0-9]{2}$ ]]; then
+        echo "INFO:tier1_reachable:true"
+      else
+        echo "WARN:tier1_unreachable:${http_code}"
+        warnings=$((warnings + 1))
+      fi
     fi
 
     echo "HEALTH_DONE:warnings=${warnings}"
