@@ -211,7 +211,14 @@ except Exception: print('')" 2>/dev/null || echo "")
     # handled explicitly in the LAUNCH_FAILED branch below (it runs inside an `if`
     # condition, which `set -e`/ERR does not trap).
     trap 'rc=$?; bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true; echo "ROLLED_BACK:${item_id} -> Ready (dispatch failed before launch, rc=$rc)"; exit "$rc"' ERR
-    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    # Branch on the RESOLVED story number ($first_arg), not the raw input ($arg).
+    # An issueless draft is materialized above into issue #$story and $first_arg
+    # is set to that number, so it must clone first-class as feature/story-<N>
+    # (matching clone_path=$WORKTREE_BASE/story-<N>). Testing $arg here instead
+    # left materialized drafts on the review-invisible feature/item-<id> path AND
+    # mounted a non-existent worktree (clone_path=story-<N> vs the item-<id> clone
+    # that create-clone-item actually made) → empty /workspace → entrypoint crash.
+    if [[ "$first_arg" =~ ^[0-9]+$ ]]; then
       "$DISPATCH" check-conflicts "$story" >/dev/null
       "$DISPATCH" create-clone "$story" | tail -1
     else
