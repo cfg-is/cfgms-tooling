@@ -25,6 +25,7 @@ Subcommands:
   add-pr <pr_num>                                 Add a GitHub PR to the project
   set-pr <item_id> <pr_num>                       Record PR number against a project item
   delete-item <item_id>                           Remove an item from the project
+  materialize <item_id>                           Convert a draft to a locked issue (in place); prints issue_num
 EOF
     exit 2
 }
@@ -713,6 +714,77 @@ PYEOF
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
+cmd_materialize() {
+    # Convert a private draft item into a real (locked) GitHub issue, in place.
+    # The same project item is retained — its content becomes an Issue. Labels
+    # and epic sub-issue linking are applied by pipeline-helper.sh materialize-issue
+    # (this command stays gh-api-graphql only, per the file contract).
+    [[ $# -ge 1 ]] || {
+        printf 'Usage: %s materialize <item_id>\n' "$0" >&2
+        exit 2
+    }
+    local item_id="$1" repo_node_id
+    repo_node_id=$(gh api "repos/${REPO_OWNER}/${REPO_NAME}" --jq '.node_id') || {
+        printf 'Error: could not resolve repository node id\n' >&2
+        exit 1
+    }
+
+    GQ_ITEM_ID="$item_id" GQ_REPO_ID="$repo_node_id" python3 - <<'PYEOF'
+import json, os, subprocess, sys
+
+
+def graphql(payload):
+    r = subprocess.run(
+        ['gh', 'api', 'graphql', '--input', '-'],
+        input=json.dumps(payload).encode(),
+        capture_output=True
+    )
+    if r.returncode != 0:
+        print(r.stderr.decode().strip(), file=sys.stderr)
+        sys.exit(1)
+    resp = json.loads(r.stdout)
+    if resp.get('errors'):
+        for e in resp['errors']:
+            print(e.get('message', str(e)), file=sys.stderr)
+        sys.exit(1)
+    return resp['data']
+
+
+item_id = os.environ['GQ_ITEM_ID']
+repo_id = os.environ['GQ_REPO_ID']
+
+# 1. Convert the draft to a real issue in this repo (item id is preserved).
+data = graphql({
+    'query': (
+        'mutation($i:ID!,$r:ID!){'
+        'convertProjectV2DraftIssueItemToIssue(input:{itemId:$i,repositoryId:$r}){'
+        'item{content{... on Issue{id number}}}}}'
+    ),
+    'variables': {'i': item_id, 'r': repo_id}
+})
+content = (data['convertProjectV2DraftIssueItemToIssue']['item'] or {}).get('content') or {}
+issue_node_id = content.get('id')
+issue_num = content.get('number')
+if not issue_node_id or not issue_num:
+    print('Error: convert did not return an issue (was the item already an issue?)',
+          file=sys.stderr)
+    sys.exit(1)
+
+# 2. Lock the new issue — internal pipeline issues take no external comments.
+graphql({
+    'query': 'mutation($l:ID!){lockLockable(input:{lockableId:$l}){clientMutationId}}',
+    'variables': {'l': issue_node_id}
+})
+
+print(json.dumps({
+    'item_id': item_id,
+    'issue_num': issue_num,
+    'issue_node_id': issue_node_id,
+    'locked': True
+}))
+PYEOF
+}
+
 subcommand="${1:-}"
 [[ -n "$subcommand" ]] || _usage
 shift
@@ -726,6 +798,7 @@ case "$subcommand" in
     add-pr)         cmd_add_pr "$@" ;;
     set-pr)         cmd_set_pr "$@" ;;
     delete-item)    cmd_delete_item "$@" ;;
+    materialize)    cmd_materialize "$@" ;;
     *)
         printf 'Error: unknown subcommand: %s\n' "$subcommand" >&2
         _usage

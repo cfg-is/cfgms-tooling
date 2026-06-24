@@ -158,13 +158,33 @@ except Exception: print('')" 2>/dev/null || echo "")
       container_name="cfg-agent-${story}"
       first_arg="${story}"
     else
-      # Item ID path: genuine issueless project drafts only (non-numeric arg
-      # that did not resolve to an issue number above).
+      # Issueless project draft → materialize it into a locked `internal` issue
+      # at dispatch, then run the rest of dispatch first-class on feature/story-<N>.
+      # (The old item-<id> branch path is review-sweep-invisible — Issue #1700 —
+      # so we convert to an issue here instead of dispatching the draft directly.)
       item_id="$arg"
-      LAST12=$(echo "$item_id" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
-      clone_path="${WORKTREE_BASE}/item-${LAST12}"
-      container_name="cfg-agent-item-${LAST12}"
-      first_arg="${item_id}"
+      PIPELINE_HELPER="$(cd "$(dirname "$0")/../.." && pwd)/scripts/pipeline-helper.sh"
+      epic_num=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
+        | python3 -c "import json,sys,re
+try:
+    b=json.load(sys.stdin).get('body') or ''
+    m=re.search(r'[Pp]arent epic[:#\s]*#?(\d+)', b)
+    print(m.group(1) if m else '')
+except Exception: print('')" 2>/dev/null || echo "")
+      mat=$(bash "$PIPELINE_HELPER" materialize-issue "$item_id" "$epic_num" 2>&1) || {
+        echo "ERROR: materialize-issue failed for ${item_id}: ${mat}" >&2
+        exit 1
+      }
+      story=$(echo "$mat" | grep -oE '#[0-9]+' | tr -d '#' | head -1)
+      if [ -z "${story:-}" ]; then
+        echo "ERROR: materialize-issue returned no issue number: ${mat}" >&2
+        exit 1
+      fi
+      echo "MATERIALIZED_AT_DISPATCH:${item_id}:#${story}"
+      issue_for_env="$story"
+      clone_path="${WORKTREE_BASE}/story-${story}"
+      container_name="cfg-agent-${story}"
+      first_arg="${story}"
     fi
 
     # Phase 2 — capability guard (defense in depth; the preflight already filters
@@ -226,6 +246,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_PROJECT_ITEM_ID=${item_id}" \
+      -e "CFGMS_AUTONOMOUS=true" \
       --cap-add NET_ADMIN \
       cfg-agent:latest \
       "${first_arg}" 2>&1); then
@@ -422,28 +443,35 @@ except Exception: print('')" 2>/dev/null || echo "")
     ;;
 
   block)
-    # Usage: po-act.sh block <ISSUE_NUM> <reason>
-    # Sets project status to Blocked, assigns to founder, posts escalation comment.
-    issue="${1:?issue number required}"
+    # Usage: po-act.sh block <ISSUE_NUM|ITEM_ID> <reason>
+    # Sets project status to Blocked. For a public issue, also posts an escalation
+    # comment; a draft item (no issue) is set by item_id and takes no comment.
+    arg="${1:?issue number or item_id required}"
     reason="${2:?reason required (use - to read stdin)}"
     ts=$(date -u +"%Y-%m-%d %H:%MZ")
     if [ "$reason" = "-" ]; then
       reason=$(cat)
     fi
     body=$(printf '## Pipeline blocked — %s\n\n%s\n\n_Escalated to founder by PO cycle._\n' "$ts" "$reason")
-    # Update project status to Blocked (idempotently add issue to project first)
-    item_id=$(bash "$PROJECT_QUEUE" add-issue "$issue" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" 2>/dev/null || true)
-    if [ -n "${item_id:-}" ]; then
-      bash "$PROJECT_QUEUE" update-field "$item_id" status "Blocked" >/dev/null 2>&1 || true
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+      # Public issue: add to project (idempotent), set Blocked, post escalation comment.
+      item_id=$(bash "$PROJECT_QUEUE" add-issue "$arg" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" 2>/dev/null || true)
+      if [ -n "${item_id:-}" ]; then
+        bash "$PROJECT_QUEUE" update-field "$item_id" status "Blocked" >/dev/null 2>&1 || true
+      fi
+      printf '%s\n' "$body" | gh issue comment "$arg" --repo "$REPO" --body-file - >/dev/null 2>&1 || true
+    else
+      # Draft item: already in the project; set Blocked by item_id (drafts take no comment).
+      bash "$PROJECT_QUEUE" update-field "$arg" status "Blocked" >/dev/null 2>&1 || true
     fi
-    printf '%s\n' "$body" | gh issue comment "$issue" --repo "$REPO" --body-file - >/dev/null
-    echo "BLOCKED:$issue"
+    echo "BLOCKED:$arg"
     ;;
 
   unblock)
-    # Usage: po-act.sh unblock <ISSUE_NUM> <reason> [--as-fix]
-    # Sets project status to Ready (or Fix with --as-fix), posts resolution comment.
-    issue="${1:?issue number required}"
+    # Usage: po-act.sh unblock <ISSUE_NUM|ITEM_ID> <reason> [--as-fix]
+    # Sets project status to Ready (or Fix with --as-fix). Posts a resolution
+    # comment for a public issue; a draft item is set by item_id (no comment).
+    arg="${1:?issue number or item_id required}"
     reason="${2:?reason required (use - to read stdin)}"
     mode="${3:-}"
     ts=$(date -u +"%Y-%m-%d %H:%MZ")
@@ -451,17 +479,18 @@ except Exception: print('')" 2>/dev/null || echo "")
       reason=$(cat)
     fi
     body=$(printf '## Pipeline unblocked — %s\n\n%s\n' "$ts" "$reason")
-    # Update project status (idempotently add issue to project first)
-    item_id=$(bash "$PROJECT_QUEUE" add-issue "$issue" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" 2>/dev/null || true)
-    if [ -n "${item_id:-}" ]; then
-      new_status="Ready"
-      if [ "$mode" = "--as-fix" ]; then
-        new_status="Fix"
+    new_status="Ready"
+    [ "$mode" = "--as-fix" ] && new_status="Fix"
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+      item_id=$(bash "$PROJECT_QUEUE" add-issue "$arg" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item_id',''))" 2>/dev/null || true)
+      if [ -n "${item_id:-}" ]; then
+        bash "$PROJECT_QUEUE" update-field "$item_id" status "$new_status" >/dev/null 2>&1 || true
       fi
-      bash "$PROJECT_QUEUE" update-field "$item_id" status "$new_status" >/dev/null 2>&1 || true
+      printf '%s\n' "$body" | gh issue comment "$arg" --repo "$REPO" --body-file - >/dev/null 2>&1 || true
+    else
+      bash "$PROJECT_QUEUE" update-field "$arg" status "$new_status" >/dev/null 2>&1 || true
     fi
-    printf '%s\n' "$body" | gh issue comment "$issue" --repo "$REPO" --body-file - >/dev/null
-    echo "UNBLOCKED:$issue${mode:+ ($mode)}"
+    echo "UNBLOCKED:$arg${mode:+ ($mode)}"
     ;;
 
   ""|-h|--help|help)

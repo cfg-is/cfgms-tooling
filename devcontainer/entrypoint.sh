@@ -201,47 +201,26 @@ SCOPE_CONSTRAINTS_SECTION='## Scope Constraints
 # with no project item, no status, and no sub-issue link — the dispatcher
 # cannot see it. Caught 2026-05-18 on epic #1500: 13 audit stories were filed
 # this way and sat orphaned from the pipeline until manual cleanup.
-FOLLOW_UP_ISSUES_SECTION='## Filing follow-up issues (when the story tells you to)
+FOLLOW_UP_ISSUES_SECTION='## Filing follow-up work (when the story tells you to)
 
-If your story asks you to file a follow-up issue (e.g., a docs audit asks you
-to file a code-fix issue for each gap found, or a Deferred annotation needs a
-tracking issue), DO NOT just call `gh issue create`. A bare `gh issue create`
-produces an issue that is invisible to the pipeline — no project item, no
-status, no sub-issue link to the parent epic — and the work sits orphaned
-until a human cleans it up.
-
-For each follow-up issue, run all FOUR calls in this order. Omit step 2 only
-if there is genuinely no parent epic (rare — usually the epic your current
-story belongs to is the right parent).
+If your story asks you to file follow-up work (e.g., a docs audit asks you to
+file a code-fix item for each gap found, or a Deferred annotation needs a
+tracking item), file it as a PRIVATE PROJECT DRAFT — never create a public issue
+directly. You are autonomous: raw issue creation is hard-blocked, and a bare issue
+is injection/leak surface that is also invisible to the pipeline. A dev work-item
+becomes a locked `internal` issue only when it is dispatched.
 
 ```bash
-# 1. Create the public GH issue
-issue_num=$(gh issue create --repo cfg-is/cfgms \
-  --title "<scope>: <title>" \
-  --label story \
-  --body-file /path/to/body.md \
-  | grep -oE "[0-9]+$")
-
-# 2. Link as sub-issue of the parent epic (so the epic tracks completion)
-./scripts/pipeline-helper.sh link-child <PARENT_EPIC_NUM> "$issue_num"
-
-# 3. Add the issue to the project queue (so the dispatcher can see it)
-item_id=$(./scripts/project-queue.sh add-issue "$issue_num" \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)[\"item_id\"])")
-
-# 4. Set initial status. Use `Draft` if the body needs Tech Lead validation
-#    before dispatch (the safe default for new gap-fix work, since you wrote
-#    the body without the BA+Tech Lead planning loop). Only use `Ready` if
-#    you are certain the body is parser-compliant (`## Dependencies` section
-#    is bare `None` or lists only `#NNN` refs to CLOSED issues, and
-#    `## Files In Scope` lists concrete file paths).
-./scripts/project-queue.sh update-field "$item_id" status "Draft"
+# Write the follow-up body to a file, then create a private draft under the epic.
+# Returns CREATED_DRAFT:<item_id>. Usually the epic your current story belongs to
+# is the right parent. The draft starts in Draft status (Tech Lead validates it
+# before it becomes Ready/dispatchable).
+./scripts/pipeline-helper.sh create-story <PARENT_EPIC_NUM> "<scope>: <title>" /path/to/body.md
 ```
 
-If any step fails, fix it before moving on — a half-filed issue is worse than
-no issue at all because it hides the problem. Story-body conventions the
-follow-up issue body must satisfy live in `.claude/agents/po.md` under
-"Reference: Story Body Conventions".'
+If create-story fails, fix it before moving on — a half-filed item is worse than
+none because it hides the problem. The follow-up body must satisfy the story-body
+conventions in `.claude/agents/po.md` under "Reference: Story Body Conventions".'
 
 # --- Phase 1: Compose prompt based on mode ---
 
