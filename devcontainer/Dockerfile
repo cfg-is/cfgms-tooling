@@ -134,6 +134,40 @@ ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy
 ENV GOMODCACHE=/home/agent/go/pkg/mod
 ENV GOFLAGS=-modcacherw
 
+# === Serena MCP server (semantic code navigation for PO/dev sessions) ===
+# Everything is fetched at BUILD time (unrestricted network) and baked into the
+# image. At RUNTIME serena resolves entirely from the warmed uv cache with
+# UV_OFFLINE=1, so NO pypi/astral egress is added to the container firewall.
+#
+# uv/uvx — pinned release binary + SHA-256 (same supply-chain pattern as trivy).
+RUN set -eu; \
+    UV_VERSION='0.11.24'; \
+    UV_SHA256='5ce1ad074a78f96c5c8122088bb85a12eb282195bc1453151a48762e4fc31fed'; \
+    curl -sSfL -o /tmp/uv.tgz \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"; \
+    printf '%s  /tmp/uv.tgz\n' "${UV_SHA256}" | sha256sum -c -; \
+    tar -xzf /tmp/uv.tgz -C /tmp; \
+    install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv  /usr/local/bin/uv; \
+    install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx; \
+    rm -rf /tmp/uv.tgz /tmp/uv-x86_64-unknown-linux-gnu
+
+# gopls — serena's Go language server (pinned), on the shared PATH.
+RUN go install golang.org/x/tools/gopls@v0.22.0 \
+    && install -m 0755 "$(go env GOPATH)/bin/gopls" /usr/local/bin/gopls
+
+# Install serena (pinned v1.5.3) as a self-contained tool for the agent user.
+# This bakes serena + all its Python deps into the image (~/.local/share/uv +
+# the `serena` launcher on ~/.local/bin), so at runtime serena starts directly
+# from the binary with no uvx git re-resolution and no pypi/astral egress.
+# setup-env.sh repoints the project .mcp.json at this binary.
+ENV UV_CACHE_DIR=/home/agent/.cache/uv
+RUN install -d -o agent -g agent /home/agent/.cache/uv /home/agent/.local \
+    && su agent -c 'set -e; export UV_CACHE_DIR=/home/agent/.cache/uv; \
+         uv tool install --from git+https://github.com/oraios/serena@v1.5.3 serena-agent' \
+    && chown -R agent:agent /home/agent/.cache/uv /home/agent/.local
+# Defense-in-depth: keep any stray uv invocation offline behind the firewall.
+ENV UV_OFFLINE=1
+
 # Not a long-running service; health checks are not applicable for on-demand
 # agent containers. HEALTHCHECK NONE suppresses the Trivy DS-0026 advisory.
 HEALTHCHECK NONE

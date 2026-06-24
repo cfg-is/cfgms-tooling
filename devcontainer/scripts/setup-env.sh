@@ -45,3 +45,31 @@ git config --global user.name "cfg-agent"
 git config --global user.email "agent@cfg.is"
 git config --global push.autoSetupRemote true
 gh auth setup-git 2>/dev/null || true
+
+# --- Serena MCP (semantic code navigation) ---
+# Serena is baked into the image as a self-contained, offline-capable binary
+# (see Dockerfile). The committed .mcp.json runs it via `uvx --from git+...`,
+# which re-resolves the git source at launch and would need pypi/astral egress —
+# so in the container we (a) repoint the serena entry at the offline binary and
+# (b) approve the project MCP server (the clone has no settings.local.json, which
+# is gitignored on the host). `skip-worktree` keeps this container-local rewrite
+# out of the dev agent's `git status` so it can never be accidentally committed.
+SERENA_BIN="${HOME}/.local/bin/serena"
+if [ -x "$SERENA_BIN" ] && [ -f /workspace/.mcp.json ]; then
+    tmp=$(mktemp)
+    jq --arg bin "$SERENA_BIN" '.mcpServers.serena = {
+        "type": "stdio", "command": $bin,
+        "args": ["start-mcp-server", "--context", "ide-assistant", "--project", "."],
+        "env": {}
+    }' /workspace/.mcp.json > "$tmp" && mv "$tmp" /workspace/.mcp.json
+    git -C /workspace update-index --skip-worktree .mcp.json 2>/dev/null || true
+
+    mkdir -p /workspace/.claude
+    WS_LOCAL="/workspace/.claude/settings.local.json"
+    if [ -f "$WS_LOCAL" ]; then
+        tmp=$(mktemp)
+        jq '.enabledMcpjsonServers = (((.enabledMcpjsonServers // []) + ["serena"]) | unique)' "$WS_LOCAL" > "$tmp" && mv "$tmp" "$WS_LOCAL"
+    else
+        echo '{"enabledMcpjsonServers":["serena"]}' > "$WS_LOCAL"
+    fi
+fi
