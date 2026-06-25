@@ -85,7 +85,7 @@ RUN set -eu; \
 
 # Nancy (Go dependency scanner)
 RUN GOPATH=$(go env GOPATH) \
-    && curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v2.0.0/nancy-v2.0.0-linux-amd64" \
+    && curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v2.1.0/nancy-v2.1.0-linux-amd64" \
        -o "$GOPATH/bin/nancy" \
     && chmod +x "$GOPATH/bin/nancy"
 
