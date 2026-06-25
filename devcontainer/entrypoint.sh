@@ -631,6 +631,12 @@ AGENT_MODEL="claude-sonnet-4-6"
 
 echo "Starting Claude agent (mode=${MODE}, model=${AGENT_MODEL})..."
 EXIT_CODE=0
+# Wait indefinitely for background tasks (the story-complete / fix-pr review team
+# runs qa-test-runner etc. as background Task tool invocations). The CLI default
+# ceiling is 600s, which terminated agents mid-validation on slow-validation
+# stories (security + fleet-e2e suites) BEFORE PR creation/commit, silently
+# dropping completed work (#2173, #2176, #2177 — dev and fix-pr agents alike).
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
 # Read prompt from file to avoid shell metacharacter corruption.
 # Issue/PR bodies contain backticks and $ in code blocks which break heredoc expansion.
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
