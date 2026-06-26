@@ -73,8 +73,8 @@ RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1 \
 # fetched at install time and can be tampered with). See
 # docs/runbooks/trivy-rollback.md for rollback procedure.
 RUN set -eu; \
-    TRIVY_VERSION='v0.71.0'; \
-    TRIVY_SHA256='30a3d22b23f88c233f1658f562fb477cae3b3e8b4761109d515b7698daf85814'; \
+    TRIVY_VERSION='v0.71.2'; \
+    TRIVY_SHA256='0510e71e2fd39bf863856d499c8dc19feb4e7336546394c502a8f5cc7ab27460'; \
     ARCHIVE="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"; \
     curl -sSfL -o "/tmp/${ARCHIVE}" \
       "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/${ARCHIVE}"; \
