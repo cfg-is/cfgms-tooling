@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Agent container entrypoint: restore creds, fetch issue, run Claude, update labels.
-# Supports three modes: issue (default), branch, and pr-fix.
+# Supports four modes: issue (default), branch, pr-fix, and resolve-conflict.
 set -euo pipefail
 
 # Helper library for prompt context assembly (fetch_* / render_* / no-op detection).
@@ -26,10 +26,11 @@ DRY_RUN=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --branch)  [[ $# -ge 2 ]] || { echo "ERROR: --branch requires a value"; exit 1; }; MODE="branch"; BRANCH="$2"; shift 2 ;;
-        --issue)   [[ $# -ge 2 ]] || { echo "ERROR: --issue requires a value"; exit 1; }; ISSUE_NUM="$2"; shift 2 ;;
-        --fix-pr)  [[ $# -ge 2 ]] || { echo "ERROR: --fix-pr requires a value"; exit 1; }; MODE="fix-pr"; PR_NUM="$2"; shift 2 ;;
-        --dry-run) DRY_RUN="true"; shift ;;
+        --branch)           [[ $# -ge 2 ]] || { echo "ERROR: --branch requires a value"; exit 1; }; MODE="branch"; BRANCH="$2"; shift 2 ;;
+        --issue)            [[ $# -ge 2 ]] || { echo "ERROR: --issue requires a value"; exit 1; }; ISSUE_NUM="$2"; shift 2 ;;
+        --fix-pr)           [[ $# -ge 2 ]] || { echo "ERROR: --fix-pr requires a value"; exit 1; }; MODE="fix-pr"; PR_NUM="$2"; shift 2 ;;
+        --resolve-conflict) [[ $# -ge 2 ]] || { echo "ERROR: --resolve-conflict requires a value"; exit 1; }; MODE="resolve-conflict"; PR_NUM="$2"; shift 2 ;;
+        --dry-run)          DRY_RUN="true"; shift ;;
         *)
             if [[ "$1" =~ ^[0-9]+$ ]]; then
                 ISSUE_NUM="$1"; shift
@@ -73,6 +74,13 @@ case "$MODE" in
             echo "ERROR: PR-fix mode requires --fix-pr <PR_NUM>"
             exit 1
         fi
+        ;;
+    resolve-conflict)
+        if [[ -z "$PR_NUM" ]]; then
+            echo "ERROR: Resolve-conflict mode requires --resolve-conflict <PR_NUM>"
+            exit 1
+        fi
+        [[ "$PR_NUM" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${PR_NUM}"; exit 1; }
         ;;
 esac
 
@@ -589,18 +597,127 @@ PROMPT_EOF
     printf '%s\n' "$FOLLOW_UP_ISSUES_SECTION" >> "$PROMPT_FILE"
 }
 
+compose_resolve_conflict_prompt() {
+    echo "Fetching PR #${PR_NUM} metadata for conflict resolution..."
+    local pr_json
+    pr_json=$(gh_api_with_retry "fetch PR #${PR_NUM}" gh pr view "$PR_NUM" \
+        --repo cfg-is/cfgms \
+        --json number,title,headRefName,body,headRepositoryOwner 2>/dev/null) || {
+        echo "ERROR: Cannot fetch PR #${PR_NUM} for conflict resolution"
+        exit 1
+    }
+
+    local pr_title pr_branch
+    pr_title=$(echo "$pr_json" | jq -r '.title // ""')
+    pr_branch=$(echo "$pr_json" | jq -r '.headRefName // ""')
+
+    if [[ -z "$pr_branch" ]]; then
+        echo "ERROR: Could not determine PR branch from PR #${PR_NUM}"
+        exit 1
+    fi
+    BRANCH="$pr_branch"
+
+    PROMPT_FILE=$(mktemp)
+    printf 'You are resolving a rebase conflict on PR #%s: %s\n\n' "$PR_NUM" "$pr_title" > "$PROMPT_FILE"
+    cat >> "$PROMPT_FILE" <<PROMPT_EOF
+## PR Branch
+
+Branch: \`${pr_branch}\`
+
+## Context
+
+This PR's branch has merge conflicts with \`origin/develop\`. A plain
+\`rebase-pr.sh\` run returned \`REBASE_CONFLICT:${PR_NUM}\`. Your job is to
+resolve the conflict markers intelligently, validate the result, and push.
+
+## Instructions
+
+You are running inside an isolated container with --dangerously-skip-permissions.
+Branch \`${pr_branch}\` is already checked out. Follow CLAUDE.md conventions.
+CFGMS_AGENT_MODE=true is set.
+
+## Phase 1: Rebase and Resolve
+
+1. Run: \`git fetch origin develop\`
+2. Run: \`git rebase origin/develop\`
+3. For each conflict:
+   - Read BOTH sides carefully using \`git diff\` or the conflict markers
+   - Preserve ALL functionality from BOTH sides — do NOT silently drop any
+     test functions, validation checks, auth filters, or tenant guards
+   - Deduplicate helper functions that both sides added (keep one copy)
+   - Understand the intent of each side before merging
+4. After each file resolved: \`git add <resolved-file>\`
+5. Continue the rebase: \`git rebase --continue\`
+6. Repeat steps 3-5 until \`git rebase --continue\` completes without conflict
+
+## Phase 2: Validation (REQUIRED — do NOT skip)
+
+After rebase completes, run ALL of the following:
+
+\`\`\`bash
+go build ./...           # must exit 0
+go vet ./...             # must exit 0
+make test-commit         # runs tests + security + lint
+\`\`\`
+
+If ANY command fails:
+1. Abort the rebase: \`git rebase --abort\` (if still in progress)
+2. Post a comment on PR #${PR_NUM} with:
+   - The conflicting files
+   - The failure output (truncated to the first 50 lines)
+   - Why manual resolution is needed
+3. Exit WITHOUT pushing anything
+
+Example comment:
+\`\`\`bash
+gh pr comment ${PR_NUM} --repo cfg-is/cfgms --body "..."
+\`\`\`
+
+## Phase 3: Push (only after Phase 2 fully passes)
+
+\`\`\`bash
+git fetch origin ${pr_branch}   # refresh the lease reference
+git push --force-with-lease origin ${pr_branch}
+\`\`\`
+
+**Security constraints (enforced):**
+- ONLY push to \`${pr_branch}\` — never to \`develop\` or any other shared branch
+- Use \`--force-with-lease\`, never bare \`--force\`
+- \`git fetch origin ${pr_branch}\` immediately before the push (refreshes the lease)
+- One attempt only — do NOT loop on failure
+
+## Phase 4: Report
+
+Post a comment on PR #${PR_NUM} summarizing:
+- Which files had conflicts and how they were resolved
+- What validation was run and that it passed
+- That the branch has been force-pushed and is ready for re-review
+
+## Failure Handling
+
+If rebase fails (e.g., the conflict is too complex to resolve safely):
+- Abort: \`git rebase --abort\`
+- Post the failure summary on PR #${PR_NUM} explaining what failed
+- Exit non-zero (the PO cycle will surface this for human triage)
+- Do NOT push partial or unvalidated changes
+
+PROMPT_EOF
+    printf '%s\n\n' "$SCOPE_CONSTRAINTS_SECTION" >> "$PROMPT_FILE"
+}
+
 # Hard refusal: issue and branch modes must source content from Projects V2.
-# fix-pr reads PR review comments gated by repo write access — a separate surface.
-if [[ "$MODE" != "fix-pr" ]] && [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
+# fix-pr and resolve-conflict read PR content gated by repo write access — separate surfaces.
+if [[ "$MODE" != "fix-pr" ]] && [[ "$MODE" != "resolve-conflict" ]] && [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
     echo "ERROR: CFGMS_PROJECT_ITEM_ID must be set — no fallback to gh issue view" >&2
     exit 1
 fi
 
 # Compose prompt based on mode
 case "$MODE" in
-    issue)    compose_issue_prompt ;;
-    branch)   compose_branch_prompt ;;
-    fix-pr)   compose_pr_fix_prompt ;;
+    issue)             compose_issue_prompt ;;
+    branch)            compose_branch_prompt ;;
+    fix-pr)            compose_pr_fix_prompt ;;
+    resolve-conflict)  compose_resolve_conflict_prompt ;;
 esac
 
 if [ "$DRY_RUN" = "true" ]; then
@@ -658,8 +775,8 @@ fi
 # In fix-pr mode, a run that exits 0 but never advanced HEAD is a silent no-op.
 # The make test-agent-complete fallback would pass trivially on unchanged code,
 # masking the failure. Detect the no-op first and skip the fallback entirely.
-if [[ "$MODE" == "fix-pr" ]] && [ "$EXIT_CODE" -eq 0 ] && [ "$HEAD_ADVANCED" != "true" ]; then
-    echo "ERROR: fix-pr agent ran but made no commits (HEAD unchanged at ${PRE_FIX_HEAD})"
+if [[ "$MODE" == "fix-pr" || "$MODE" == "resolve-conflict" ]] && [ "$EXIT_CODE" -eq 0 ] && [ "$HEAD_ADVANCED" != "true" ]; then
+    echo "ERROR: ${MODE} agent ran but made no commits (HEAD unchanged at ${PRE_FIX_HEAD})"
     echo "Skipping make test-agent-complete fallback (would pass trivially on unchanged code)."
     EXIT_CODE=1
     # Best-effort idempotent breadcrumb on the PR.
@@ -751,7 +868,7 @@ if [ "$EXIT_CODE" -eq 0 ]; then
 else
     echo "Agent failed with exit code ${EXIT_CODE}"
 
-    if [[ "$MODE" != "fix-pr" ]] && [ -z "$PR_URL" ]; then
+    if [[ "$MODE" != "fix-pr" ]] && [[ "$MODE" != "resolve-conflict" ]] && [ -z "$PR_URL" ]; then
         if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
             # Agent produced work but failed — capture it as a draft PR so the
             # cron's resume_failed_session path can pick it up.

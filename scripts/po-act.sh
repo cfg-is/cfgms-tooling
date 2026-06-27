@@ -8,6 +8,7 @@
 #   dispatch <STORY_NUM>            Fresh story: claim (Ready->In Progress) + check-conflicts + clone + launch
 #   claim <ITEM_ID>                 Claim a Ready story (Ready->In Progress) for in-session work; CLAIMED/CLAIM_LOST
 #   dispatch-fix <PR_NUM>           Fix cycle: remove stale container + clone-pr + launch
+#   resolve-conflict <PR_NUM>       Conflict resolution: author-gate + clone-pr + launch resolve-conflict agent
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
 #   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
@@ -300,6 +301,27 @@ except Exception: print('')" 2>/dev/null || echo "")
     "$DISPATCH" create-clone-pr "$pr" | tail -1
     "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/pr-fix-${pr}" --fix-pr "$pr" | tail -1
     echo "DISPATCHED_FIX:$pr"
+    ;;
+
+  resolve-conflict)
+    pr="${1:?PR number required}"
+    [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 1; }
+    container="cfg-agent-resolve-conflict-${pr}"
+    # Subcommand-level author gate (defense in depth — must run before any
+    # clone/fetch/checkout/launch). Uses #1786's permission-level helper
+    # (push/maintain/admin). The interim authorAssociation check was replaced
+    # once #1786 landed; this subcommand-level assertion stays regardless.
+    if ! "$DISPATCH" check-pr-author "$pr"; then
+      echo "RESOLVE_CONFLICT_REFUSED:${pr}:external_author"
+      exit 3
+    fi
+    # Remove any stale exited container from a previous attempt
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    # Remove any stale worktree directory (separate namespace from pr-fix-<PR>)
+    rm -rf "${WORKTREE_BASE}/resolve-conflict-${pr}" 2>/dev/null || true
+    "$DISPATCH" create-clone-pr --dest-prefix "resolve-conflict-" "$pr" | tail -1
+    "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/resolve-conflict-${pr}" --resolve-conflict "$pr" | tail -1
+    echo "DISPATCHED_RESOLVE_CONFLICT:${pr}"
     ;;
 
   close-merged)

@@ -655,9 +655,20 @@ case "$cmd" in
     ;;
 
   create-clone-pr)
+    # Optional --dest-prefix <PREFIX> flag (default: "pr-fix-") lets callers
+    # land the clone in a distinct namespace (e.g. "resolve-conflict-" for the
+    # resolve-conflict agent so it never collides with a simultaneous fix-pr
+    # container on the same PR).
+    dest_prefix="pr-fix-"
+    while [[ $# -gt 0 && "$1" == --* ]]; do
+      case "$1" in
+        --dest-prefix) dest_prefix="${2:?--dest-prefix requires a value}"; shift 2 ;;
+        *) echo "Unknown flag for create-clone-pr: $1"; exit 1 ;;
+      esac
+    done
     [[ $# -eq 1 ]] || { echo "create-clone-pr requires exactly one PR number"; exit 1; }
     pr_num="$1"
-    dest="${WORKTREE_BASE}/pr-fix-${pr_num}"
+    dest="${WORKTREE_BASE}/${dest_prefix}${pr_num}"
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
     # Fetch all PR metadata in one call (author gate + branch + body).
@@ -699,7 +710,7 @@ case "$cmd" in
     git checkout "$pr_branch"
     trap - ERR
 
-    echo "CLONE_OK:pr-fix-${pr_num}:${pr_branch}:issue=${issue_num:-none}"
+    echo "CLONE_OK:${dest_prefix}${pr_num}:${pr_branch}:issue=${issue_num:-none}"
     ;;
 
   launch)
@@ -774,9 +785,10 @@ case "$cmd" in
     extra_labels=()
     for i in "${!entrypoint_args[@]}"; do
       case "${entrypoint_args[$i]}" in
-        --fix-pr) mode_label="fix-pr"; fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
-        --branch) extra_labels+=(--label "branch=${entrypoint_args[$((i+1))]}") ;;
-        --issue)  extra_labels+=(--label "issue=${entrypoint_args[$((i+1))]}") ;;
+        --fix-pr)          mode_label="fix-pr";          fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
+        --resolve-conflict) mode_label="resolve-conflict";                                           extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
+        --branch)          extra_labels+=(--label "branch=${entrypoint_args[$((i+1))]}") ;;
+        --issue)           extra_labels+=(--label "issue=${entrypoint_args[$((i+1))]}") ;;
       esac
     done
 
@@ -1163,6 +1175,8 @@ else:
     clone_dir=""
     if [[ "$container_name" =~ ^cfg-agent-pr-fix-(.+)$ ]]; then
       clone_dir="${WORKTREE_BASE}/pr-fix-${BASH_REMATCH[1]}"
+    elif [[ "$container_name" =~ ^cfg-agent-resolve-conflict-(.+)$ ]]; then
+      clone_dir="${WORKTREE_BASE}/resolve-conflict-${BASH_REMATCH[1]}"
     elif [[ "$container_name" =~ ^cfg-agent-branch-(.+)$ ]]; then
       clone_dir="${WORKTREE_BASE}/${BASH_REMATCH[1]}"
     elif [[ "$container_name" =~ ^cfg-agent-interactive-(.+)$ ]]; then

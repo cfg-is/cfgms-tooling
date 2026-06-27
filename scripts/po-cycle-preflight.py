@@ -1272,7 +1272,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
         if pr.get("is_external") and not pr.get("is_released"):
             recs.append({
                 "pr": pr["pr"],
-                "story": pr["story_number"],  # always None for external PRs (AC4)
+                "story": pr["story_number"],  # always None for external PRs (#1786 AC4)
                 "action": "skip",
                 "reason": (
                     f"external-author PR quarantined (author: {pr.get('author_login') or 'unknown'}) — "
@@ -1317,7 +1317,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "rebase",
-                "reason": "mergeStateStatus=DIRTY (conflicts with develop) — run `./.claude/scripts/rebase-pr.sh <PR>`; if it returns REBASE_CONFLICT, escalate to dispatch-fix",
+                "reason": "mergeStateStatus=DIRTY (conflicts with develop) — run `./.claude/scripts/rebase-pr.sh <PR>`; if it returns REBASE_CONFLICT, escalate to resolve-conflict",
             })
             continue
         if not in_queue and ms == "BEHIND" and pr.get("auto_merge_enabled"):
@@ -1376,6 +1376,36 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
             continue
 
         if pr["has_acceptance_review_comment"]:
+            # AC4 (Issue #1977): a new commit landed AFTER a passing review invalidates
+            # the verdict — the reviewer has not seen the new code (e.g. a
+            # resolve-conflict rebase). Route to re-review so the trust chain is
+            # closed. This check runs before the enqueue_merge path so a
+            # prior-PASS PR is never enqueued without a re-review of the new head.
+            if verdict == "pass" and fix_landed_after_review(pr):
+                if overall == "green":
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "spawn_acceptance_reviewer",
+                        "reason": "commit landed after review PASS — prior verdict invalidated; re-review required before enqueue",
+                    })
+                elif overall == "pending":
+                    pending = pr["ci_summary"]["pending_checks"][:3]
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "defer",
+                        "reason": f"commit landed after review PASS; CI re-running: {', '.join(pending)} — re-review once CI completes",
+                    })
+                else:
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "skip",
+                        "reason": "commit landed after review PASS but CI is red — fix cycle owns this before re-review",
+                    })
+                continue
+
             # Review passed (or verdict unparseable). Flag as stuck if CI green
             # + mergeable but not in queue and not already auto-merge-enabled.
             if (
@@ -2032,11 +2062,18 @@ def main():
     )
     # Pull the active fix-agent set out of running_containers so the review
     # recommender can skip rebase/dispatch-fix work for any PR with an
-    # in-flight fix container. Container name pattern: cfg-agent-pr-fix-<PR>.
+    # in-flight fix or resolve-conflict container. Container name patterns:
+    #   cfg-agent-pr-fix-<PR>         — fix-pr agent (Issue #1786)
+    #   cfg-agent-resolve-conflict-<PR> — conflict-resolution agent (Issue #1977)
+    # Both push to the PR branch and must not race with a rebase or second dispatch.
     active_fix_pr_nums = set()
     for name in containers or []:
         if name.startswith("cfg-agent-pr-fix-"):
             tail = name.removeprefix("cfg-agent-pr-fix-")
+            if tail.isdigit():
+                active_fix_pr_nums.add(int(tail))
+        elif name.startswith("cfg-agent-resolve-conflict-"):
+            tail = name.removeprefix("cfg-agent-resolve-conflict-")
             if tail.isdigit():
                 active_fix_pr_nums.add(int(tail))
     # Story numbers with project status Blocked — their PRs are fenced off from
