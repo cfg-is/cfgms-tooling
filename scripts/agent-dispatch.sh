@@ -325,6 +325,90 @@ refresh_creds_from_host() {
     || echo "WARN: Failed to refresh credentials from host"
 }
 
+# ---------------------------------------------------------------------------
+# External-author trust gate helpers (Issue #1786)
+# ---------------------------------------------------------------------------
+
+# _check_author_permission <login> [<pr_num>] [<pr_labels_newline_separated>]
+# Classifies a PR author as "internal" or "external:<reason>".
+# Trusts only push/maintain/admin collaborators (fail-closed on any API error).
+# When external and the release marker human-reviewed:ok is present (and was
+# applied by a push+ actor), returns "internal" (PR has been released).
+#
+# Test hooks (all env vars, only active when set):
+#   CFGMS_TEST_COLLAB_PERM   — override the author's permission lookup
+#   CFGMS_TEST_ACTOR_LOGIN   — override the GraphQL actor-login lookup (set to
+#                              empty to simulate "no actor found"; use +x check)
+#   CFGMS_TEST_ACTOR_PERM    — override the label-actor's permission lookup;
+#                              falls back to CFGMS_TEST_COLLAB_PERM if unset
+_check_author_permission() {
+  local login="$1"
+  local pr_num="${2:-}"
+  local pr_labels_str="${3:-}"
+
+  if [[ -z "$login" ]]; then
+    echo "external:null_author"
+    return 0
+  fi
+
+  local perm
+  if [[ -n "${CFGMS_TEST_COLLAB_PERM:-}" ]]; then
+    perm="$CFGMS_TEST_COLLAB_PERM"
+  else
+    perm=$(gh api "repos/cfg-is/cfgms/collaborators/${login}/permission" \
+      --jq '.permission // ""' 2>/dev/null || echo "")
+  fi
+
+  if [[ "$perm" == "push" || "$perm" == "maintain" || "$perm" == "admin" ]]; then
+    echo "internal"
+    return 0
+  fi
+
+  # External author — check for a valid human-reviewed:ok release marker (AC5).
+  # Only the label presence is checked here; actor affiliation is verified below.
+  if [[ -n "$pr_num" ]] && echo "$pr_labels_str" | grep -qx "human-reviewed:ok" 2>/dev/null; then
+    local actor_login
+    if [[ -n "${CFGMS_TEST_ACTOR_LOGIN+x}" ]]; then
+      actor_login="${CFGMS_TEST_ACTOR_LOGIN}"
+    else
+      local tl_gql
+      tl_gql="query { repository(owner: \"cfg-is\", name: \"cfgms\") { pullRequest(number: ${pr_num}) { timelineItems(itemTypes: [LABELED_EVENT], first: 50) { nodes { ... on LabeledEvent { label { name } actor { login } } } } } } }"
+      actor_login=$(gh api graphql -f "query=${tl_gql}" \
+        --jq '[.data.repository.pullRequest.timelineItems.nodes[] | select(.label.name == "human-reviewed:ok") | .actor.login] | last // ""' \
+        2>/dev/null || echo "")
+    fi
+    if [[ -n "$actor_login" ]]; then
+      local actor_perm
+      if [[ -n "${CFGMS_TEST_ACTOR_PERM+x}" ]]; then
+        actor_perm="${CFGMS_TEST_ACTOR_PERM}"
+      elif [[ -n "${CFGMS_TEST_COLLAB_PERM:-}" ]]; then
+        actor_perm="$CFGMS_TEST_COLLAB_PERM"
+      else
+        actor_perm=$(gh api "repos/cfg-is/cfgms/collaborators/${actor_login}/permission" \
+          --jq '.permission // ""' 2>/dev/null || echo "")
+      fi
+      if [[ "$actor_perm" == "push" || "$actor_perm" == "maintain" || "$actor_perm" == "admin" ]]; then
+        echo "internal"  # Released by push+ collaborator (AC5)
+        return 0
+      fi
+    fi
+  fi
+
+  echo "external:${perm:-api_error}"
+  return 0
+}
+
+# _post_quarantine_comment <pr_num> <author_login>
+# Posts a best-effort quarantine notice on the PR. Idempotent (duplicate comments
+# are harmless). Uses || true so a failed comment never aborts the caller.
+_post_quarantine_comment() {
+  local pr_num="$1"
+  local author_login="${2:-unknown}"
+  gh pr comment "$pr_num" --repo cfg-is/cfgms \
+    --body "**External-author PR quarantined.** Author \`${author_login}\` is not a trusted (\`push\`/\`maintain\`/\`admin\`) repository collaborator. The autonomous pipeline will not fetch, review, rebase, fix, or merge this PR until a maintainer applies the \`human-reviewed:ok\` label (verified to push+ actor). See \`docs/development/external-contributors.md\` for the contributor triage and release process." \
+    2>/dev/null || true
+}
+
 # Gate on credential validity before launching any agent container.
 # Threshold: 30 minutes (raised from 15; a 401 was observed at 27 min remaining).
 # Sets CFGMS_TEST_CREDS_STATUS to inject a synthetic result in hermetic tests.
@@ -576,14 +660,30 @@ case "$cmd" in
     dest="${WORKTREE_BASE}/pr-fix-${pr_num}"
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
-    # Get branch from PR
-    pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null) || {
-      echo "ERROR: Failed to get branch for PR #${pr_num}"
+    # Fetch all PR metadata in one call (author gate + branch + body).
+    pr_meta_fix=$(gh pr view "$pr_num" --json headRefName,body,labels,author 2>/dev/null) || {
+      echo "ERROR: Failed to get metadata for PR #${pr_num}"
       exit 1
     }
+    pr_branch=$(echo "$pr_meta_fix" | jq -r '.headRefName // empty')
+    pr_body=$(echo "$pr_meta_fix" | jq -r '.body // ""')
+    pr_labels_fix=$(echo "$pr_meta_fix" | jq -r '.labels[].name')
+    pr_author_login=$(echo "$pr_meta_fix" | jq -r '.author.login // empty')
 
-    # Extract issue number from PR body
-    pr_body=$(gh pr view "$pr_num" --json body -q '.body' 2>/dev/null || echo "")
+    if [[ -z "$pr_branch" ]]; then
+      echo "ERROR: Failed to get branch for PR #${pr_num}"
+      exit 1
+    fi
+
+    # External-author gate (Issue #1786): check trust BEFORE git clone/fetch of PR content.
+    author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels_fix")
+    if [[ "$author_trust" != "internal" ]]; then
+      _post_quarantine_comment "$pr_num" "$pr_author_login"
+      echo "FIX_REFUSED:${pr_num}:external_author_${pr_author_login}:${author_trust}"
+      exit 3
+    fi
+
+    # Extract issue number from body or branch name.
     issue_num=$(echo "$pr_body" | grep -oP 'Fixes #\K[0-9]+' | head -1 || true)
     if [[ -z "$issue_num" ]] && [[ "$pr_branch" =~ story-([0-9]+) ]]; then
       issue_num="${BASH_REMATCH[1]}"
@@ -1249,7 +1349,7 @@ else:
 
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
-      --json state,headRefName,body,labels,headRepositoryOwner 2>/dev/null) || {
+      --json state,headRefName,body,labels,headRepositoryOwner,author 2>/dev/null) || {
       echo "REVIEW_REFUSED:${pr_num}:pr_not_found"
       exit 3
     }
@@ -1258,6 +1358,7 @@ else:
     fork_owner=$(echo "$pr_meta" | jq -r '.headRepositoryOwner.login // empty')
     pr_body=$(echo "$pr_meta" | jq -r '.body // ""')
     pr_labels=$(echo "$pr_meta" | jq -r '.labels[].name')
+    pr_author_login=$(echo "$pr_meta" | jq -r '.author.login // empty')
 
     if [[ "$state" != "OPEN" ]]; then
       echo "REVIEW_REFUSED:${pr_num}:pr_state_${state}"
@@ -1267,6 +1368,16 @@ else:
       echo "REVIEW_REFUSED:${pr_num}:fork_branch_${fork_owner}"
       exit 3
     fi
+
+    # External-author gate (Issue #1786): check trust BEFORE any git fetch/checkout.
+    # Fail-closed: null/empty author or any API error → external.
+    author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels")
+    if [[ "$author_trust" != "internal" ]]; then
+      _post_quarantine_comment "$pr_num" "$pr_author_login"
+      echo "REVIEW_REFUSED:${pr_num}:external_author_${pr_author_login}:${author_trust}"
+      exit 3
+    fi
+
     validate_branch "$pr_branch"
 
     # Resolve story/item from the branch (authoritative) or, for legacy
@@ -1632,6 +1743,38 @@ PROMPT_EOF
     done
 
     echo "CLEANUP_STALE_DONE:cleaned=${cleaned}"
+    ;;
+
+  check-pr-author)
+    # Public API used by po-act.sh (Issue #1786).
+    # check-pr-author <PR_NUM>
+    # Exits 0 (internal) or 3 (external/quarantined).
+    [[ $# -eq 1 ]] || { echo "check-pr-author requires exactly one PR number"; exit 1; }
+    _cpa_pr="$1"
+    _cpa_meta=$(gh pr view "$_cpa_pr" --json author,labels 2>/dev/null) || {
+      echo "AUTHOR_CHECK_ERROR:${_cpa_pr}:api_error"
+      exit 3
+    }
+    _cpa_login=$(echo "$_cpa_meta" | jq -r '.author.login // empty')
+    _cpa_labels=$(echo "$_cpa_meta" | jq -r '.labels[].name')
+    _cpa_trust=$(_check_author_permission "$_cpa_login" "$_cpa_pr" "$_cpa_labels")
+    if [[ "$_cpa_trust" == "internal" ]]; then
+      echo "AUTHOR_TRUSTED:${_cpa_pr}:${_cpa_login}"
+      exit 0
+    else
+      _post_quarantine_comment "$_cpa_pr" "$_cpa_login"
+      echo "AUTHOR_EXTERNAL:${_cpa_pr}:${_cpa_login}:${_cpa_trust}"
+      exit 3
+    fi
+    ;;
+
+  _test-check-author)
+    # Hidden test hook for review_pr_detection.test.sh (Issue #1786).
+    # _test-check-author <login> [<pr_num>] [<pr_labels_newline_separated>]
+    # Calls _check_author_permission with the supplied args and prints result.
+    # Test hooks: CFGMS_TEST_COLLAB_PERM, CFGMS_TEST_ACTOR_LOGIN, CFGMS_TEST_ACTOR_PERM.
+    [[ $# -ge 1 ]] || { echo "_test-check-author requires <login> [<pr_num>] [<pr_labels>]"; exit 1; }
+    _check_author_permission "${1}" "${2:-}" "${3:-}"
     ;;
 
   _test-resolve-pr)

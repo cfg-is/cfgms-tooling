@@ -50,6 +50,9 @@ BARE_PATH_RE = re.compile(
 )
 BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)")
 
+# Permission levels that indicate a trusted (first-party) collaborator.
+_TRUSTED_PERMS = frozenset({"push", "maintain", "admin"})
+
 # Execution-environment routing. A story declares the environment it must run in
 # via a `## Environment` body section and/or a `needs-<env>` GitHub label; a host
 # declares the environments it can serve via CFGMS_PO_HOST_CAPS. The default for
@@ -107,6 +110,10 @@ CACHE_FILE_NAME = "preflight.json"
 # regress back to per-issue / per-PR fan-out.
 _GH_CALL_COUNT = 0
 
+# Per-cycle collaborator permission cache. Key: login (str), value: permission
+# string or None (None = API failure / 404 / unknown → treated as external).
+_perm_cache: dict = {}
+
 
 def gh_graphql_tolerant(query):
     """Run a GraphQL query that may produce partial errors (e.g. mixed-type
@@ -151,6 +158,75 @@ def gh(*args, check=True):
         return json.loads(result.stdout)
     except json.JSONDecodeError:
         return result.stdout
+
+
+def _collab_permission(login):
+    """Return collaborator permission level for a login, or None on any failure.
+
+    Permission levels GitHub returns: 'admin', 'maintain', 'push', 'triage',
+    'read', 'none'.  A non-affirmative outcome (404, 403, 5xx, timeout, JSON
+    error) returns None — callers treat None as external (fail-closed).
+
+    Test hook: set CFGMS_TEST_COLLAB_PERM_MAP to a JSON object {"login": "perm"}.
+    Logins absent from the map return None (simulates 404).
+
+    Cached per module lifetime (one Python process = one preflight cycle).
+    """
+    global _GH_CALL_COUNT, _perm_cache
+    if login in _perm_cache:
+        return _perm_cache[login]
+
+    test_map_env = os.environ.get("CFGMS_TEST_COLLAB_PERM_MAP")
+    if test_map_env is not None:
+        try:
+            test_map = json.loads(test_map_env)
+            perm = test_map.get(login)  # None if absent → simulates 404
+        except (json.JSONDecodeError, TypeError):
+            perm = None
+        _perm_cache[login] = perm
+        return perm
+
+    _GH_CALL_COUNT += 1
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/cfg-is/cfgms/collaborators/{login}/permission",
+             "--jq", ".permission"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=15,
+        )
+        perm = result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+    except Exception:
+        perm = None
+    _perm_cache[login] = perm
+    return perm
+
+
+def is_external(login):
+    """Return True if the login is NOT a trusted (push+/maintain/admin) collaborator.
+
+    Fails closed: null/empty login, deleted/ghost accounts, API errors, 403/404,
+    and any non-affirmative permission outcome all resolve to True (external).
+    This is the single source of truth for author-trust classification (Issue #1786).
+    """
+    if not login or not str(login).strip():
+        return True  # null/empty login = ghost/deleted account = external
+    perm = _collab_permission(str(login).strip())
+    return perm not in _TRUSTED_PERMS
+
+
+def _release_marker_actor_login(timeline_items):
+    """Return the actor login of the most recent 'human-reviewed:ok' LABELED_EVENT.
+
+    GitHub returns timeline items in chronological order; iterating to the last
+    matching item gives the most recent applicant of the release label.
+    Returns empty string if no matching event is found.
+    """
+    actor = ""
+    for item in (timeline_items or []):
+        label_name = ((item.get("label") or {}).get("name")) or ""
+        if label_name == "human-reviewed:ok":
+            actor = ((item.get("actor") or {}).get("login")) or ""
+    return actor
 
 
 PARENT_EPIC_RE = re.compile(r"Parent epic:\s*#(\d+)", re.IGNORECASE)
@@ -216,6 +292,17 @@ query {
         mergeable
         mergeStateStatus
         autoMergeRequest { enabledAt }
+        author { login }
+        labels(first: 20) { nodes { name } }
+        timelineItems(itemTypes: [LABELED_EVENT], first: 20) {
+          nodes {
+            ... on LabeledEvent {
+              createdAt
+              label { name }
+              actor { login }
+            }
+          }
+        }
         comments(first: 30) { nodes { author { login } body createdAt } }
         commits(last: 1) {
           nodes {
@@ -286,6 +373,9 @@ query {
             "mergeable": n.get("mergeable"),
             "mergeStateStatus": n.get("mergeStateStatus"),
             "autoMergeRequest": n.get("autoMergeRequest"),
+            "author_login": ((n.get("author") or {}).get("login")) or "",
+            "labels": ((n.get("labels") or {}).get("nodes")) or [],
+            "timeline_items": ((n.get("timelineItems") or {}).get("nodes")) or [],
             "comments": ((n.get("comments") or {}).get("nodes")) or [],
             "statusCheckRollup": _normalize_status_check_rollup(rollup),
             "latest_commit_date": latest_commit_date,
@@ -1172,6 +1262,27 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
             })
             continue
 
+        # PRIORITY 0.55: external-author PR quarantine (Issue #1786).
+        # A PR whose author is not a push+/maintain/admin collaborator must never
+        # be rebased, reviewed, fixed, or enqueued by the autonomous pipeline.
+        # Applies BEFORE the draft/blocked check so an external draft still gets
+        # the quarantine reason, not the founder-managed reason.
+        # Exception: a validly-released PR (human-reviewed:ok applied by push+
+        # actor) is cleared and proceeds through the normal pipeline.
+        if pr.get("is_external") and not pr.get("is_released"):
+            recs.append({
+                "pr": pr["pr"],
+                "story": pr["story_number"],  # always None for external PRs (AC4)
+                "action": "skip",
+                "reason": (
+                    f"external-author PR quarantined (author: {pr.get('author_login') or 'unknown'}) — "
+                    "pipeline will not fetch, review, or merge until a maintainer applies "
+                    "the human-reviewed:ok label (verified to push+ actor). "
+                    "See docs/development/external-contributors.md for release process."
+                ),
+            })
+            continue
+
         # PRIORITY 0.6: founder-managed / fenced-off PRs. A draft PR that is NOT
         # a wip_session_failed resume is manual work in progress; a PR whose
         # linked story has project status Blocked was deliberately removed from
@@ -1473,6 +1584,78 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
             "reason": f"Fix-status story with open PR (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
         })
     return recs
+
+
+def _build_pr_summaries(prs):
+    """Build pr_summaries from raw PR nodes (Phase 4 of the preflight cycle).
+
+    Each summary includes author trust signals (is_external, is_released) and
+    story_number (None when author is external — defeats branch-name impersonation).
+
+    Extracted as a standalone function so it is unit-testable without mocking
+    the full main() flow (Issue #1786 — external-author gating).
+    """
+    summaries = []
+    for pr in prs:
+        head = pr.get("headRefName", "")
+        title = pr.get("title", "")
+        body = pr.get("body") or ""
+
+        # Author trust classification (fail-closed).
+        author_login = pr.get("author_login", "")
+        pr_is_external = is_external(author_login)
+
+        # Release marker: human-reviewed:ok label present AND applied by push+ actor.
+        labels = pr.get("labels", [])
+        pr_label_names = {
+            (l.get("name") if isinstance(l, dict) else l) or ""
+            for l in labels
+        }
+        pr_is_released = False
+        if "human-reviewed:ok" in pr_label_names:
+            actor_login = _release_marker_actor_login(pr.get("timeline_items", []))
+            if actor_login and not is_external(actor_login):
+                pr_is_released = True
+
+        # story_number only assigned to internal-author PRs.
+        # An external author naming their branch feature/story-N-agent gains no
+        # pipeline trust from the branch name (impersonation defeated — AC4).
+        story_number = None
+        if not pr_is_external:
+            m = BRANCH_STORY_RE.match(head)
+            if m and m.group(1) and m.group(1).isdigit():
+                story_number = int(m.group(1))
+
+        comments = pr.get("comments") or []
+        has_review_comment = any(is_trusted_review_comment(c) for c in comments)
+        review_verdict_val, review_comment_date = latest_review(comments)
+        is_draft = bool(pr.get("isDraft"))
+        wip_session_failed = is_draft and (
+            body.startswith("Agent session failed with exit code")
+            or (title.startswith("WIP:") and title.endswith("(agent failed)"))
+        )
+
+        summaries.append({
+            "pr": pr["number"],
+            "title": title,
+            "head_ref": head,
+            "author_login": author_login,
+            "is_external": pr_is_external,
+            "is_released": pr_is_released,
+            "story_number": story_number,
+            "comment_count": len(comments),
+            "has_acceptance_review_comment": has_review_comment,
+            "latest_review_verdict": review_verdict_val,
+            "latest_review_comment_date": review_comment_date,
+            "latest_commit_date": pr.get("latest_commit_date"),
+            "is_draft": is_draft,
+            "wip_session_failed": wip_session_failed,
+            "merge_state_status": pr.get("mergeStateStatus"),
+            "mergeable": pr.get("mergeable"),
+            "auto_merge_enabled": pr.get("autoMergeRequest") is not None,
+            "ci_summary": ci_summary(pr.get("statusCheckRollup") or []),
+        })
+    return summaries
 
 
 def main():
@@ -1795,46 +1978,42 @@ def main():
         if s.get("number") is not None and s["number"] in pr_story_nums and s["number"] not in in_progress_nums
     ]
 
-    # Phase 4: PR summaries
-    pr_summaries = []
-    for pr in prs:
-        head = pr.get("headRefName", "")
-        m = BRANCH_STORY_RE.match(head)
-        if m and m.group(1) and m.group(1).isdigit():
-            story_number = int(m.group(1))
-        else:
-            story_number = None
-        comments = pr.get("comments") or []
-        has_review_comment = any(is_trusted_review_comment(c) for c in comments)
-        review_verdict_val, review_comment_date = latest_review(comments)
-        body = pr.get("body") or ""
-        title = pr.get("title", "")
-        is_draft = bool(pr.get("isDraft"))
-        # Detect WIP draft PRs created by .devcontainer/entrypoint.sh on agent
-        # session failure (token reauth, token-limit truncation, etc.). The
-        # entrypoint pushes draft PRs with the literal markers below.
-        wip_session_failed = is_draft and (
-            body.startswith("Agent session failed with exit code")
-            or title.startswith("WIP:") and title.endswith("(agent failed)")
-        )
-        pr_summaries.append({
-            "pr": pr["number"],
-            "title": title,
-            "head_ref": head,
-            "story_number": story_number,
-            "comment_count": len(comments),
-            "has_acceptance_review_comment": has_review_comment,
-            "latest_review_verdict": review_verdict_val,
-            "latest_review_comment_date": review_comment_date,
-            "latest_commit_date": pr.get("latest_commit_date"),
-            "is_draft": is_draft,
-            "wip_session_failed": wip_session_failed,
-            "merge_state_status": pr.get("mergeStateStatus"),
-            "mergeable": pr.get("mergeable"),
-            "auto_merge_enabled": pr.get("autoMergeRequest") is not None,
-            "ci_summary": ci_summary(pr.get("statusCheckRollup") or []),
-        })
+    # Phase 3.5: pre-warm collaborator permission cache in parallel (Issue #1786).
+    # Resolve each unique PR author login once before Phase 4 processes pr_summaries,
+    # so all is_external() calls below are cache hits (no per-PR serial API calls).
+    unique_author_logins = {
+        pr.get("author_login", "")
+        for pr in prs
+        if pr.get("author_login")
+    }
+    if unique_author_logins:
+        with ThreadPoolExecutor(max_workers=min(len(unique_author_logins), 5)) as ex:
+            warmup_futures = {ex.submit(_collab_permission, login): login
+                              for login in unique_author_logins}
+            for fut in as_completed(warmup_futures):
+                try:
+                    fut.result()  # Result stored in _perm_cache by _collab_permission
+                except Exception as e:
+                    degraded_reasons.append(
+                        f"permission cache warmup failed for {warmup_futures[fut]!r}: {e}"
+                    )
+
+    # Phase 4: PR summaries (includes author trust classification — Issue #1786).
+    pr_summaries = _build_pr_summaries(prs)
     out["prs_open"] = pr_summaries
+
+    # Surface external-author PRs as a top-priority cron section (AC7).
+    out["external_prs"] = [
+        {
+            "pr": s["pr"],
+            "author_login": s.get("author_login", ""),
+            "head_ref": s.get("head_ref", ""),
+            "title": s.get("title", ""),
+            "is_released": s.get("is_released", False),
+        }
+        for s in pr_summaries
+        if s.get("is_external")
+    ]
 
     caps = host_caps()
     out["host_caps"] = sorted(caps)
@@ -1938,6 +2117,7 @@ def write_output(out, mode):
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
         },
         "host_caps": out.get("host_caps", [DEFAULT_ENV]),
+        "external_prs": out.get("external_prs", []),
         "windows_queue": out.get("windows_queue", []),
         "running_containers": out.get("running_containers", []),
         "merge_queue": out.get("merge_queue", []),

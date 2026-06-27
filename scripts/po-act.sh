@@ -26,9 +26,12 @@
 set -euo pipefail
 
 REPO="cfg-is/cfgms"
-WORKTREE_BASE="$(cd "$(dirname "$0")/../.." && pwd)/../worktrees"
-WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
-DISPATCH="$(dirname "$0")/agent-dispatch.sh"
+WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-}"
+if [[ -z "$WORKTREE_BASE" ]]; then
+  WORKTREE_BASE="$(cd "$(dirname "$0")/../.." && pwd)/../worktrees"
+  WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
+fi
+DISPATCH="${CFGMS_TEST_DISPATCH:-$(dirname "$0")/agent-dispatch.sh}"
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
 PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
 
@@ -285,6 +288,11 @@ except Exception: print('')" 2>/dev/null || echo "")
   dispatch-fix)
     pr="${1:?PR number required}"
     container="cfg-agent-pr-fix-${pr}"
+    # External-author gate (Issue #1786): refuse before touching any PR content.
+    if ! "$DISPATCH" check-pr-author "$pr"; then
+      echo "DISPATCH_FIX_REFUSED:${pr}:external_author"
+      exit 3
+    fi
     # Remove any stale exited container from a previous attempt
     docker rm -f "$container" >/dev/null 2>&1 || true
     # Remove any stale worktree directory
@@ -305,6 +313,13 @@ except Exception: print('')" 2>/dev/null || echo "")
   enqueue)
     pr="${1:?PR number required}"
     story="${2:-}"
+    # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
+    # Even if review-pr passed earlier, labels or collaborator status may have
+    # changed between review and merge. Fail-closed: refuse if not internal.
+    if ! "$DISPATCH" check-pr-author "$pr"; then
+      echo "ENQUEUE_REFUSED:${pr}:external_author"
+      exit 3
+    fi
     # If a story is provided, ensure the PR body contains a GitHub auto-close
     # keyword for that issue. Dev agents miss this ~85% of the time, leaving
     # orphan issues that stay open after the PR merges. Patching here is cheap
