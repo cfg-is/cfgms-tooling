@@ -18,6 +18,17 @@ set -euo pipefail
 
 PROMPT_FILE="/workspace/.acceptance-review-prompt.md"
 
+# Distributed-lease release (multi-host cron coordination). agent-dispatch.sh
+# review-pr acquired pr-<N> and passed it as CFGMS_LEASE_KEY; release it on exit
+# so whichever cron host comes back first can pick up the next phase (fix on
+# FAIL, or merge on PASS). TTL reclaim is the backstop if this container dies.
+release_cfgms_lease() {
+  [ -n "${CFGMS_LEASE_KEY:-}" ] || return 0
+  [ -f /workspace/scripts/pipeline-helper.sh ] || return 0
+  bash /workspace/scripts/pipeline-helper.sh lease-release "$CFGMS_LEASE_KEY" >/dev/null 2>&1 || true
+}
+trap release_cfgms_lease EXIT
+
 # --- Phase 0: Environment setup ---
 
 # Shared setup: firewall, credential symlinks, git config (idempotent).

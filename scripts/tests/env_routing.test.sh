@@ -11,6 +11,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Route lease calls to the hermetic mock so this test never touches real GitHub.
+export CFGMS_TEST_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh"
+# Bypass the resource admission gate so tests are deterministic on any host.
+export CFGMS_AGENT_CAPACITY_GATE=off
 PREFLIGHT="${SCRIPT_DIR}/../po-cycle-preflight.py"
 
 if [[ ! -f "${PREFLIGHT}" ]]; then

@@ -306,8 +306,7 @@ rm -rf "$tmpdir4"
 # T8: cleanup-issue calls revoke (structural)
 # ---------------------------------------------------------------------------
 ran=$((ran + 1))
-if awk '/^  cleanup-issue\)/{p=1} p && /^  cleanup-stale\)/{exit} p' "${DISPATCH}" | \
-    grep -q 'revoke_agent_creds'; then
+if grep -q 'revoke_agent_creds' <<<"$(awk '/^  cleanup-issue\)/{p=1} p && /^  cleanup-stale\)/{exit} p' "${DISPATCH}")"; then
   printf '  ok    T8 cleanup-issue calls revoke_agent_creds\n'
 else
   fail=$((fail + 1))
@@ -318,8 +317,7 @@ fi
 # T9: cleanup-stale calls revoke (structural)
 # ---------------------------------------------------------------------------
 ran=$((ran + 1))
-if awk '/^  cleanup-stale\)/{p=1} p && /^  CLEANUP_STALE_DONE/{exit} p' "${DISPATCH}" | \
-    grep -q 'revoke_agent_creds'; then
+if grep -q 'revoke_agent_creds' <<<"$(awk '/^  cleanup-stale\)/{p=1} p && /^  CLEANUP_STALE_DONE/{exit} p' "${DISPATCH}")"; then
   printf '  ok    T9 cleanup-stale calls revoke_agent_creds\n'
 else
   fail=$((fail + 1))
@@ -330,8 +328,7 @@ fi
 # T10: cleanup-stale-reviews calls revoke (structural)
 # ---------------------------------------------------------------------------
 ran=$((ran + 1))
-if awk '/^  cleanup-stale-reviews\)/{p=1} p && /^  CLEANUP_STALE_REVIEWS_DONE/{exit} p' "${DISPATCH}" | \
-    grep -q 'revoke_agent_creds'; then
+if grep -q 'revoke_agent_creds' <<<"$(awk '/^  cleanup-stale-reviews\)/{p=1} p && /^  CLEANUP_STALE_REVIEWS_DONE/{exit} p' "${DISPATCH}")"; then
   printf '  ok    T10 cleanup-stale-reviews calls revoke_agent_creds\n'
 else
   fail=$((fail + 1))
@@ -373,8 +370,7 @@ rm -rf "$tmpdir5"
 # Stale containers go through cleanup-stale which calls revoke_agent_creds.
 # ---------------------------------------------------------------------------
 ran=$((ran + 1))
-if awk '/^  cleanup-stale\)/{p=1} p && /CLEANUP_STALE_DONE/{exit} p' "${DISPATCH}" | \
-    grep -q 'revoke_agent_creds'; then
+if grep -q 'revoke_agent_creds' <<<"$(awk '/^  cleanup-stale\)/{p=1} p && /CLEANUP_STALE_DONE/{exit} p' "${DISPATCH}")"; then
   printf '  ok    T12 stale/orphan path calls revoke (normal and orphan coverage via cleanup-stale)\n'
 else
   fail=$((fail + 1))

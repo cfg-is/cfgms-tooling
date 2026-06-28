@@ -801,6 +801,28 @@ def running_containers():
         return None
 
 
+def host_capacity():
+    """Resource-admission snapshot for this host (planning hint for the cron).
+
+    Delegates to ``agent-dispatch.sh capacity --json`` — the same gate every
+    launch path enforces — so the dashboard/cron can see how many more agent
+    containers fit before the host hits its ceilings (RAM/disk 90%, CPU 75%).
+    Returns the parsed dict, or {"available": None} when docker/the script is
+    unavailable (e.g. a non-orchestrator host).
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-dispatch.sh")
+    try:
+        result = subprocess.run(
+            ["bash", script, "capacity", "--json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        data = json.loads(result.stdout.strip() or "{}")
+        data["available"] = bool(data.get("can_launch"))
+        return data
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {"available": None}
+
+
 def code_health_check():
     """Run a fast check of develop's code health so the PO can decide whether
     to dispatch this cycle.
@@ -1787,6 +1809,7 @@ def main():
         "blocked": blocked_issues,
     }
     out["running_containers"] = containers
+    out["capacity"] = host_capacity()
     out["merge_queue"] = merge_queue
     out["code_health"] = code_health
     out["done_on_merge_count"] = done_on_merge_count
@@ -2154,6 +2177,7 @@ def write_output(out, mode):
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
         },
         "host_caps": out.get("host_caps", [DEFAULT_ENV]),
+        "capacity": out.get("capacity", {}),
         "external_prs": out.get("external_prs", []),
         "windows_queue": out.get("windows_queue", []),
         "running_containers": out.get("running_containers", []),

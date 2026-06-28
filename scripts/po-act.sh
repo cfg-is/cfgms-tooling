@@ -5,10 +5,11 @@
 # All actions target the cfg-is/cfgms repo and the develop branch queue.
 #
 # Subcommands:
-#   dispatch <STORY_NUM>            Fresh story: claim (Ready->In Progress) + check-conflicts + clone + launch
-#   claim <ITEM_ID>                 Claim a Ready story (Ready->In Progress) for in-session work; CLAIMED/CLAIM_LOST
-#   dispatch-fix <PR_NUM>           Fix cycle: remove stale container + clone-pr + launch
-#   resolve-conflict <PR_NUM>       Conflict resolution: author-gate + clone-pr + launch resolve-conflict agent
+#   dispatch <STORY_NUM>            Fresh story: lease + claim (Ready->In Progress) + check-conflicts + clone + launch
+#   claim <ITEM_ID>                 Lease + claim a Ready story (Ready->In Progress) for in-session work; CLAIMED/CLAIM_LOST
+#   release-story <ITEM_ID>         Release a story lease held by an in-session (§7) self-dispatch after the PR is up
+#   dispatch-fix <PR_NUM>           Fix cycle: lease pr-<N> + remove stale container + clone-pr + launch
+#   resolve-conflict <PR_NUM>       Conflict resolution: lease pr-<N> + author-gate + clone-pr + launch resolve-conflict agent
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
 #   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
@@ -35,6 +36,13 @@ fi
 DISPATCH="${CFGMS_TEST_DISPATCH:-$(dirname "$0")/agent-dispatch.sh}"
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
 PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
+PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/pipeline-helper.sh}"
+
+# Default lease TTLs (seconds). A held lease past its TTL is reclaimable by any
+# host — the backstop for a host that died holding it. Sized well above the
+# normal operation duration so a live op is never reclaimed out from under it.
+LEASE_TTL_STORY="${CFGMS_LEASE_TTL_STORY:-7200}"   # dev container: long stories
+LEASE_TTL_PR="${CFGMS_LEASE_TTL_PR:-3600}"         # review/fix/resolve container
 
 # Cache path (matches po-cycle-preflight.py defaults). No /tmp writes.
 if [ -n "${PO_CACHE_DIR:-}" ]; then
@@ -47,17 +55,57 @@ fi
 CACHE_FILE="$CACHE_DIR/preflight.json"
 
 # ── Shared claim / routing helpers ──────────────────────────────────────────
-# The pipeline can run on more than one host (e.g. a Linux orchestrator dispatching
-# docker agents + a Windows host self-dispatching its tagged stories in-session).
-# Hosts work disjoint slices by execution environment, so no distributed lock is
-# needed — but each host MUST claim a story (set status away from Ready) BEFORE it
-# starts any work, so two out-of-phase loops can't both pick the same item.
+# The pipeline can run `/po cron` on MORE THAN ONE host concurrently, including
+# homogeneous (e.g. multiple Linux) hosts. Cross-host mutual exclusion is provided
+# by a distributed lease (an atomic git ref — see pipeline-helper.sh lease-*),
+# acquired on the work unit BEFORE any side effect. The lease is the hard
+# interlock; the Projects V2 status flip below is the human-readable dashboard
+# signal layered on top (it is NOT relied on for concurrency — Projects V2 has no
+# CAS, so the status flip alone is last-writer-wins).
+
+# _acquire_lease <key> <ttl> <skip_label>
+#   Try to claim <key>. On success (ACQUIRED/RECLAIMED) records it in LEASE_HELD
+#   and returns 0. On contention (HELD) or error, prints a DISPATCH_SKIPPED line
+#   tagged <skip_label> and returns 1 — the caller should exit 0 (clean skip).
+LEASE_HELD=""
+_acquire_lease() {
+  local key="$1" ttl="$2" label="$3" out
+  out=$(bash "$PIPELINE_HELPER" lease-acquire "$key" "$ttl" 2>/dev/null || true)
+  case "$out" in
+    ACQUIRED:*|RECLAIMED:*) LEASE_HELD="$key"; return 0 ;;
+    HELD:*)  echo "DISPATCH_SKIPPED:${label}:lease_held (${out})"; return 1 ;;
+    *)       echo "DISPATCH_SKIPPED:${label}:lease_error (${out:-no output})"; return 1 ;;
+  esac
+}
+
+# _release_lease [key]
+#   Release the named key, or LEASE_HELD if no arg. Idempotent; never fails the
+#   caller. Used on rollback paths where the container that would own the lease
+#   never launched. (When a container DOES launch, it owns release — the host
+#   must NOT release after a successful launch.)
+_release_lease() {
+  local key="${1:-$LEASE_HELD}"
+  [ -n "$key" ] || return 0
+  bash "$PIPELINE_HELPER" lease-release "$key" >/dev/null 2>&1 || true
+}
+
+# _capacity_ok
+#   Resource admission gate (delegates to agent-dispatch.sh capacity). Returns 0
+#   when the host has room for another agent container; on no room, echoes the
+#   CAPACITY_FULL line and returns 1. Bypass with CFGMS_AGENT_CAPACITY_GATE=off.
+_capacity_ok() {
+  [[ "${CFGMS_AGENT_CAPACITY_GATE:-on}" == "off" ]] && return 0
+  local out
+  out=$("$DISPATCH" capacity 2>/dev/null) && return 0
+  echo "$out"
+  return 1
+}
 
 # _claim_item <item_id>
-#   Atomically-ish claim: re-read status; proceed only if still Ready; set it to
-#   In Progress. Prints CLAIMED:<item> (rc 0) or CLAIM_LOST:<item> (rc 1). The
-#   read-then-set is last-writer-wins (Projects V2 has no CAS), but combined with
-#   disjoint per-host env slices it is sufficient to prevent cross-host collisions.
+#   Re-read status; proceed only if still Ready; set it to In Progress. Prints
+#   CLAIMED:<item> (rc 0) or CLAIM_LOST:<item> (rc 1). This is the dashboard-state
+#   transition and a same-host overlap guard; cross-host safety comes from the
+#   lease the caller already holds, NOT from this read-then-set.
 _claim_item() {
   local item_id="$1" cur
   cur=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
@@ -118,6 +166,13 @@ case "$cmd" in
     arg="${1:?story number or item_id required}"
     PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
 
+    # Resource admission gate (before any lease/materialize/clone). Defer if the
+    # host has no room for another agent container — RAM/disk 90%, CPU 75%.
+    if ! cap=$(_capacity_ok); then
+      echo "DISPATCH_DEFERRED:${arg}:resources (${cap})"
+      exit 0
+    fi
+
     # If arg is an item_id (non-numeric), resolve it to the underlying GitHub
     # issue number. A project item linked to a public issue carries `issue_num`;
     # when present we MUST dispatch via the issue-number path so the branch is
@@ -161,13 +216,19 @@ except Exception: print('')" 2>/dev/null || echo "")
       clone_path="${WORKTREE_BASE}/story-${story}"
       container_name="cfg-agent-${story}"
       first_arg="${story}"
+      # Acquire the story lease before any clone/launch so a second host's
+      # out-of-phase cycle can't dispatch the same existing Ready issue.
+      _acquire_lease "story-${item_id}" "$LEASE_TTL_STORY" "${story}" || exit 0
     else
       # Issueless project draft → materialize it into a locked `internal` issue
       # at dispatch, then run the rest of dispatch first-class on feature/story-<N>.
       # (The old item-<id> branch path is review-sweep-invisible — Issue #1700 —
       # so we convert to an issue here instead of dispatching the draft directly.)
       item_id="$arg"
-      PIPELINE_HELPER="$(cd "$(dirname "$0")/../.." && pwd)/scripts/pipeline-helper.sh"
+      # Acquire the story lease BEFORE materialize — materialize-issue mints a
+      # fresh GitHub issue every call, so two racing hosts would otherwise create
+      # two issues (+ two branches/containers/PRs) for the same draft.
+      _acquire_lease "story-${item_id}" "$LEASE_TTL_STORY" "${item_id}" || exit 0
       epic_num=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
         | python3 -c "import json,sys,re
 try:
@@ -202,9 +263,11 @@ except Exception: print('')" 2>/dev/null || echo "")
       exit 0
     fi
 
-    # Phase 3 — claim before work. Only the host that flips Ready -> In Progress
-    # proceeds; a loser exits cleanly without touching the clone or container.
+    # Phase 3 — claim before work. We already hold the story lease (cross-host
+    # interlock); this flips the dashboard status. On the rare CLAIM_LOST (status
+    # changed by a human or a same-host overlap) release the lease and exit clean.
     if ! _claim_item "$item_id"; then
+      _release_lease "story-${item_id}"
       exit 0
     fi
 
@@ -214,7 +277,7 @@ except Exception: print('')" 2>/dev/null || echo "")
     # failure would exit with the story stuck In Progress. The docker-run failure is
     # handled explicitly in the LAUNCH_FAILED branch below (it runs inside an `if`
     # condition, which `set -e`/ERR does not trap).
-    trap 'rc=$?; bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true; echo "ROLLED_BACK:${item_id} -> Ready (dispatch failed before launch, rc=$rc)"; exit "$rc"' ERR
+    trap 'rc=$?; bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true; bash "$PIPELINE_HELPER" lease-release "story-${item_id}" >/dev/null 2>&1 || true; echo "ROLLED_BACK:${item_id} -> Ready (dispatch failed before launch, rc=$rc)"; exit "$rc"' ERR
     # Branch on the RESOLVED story number ($first_arg), not the raw input ($arg).
     # An issueless draft is materialized above into issue #$story and $first_arg
     # is set to that number, so it must clone first-class as feature/story-<N>
@@ -257,6 +320,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_PROJECT_ITEM_ID=${item_id}" \
+      -e "CFGMS_LEASE_KEY=story-${item_id}" \
       -e "CFGMS_AUTONOMOUS=true" \
       --cap-add NET_ADMIN \
       cfg-agent:latest \
@@ -268,8 +332,10 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "LAUNCH_FAILED:${first_arg}:${container_id}"
       rm -rf "$clone_path"
       echo "CLEANED:clone:${clone_path}"
-      # Release the claim: launch never happened, so return the story to Ready.
+      # Release the claim + lease: launch never happened, so return the story to
+      # Ready and free the lease for the next cycle/host.
       bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true
+      _release_lease "story-${item_id}"
       echo "ROLLED_BACK:${item_id} -> Ready"
       exit 1
     fi
@@ -280,10 +346,31 @@ except Exception: print('')" 2>/dev/null || echo "")
 
   claim)
     # Standalone claim primitive for self-dispatch (no-docker, in-session) mode:
-    # a host claims a Ready story before working it locally. Same Ready->In
-    # Progress guard the docker dispatch path uses. Exit 0 = CLAIMED, 1 = lost.
+    # a host claims a Ready story before working it locally. Acquires the story
+    # lease (cross-host interlock) THEN flips Ready->In Progress. The in-session
+    # work has no container to release the lease on exit, so §7 must call
+    # `po-act.sh release-story <item_id>` once the PR is up (TTL reclaim is the
+    # backstop if the session dies). Exit 0 = CLAIMED, 1 = lost/held.
     item_id="${1:?item_id required}"
-    _claim_item "$item_id"
+    # Acquire the cross-host lease first; report contention as CLAIM_LOST so §7's
+    # drain loop treats it like any other lost claim.
+    acq=$(bash "$PIPELINE_HELPER" lease-acquire "story-${item_id}" "$LEASE_TTL_STORY" 2>/dev/null || true)
+    case "$acq" in
+      ACQUIRED:*|RECLAIMED:*) LEASE_HELD="story-${item_id}" ;;
+      *) echo "CLAIM_LOST:${item_id} (lease held: ${acq:-error})"; exit 1 ;;
+    esac
+    if ! _claim_item "$item_id"; then
+      _release_lease "story-${item_id}"
+      exit 1
+    fi
+    ;;
+
+  release-story)
+    # Release a story lease held by a self-dispatch (§7) session — call after the
+    # PR is up so another host can pick up review/fix. Idempotent.
+    item_id="${1:?item_id required}"
+    _release_lease "story-${item_id}"
+    echo "RELEASED:story-${item_id}"
     ;;
 
   dispatch-fix)
@@ -294,12 +381,23 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "DISPATCH_FIX_REFUSED:${pr}:external_author"
       exit 3
     fi
+    # Resource admission gate before claiming the lease.
+    if ! cap=$(_capacity_ok); then
+      echo "DISPATCH_FIX_DEFERRED:${pr}:resources (${cap})"
+      exit 0
+    fi
+    # Cross-host PR lease — pr-<N> is shared by review/fix/resolve (mutually
+    # exclusive ops on one PR). If another host already holds it, skip cleanly.
+    _acquire_lease "pr-${pr}" "$LEASE_TTL_PR" "pr-${pr}" || exit 0
+    # Release the lease if clone/launch fails; on success the container owns it.
+    trap '_release_lease "pr-${pr}"' ERR
     # Remove any stale exited container from a previous attempt
     docker rm -f "$container" >/dev/null 2>&1 || true
     # Remove any stale worktree directory
     rm -rf "${WORKTREE_BASE}/pr-fix-${pr}" 2>/dev/null || true
     "$DISPATCH" create-clone-pr "$pr" | tail -1
-    "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/pr-fix-${pr}" --fix-pr "$pr" | tail -1
+    CFGMS_LEASE_KEY="pr-${pr}" "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/pr-fix-${pr}" --fix-pr "$pr" | tail -1
+    trap - ERR
     echo "DISPATCHED_FIX:$pr"
     ;;
 
@@ -315,12 +413,22 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "RESOLVE_CONFLICT_REFUSED:${pr}:external_author"
       exit 3
     fi
+    # Resource admission gate before claiming the lease.
+    if ! cap=$(_capacity_ok); then
+      echo "RESOLVE_CONFLICT_DEFERRED:${pr}:resources (${cap})"
+      exit 0
+    fi
+    # Cross-host PR lease (same pr-<N> key as review/fix — they never run together
+    # on one PR). Skip cleanly if another host holds it.
+    _acquire_lease "pr-${pr}" "$LEASE_TTL_PR" "pr-${pr}" || exit 0
+    trap '_release_lease "pr-${pr}"' ERR
     # Remove any stale exited container from a previous attempt
     docker rm -f "$container" >/dev/null 2>&1 || true
     # Remove any stale worktree directory (separate namespace from pr-fix-<PR>)
     rm -rf "${WORKTREE_BASE}/resolve-conflict-${pr}" 2>/dev/null || true
     "$DISPATCH" create-clone-pr --dest-prefix "resolve-conflict-" "$pr" | tail -1
-    "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/resolve-conflict-${pr}" --resolve-conflict "$pr" | tail -1
+    CFGMS_LEASE_KEY="pr-${pr}" "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/resolve-conflict-${pr}" --resolve-conflict "$pr" | tail -1
+    trap - ERR
     echo "DISPATCHED_RESOLVE_CONFLICT:${pr}"
     ;;
 

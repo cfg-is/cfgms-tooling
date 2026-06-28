@@ -42,6 +42,13 @@ Community issues (human-directed, interactive sessions only):
 
 Lock maintenance (run from the PO cron):
   lock-sweep                                     Lock+internal pipeline PRs; re-lock any unlocked internal issue
+
+Distributed leases (multi-host cron coordination — atomic git-ref lock):
+  lease-acquire <key> [ttl_seconds]              Try to claim <key>; ACQUIRED/RECLAIMED (rc0), HELD (rc1), ACQUIRE_ERROR (rc2)
+  lease-release <key>                            Release <key> (idempotent)
+  lease-status <key>                             HELD:<holder>:exp:expired | FREE
+  lease-list                                     TSV of all live leases: key, holder, exp, expired
+  lease-gc                                       Delete all expired lease refs (run from cleanup-stale)
 USAGE
   exit 1
 }
@@ -315,6 +322,164 @@ for iss in issues:
 
 print(f"LOCK_SWEEP_DONE:{locked_count}")
 PYEOF
+    ;;
+
+  # ── Distributed leases (multi-host cron coordination) ────────────────
+  #
+  # The pipeline can run `/po cron` on more than one host concurrently. To keep
+  # two hosts from dispatching the same work unit, every collision-prone action
+  # (dev dispatch, PR review/fix/resolve, epic decompose, pin refresh, sweep)
+  # acquires a lease keyed on the work unit BEFORE acting.
+  #
+  # The lease is a git ref under refs/cfgms-lease/<key>. Creating a ref is the
+  # ONE server-atomic operation GitHub exposes — POST git/refs returns 422 if the
+  # ref already exists — so exactly one racing host wins regardless of how many
+  # attempt it. No host-local state is involved: the lock lives in GitHub, so
+  # every host sees it. The ref points at an orphan commit whose message encodes
+  # holder + acquired + exp epochs; a held lease past its exp is reclaimable
+  # (covers a host that died holding it). Reclaim (PATCH ref --force) is the only
+  # non-atomic step, but it is bounded to crash recovery, not steady state.
+  #
+  # Lifetimes:
+  #  - Container ops (dev/review/fix/resolve): the launching host acquires, passes
+  #    CFGMS_LEASE_KEY into the container, and the container's entrypoint releases
+  #    on exit. Crash backstop = TTL reclaim.
+  #  - Inline ops (decompose/pin/sweep/rebase): the host acquires, runs in-session,
+  #    releases in a trap. Short TTL.
+
+  lease-acquire)
+    # lease-acquire <key> [ttl_seconds]
+    # ACQUIRED:<key>:<holder>:exp=<exp>   (rc 0) — you now hold it
+    # RECLAIMED:<key>:<holder> (was <prev>) (rc 0) — prior holder's lease expired
+    # HELD:<key>:<holder>:exp=<exp>       (rc 1) — someone else holds a live lease
+    # ACQUIRE_ERROR:<key>:<detail>        (rc 2) — API/transport failure
+    key=$(printf '%s' "${1:?Usage: lease-acquire <key> [ttl_seconds]}" | tr -c 'A-Za-z0-9._-' '-')
+    ttl="${2:-3600}"
+    owner="${REPO%%/*}"; name="${REPO##*/}"
+    holder="${CFGMS_HOST_ID:-$(hostname 2>/dev/null || echo unknown)}"
+    now=$(date +%s); exp=$(( now + ttl ))
+    empty_tree="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    msg="cfgms-lease key=${key} holder=${holder} acquired=${now} exp=${exp}"
+
+    commit_sha=$(gh api -X POST "repos/${owner}/${name}/git/commits" \
+      -f message="$msg" -f tree="$empty_tree" --jq '.sha' 2>/dev/null || true)
+    if [ -z "$commit_sha" ]; then
+      echo "ACQUIRE_ERROR:${key}:could not create lease commit object"
+      exit 2
+    fi
+
+    err_file=$(mktemp)
+    if gh api -X POST "repos/${owner}/${name}/git/refs" \
+        -f ref="refs/cfgms-lease/${key}" -f sha="$commit_sha" >/dev/null 2>"$err_file"; then
+      rm -f "$err_file"
+      echo "ACQUIRED:${key}:${holder}:exp=${exp}"
+      exit 0
+    fi
+
+    # createRef failed — distinguish "already exists" (contention) from real errors.
+    if ! grep -qi "already exists" "$err_file"; then
+      detail=$(tr -d '\n' < "$err_file" | cut -c1-200); rm -f "$err_file"
+      echo "ACQUIRE_ERROR:${key}:${detail}"
+      exit 2
+    fi
+    rm -f "$err_file"
+
+    # Held — inspect the incumbent for staleness.
+    cur_sha=$(gh api "repos/${owner}/${name}/git/ref/cfgms-lease/${key}" --jq '.object.sha' 2>/dev/null || true)
+    cur_msg=""
+    [ -n "$cur_sha" ] && cur_msg=$(gh api "repos/${owner}/${name}/git/commits/${cur_sha}" --jq '.message' 2>/dev/null || true)
+    cur_exp=$(printf '%s' "$cur_msg" | grep -oE 'exp=[0-9]+' | head -1 | cut -d= -f2)
+    cur_holder=$(printf '%s' "$cur_msg" | grep -oE 'holder=[^ ]+' | head -1 | cut -d= -f2)
+    cur_holder="${cur_holder:-unknown}"
+
+    if [ -n "$cur_exp" ] && [ "$now" -gt "$cur_exp" ]; then
+      # Stale — reclaim by force-pointing the ref at our fresh commit.
+      if gh api -X PATCH "repos/${owner}/${name}/git/refs/cfgms-lease/${key}" \
+          -f sha="$commit_sha" -F force=true >/dev/null 2>&1; then
+        echo "RECLAIMED:${key}:${holder} (was ${cur_holder}, expired)"
+        exit 0
+      fi
+      echo "ACQUIRE_ERROR:${key}:reclaim of expired lease (holder ${cur_holder}) failed"
+      exit 2
+    fi
+    echo "HELD:${key}:${cur_holder}:exp=${cur_exp:-unknown}"
+    exit 1
+    ;;
+
+  lease-release)
+    # lease-release <key>  →  RELEASED:<key> (idempotent; FREE if already gone)
+    key=$(printf '%s' "${1:?Usage: lease-release <key>}" | tr -c 'A-Za-z0-9._-' '-')
+    owner="${REPO%%/*}"; name="${REPO##*/}"
+    if gh api -X DELETE "repos/${owner}/${name}/git/refs/cfgms-lease/${key}" >/dev/null 2>&1; then
+      echo "RELEASED:${key}"
+    else
+      # 404/422 → ref already absent; any other error is non-fatal for a release.
+      echo "FREE:${key}"
+    fi
+    exit 0
+    ;;
+
+  lease-status)
+    # lease-status <key>  →  HELD:<key>:<holder>:exp=<exp>:expired=<bool> | FREE:<key>
+    key=$(printf '%s' "${1:?Usage: lease-status <key>}" | tr -c 'A-Za-z0-9._-' '-')
+    owner="${REPO%%/*}"; name="${REPO##*/}"
+    # Key off exit status, not stdout: gh api writes the 404 body to stdout and
+    # ignores --jq on error, so an empty-stdout test would misread a free key.
+    if ! cur_sha=$(gh api "repos/${owner}/${name}/git/ref/cfgms-lease/${key}" --jq '.object.sha' 2>/dev/null); then
+      cur_sha=""
+    fi
+    if [ -z "$cur_sha" ]; then echo "FREE:${key}"; exit 0; fi
+    cur_msg=$(gh api "repos/${owner}/${name}/git/commits/${cur_sha}" --jq '.message' 2>/dev/null || true)
+    cur_exp=$(printf '%s' "$cur_msg" | grep -oE 'exp=[0-9]+' | head -1 | cut -d= -f2)
+    cur_holder=$(printf '%s' "$cur_msg" | grep -oE 'holder=[^ ]+' | head -1 | cut -d= -f2)
+    now=$(date +%s); expired=false
+    [ -n "$cur_exp" ] && [ "$now" -gt "$cur_exp" ] && expired=true
+    echo "HELD:${key}:${cur_holder:-unknown}:exp=${cur_exp:-unknown}:expired=${expired}"
+    exit 0
+    ;;
+
+  lease-list)
+    # lease-list  →  one TSV line per live lease ref: <key>\t<holder>\t<exp>\t<expired>
+    owner="${REPO%%/*}"; name="${REPO##*/}"
+    now=$(date +%s)
+    refs_json=$(gh api "repos/${owner}/${name}/git/matching-refs/cfgms-lease/" 2>/dev/null || echo '[]')
+    printf '%s' "$refs_json" | python3 -c "
+import json,sys,subprocess
+try: refs=json.load(sys.stdin)
+except Exception: refs=[]
+now=${now}
+for r in refs:
+    key=r['ref'].replace('refs/cfgms-lease/','')
+    sha=r.get('object',{}).get('sha','')
+    msg=''
+    if sha:
+        p=subprocess.run(['gh','api','repos/${owner}/${name}/git/commits/'+sha,'--jq','.message'],capture_output=True,text=True)
+        msg=p.stdout.strip()
+    import re
+    exp=(re.search(r'exp=(\d+)',msg) or [None,''])[1]
+    holder=(re.search(r'holder=(\S+)',msg) or [None,''])[1]
+    expired = bool(exp) and now>int(exp)
+    print(f'{key}\t{holder}\t{exp}\t{expired}')
+" 2>/dev/null || true
+    exit 0
+    ;;
+
+  lease-gc)
+    # lease-gc  →  delete every expired lease ref. Safe to run every cycle.
+    # Belt-and-suspenders alongside acquire-time reclaim: keeps refs/cfgms-lease/
+    # tidy when a crashed holder's work is picked up by status/stalled recovery
+    # rather than by a direct re-acquire of the same key.
+    owner="${REPO%%/*}"; name="${REPO##*/}"
+    gced=0
+    while IFS=$'\t' read -r key holder exp expired; do
+      [ "$expired" = "True" ] || [ "$expired" = "true" ] || continue
+      if gh api -X DELETE "repos/${owner}/${name}/git/refs/cfgms-lease/${key}" >/dev/null 2>&1; then
+        echo "GC_RELEASED:${key} (was ${holder:-unknown}, expired)"
+        gced=$(( gced + 1 ))
+      fi
+    done < <(bash "$0" lease-list)
+    echo "LEASE_GC_DONE:${gced}"
+    exit 0
     ;;
 
   *)

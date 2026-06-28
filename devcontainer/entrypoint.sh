@@ -14,6 +14,21 @@ source "$(dirname "${BASH_SOURCE[0]}")/agent-context.sh"
 # at /usr/local/bin/ with no sibling scripts/ dir. Test harness overrides via
 # CFGMS_TEST_PROJECT_QUEUE to point at the host repo.
 PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-/workspace/scripts/project-queue.sh}"
+PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-/workspace/scripts/pipeline-helper.sh}"
+
+# Distributed-lease release (multi-host cron coordination). The launching host
+# passed CFGMS_LEASE_KEY (story-<item> for dev, pr-<N> for fix/resolve) and is
+# counting on THIS container to release it on exit — that "unlock when the agent
+# returns" is what lets whichever cron host comes back first pick up the next
+# phase (review/fix). Released unconditionally (success OR failure): a failed dev
+# run that resets the story to Ready must also free the lease so a later cycle
+# can re-dispatch. TTL reclaim is the backstop if the container dies first.
+release_cfgms_lease() {
+  [ -n "${CFGMS_LEASE_KEY:-}" ] || return 0
+  [ -f "$PIPELINE_HELPER" ] || return 0
+  bash "$PIPELINE_HELPER" lease-release "$CFGMS_LEASE_KEY" >/dev/null 2>&1 || true
+}
+trap release_cfgms_lease EXIT
 
 # --- Argument parsing ---
 MODE="issue"
