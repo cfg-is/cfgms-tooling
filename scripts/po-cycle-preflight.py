@@ -1153,7 +1153,11 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
             })
             continue
 
-        open_deps = [d for d in s["deps_parsed"] if dep_states.get(d) != "CLOSED"]
+        # A dependency is satisfied whether it resolves to a CLOSED issue or a
+        # MERGED pull request. PR numbers appear in deps when the body annotates
+        # "(PR: #MMM)" (per ba.md); a merged PR means the dependency is delivered,
+        # so it must NOT hold the dependent story (Issue: dep-gate held on MERGED PRs).
+        open_deps = [d for d in s["deps_parsed"] if dep_states.get(d) not in ("CLOSED", "MERGED")]
         if open_deps:
             dep_desc = ", ".join(
                 f"#{d}({dep_states.get(d, 'UNKNOWN')})" for d in open_deps
