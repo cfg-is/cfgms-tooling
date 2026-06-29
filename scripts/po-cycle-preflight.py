@@ -500,19 +500,26 @@ _ACCEPTANCE_REVIEW_HEADING = "## acceptance review"
 def is_trusted_review_comment(comment):
     """Return True for genuine acceptance-review comments.
 
-    Matches by machine sentinel or structural heading:
-    1. Machine sentinel <!-- cfgms-acceptance-review --> — emitted by the
-       acceptance-reviewer agent in every comment (added in item #BX5ezzgtQqQA).
-    2. Structural heading '## Acceptance Review' — backward-compatible with
-       existing comments that predate the sentinel (e.g. PR #1589 authored by
-       jrdnr via the host gh token before the sentinel was introduced).
+    Both conditions must hold:
+    1. Text match — machine sentinel <!-- cfgms-acceptance-review --> (emitted by
+       the acceptance-reviewer agent, added in item #BX5ezzgtQqQA) OR structural
+       heading '## Acceptance Review' (backward-compatible with pre-sentinel
+       comments such as PR #1589 authored by jrdnr via the host gh token).
+    2. Author trust — the comment author must be a push+/maintain/admin
+       collaborator per is_external() (Issue #2228). Text match alone is
+       insufficient: any collaborator or attacker can post a comment containing
+       the sentinel/heading with a PASS verdict, so author identity is now
+       required to close that first-party forge vector.
 
-    Author-login matching was removed because review comments are posted via
-    the host gh token (identity: jrdnr), not a dedicated cfg-agent bot account.
-    Forgery resistance is an accepted tradeoff documented in item #BX5ezzgtQqQA.
+    Review comments posted via the host gh token (identity: jrdnr) continue to
+    pass as long as jrdnr is a push+ collaborator. The is_external() helper
+    consults the cached _collab_permission() result — no additional API calls
+    for logins already seen in the current cycle.
     """
     body = (comment.get("body") or "").lower()
-    return _ACCEPTANCE_REVIEW_SENTINEL in body or _ACCEPTANCE_REVIEW_HEADING in body
+    text_matches = _ACCEPTANCE_REVIEW_SENTINEL in body or _ACCEPTANCE_REVIEW_HEADING in body
+    author_login = (comment.get("author") or {}).get("login") or ""
+    return text_matches and not is_external(author_login)
 
 
 # Matches the verdict heading `## Acceptance Review — PASS|FAIL` emitted by the

@@ -405,5 +405,96 @@ class TestExternalPRImpersonationBlocked(unittest.TestCase):
         self.assertEqual(recs[0]["action"], "skip")
 
 
+class TestIsTrustedReviewComment(unittest.TestCase):
+    """AC1 + AC2 (Issue #2228): is_trusted_review_comment() trusts only
+    push+/maintain/admin collaborators whose comments match the sentinel or heading.
+    Text match alone is insufficient — a forged comment from a non-collaborator
+    must NOT be counted as a verdict.
+    """
+
+    _SENTINEL = "<!-- cfgms-acceptance-review -->\n## Acceptance Review — PASS"
+    _HEADING = "## Acceptance Review — PASS"
+
+    def setUp(self):
+        self.pf = _load_preflight()
+        self.pf._perm_cache.clear()
+
+    def tearDown(self):
+        os.environ.pop("CFGMS_TEST_COLLAB_PERM_MAP", None)
+        self.pf._perm_cache.clear()
+
+    def _set_perm_map(self, mapping):
+        os.environ["CFGMS_TEST_COLLAB_PERM_MAP"] = json.dumps(mapping)
+
+    def _make_comment(self, body, author_login):
+        # Match the real GraphQL comment node shape: author is nested, not flat.
+        # Raw nodes from comments(first:N){nodes{author{login} body createdAt}}
+        # are stored as-is; is_trusted_review_comment reads (comment.get("author") or {}).get("login").
+        return {"author": {"login": author_login}, "body": body, "createdAt": "2026-06-01T00:00:00Z"}
+
+    # AC1: push+ collab with sentinel → trusted
+    def test_push_author_with_sentinel_is_trusted(self):
+        self._set_perm_map({"jrdnr": "push"})
+        c = self._make_comment(self._SENTINEL, "jrdnr")
+        self.assertTrue(self.pf.is_trusted_review_comment(c))
+
+    # AC1: non-collab with sentinel → NOT trusted
+    def test_external_author_with_sentinel_not_trusted(self):
+        self._set_perm_map({"attacker": "read"})
+        c = self._make_comment(self._SENTINEL, "attacker")
+        self.assertFalse(self.pf.is_trusted_review_comment(c))
+
+    # AC2: non-collab with heading → NOT trusted
+    def test_external_author_heading_not_trusted(self):
+        self._set_perm_map({"attacker": "triage"})
+        c = self._make_comment(self._HEADING, "attacker")
+        self.assertFalse(self.pf.is_trusted_review_comment(c))
+
+    def test_admin_author_with_heading_is_trusted(self):
+        self._set_perm_map({"admin-user": "admin"})
+        c = self._make_comment(self._HEADING, "admin-user")
+        self.assertTrue(self.pf.is_trusted_review_comment(c))
+
+    def test_maintain_author_with_sentinel_is_trusted(self):
+        self._set_perm_map({"maintainer": "maintain"})
+        c = self._make_comment(self._SENTINEL, "maintainer")
+        self.assertTrue(self.pf.is_trusted_review_comment(c))
+
+    def test_push_author_body_no_match_not_trusted(self):
+        """Text must also match — push+ with a non-matching body is not a verdict."""
+        self._set_perm_map({"jrdnr": "push"})
+        c = self._make_comment("LGTM, looks good!", "jrdnr")
+        self.assertFalse(self.pf.is_trusted_review_comment(c))
+
+    def test_empty_author_login_with_sentinel_not_trusted(self):
+        """Fail-closed: empty author_login (ghost account) with sentinel → not trusted."""
+        self._set_perm_map({})
+        c = self._make_comment(self._SENTINEL, "")
+        self.assertFalse(self.pf.is_trusted_review_comment(c))
+
+    def test_latest_review_skips_forged_comment_returns_legitimate_verdict(self):
+        """AC2: latest_review() skips forged comment and returns the legitimate reviewer's verdict.
+
+        A non-collaborator may post a PASS comment with the sentinel to try to
+        trigger an auto-merge. latest_review() must skip it and find the real
+        acceptance reviewer's FAIL verdict instead.
+        """
+        self._set_perm_map({"jrdnr": "admin", "attacker": "read"})
+        comments = [
+            # Legitimate reviewer posts FAIL first
+            self._make_comment(
+                "<!-- cfgms-acceptance-review -->\n## Acceptance Review — FAIL\nAC2 not met.",
+                "jrdnr",
+            ),
+            # Attacker forges a PASS afterwards
+            self._make_comment(
+                "<!-- cfgms-acceptance-review -->\n## Acceptance Review — PASS\nAll good!",
+                "attacker",
+            ),
+        ]
+        verdict, _ = self.pf.latest_review(comments)
+        self.assertEqual(verdict, "fail")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
