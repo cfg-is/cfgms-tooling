@@ -174,41 +174,50 @@ Review your own changes for quality issues before proceeding:
 - Verify tests exercise error paths, not just happy paths
 - Fix any issues found'
 
-# Adversarial review phase — the 3-specialist review that catches issues the
-# implementing agent is blind to. Uses the same agents as /story-complete.
+# Adversarial review phase — runs the shared story-review workflow (the same
+# review-fix-verify gate /story-complete uses) so both review paths share ONE
+# implementation. The workflow orchestrates the review lenses + bounded fix loop.
 ADVERSARIAL_REVIEW_SECTION='## Phase 4: Adversarial Team Review (MANDATORY)
 
-Before committing, you MUST spawn three specialist review agents in parallel using
-the Agent tool. These agents review your work with fresh context. Read each agent
-definition file and include its full instructions in the agent prompt.
+Before committing, you MUST run the shared **story-review** workflow — the same
+review-fix-verify gate the interactive /story-complete path uses. Do NOT hand-spawn
+review agents. Do NOT skip this phase. Do NOT commit or create a PR before the
+workflow returns a passing verdict.
 
-**IMPORTANT**: Do NOT skip this phase. Do NOT commit or create a PR before all
-three specialists have reported PASS.
+### Run the workflow
 
-### Spawn these three agents in parallel:
+Call the Workflow tool with the shared gate, parameterized for the container
+(no Docker, so 3 lenses — code review / test quality / security; acceptance is
+verified post-PR by the cron acceptance-reviewer, so it is disabled here):
 
-1. **qa-test-runner** (subagent_type: qa-test-runner)
-   - Read `.claude/agents/qa-test-runner.md` for instructions
-   - OVERRIDE: Run `make test-agent-complete` instead of `make test-quality` (no Docker in container)
-   - Reports pass/fail with specific test names and error details
-   - After it passes, write the marker file: `touch /tmp/agent-validation-passed`
+```
+Workflow({
+  name: "story-review",
+  args: {
+    testTarget: "test-agent-complete",
+    includeAcceptanceChecker: false,
+    storyRef: "<the issue #, item id, or PR you are working>",
+    changedFiles: [<the output of: git diff --name-only origin/develop...HEAD>]
+  }
+})
+```
 
-2. **qa-code-reviewer** (subagent_type: qa-code-reviewer)
-   - Read `.claude/agents/qa-code-reviewer.md` for instructions
-   - Reviews all changed files for test quality, missing tests, mocks, hacky workarounds
-   - MUST verify: every new .go file has corresponding _test.go with functional tests
-   - MUST reject: new production code without tests, tests without error path coverage
+It runs the lenses in parallel, then a bounded fix loop that re-runs only the
+failed lenses (max 3 rounds), and returns
+`{ passed, reviewRounds, fixRounds, perRound, remainingFindings }`.
 
-3. **security-engineer** (subagent_type: security-engineer)
-   - Read `.claude/agents/security-engineer.md` for instructions
-   - Runs security scans and reviews for vulnerabilities, central provider violations
-   - Reports blocking issues with file:line references
+### Gate on the aggregate workflow verdict (NOT any single lens)
 
-### After all three report back:
+- If the workflow returns **passed: true**: write the validation marker with
+  `touch /tmp/agent-validation-passed`, then proceed to the commit/PR phase.
+- If it returns **passed: false** (the fix loop was exhausted without converging):
+  do NOT write the marker and do NOT open a normal PR. Open a **draft** PR whose
+  body lists the unresolved `remainingFindings` for a human to finish, then stop.
 
-- If ALL three report PASS: proceed to commit phase
-- If ANY report BLOCKING issues: fix the issues, then re-run ONLY the failing specialists
-- Maximum 3 fix iterations. If issues persist after 3 rounds, commit as draft PR with failure details.'
+The marker is the signal the entrypoint uses to decide success, so it MUST reflect
+the aggregate workflow verdict. Never write it because one lens (e.g. tests) passed
+while another (code review or security) reported a blocking finding — that is the
+exact failure mode this gate exists to prevent.'
 
 # Scope constraints — identical across all modes
 SCOPE_CONSTRAINTS_SECTION='## Scope Constraints
@@ -803,9 +812,10 @@ if [[ "$MODE" == "fix-pr" || "$MODE" == "resolve-conflict" ]] && [ "$EXIT_CODE" 
             echo "WARN: failed to post no-op comment on PR #${PR_NUM}"
     fi
 elif [ "$EXIT_CODE" -eq 0 ] && [ ! -f /tmp/agent-validation-passed ]; then
-    # The agent is instructed to have qa-test-runner write /tmp/agent-validation-passed
-    # after make test-agent-complete passes. If the marker is missing, tests either
-    # failed or were never run — both are failures.
+    # The agent is instructed to write /tmp/agent-validation-passed only when the
+    # story-review workflow returns passed:true. If the marker is missing, the
+    # workflow either did not pass or was never run — both are failures, so fall
+    # back to enforcing make test-agent-complete directly.
     echo "ERROR: Agent exited 0 but validation marker not found"
     echo "The qa-test-runner specialist either failed or was not run."
     echo "Running make test-agent-complete as fallback enforcement..."

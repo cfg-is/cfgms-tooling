@@ -546,6 +546,45 @@ test_16_hard_refusal_missing_project_item_id() {
 }
 
 # ============================================================================
+# TEST 17 — dry-run: review gate invokes the shared story-review workflow
+# (Story #2308 — must fail against develop@HEAD, pass after this story)
+# The composed prompt must drive the review via `Workflow({name:"story-review"})`
+# with the marker gated on the aggregate `passed:true` verdict, and must NOT still
+# carry the old hand-spawn-three-specialist-agents prose.
+# ============================================================================
+test_17_review_gate_uses_story_review_workflow() {
+    setup_entrypoint_stubs
+
+    local output rc=0
+    output=$(CFGMS_PROJECT_ITEM_ID="pv2-test-item" \
+        CFGMS_TEST_PROJECT_QUEUE="$TEST_ENTRY_DIR/project-queue.sh" \
+        HOME="$TEST_ENTRY_DIR/home" \
+        bash "$SCRIPT_DIR/entrypoint.sh" 9999 --dry-run 2>&1) || rc=$?
+
+    if [[ "$rc" -ne 0 ]]; then
+        _fail "issue --dry-run exited $rc (expected 0)"
+        teardown_entrypoint_stubs
+        return
+    fi
+
+    # The review phase now invokes the shared workflow by name.
+    assert_contains "$output" 'name: "story-review"' \
+        "prompt invokes the story-review workflow"
+    assert_contains "$output" "test-agent-complete" \
+        "workflow is parameterized with the container test target"
+    # Marker is gated on the aggregate verdict, not a single lens.
+    assert_contains "$output" "touch /tmp/agent-validation-passed" \
+        "marker write instruction present"
+    assert_contains "$output" "aggregate workflow verdict" \
+        "marker is gated on the aggregate workflow verdict"
+    # The old hand-spawn-3-agents pattern is gone (regression guard).
+    assert_not_contains "$output" "spawn three specialist review agents" \
+        "old hand-spawn-three-agents prose removed"
+
+    teardown_entrypoint_stubs
+}
+
+# ============================================================================
 # runner
 # ============================================================================
 
@@ -565,6 +604,7 @@ run_test "T13 — review-level comments render" test_13_review_level_comments_re
 run_test "T14 — dry-run issue mode: no injection, project body present" test_14_dry_run_issue_mode_no_injection
 run_test "T15 — dry-run branch mode: no injection, project body present" test_15_dry_run_branch_mode_no_injection
 run_test "T16 — hard refusal when CFGMS_PROJECT_ITEM_ID unset" test_16_hard_refusal_missing_project_item_id
+run_test "T17 — dry-run: review gate invokes story-review workflow" test_17_review_gate_uses_story_review_workflow
 
 echo ""
 echo "============================================================"
