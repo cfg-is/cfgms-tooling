@@ -1858,10 +1858,14 @@ def main():
     out["epics_caveat"] = (
         "Two decomposition signals are checked: (1) GitHub sub-issue links "
         "(sub_issues_total), (2) open issues with 'Parent epic: #NNN' body refs "
-        "(body_referencing_issues — catches issue-based decompositions that "
-        "skipped addSubIssue). Pure project-draft decompositions are NOT "
-        "detected by either signal; those need a manual decomposition-complete "
-        "marker on the epic (or close the epic when stories ship)."
+        "(body_referencing_issues — catches decompositions that skipped "
+        "addSubIssue). Since ADR-015, create-story materializes stories as "
+        "sub-issue-linked internal issues at decomposition, so signal (1) is "
+        "authoritative for new epics. Exception: an epic decomposed ENTIRELY "
+        "into --defer drafts (security-sensitive bodies held private until "
+        "dispatch) is invisible to both signals — those still need a manual "
+        "decomposition-complete marker comment on the epic (or close the epic "
+        "when stories ship)."
     )
 
     # Phase 2: fetch story bodies relevant to conflict detection.

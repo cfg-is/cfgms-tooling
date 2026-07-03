@@ -15,7 +15,11 @@ usage() {
 Pipeline Helper — wraps gh CLI for subagent permission compatibility
 
 Story lifecycle:
-  create-story <epic_num> <title> <body_file>   Create story as a project draft item (not a GitHub issue)
+  create-story <epic_num> <title> <body_file> [--defer]
+                                                 Create story and materialize it immediately as a locked
+                                                 `internal` issue linked under its epic (ADR-015). With
+                                                 --defer, stay a private project draft until dispatch —
+                                                 for security-sensitive or business-adjacent bodies.
   edit-body <issue_num> <body_file>              Replace issue body from file
   append-section <issue_num> <section> <file>    Append content after ## <section> heading
 
@@ -34,7 +38,8 @@ Issue queries:
 Epic operations:
   create-epic <title> <body_file>                Create epic issue (epic+internal label, locked)
 
-Dispatch / materialization (privileged — called by po-act.sh dispatch):
+Materialization (privileged — called by create-story at decomposition; by
+po-act.sh dispatch for --defer drafts):
   materialize-issue <item_id> [epic_num]         Convert a draft to a locked internal issue; link under epic
 
 Community issues (human-directed, interactive sessions only):
@@ -61,9 +66,10 @@ case "$cmd" in
   # ── Story lifecycle ──────────────────────────────────────────────
 
   create-story)
-    epic_num="${1:?Usage: create-story <epic_num> <title> <body_file>}"
-    title="${2:?Usage: create-story <epic_num> <title> <body_file>}"
-    body_file="${3:?Usage: create-story <epic_num> <title> <body_file>}"
+    epic_num="${1:?Usage: create-story <epic_num> <title> <body_file> [--defer]}"
+    title="${2:?Usage: create-story <epic_num> <title> <body_file> [--defer]}"
+    body_file="${3:?Usage: create-story <epic_num> <title> <body_file> [--defer]}"
+    defer="${4:-}"
 
     if [ ! -f "$body_file" ]; then
       echo "ERROR: Body file not found: $body_file"
@@ -72,11 +78,32 @@ case "$cmd" in
 
     PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
 
-    # Create a project draft item (private; not a public GitHub issue).
-    # epic_num is passed as story_num — a traceability hint; 0 is acceptable too.
+    # Create a project draft item first. epic_num doubles as the traceability
+    # hint (story_num) on the board; 0 = no epic.
     draft_json=$(bash "$PROJECT_QUEUE" create-draft "$epic_num" "$title" "$body_file")
     item_id=$(echo "$draft_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['item_id'])")
-    echo "CREATED_DRAFT:${item_id}"
+
+    # --defer keeps the story a private draft until dispatch. Reserved for
+    # bodies that must not be world-readable while queued: security fixes
+    # describing live vulnerabilities, business/customer specifics.
+    if [ "$defer" = "--defer" ]; then
+      echo "CREATED_DRAFT:${item_id}"
+      exit 0
+    fi
+
+    # Default (ADR-015): materialize at decomposition. The issue is created by
+    # CONVERT (never `gh issue create`), born locked + `internal`, and linked
+    # under its epic so subIssuesSummary tracks decomposition machine-visibly.
+    # Injection stays closed by the lock; deferral never added protection.
+    link_epic=""
+    if [ "$epic_num" != "0" ]; then link_epic="$epic_num"; fi
+    mat_out=$(bash "$0" materialize-issue "$item_id" $link_epic) || {
+      echo "ERROR: create-story materialize failed for ${item_id}: ${mat_out}"
+      echo "CREATED_DRAFT:${item_id}"
+      exit 1
+    }
+    issue_num=$(echo "$mat_out" | grep -oE '#[0-9]+' | tr -d '#' | head -1)
+    echo "CREATED_ISSUE:${item_id}:#${issue_num}"
     ;;
 
   edit-body)
@@ -208,9 +235,10 @@ case "$cmd" in
   # ── Dispatch-time issue materialization (privileged) ─────────────
 
   materialize-issue)
-    # Convert a Ready draft into a locked `internal` issue at dispatch, then
-    # (optionally) link it under its epic. Uses convert — NOT `gh issue create` —
-    # so it never trips the autonomous gate. Called by po-act.sh dispatch.
+    # Convert a draft into a locked `internal` issue, then (optionally) link it
+    # under its epic. Uses convert — NOT `gh issue create` — so it never trips
+    # the autonomous gate. Called by create-story at decomposition (ADR-015
+    # default) and by po-act.sh dispatch for --defer drafts.
     item_id="${1:?Usage: materialize-issue <item_id> [epic_num]}"
     epic_num="${2:-}"
 

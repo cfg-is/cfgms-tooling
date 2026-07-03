@@ -221,9 +221,12 @@ except Exception: print('')" 2>/dev/null || echo "")
       _acquire_lease "story-${item_id}" "$LEASE_TTL_STORY" "${story}" || exit 0
     else
       # Issueless project draft → materialize it into a locked `internal` issue
-      # at dispatch, then run the rest of dispatch first-class on feature/story-<N>.
-      # (The old item-<id> branch path is review-sweep-invisible — Issue #1700 —
-      # so we convert to an issue here instead of dispatching the draft directly.)
+      # now, then run the rest of dispatch first-class on feature/story-<N>.
+      # Since ADR-015, stories materialize at DECOMPOSITION (create-story), so
+      # this path only serves `--defer` drafts (security-sensitive bodies held
+      # private until dispatch). (The old item-<id> branch path is review-sweep-
+      # invisible — Issue #1700 — so we always convert rather than dispatching
+      # the draft directly.)
       item_id="$arg"
       # Acquire the story lease BEFORE materialize — materialize-issue mints a
       # fresh GitHub issue every call, so two racing hosts would otherwise create
