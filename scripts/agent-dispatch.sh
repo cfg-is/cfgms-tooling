@@ -1092,28 +1092,68 @@ case "$cmd" in
     # Remove stale container with the same name (only one PO live at a time)
     docker rm -f "$container_name" 2>/dev/null || true
 
+    # Fresh /po sessions (i.e. NOT --resume/--continue) always start on a clean,
+    # up-to-date develop so a stale branch left by a prior session can't leak in.
+    # Any uncommitted work is stashed, not discarded (committed work is already
+    # safe on its own branch). This runs only after the old container is gone,
+    # so we never mutate the shared clone underneath a live session.
+    if [[ "${1:-}" != "--resume" && "${1:-}" != "--continue" ]]; then
+      echo "Refreshing po-live workspace to a clean, up-to-date develop..."
+      git -C "$clone_dir" fetch --quiet origin develop \
+        || echo "  ! warning: fetch of origin/develop failed; refreshing against last-known origin/develop" >&2
+      if [[ -n "$(git -C "$clone_dir" status --porcelain 2>/dev/null)" ]]; then
+        stash_label="po-live-autobackup-$(date -u +%Y%m%dT%H%M%SZ)"
+        if git -C "$clone_dir" stash push -u -m "$stash_label" >/dev/null 2>&1; then
+          echo "  ! Stashed uncommitted changes as '${stash_label}'"
+          echo "    (recover with: git -C '${clone_dir}' stash list)"
+        else
+          echo "ERROR: could not stash uncommitted changes in ${clone_dir}; refusing to refresh to develop." >&2
+          echo "       Resolve manually (commit/stash/clean the clone), then relaunch." >&2
+          exit 1
+        fi
+      fi
+      git -C "$clone_dir" checkout -q -B develop origin/develop
+    fi
+
     # Build the initial prompt without trailing space when args are empty.
     # Trailing space leaves Claude's input box mid-word and shows the slash-
     # command autocomplete dropdown instead of submitting on Enter.
-    if [[ -n "$args" ]]; then
-      po_prompt="/po ${args}"
-      po_name="PO: ${args}"
+    # Resume mode: reattach to an existing Claude session in the same /workspace
+    # clone instead of seeding a fresh /po. These forward Claude's own flags:
+    #   --continue          -> claude --continue  (most recent session)
+    #   --resume            -> claude --continue  (bare: convenience alias)
+    #   --resume <session-id> -> claude --resume <session-id>  (that exact one)
+    # The session transcript persists on the host-mounted ~/.claude.
+    if [[ "${1:-}" == "--continue" ]]; then
+      claude_args=( --continue )
+      session_desc="continue last session"
+    elif [[ "${1:-}" == "--resume" ]]; then
+      if [[ -n "${2:-}" ]]; then
+        claude_args=( --resume "$2" )
+        session_desc="resume session ${2}"
+      else
+        claude_args=( --continue )
+        session_desc="resume last session"
+      fi
+    elif [[ -n "$args" ]]; then
+      claude_args=( --name "PO: ${args}" "/po ${args}" )
+      session_desc="/po ${args}"
     else
-      po_prompt="/po"
-      po_name="PO"
+      claude_args=( --name "PO" "/po" )
+      session_desc="/po"
     fi
 
     echo "================================================"
     echo " CFGMS PO Live Session"
-    echo " Initial prompt: ${po_prompt}"
+    echo " Session:        ${session_desc}"
     echo " Clone:          ${real_path}"
     echo "================================================"
 
     host_claude_dir="$HOME/.claude"
     host_claude_json="$HOME/.claude.json"
 
-    # Pass $1 (display name) and $2 (initial prompt) via bash -c positional
-    # args to avoid shell-quote escaping pain when args contain special chars.
+    # Pass the resolved claude args via bash -c positional args ("$@") to avoid
+    # shell-quote escaping pain when args contain special characters.
     exec docker run -it --rm \
       --name "$container_name" \
       --label "cfg-agent=true" \
@@ -1132,10 +1172,9 @@ case "$cmd" in
       --cap-add NET_ADMIN \
       --entrypoint /bin/bash \
       cfg-agent:latest \
-      -c 'setup-env.sh && exec claude --dangerously-skip-permissions --name "$1" "$2"' \
-      cfg-agent-live-po \
-      "$po_name" \
-      "$po_prompt"
+      -c 'setup-env.sh && exec claude --dangerously-skip-permissions "$@"' \
+      _ \
+      "${claude_args[@]}"
     ;;
 
   launch-interactive)
