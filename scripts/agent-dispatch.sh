@@ -14,14 +14,19 @@ AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
 # ---------------------------------------------------------------------------
 # Resource-based admission gate (replaces the hand-tuned container count).
 # A new agent container is admitted only if launching one keeps the host within
-# its ceilings: RAM and disk under 90% utilization, committed CPU under 75% of
-# cores. Per-host and self-tuning — a big box runs more, a laptop fewer, and it
-# adapts to whatever else is already running. A coarse 2×ncpu count ceiling is a
+# its ceilings: RAM and disk under 90% utilization (reservation-based — a
+# container holds its memory/disk for its whole life), and the measured 1-min
+# CPU load average under 75% of cores (utilization-based — agents are bursty, so
+# a static per-core reservation caps the host far below real capacity). Per-host
+# and self-tuning — a big box runs more, a laptop fewer, and it adapts to
+# whatever else is already running. A coarse 2×ncpu count ceiling is a
 # runaway-loop backstop, not the primary limit.
 #
-# All thresholds are env-overridable; the per-agent figures default to the
-# docker run reservations (--memory=4g --cpus=4) plus a disk allowance covering
-# the clone + go build/mod cache growth.
+# All thresholds are env-overridable; the per-agent RAM/disk figures default to
+# the docker run reservations (--memory=4g, plus a disk allowance covering the
+# clone + go build/mod cache growth). The CPU gate uses CFGMS_AGENT_CPU_LOAD
+# (expected sustained cores per agent, ~1.5) against live load, not the
+# container's --cpus limit.
 # ---------------------------------------------------------------------------
 _capacity_compute() {
   # _capacity_compute <line|json>
@@ -78,14 +83,24 @@ for p in {os.environ.get("CAP_WORKTREE", ""), os.environ.get("CAP_DOCKER_ROOT", 
     except Exception:
         pass
 slots["disk"] = disk_slot
-# CPU: committed cores (reservation-based; deterministic, prevents herd). Also
-# refuse outright if the 1-min load already exceeds the ceiling.
-slots["cpu"] = max(0, slots_for(cpu_ceil * ncpu, running * per_cpu, per_cpu))
+# CPU: utilization-based, NOT a static per-agent core reservation. Agent
+# containers are bursty (short build/test spikes) and mostly I/O- and
+# network-bound (git clone, waiting on CI), so reserving a full `--cpus=4`
+# slice each caps the host far below real capacity — a 16-core box that ran
+# 5-7 agents fine would refuse a 4th. Instead gate on the measured 1-min load
+# average (actual run-queue depth). `per_cpu_load` is the expected *sustained*
+# load one agent contributes (bursty, ~1.5 cores), and blending with
+# `running * per_cpu_load` guards the same-cycle thundering herd: load average
+# lags fresh launches by ~1 min, so the estimate keeps a burst of dispatches in
+# one cron cycle from all reading the same stale-low load. Falls back to the
+# reservation estimate where getloadavg is unavailable (non-Linux).
+per_cpu_load = f("CFGMS_AGENT_CPU_LOAD", 1.5)
 try:
-    if os.getloadavg()[0] > cpu_ceil * ncpu:
-        slots["cpu"] = 0
+    load1 = os.getloadavg()[0]
 except Exception:
-    pass
+    load1 = running * per_cpu_load
+used_cpu = max(load1, running * per_cpu_load)
+slots["cpu"] = max(0, slots_for(cpu_ceil * ncpu, used_cpu, per_cpu_load))
 # Runaway backstop: never more than 2×ncpu agents regardless of headroom.
 slots["count"] = max(0, int(2 * ncpu) - running)
 

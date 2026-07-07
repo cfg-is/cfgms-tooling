@@ -2,7 +2,8 @@
 # Tests for the resource-based admission gate (agent-dispatch.sh capacity) and its
 # integration into po-act.sh dispatch paths. The gate replaces the hand-tuned
 # container-count cap: a new agent is admitted only while the host stays under its
-# ceilings (RAM/disk 90%, CPU 75%, 2xncpu backstop).
+# ceilings (RAM/disk 90% reservation, CPU 75% of cores by measured 1-min load,
+# 2xncpu backstop).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,12 +45,24 @@ check_contains "json can_launch false" "$out" '"can_launch": false'
 check_contains "json names binding resource" "$out" '"binding"'
 
 # T3: zero per-agent sizes + full ceilings -> room available (CAPACITY_OK).
+# CFGMS_AGENT_CPU_LOAD=0 neutralizes the load-based CPU gate (per<=0 -> unbounded),
+# the CPU analog of the zero-size mem/disk reservations, so only ceilings decide.
 rc=0
-out="$(CFGMS_AGENT_MEM_MB=0 CFGMS_AGENT_DISK_GB=0 CFGMS_AGENT_CPUS=0 \
+out="$(CFGMS_AGENT_MEM_MB=0 CFGMS_AGENT_DISK_GB=0 CFGMS_AGENT_CPU_LOAD=0 \
        CFGMS_AGENT_MEM_CEIL=1.0 CFGMS_AGENT_DISK_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=1.0 \
        bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
 check_contains "abundant resources -> CAPACITY_OK" "$out" "CAPACITY_OK"
 check_rc "CAPACITY_OK exits 0" "$rc" "0"
+
+# T3b: the CPU dimension is load-based — a 0% CPU ceiling forces CAPACITY_FULL:cpu
+# (any nonzero load exceeds a zero budget) even with RAM/disk abundant. Proves the
+# gate reads live load, not a per-agent core reservation.
+rc=0
+out="$(CFGMS_AGENT_MEM_MB=0 CFGMS_AGENT_DISK_GB=0 \
+       CFGMS_AGENT_MEM_CEIL=1.0 CFGMS_AGENT_DISK_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=0.0 \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+check_contains "0% cpu ceiling -> CAPACITY_FULL:cpu" "$out" "CAPACITY_FULL:cpu"
+check_rc "cpu-forced-full exits 1" "$rc" "1"
 
 # ---------------------------------------------------------------------------
 # T4: po-act dispatch-fix defers when the host is out of capacity (before lease).
