@@ -46,8 +46,9 @@ def check(desc, got, want):
 # ── detect_required_env: body section ──
 check("env body 'windows'", m.detect_required_env("windows", []), "windows")
 check("env body 'Windows 11 host'", m.detect_required_env("Windows 11 host", []), "windows")
-check("env body 'macos'", m.detect_required_env("macos", []), "macos")
-check("env body 'darwin' alias", m.detect_required_env("build on a darwin runner", []), "macos")
+# macOS is not a routing env — no macOS dev host; dev on Linux, validate in CI.
+check("env body 'macos' -> linux", m.detect_required_env("macos", []), "linux")
+check("env body 'darwin' alias -> linux", m.detect_required_env("build on a darwin runner", []), "linux")
 check("env body 'linux'", m.detect_required_env("linux", []), "linux")
 check("env body None -> linux", m.detect_required_env(None, []), "linux")
 check("env body empty -> linux", m.detect_required_env("", []), "linux")
@@ -55,7 +56,7 @@ check("env body empty -> linux", m.detect_required_env("", []), "linux")
 # ── detect_required_env: labels (dict and str forms), label wins ──
 check("label needs-windows (dict)", m.detect_required_env(None, [{"name": "needs-windows"}]), "windows")
 check("label needs-windows (str)", m.detect_required_env(None, ["needs-windows"]), "windows")
-check("label needs-macos", m.detect_required_env(None, [{"name": "needs-macos"}]), "macos")
+check("label needs-macos -> linux", m.detect_required_env(None, [{"name": "needs-macos"}]), "linux")
 check("label overrides linux body", m.detect_required_env("linux", [{"name": "needs-windows"}]), "windows")
 check("unrelated label -> linux", m.detect_required_env(None, [{"name": "story"}]), "linux")
 

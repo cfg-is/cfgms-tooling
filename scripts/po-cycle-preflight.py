@@ -74,21 +74,25 @@ def detect_required_env(env_section, labels):
     """Resolve a story's required execution environment from its `## Environment`
     section text and its GitHub labels. Label wins (explicit founder/Planning
     signal); body marker is the fallback that also works for label-less project
-    drafts. Defaults to "linux"."""
+    drafts. Defaults to "linux".
+
+    macOS is deliberately NOT a routing env: there is no macOS dev host, so
+    darwin-targeting stories (macOS launcher/.pkg, `manager_darwin.go`, etc.) are
+    written and cross-compiled on Linux and validated by CI's macOS runners.
+    `needs-macos` / a macos-mentioning `## Environment` therefore fall through to
+    the Linux default rather than parking forever for a host that will never
+    self-dispatch them. Windows routing stays (a real Windows host self-dispatches
+    those via §7)."""
     label_names = {
         ((l.get("name") if isinstance(l, dict) else l) or "").lower()
         for l in (labels or [])
     }
     if "needs-windows" in label_names:
         return "windows"
-    if "needs-macos" in label_names:
-        return "macos"
     if env_section:
         t = env_section.strip().lower()
         if "windows" in t:
             return "windows"
-        if "macos" in t or "darwin" in t:
-            return "macos"
     return DEFAULT_ENV
 
 
@@ -2087,9 +2091,9 @@ def main():
     out["host_caps"] = sorted(caps)
     # Ready stories whose required env this host cannot serve — surfaced so the
     # dashboard can show the cross-host backlog (e.g. the Windows queue) and so a
-    # self-dispatch host can pick up exactly its slice. Intentionally windows-only
-    # for now (macos routing is reserved — see the needs-macos label); add a
-    # parallel macos_queue here if/when a macOS host comes online.
+    # self-dispatch host can pick up exactly its slice. Windows-only by design:
+    # macOS is not a routing env (no macOS dev host — darwin stories dev on Linux
+    # + validate in CI, see detect_required_env), so there is no macos_queue.
     out["windows_queue"] = [
         {"number": s["number"], "item_id": s.get("item_id", ""), "title": s["title"]}
         for s in ready_parsed
