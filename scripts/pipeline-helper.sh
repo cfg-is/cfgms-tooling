@@ -15,11 +15,15 @@ usage() {
 Pipeline Helper — wraps gh CLI for subagent permission compatibility
 
 Story lifecycle:
-  create-story <epic_num> <title> <body_file> [--defer]
+  create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]
                                                  Create story and materialize it immediately as a locked
                                                  `internal` issue linked under its epic (ADR-015). With
                                                  --defer, stay a private project draft until dispatch —
                                                  for security-sensitive or business-adjacent bodies.
+                                                 --cap applies descriptive cap:* capability tags (the
+                                                 consuming product capability; multi-valued, e.g.
+                                                 cms,twin). Deferred: intent rides a body marker until
+                                                 materialize. Vocabulary: docs/product/roadmap.md.
   edit-body <issue_num> <body_file>              Replace issue body from file
   append-section <issue_num> <section> <file>    Append content after ## <section> heading
 
@@ -36,11 +40,15 @@ Issue queries:
   list-prs <search>                              List open PRs matching search (JSON)
 
 Epic operations:
-  create-epic <title> <body_file>                Create epic issue (epic+internal label, locked)
+  create-epic <title> <body_file> [--cap <c1,c2>]
+                                                 Create epic issue (epic+internal label, locked). --cap
+                                                 applies descriptive cap:* tags stories inherit at decomposition.
 
 Materialization (privileged — called by create-story at decomposition; by
 po-act.sh dispatch for --defer drafts):
-  materialize-issue <item_id> [epic_num]         Convert a draft to a locked internal issue; link under epic
+  materialize-issue <item_id> [epic_num] [--cap <c1,c2>]
+                                                 Convert a draft to a locked internal issue; link under epic.
+                                                 Applies cap:* from --cap, or from the body marker on defer.
 
 Community issues (human-directed, interactive sessions only):
   create-community-issue <title> <body_file>     Create a PUBLIC, UNLOCKED community issue
@@ -66,10 +74,20 @@ case "$cmd" in
   # ── Story lifecycle ──────────────────────────────────────────────
 
   create-story)
-    epic_num="${1:?Usage: create-story <epic_num> <title> <body_file> [--defer]}"
-    title="${2:?Usage: create-story <epic_num> <title> <body_file> [--defer]}"
-    body_file="${3:?Usage: create-story <epic_num> <title> <body_file> [--defer]}"
-    defer="${4:-}"
+    epic_num="${1:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]}"
+    title="${2:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]}"
+    body_file="${3:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]}"
+    shift 3
+    # Flags may appear in any order after the three positionals.
+    defer=""
+    cap=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --defer) defer="--defer"; shift ;;
+        --cap)   cap="${2:?--cap requires a comma-separated value (e.g. cms,twin)}"; shift 2 ;;
+        *) echo "ERROR: unknown create-story arg: $1"; exit 1 ;;
+      esac
+    done
 
     if [ ! -f "$body_file" ]; then
       echo "ERROR: Body file not found: $body_file"
@@ -78,9 +96,20 @@ case "$cmd" in
 
     PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
 
+    # cap:* capability tags (descriptive, multi-valued) name the product capability
+    # that CONSUMES this story — see docs/product/roadmap.md. For a --defer draft
+    # (no labels until dispatch) the intent must ride in the body as a
+    # machine-readable marker so materialize-issue can apply it later.
+    effective_body="$body_file"
+    if [ "$defer" = "--defer" ] && [ -n "$cap" ]; then
+      effective_body="$(mktemp)"
+      cat "$body_file" > "$effective_body"
+      printf '\n\n<!-- cap: %s -->\n' "$cap" >> "$effective_body"
+    fi
+
     # Create a project draft item first. epic_num doubles as the traceability
     # hint (story_num) on the board; 0 = no epic.
-    draft_json=$(bash "$PROJECT_QUEUE" create-draft "$epic_num" "$title" "$body_file")
+    draft_json=$(bash "$PROJECT_QUEUE" create-draft "$epic_num" "$title" "$effective_body")
     item_id=$(echo "$draft_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['item_id'])")
 
     # --defer keeps the story a private draft until dispatch. Reserved for
@@ -97,7 +126,10 @@ case "$cmd" in
     # Injection stays closed by the lock; deferral never added protection.
     link_epic=""
     if [ "$epic_num" != "0" ]; then link_epic="$epic_num"; fi
-    mat_out=$(bash "$0" materialize-issue "$item_id" $link_epic) || {
+    mat_args=("$item_id")
+    if [ -n "$link_epic" ]; then mat_args+=("$link_epic"); fi
+    if [ -n "$cap" ]; then mat_args+=(--cap "$cap"); fi
+    mat_out=$(bash "$0" materialize-issue "${mat_args[@]}") || {
       echo "ERROR: create-story materialize failed for ${item_id}: ${mat_out}"
       echo "CREATED_DRAFT:${item_id}"
       exit 1
@@ -209,8 +241,16 @@ case "$cmd" in
   # ── Epic operations ──────────────────────────────────────────────
 
   create-epic)
-    title="${1:?Usage: create-epic <title> <body_file>}"
-    body_file="${2:?Usage: create-epic <title> <body_file>}"
+    title="${1:?Usage: create-epic <title> <body_file> [--cap <c1,c2>]}"
+    body_file="${2:?Usage: create-epic <title> <body_file> [--cap <c1,c2>]}"
+    shift 2
+    cap=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --cap) cap="${2:?--cap requires a comma-separated value}"; shift 2 ;;
+        *) echo "ERROR: unknown create-epic arg: $1"; exit 1 ;;
+      esac
+    done
 
     if [ ! -f "$body_file" ]; then
       echo "ERROR: Body file not found: $body_file"
@@ -224,7 +264,14 @@ case "$cmd" in
 
     epic_num=$(echo "$epic_url" | grep -oP '\d+$')
     # Epics are internal pipeline anchors: tag `internal` and lock to external comment.
-    gh issue edit "$epic_num" --repo "$REPO" --add-label "internal" >/dev/null
+    # cap:* capability tags (descriptive) declare which product capability the epic
+    # serves; stories inherit them at decomposition. See docs/product/roadmap.md.
+    epic_labels="internal"
+    if [ -n "$cap" ]; then
+      cap_labels=$(printf '%s' "$cap" | tr ',' '\n' | sed -E 's/^[[:space:]]*(cap:)?/cap:/; s/[[:space:]]*$//' | grep -vx 'cap:' | paste -sd, - || true)
+      if [ -n "$cap_labels" ]; then epic_labels="${epic_labels},${cap_labels}"; fi
+    fi
+    gh issue edit "$epic_num" --repo "$REPO" --add-label "$epic_labels" >/dev/null
     epic_node=$(gh issue view "$epic_num" --repo "$REPO" --json id -q .id)
     gh api graphql \
       -f query='mutation($l: ID!) { lockLockable(input: {lockableId: $l}) { clientMutationId } }' \
@@ -239,15 +286,37 @@ case "$cmd" in
     # under its epic. Uses convert — NOT `gh issue create` — so it never trips
     # the autonomous gate. Called by create-story at decomposition (ADR-015
     # default) and by po-act.sh dispatch for --defer drafts.
-    item_id="${1:?Usage: materialize-issue <item_id> [epic_num]}"
-    epic_num="${2:-}"
+    #   materialize-issue <item_id> [epic_num] [--cap <c1,c2>]
+    item_id="${1:?Usage: materialize-issue <item_id> [epic_num] [--cap <c1,c2>]}"
+    shift
+    epic_num=""
+    cap=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --cap) cap="${2:?--cap requires a comma-separated value}"; shift 2 ;;
+        *) epic_num="$1"; shift ;;
+      esac
+    done
 
     PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
     mat_json=$(bash "$PROJECT_QUEUE" materialize "$item_id")
     issue_num=$(echo "$mat_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['issue_num'])")
 
-    # Issue is already locked by project-queue materialize. Tag internal + story.
-    gh issue edit "$issue_num" --repo "$REPO" --add-label "internal,story" >/dev/null
+    # Base labels. cap:* capability tags are descriptive/multi-valued (see
+    # docs/product/roadmap.md) and orthogonal to Projects-V2 queue state.
+    labels="internal,story"
+    # For a --defer draft materialized later, --cap isn't passed; recover the
+    # intent from the body marker create-story embedded.
+    if [ -z "$cap" ]; then
+      body=$(gh issue view "$issue_num" --repo "$REPO" --json body -q .body 2>/dev/null || true)
+      cap=$(printf '%s' "$body" | grep -oE '<!-- cap:[^>]*-->' | sed -E 's/.*cap:[[:space:]]*//; s/[[:space:]]*-->.*//' | head -1 || true)
+    fi
+    if [ -n "$cap" ]; then
+      cap_labels=$(printf '%s' "$cap" | tr ',' '\n' | sed -E 's/^[[:space:]]*(cap:)?/cap:/; s/[[:space:]]*$//' | grep -vx 'cap:' | paste -sd, - || true)
+      if [ -n "$cap_labels" ]; then labels="${labels},${cap_labels}"; fi
+    fi
+    # Issue is already locked by project-queue materialize. Tag internal + story (+ cap:*).
+    gh issue edit "$issue_num" --repo "$REPO" --add-label "$labels" >/dev/null
 
     # Link under the epic so subIssuesSummary tracks completion.
     if [ -n "$epic_num" ]; then
@@ -291,7 +360,7 @@ case "$cmd" in
     # create->lock race in materialize/create-epic). Locked items take no external
     # comments — the injection surface stays closed.
     python3 - "$REPO" <<'PYEOF'
-import json, subprocess, sys
+import json, re, subprocess, sys
 
 repo = sys.argv[1]
 owner, name = repo.split('/')
@@ -331,6 +400,17 @@ for pr in prs:
     if 'internal' not in labels:
         subprocess.run(['gh', 'pr', 'edit', str(pr['number']), '--repo', repo,
                         '--add-label', 'internal'], capture_output=True)
+    # Carry the linked story's cap:* capability tags onto the PR (issue -> PR).
+    # feature/story-<N> branches key on the story issue number; feature/item-*
+    # branches have no issue to read from, so cap carry only applies to story-*.
+    m = re.match(r'feature/story-(\d+)', pr['headRefName'])
+    if m:
+        iss = gh_json(['issue', 'view', m.group(1), '--repo', repo, '--json', 'labels'])
+        iss_caps = [l['name'] for l in (iss or {}).get('labels', []) if l['name'].startswith('cap:')]
+        missing = [c for c in iss_caps if c not in labels]
+        if missing:
+            subprocess.run(['gh', 'pr', 'edit', str(pr['number']), '--repo', repo,
+                            '--add-label', ','.join(missing)], capture_output=True)
     if not is_locked:
         lock(pr['id'])
         locked_count += 1
