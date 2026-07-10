@@ -28,6 +28,11 @@ RUN set -eu; \
 # Stage 1 (runtime): main agent container with full tooling
 FROM golang:1.26.5-bookworm
 
+# Declare TARGETARCH so BuildKit auto-populates it from the build platform.
+# Must be declared inside the consuming stage; an undeclared ${TARGETARCH}
+# expands to empty and silently breaks all architecture mappings below.
+ARG TARGETARCH
+
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -72,10 +77,16 @@ RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1 \
 # piping the trivy main branch's install.sh through `sh` (whose contents are
 # fetched at install time and can be tampered with). See
 # docs/runbooks/trivy-rollback.md for rollback procedure.
+# Per-architecture checksums from trivy_<ver>_checksums.txt release asset at
+# https://github.com/aquasecurity/trivy/releases/download/<ver>/trivy_<ver>_checksums.txt
 RUN set -eu; \
     TRIVY_VERSION='v0.72.0'; \
-    TRIVY_SHA256='bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea'; \
-    ARCHIVE="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"; \
+    case "$TARGETARCH" in \
+      amd64) TRIVY_ARCH='Linux-64bit'; TRIVY_SHA256='bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea' ;; \
+      arm64) TRIVY_ARCH='Linux-ARM64'; TRIVY_SHA256='2ca2c023109c2db6b2b77366b6717291452d4531167377d95c79547f0c8e3467' ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ARCHIVE="trivy_${TRIVY_VERSION#v}_${TRIVY_ARCH}.tar.gz"; \
     curl -sSfL -o "/tmp/${ARCHIVE}" \
       "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/${ARCHIVE}"; \
     printf '%s  /tmp/%s\n' "${TRIVY_SHA256}" "${ARCHIVE}" | sha256sum -c -; \
@@ -84,8 +95,14 @@ RUN set -eu; \
     rm -f "/tmp/${ARCHIVE}" /tmp/trivy
 
 # Nancy (Go dependency scanner)
-RUN GOPATH=$(go env GOPATH) \
-    && curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v2.1.0/nancy-v2.1.0-linux-amd64" \
+RUN set -eu; \
+    GOPATH=$(go env GOPATH); \
+    case "$TARGETARCH" in \
+      amd64) NANCY_ARCH='linux-amd64' ;; \
+      arm64) NANCY_ARCH='linux-arm64' ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v2.1.0/nancy-v2.1.0-${NANCY_ARCH}" \
        -o "$GOPATH/bin/nancy" \
     && chmod +x "$GOPATH/bin/nancy"
 
@@ -140,16 +157,25 @@ ENV GOFLAGS=-modcacherw
 # UV_OFFLINE=1, so NO pypi/astral egress is added to the container firewall.
 #
 # uv/uvx — pinned release binary + SHA-256 (same supply-chain pattern as trivy).
+# Per-architecture checksums from <artifact>.tar.gz.sha256 release asset at
+# https://github.com/astral-sh/uv/releases/download/<ver>/<artifact>.tar.gz.sha256
+# The tarball extracts to a directory named after the artifact triple, so the
+# install paths use the resolved triple variable.
 RUN set -eu; \
     UV_VERSION='0.11.24'; \
-    UV_SHA256='5ce1ad074a78f96c5c8122088bb85a12eb282195bc1453151a48762e4fc31fed'; \
+    case "$TARGETARCH" in \
+      amd64) UV_TRIPLE='x86_64-unknown-linux-gnu';  UV_SHA256='5ce1ad074a78f96c5c8122088bb85a12eb282195bc1453151a48762e4fc31fed' ;; \
+      arm64) UV_TRIPLE='aarch64-unknown-linux-gnu'; UV_SHA256='e22c66d36a0098b17cff80a8647e0b8c58202af899d4e9eb820fc7ad126435a1' ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ARTIFACT="uv-${UV_TRIPLE}.tar.gz"; \
     curl -sSfL -o /tmp/uv.tgz \
-      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"; \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${ARTIFACT}"; \
     printf '%s  /tmp/uv.tgz\n' "${UV_SHA256}" | sha256sum -c -; \
     tar -xzf /tmp/uv.tgz -C /tmp; \
-    install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv  /usr/local/bin/uv; \
-    install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx; \
-    rm -rf /tmp/uv.tgz /tmp/uv-x86_64-unknown-linux-gnu
+    install -m 0755 "/tmp/uv-${UV_TRIPLE}/uv"  /usr/local/bin/uv; \
+    install -m 0755 "/tmp/uv-${UV_TRIPLE}/uvx" /usr/local/bin/uvx; \
+    rm -rf /tmp/uv.tgz "/tmp/uv-${UV_TRIPLE}"
 
 # gopls — serena's Go language server (pinned), on the shared PATH.
 RUN go install golang.org/x/tools/gopls@v0.22.0 \
