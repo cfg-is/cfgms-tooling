@@ -8,7 +8,7 @@
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
 # and .git history are never baked into the final image's layers.
 # CLI_BINARY=cfg  Entry point: ./cmd/cfg
-FROM golang:1.26.4-bookworm AS cfg-builder
+FROM golang:1.26.5-bookworm AS cfg-builder
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
@@ -26,7 +26,7 @@ RUN set -eu; \
        ./cmd/cfg
 
 # Stage 1 (runtime): main agent container with full tooling
-FROM golang:1.26.4-bookworm
+FROM golang:1.26.5-bookworm
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
