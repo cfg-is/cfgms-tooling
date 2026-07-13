@@ -298,12 +298,19 @@ query {
         autoMergeRequest { enabledAt }
         author { login }
         labels(first: 20) { nodes { name } }
-        timelineItems(itemTypes: [LABELED_EVENT], first: 20) {
+        timelineItems(itemTypes: [LABELED_EVENT, ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT], first: 50) {
           nodes {
+            __typename
             ... on LabeledEvent {
               createdAt
               label { name }
               actor { login }
+            }
+            ... on AddedToMergeQueueEvent {
+              createdAt
+            }
+            ... on RemovedFromMergeQueueEvent {
+              createdAt
             }
           }
         }
@@ -1476,8 +1483,52 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 continue
 
             # Only reaches here when verdict == "pass" and no fix commit landed
-            # after the review (prior PASS is still valid). Flag as stuck if CI
-            # green + mergeable but not in queue and not already auto-merge-enabled.
+            # after the review (prior PASS is still valid).
+
+            # Issue #2589: queue-eviction escalation. A PR evicted from the merge
+            # queue >= 2 times since its latest commit is implicated — one
+            # eviction can be innocent ALLGREEN-group fallout, but two on the same
+            # head SHA means this PR's own merge-commit CI keeps failing. Do NOT
+            # keep silently re-enqueuing it forever; route to
+            # investigate_queue_failures so the cycle diagnoses and moves it to
+            # Fix (mirrors the rebase_then_investigate handling).
+            eviction_count = pr.get("eviction_count", 0)
+            if eviction_count >= 2 and not in_queue:
+                recs.append({
+                    "pr": pr["pr"],
+                    "story": pr["story_number"],
+                    "action": "investigate_queue_failures",
+                    "reason": f"reviewed PASS but evicted from the merge queue {eviction_count}x since the latest commit — merge-commit CI keeps failing; run `po-act.sh diagnose <PR>` + set status Fix instead of re-enqueuing",
+                })
+                continue
+
+            # Issue #2589: one-shot CI rerun for a transiently-red PASS PR. A
+            # PASS-verdict PR whose head CI went red while it sits OUT of the
+            # queue (a flake, or a superseded run) gets exactly one
+            # `gh run rerun --failed`. failed_run_attempt > 1 means the rerun
+            # already happened and CI is still red → not a flake; investigate
+            # instead of today's terminal skip. StatusContext legacy checks have
+            # no attempt and default to 1. (Budget is 1 to break the loop, not
+            # to mask flakes the de-flake stories must fix.)
+            if overall == "red" and not in_queue:
+                if pr.get("failed_run_attempt", 1) <= 1:
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "rerun_failed_checks",
+                        "reason": "reviewed PASS but head CI went red while out of the queue (attempt 1) — one-shot `po-act.sh rerun <PR>` to clear a transient flake before enqueueing",
+                    })
+                else:
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "investigate_queue_failures",
+                        "reason": "reviewed PASS but head CI is still red after a rerun (attempt > 1) — not a transient flake; run `po-act.sh diagnose <PR>` + set status Fix",
+                    })
+                continue
+
+            # Flag as stuck if CI green + mergeable but not in queue and not
+            # already auto-merge-enabled.
             if (
                 overall == "green"
                 and pr.get("mergeable") == "MERGEABLE"
@@ -1686,6 +1737,57 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
     return recs
 
 
+def count_merge_queue_evictions(timeline_items, since_iso):
+    """Count RemovedFromMergeQueueEvent timeline items dated after since_iso.
+
+    since_iso is the PR's latest-commit ISO timestamp, so a fixed-and-repushed
+    PR starts a fresh eviction budget — evictions before the newest commit are
+    stale and don't count. timeline_items are the raw GraphQL nodes (each has a
+    __typename; RemovedFromMergeQueueEvent carries createdAt). ISO-8601 UTC
+    strings compare lexicographically. Manual dequeues (po-act.sh dequeue) are
+    indistinguishable from GitHub evictions in the timeline, so both count — the
+    escalation threshold of 2 tolerates one benign dequeue. (Issue #2589)
+    """
+    if not since_iso:
+        return 0
+    count = 0
+    for item in timeline_items or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("__typename") != "RemovedFromMergeQueueEvent":
+            continue
+        created = item.get("createdAt")
+        if created and created > since_iso:
+            count += 1
+    return count
+
+
+def _latest_failing_run_attempt(head_ref):
+    """Return the attempt number of the most recent failed workflow run on
+    head_ref, or 1 if none/unknown. Called only for a PASS PR whose head CI is
+    red and sits OUT of the queue (Issue #2589 rerun budget), so these two
+    scoped gh calls run at most once or twice per cycle. 1 == not yet rerun
+    (eligible for one `po-act.sh rerun`); > 1 == a rerun already ran (escalate
+    to investigate).
+    """
+    if not head_ref:
+        return 1
+    runs = gh("run", "list", "--branch", head_ref, "--limit", "20",
+              "--json", "databaseId,conclusion", check=False)
+    if not isinstance(runs, list):
+        return 1
+    failing = next(
+        (r for r in runs if isinstance(r, dict) and r.get("conclusion") == "failure"),
+        None,
+    )
+    if not failing or failing.get("databaseId") is None:
+        return 1
+    view = gh("run", "view", str(failing["databaseId"]), "--json", "attempt", check=False)
+    if isinstance(view, dict) and isinstance(view.get("attempt"), int) and view["attempt"] >= 1:
+        return view["attempt"]
+    return 1
+
+
 def _build_pr_summaries(prs):
     """Build pr_summaries from raw PR nodes (Phase 4 of the preflight cycle).
 
@@ -1754,6 +1856,15 @@ def _build_pr_summaries(prs):
             "mergeable": pr.get("mergeable"),
             "auto_merge_enabled": pr.get("autoMergeRequest") is not None,
             "ci_summary": ci_summary(pr.get("statusCheckRollup") or []),
+            # Issue #2589: merge-queue awareness.
+            # eviction_count is pure (timeline + latest commit); queue_state and
+            # failed_run_attempt are injected in main() (queue_state from the
+            # mergeQueue map, failed_run_attempt via a scoped run lookup for the
+            # rare red-CI PR) so this transform stays API-free and unit-testable.
+            "eviction_count": count_merge_queue_evictions(
+                pr.get("timeline_items", []), pr.get("latest_commit_date")),
+            "queue_state": None,
+            "failed_run_attempt": 1,
         })
     return summaries
 
@@ -2105,6 +2216,25 @@ def main():
 
     # Phase 4: PR summaries (includes author trust classification — Issue #1786).
     pr_summaries = _build_pr_summaries(prs)
+
+    # Issue #2589: inject merge-queue-derived fields _build_pr_summaries can't
+    # compute (it is API-free by design so it stays unit-testable).
+    #  - queue_state: the mergeQueue entry state for a queued PR, else None.
+    #  - failed_run_attempt: only for a PASS PR whose head CI is red AND is not
+    #    in the queue (the sole rerun-eligible shape) — a scoped lookup of the
+    #    failing run's attempt, so the recommender reruns once then escalates.
+    #    Bounded to those (0-2 per cycle); no broad extra round-trip.
+    queue_state_by_pr = {e["pr_number"]: e.get("state") for e in merge_queue}
+    for s in pr_summaries:
+        s["queue_state"] = queue_state_by_pr.get(s["pr"])
+        if (
+            s["pr"] not in queued_pr_numbers
+            and s.get("has_acceptance_review_comment")
+            and s.get("latest_review_verdict") == "pass"
+            and (s.get("ci_summary") or {}).get("overall") == "red"
+        ):
+            s["failed_run_attempt"] = _latest_failing_run_attempt(s.get("head_ref", ""))
+
     out["prs_open"] = pr_summaries
 
     # Surface external-author PRs as a top-priority cron section (AC7).
