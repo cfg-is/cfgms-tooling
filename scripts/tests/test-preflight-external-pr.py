@@ -269,10 +269,11 @@ class TestComputeReviewRecommendationsExternalPR(unittest.TestCase):
     def _make_summary(self, pr_num=999, story_num=None, is_external=True,
                       is_released=False, is_draft=False, ci_overall="green",
                       has_review=False, wip_failed=False, merge_state="CLEAN",
-                      mergeable="MERGEABLE"):
+                      mergeable="MERGEABLE", author_login="external-user"):
         return {
             "pr": pr_num,
             "story_number": story_num,
+            "author_login": author_login,
             "is_external": is_external,
             "is_released": is_released,
             "is_draft": is_draft,
@@ -296,11 +297,14 @@ class TestComputeReviewRecommendationsExternalPR(unittest.TestCase):
 
     def test_external_unreleased_pr_is_skipped(self):
         """AC3: unreleased external PR → action=skip (quarantined, never reviewed/merged)."""
-        summaries = [self._make_summary(is_external=True, is_released=False)]
+        summaries = [self._make_summary(is_external=True, is_released=False,
+                                        author_login="external-user")]
         recs = self.pf.compute_review_recommendations(summaries, set())
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["action"], "skip")
         self.assertIn("external", recs[0]["reason"].lower())
+        # Verify the author login appears in the quarantine reason (not silently 'unknown').
+        self.assertIn("external-user", recs[0]["reason"])
 
     def test_external_released_pr_proceeds_to_review(self):
         """AC5: validly released external PR (human-reviewed:ok by push+) proceeds normally."""
@@ -494,6 +498,92 @@ class TestIsTrustedReviewComment(unittest.TestCase):
         ]
         verdict, _ = self.pf.latest_review(comments)
         self.assertEqual(verdict, "fail")
+
+
+class TestWaitVerdictReviewRecommendations(unittest.TestCase):
+    """Issue #2588: WAIT verdict (verdict=None) must route to spawn_acceptance_reviewer,
+    not enqueue_merge.
+
+    Covers the three required cases from the acceptance criteria:
+    (a) has_review=True, verdict=None, CI=green → spawn_acceptance_reviewer
+    (b) has_review=True, verdict="pass", CI=green → enqueue_merge (regression guard)
+    (c) has_review=True, verdict="fail" → skip/unchanged (regression guard)
+    """
+
+    def setUp(self):
+        self.pf = _load_preflight()
+
+    def _make_summary(self, pr_num=101, story_num=42, has_review=False,
+                      verdict=None, ci_overall="green", auto_merge=False,
+                      merge_state="CLEAN", mergeable="MERGEABLE"):
+        """Build a pr_summary dict for an internal, non-draft PR with controllable review state."""
+        pending_checks = ["unit-tests"] if ci_overall == "pending" else []
+        failed_checks = ["unit-tests"] if ci_overall == "red" else []
+        return {
+            "pr": pr_num,
+            "story_number": story_num,
+            "is_external": False,
+            "is_released": False,
+            "is_draft": False,
+            "wip_session_failed": False,
+            "has_acceptance_review_comment": has_review,
+            "latest_review_verdict": verdict,
+            "latest_review_comment_date": None,
+            "latest_commit_date": None,
+            "merge_state_status": merge_state,
+            "mergeable": mergeable,
+            "auto_merge_enabled": auto_merge,
+            "ci_summary": {
+                "overall": ci_overall,
+                "pass": 4 if ci_overall == "green" else 0,
+                "pending": 1 if ci_overall == "pending" else 0,
+                "fail": 1 if ci_overall == "red" else 0,
+                "skipped": 0,
+                "pending_checks": pending_checks,
+                "failed_checks": failed_checks,
+            },
+        }
+
+    # (a) The bug: WAIT verdict (verdict=None) must NOT enqueue
+    def test_wait_verdict_green_ci_spawns_reviewer(self):
+        """AC (a): has_review=True + verdict=None + CI=green → spawn_acceptance_reviewer, not enqueue_merge."""
+        summaries = [self._make_summary(has_review=True, verdict=None, ci_overall="green")]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "spawn_acceptance_reviewer",
+                         f"Expected spawn_acceptance_reviewer but got {recs[0]['action']!r}: {recs[0]['reason']!r}")
+
+    def test_wait_verdict_pending_ci_defers(self):
+        """WAIT verdict + pending CI → defer (not spawn; CI not green yet)."""
+        summaries = [self._make_summary(has_review=True, verdict=None, ci_overall="pending")]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "defer")
+
+    def test_wait_verdict_red_ci_skips(self):
+        """WAIT verdict + red CI → skip (fix cycle owns it)."""
+        summaries = [self._make_summary(has_review=True, verdict=None, ci_overall="red")]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "skip")
+
+    # (b) Regression guard: explicit PASS must still produce enqueue_merge
+    def test_pass_verdict_green_ci_enqueues(self):
+        """AC (b): has_review=True + verdict='pass' + CI=green → enqueue_merge (regression guard)."""
+        summaries = [self._make_summary(has_review=True, verdict="pass", ci_overall="green")]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "enqueue_merge",
+                         f"Expected enqueue_merge but got {recs[0]['action']!r}: {recs[0]['reason']!r}")
+
+    # (c) Regression guard: FAIL path unchanged
+    def test_fail_verdict_no_fix_commit_skips(self):
+        """AC (c): has_review=True + verdict='fail' + no fix commit landed → skip (regression guard)."""
+        summaries = [self._make_summary(has_review=True, verdict="fail", ci_overall="green")]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "skip")
+        self.assertIn("fail", recs[0]["reason"].lower())
 
 
 if __name__ == "__main__":

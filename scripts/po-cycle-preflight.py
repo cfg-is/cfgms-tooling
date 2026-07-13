@@ -1443,8 +1443,41 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                     })
                 continue
 
-            # Review passed (or verdict unparseable). Flag as stuck if CI green
-            # + mergeable but not in queue and not already auto-merge-enabled.
+            # Issue #2588: A review comment with no parseable verdict (verdict=None)
+            # means the reviewer posted a WAIT (CI still pending when they ran) or
+            # an unstructured comment that doesn't match _REVIEW_VERDICT_RE.
+            # This must NOT fall through to enqueue_merge — that would permanently
+            # skip re-spawning the acceptance reviewer once CI goes green.
+            # Route to spawn_acceptance_reviewer so the reviewer issues a definitive
+            # PASS or FAIL before this PR can enter the merge queue.
+            if verdict is None:
+                if overall == "green":
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "spawn_acceptance_reviewer",
+                        "reason": "acceptance-review comment present but verdict is WAIT or unparseable — re-spawn to obtain a definitive PASS or FAIL before enqueueing",
+                    })
+                elif overall == "pending":
+                    pending = pr["ci_summary"]["pending_checks"][:3]
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "defer",
+                        "reason": f"acceptance-review comment present but no parseable verdict; CI pending: {', '.join(pending)}",
+                    })
+                else:
+                    recs.append({
+                        "pr": pr["pr"],
+                        "story": pr["story_number"],
+                        "action": "skip",
+                        "reason": "acceptance-review comment present but no parseable verdict; CI red — fix cycle owns this",
+                    })
+                continue
+
+            # Only reaches here when verdict == "pass" and no fix commit landed
+            # after the review (prior PASS is still valid). Flag as stuck if CI
+            # green + mergeable but not in queue and not already auto-merge-enabled.
             if (
                 overall == "green"
                 and pr.get("mergeable") == "MERGEABLE"
