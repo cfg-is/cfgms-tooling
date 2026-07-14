@@ -266,8 +266,10 @@ def _normalize_status_check_rollup(rollup):
 
 def gh_graphql_pipeline_overview():
     """One GraphQL round-trip that replaces four prior gh calls (Issue #1581):
-    epic summary, merge queue, open story PRs (head:feature/*), and the
-    'Parent epic in:body' search for epics that lack sub-issue links.
+    epic summary, merge queue, all open PRs (any branch — story linkage comes
+    from the branch name or the PR's closing-issue reference, so windows §7
+    fix/* PRs reach review instead of stranding), and the 'Parent epic in:body'
+    search for epics that lack sub-issue links.
 
     Returns dict: {epics: [...], merge_queue: [...], prs: [...], body_refs: {...}}.
     On failure, returns the same shape with empty lists/dicts so callers can
@@ -285,7 +287,7 @@ query {
       }
     }
   }
-  storyPRs: search(query: "repo:cfg-is/cfgms is:pr is:open head:feature/", type: ISSUE, first: 50) {
+  storyPRs: search(query: "repo:cfg-is/cfgms is:pr is:open", type: ISSUE, first: 50) {
     nodes {
       ... on PullRequest {
         number
@@ -297,6 +299,7 @@ query {
         mergeStateStatus
         autoMergeRequest { enabledAt }
         author { login }
+        closingIssuesReferences(first: 5) { nodes { number } }
         labels(first: 20) { nodes { name } }
         timelineItems(itemTypes: [LABELED_EVENT, ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT], first: 50) {
           nodes {
@@ -384,6 +387,11 @@ query {
             "mergeable": n.get("mergeable"),
             "mergeStateStatus": n.get("mergeStateStatus"),
             "autoMergeRequest": n.get("autoMergeRequest"),
+            "closing_issue_numbers": [
+                c.get("number") for c in
+                (((n.get("closingIssuesReferences") or {}).get("nodes")) or [])
+                if c and c.get("number") is not None
+            ],
             "author_login": ((n.get("author") or {}).get("login")) or "",
             "labels": ((n.get("labels") or {}).get("nodes")) or [],
             "timeline_items": ((n.get("timelineItems") or {}).get("nodes")) or [],
@@ -1827,6 +1835,19 @@ def _build_pr_summaries(prs):
             m = BRANCH_STORY_RE.match(head)
             if m and m.group(1) and m.group(1).isdigit():
                 story_number = int(m.group(1))
+            else:
+                # Branch name doesn't encode a story (e.g. windows §7 self-dispatch
+                # PRs on fix/* branches, or ad-hoc fixes). Fall back to the PR's
+                # GitHub-computed closing-issue reference ("Fixes #N"). This lets
+                # story-linked PRs on any branch reach acceptance review instead of
+                # stranding — the head:feature/ query filter used to drop them
+                # entirely (recurring manual-clear tax; #2649/#2639/#2620/#2655/#2653).
+                # A PR with no closing reference keeps story_number=None and
+                # surfaces as no_story_link (visible) rather than silently vanishing.
+                for cin in pr.get("closing_issue_numbers", []):
+                    if isinstance(cin, int):
+                        story_number = cin
+                        break
 
         comments = pr.get("comments") or []
         has_review_comment = any(is_trusted_review_comment(c) for c in comments)
