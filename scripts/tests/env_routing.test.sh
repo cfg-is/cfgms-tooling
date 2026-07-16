@@ -49,6 +49,11 @@ check("env body 'Windows 11 host'", m.detect_required_env("Windows 11 host", [])
 # macOS is not a routing env — no macOS dev host; dev on Linux, validate in CI.
 check("env body 'macos' -> linux", m.detect_required_env("macos", []), "linux")
 check("env body 'darwin' alias -> linux", m.detect_required_env("build on a darwin runner", []), "linux")
+# A negated/omission mention of "windows" must not route to windows — the
+# section's leading word is what matters, not any substring occurrence.
+check("env body omission mentioning windows -> linux",
+      m.detect_required_env("(omit — ordinary Linux-buildable Go change; storage-layer only, no Windows API)", []),
+      "linux")
 check("env body 'linux'", m.detect_required_env("linux", []), "linux")
 check("env body None -> linux", m.detect_required_env(None, []), "linux")
 check("env body empty -> linux", m.detect_required_env("", []), "linux")

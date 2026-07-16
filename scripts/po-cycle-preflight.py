@@ -91,7 +91,16 @@ def detect_required_env(env_section, labels):
         return "windows"
     if env_section:
         t = env_section.strip().lower()
-        if "windows" in t:
+        # The `## Environment` convention: when windows IS required, the section's
+        # first word is "windows" (optionally followed by more context on the same
+        # or later lines, e.g. "windows\nRouted to the Windows host because..."). When
+        # windows is NOT required, the section instead opens with an explanation
+        # (e.g. "(omit — ordinary Linux-buildable Go change ... no Windows API)") that
+        # may itself mention "windows" in passing. A substring search over the whole
+        # section false-positives on exactly those omission explanations — only the
+        # leading-word form is a routing directive.
+        first_word = t.split(None, 1)[0].strip(".,:;()") if t else ""
+        if first_word == "windows":
             return "windows"
     return DEFAULT_ENV
 
