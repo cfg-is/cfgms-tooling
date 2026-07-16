@@ -107,7 +107,7 @@ RUN set -eu; \
     && chmod +x "$GOPATH/bin/nancy"
 
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.95.8/scripts/install.sh | sh -s -- -b /usr/local/bin v3.95.8 || true
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.95.9/scripts/install.sh | sh -s -- -b /usr/local/bin v3.95.9 || true
 
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code
