@@ -64,7 +64,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Go-based security and quality tools
 # Versions MUST match .github/workflows/dependency-pin-check.yml
-RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1 \
+RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
     && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
     && go install github.com/google/go-licenses/v2@v2.0.1 \
