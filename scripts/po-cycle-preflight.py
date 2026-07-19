@@ -1048,6 +1048,7 @@ def parse_story(issue):
     return {
         "number": number,
         "title": issue.get("title", ""),
+        "state": issue.get("state"),
         "parse_ok": len(warnings) == 0,
         "parse_warnings": warnings,
         "deps_parsed": deps_parsed,
@@ -1153,6 +1154,8 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
     """Greedy conflict-free selection.
 
     Order: ascending story number (stable, predictable); pure drafts (number=None) last.
+    Hold if the story's own issue is already CLOSED/MERGED — the board item is
+    stale and dispatching would burn an agent on delivered work.
     Hold if the story's required execution env is not in this host's caps (routing
     to another host — e.g. windows stories on the linux orchestrator).
     Skip if any dep is not CLOSED.
@@ -1171,6 +1174,27 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
         num = s["number"]
         item_id = s.get("item_id", "")
         req_env = s.get("requires_env", DEFAULT_ENV)
+
+        # Self-closure gate. A story whose own issue is CLOSED (or whose number
+        # resolves to a MERGED PR) was delivered out-of-band — merged under
+        # another PR, or closed by hand — while its project item stayed at
+        # Ready. Without this check the item is re-recommended every cycle and
+        # an agent is dispatched onto already-shipped work until a sweep
+        # happens to notice. Runs before the env/dep gates so the stale board
+        # state is reported regardless of routing. Draft items (number=None)
+        # and stories fetched without a state carry state=None and fall
+        # through — absence of state is never treated as closed.
+        state = s.get("state")
+        if state in ("CLOSED", "MERGED"):
+            recommendations.append({
+                "number": num,
+                "item_id": item_id,
+                "action": "hold",
+                "reason": f"story issue is {state} — board item is stale, move it to Done",
+                "stale_board": True,
+            })
+            continue
+
         if req_env not in caps:
             recommendations.append({
                 "number": num,
