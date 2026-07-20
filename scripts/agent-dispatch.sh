@@ -1073,7 +1073,22 @@ case "$cmd" in
       for a in "$@"; do
         escaped+=" $(printf '%q' "$a")"
       done
-      exec tmux split-window -h "POLIVE_INNER=1 $0 po-live${escaped}"
+      # `tmux split-window` exits 0 for *creating the pane*, not for the command
+      # inside it surviving. A pane whose command dies immediately is closed by
+      # tmux, so a failed launch used to report success with nothing running.
+      # Capture the pane id, keep a dead pane visible so its error survives, and
+      # verify the pane still exists before claiming the session started.
+      pane=$(tmux split-window -h -P -F '#{pane_id}' \
+        "POLIVE_INNER=1 $0 po-live${escaped}") || exit 1
+      tmux set-option -p -t "$pane" remain-on-exit on 2>/dev/null || true
+      sleep 2
+      if ! tmux list-panes -a -F '#{pane_id}' | grep -qx "$pane"; then
+        echo "ERROR: po-live pane exited immediately — the container never started." >&2
+        echo "       Re-run the inner path to see the failure:" >&2
+        echo "         POLIVE_INNER=1 $0 po-live${escaped}" >&2
+        exit 1
+      fi
+      exit 0
     fi
 
     if [[ -z "$TMUX" && -z "${POLIVE_INNER:-}" ]]; then
@@ -1116,6 +1131,23 @@ case "$cmd" in
       echo "Refreshing po-live workspace to a clean, up-to-date develop..."
       git -C "$clone_dir" fetch --quiet origin develop \
         || echo "  ! warning: fetch of origin/develop failed; refreshing against last-known origin/develop" >&2
+      # Clear skip-worktree / assume-unchanged before inspecting the tree.
+      # `.devcontainer/scripts/setup-env.sh` marks `.mcp.json` skip-worktree so
+      # its per-container rewrite doesn't dirty every agent's clone. That hides
+      # the file from `status --porcelain`, so the stash below never fired and
+      # the checkout then refused with "local changes would be overwritten" —
+      # a silent, permanent break of every fresh po-live session. Clearing the
+      # bits first lets the existing stash-then-checkout path see the truth and
+      # preserve the content instead of discarding it.
+      # In `ls-files -v`, `S` marks skip-worktree and a LOWERCASE tag marks
+      # assume-unchanged; `H` is an ordinary cached file, so it must not match.
+      # The two --no-* flags MUST be separate invocations: passing both in one
+      # `update-index` call exits 0 and silently applies neither (verified —
+      # the S bit survives), which is exactly how this stayed broken.
+      git -C "$clone_dir" ls-files -v 2>/dev/null | awk '/^S / {print $2}' \
+        | xargs -r git -C "$clone_dir" update-index --no-skip-worktree || true
+      git -C "$clone_dir" ls-files -v 2>/dev/null | awk '/^[[:lower:]] / {print $2}' \
+        | xargs -r git -C "$clone_dir" update-index --no-assume-unchanged || true
       if [[ -n "$(git -C "$clone_dir" status --porcelain 2>/dev/null)" ]]; then
         stash_label="po-live-autobackup-$(date -u +%Y%m%dT%H%M%SZ)"
         if git -C "$clone_dir" stash push -u -m "$stash_label" >/dev/null 2>&1; then
