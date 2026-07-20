@@ -48,10 +48,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dnsmasq \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js 22 (required by Claude Code — Debian Bookworm ships Node 18 which
-# lacks Array.with() and other APIs used since Claude Code 2.1.79)
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+# Node.js — major version tracks web/.nvmrc, the same file frontend-ci.yml reads
+# via node-version-file, so the container, CI, and the web toolchain never drift.
+# (Debian Bookworm ships Node 18, too old for both the web build and Claude Code,
+# which needs >=22 — a web/.nvmrc bump past Claude Code's supported range would
+# need checking here since this Node also runs Claude Code.)
+COPY web/.nvmrc /tmp/nvmrc
+RUN NODE_MAJOR="$(cut -d. -f1 < /tmp/nvmrc)" \
+    && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && apt-get install -y --no-install-recommends nodejs \
+    && rm -f /tmp/nvmrc \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI
@@ -132,6 +138,18 @@ RUN go mod download \
     && chown -R agent:agent /home/agent/go/pkg/mod \
     && rm go.mod go.sum
 WORKDIR /
+
+# Pre-warm the npm cache so per-agent `npm ci` in web/ resolves tarballs from the
+# warm cache instead of a cold registry pull each dispatch — same rationale as the
+# Go module / Trivy DB pre-caches above. We keep the CACHE (~/.npm), not
+# node_modules: /workspace is bind-mounted at runtime and the checked-out lockfile
+# may differ, so `npm ci` must re-resolve — but it pulls unchanged tarballs from
+# the integrity-hash-keyed cache offline and only fetches genuinely-new deps from
+# the registry (npmjs.org is allowlisted in dnsmasq-allowlist.conf).
+COPY web/package.json web/package-lock.json /tmp/webcache/
+RUN chown -R agent:agent /tmp/webcache \
+    && su agent -c 'cd /tmp/webcache && npm ci --no-audit --no-fund' \
+    && rm -rf /tmp/webcache
 
 # CLI_BINARY=cfg — install cfg CLI built in the builder stage above.
 # The builder stage is discarded; only the binary is copied to this layer.
