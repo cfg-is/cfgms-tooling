@@ -162,6 +162,56 @@ check_contains "lease-gc releases expired key" "$out" "GC_RELEASED:gc-key"
 out="$(run lease-status gc-key)"
 check_contains "gc'd key is FREE" "$out" "FREE:gc-key"
 
+# --- 10. lease-gc liveness guard -----------------------------------------------
+# An expired `pr-<N>` lease whose holder container is STILL RUNNING must not be
+# collected: deleting it leaves live work with no interlock, so a second host can
+# claim a PR that is actively being worked. Observed repeatedly on 2026-07-19 —
+# fix containers ran 2h35m against a 1h PR TTL. A fake `docker` on PATH drives
+# both branches; DOCKER_FAKE_RUNNING lists the pr numbers reported as live.
+cat > "$FAKE_BIN/docker" <<'DOCKER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  info) exit 0 ;;
+  ps)
+    want=""
+    for a in "$@"; do case "$a" in label=pr=*) want="${a#label=pr=}" ;; esac; done
+    for n in ${DOCKER_FAKE_RUNNING:-}; do
+      [ "$n" = "$want" ] && { echo "deadbeefcafe"; exit 0; }
+    done
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+DOCKER_EOF
+chmod +x "$FAKE_BIN/docker"
+
+# 10a. holder container alive → skipped, lease survives
+run lease-acquire pr-9001 -5 >/dev/null
+out="$(DOCKER_FAKE_RUNNING="9001" run lease-gc)"
+check_contains "expired pr lease with live container is SKIPPED" "$out" "GC_SKIPPED:pr-9001"
+out="$(run lease-status pr-9001)"
+check_contains "skipped lease still HELD" "$out" "HELD:pr-9001"
+
+# 10b. same lease, container now gone → collected
+out="$(DOCKER_FAKE_RUNNING="" run lease-gc)"
+check_contains "expired pr lease with no container is RELEASED" "$out" "GC_RELEASED:pr-9001"
+out="$(run lease-status pr-9001)"
+check_contains "released pr lease is FREE" "$out" "FREE:pr-9001"
+
+# 10c. guard is scoped to pr-* keys only — a story lease cannot be mapped to a
+# container label, so it must still be collected on TTL alone.
+run lease-acquire story-abc123 -5 >/dev/null
+out="$(DOCKER_FAKE_RUNNING="9001" run lease-gc)"
+check_contains "story lease still collected on TTL" "$out" "GC_RELEASED:story-abc123"
+
+# 10d. a non-expired pr lease is untouched regardless of container state
+run lease-acquire pr-9002 3600 >/dev/null
+out="$(DOCKER_FAKE_RUNNING="9002" run lease-gc)"
+check_contains "unexpired pr lease neither skipped nor released" "$out" "LEASE_GC_DONE:0"
+out="$(run lease-status pr-9002)"
+check_contains "unexpired pr lease still HELD" "$out" "HELD:pr-9002"
+run lease-release pr-9002 >/dev/null
+
 echo ""
 if [[ "$fail" -eq 0 ]]; then
   printf 'lease.test.sh: PASS (%d checks)\n' "$ran"; exit 0

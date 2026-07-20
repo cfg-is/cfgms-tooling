@@ -1719,7 +1719,9 @@ for i in items:
     # EXIT trap and disarm it only after a successful detached launch (then the
     # container owns release).
     PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-${REPO_ROOT}/scripts/pipeline-helper.sh}"
-    review_lease_out=$(bash "$PIPELINE_HELPER" lease-acquire "pr-${pr_num}" "${CFGMS_LEASE_TTL_PR:-3600}" 2>/dev/null || true)
+    # Default must match po-act.sh's LEASE_TTL_PR — a shorter value here would
+    # expire a review lease under a live container (see lease-gc liveness guard).
+    review_lease_out=$(bash "$PIPELINE_HELPER" lease-acquire "pr-${pr_num}" "${CFGMS_LEASE_TTL_PR:-21600}" 2>/dev/null || true)
     case "$review_lease_out" in
       ACQUIRED:*|RECLAIMED:*) ;;
       HELD:*) echo "REVIEW_REFUSED:${pr_num}:lease_held"; exit 3 ;;

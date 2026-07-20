@@ -41,8 +41,13 @@ PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-$(cd "$(dirname "$0")/../.." && p
 # Default lease TTLs (seconds). A held lease past its TTL is reclaimable by any
 # host — the backstop for a host that died holding it. Sized well above the
 # normal operation duration so a live op is never reclaimed out from under it.
-LEASE_TTL_STORY="${CFGMS_LEASE_TTL_STORY:-7200}"   # dev container: long stories
-LEASE_TTL_PR="${CFGMS_LEASE_TTL_PR:-3600}"         # review/fix/resolve container
+# TTLs must exceed the longest realistic container runtime, or a lease expires
+# under live work and the interlock disappears. Measured 2026-07-19: dev
+# containers past 3h, a fix container at 2h35m against the old 1h PR TTL. The
+# liveness guard in `pipeline-helper.sh lease-gc` covers pr-* keys; these
+# headroom values cover story-* keys, which cannot be mapped to a container.
+LEASE_TTL_STORY="${CFGMS_LEASE_TTL_STORY:-21600}"  # dev container: long stories (6h)
+LEASE_TTL_PR="${CFGMS_LEASE_TTL_PR:-21600}"        # review/fix/resolve container (6h)
 
 # Cache path (matches po-cycle-preflight.py defaults). No /tmp writes.
 if [ -n "${PO_CACHE_DIR:-}" ]; then

@@ -577,16 +577,33 @@ for r in refs:
     # Belt-and-suspenders alongside acquire-time reclaim: keeps refs/cfgms-lease/
     # tidy when a crashed holder's work is picked up by status/stalled recovery
     # rather than by a direct re-acquire of the same key.
+    # LIVENESS GUARD: a lease may expire while its holder is still working —
+    # observed repeatedly with fix containers running 2h35m against a 1h PR TTL
+    # and dev containers past 3h. Deleting the ref then leaves live work with no
+    # interlock, so a second host can claim a PR that is actively being worked.
+    # Agent containers carry a `pr=<N>` label, so a `pr-<N>` lease maps directly
+    # to its holder; skip GC while that container is alive. Falls through to
+    # plain TTL behaviour where docker is absent (GC may run off-host).
     owner="${REPO%%/*}"; name="${REPO##*/}"
-    gced=0
+    have_docker=false
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && have_docker=true
+    gced=0; skipped=0
     while IFS=$'\t' read -r key holder exp expired; do
       [ "$expired" = "True" ] || [ "$expired" = "true" ] || continue
+      if [ "$have_docker" = true ] && [[ "$key" =~ ^pr-([0-9]+)$ ]]; then
+        pr_num="${BASH_REMATCH[1]}"
+        if [ -n "$(docker ps -q --filter "label=cfg-agent=true" --filter "label=pr=${pr_num}" 2>/dev/null)" ]; then
+          echo "GC_SKIPPED:${key} (expired but holder container still running)"
+          skipped=$(( skipped + 1 ))
+          continue
+        fi
+      fi
       if gh api -X DELETE "repos/${owner}/${name}/git/refs/cfgms-lease/${key}" >/dev/null 2>&1; then
         echo "GC_RELEASED:${key} (was ${holder:-unknown}, expired)"
         gced=$(( gced + 1 ))
       fi
     done < <(bash "$0" lease-list)
-    echo "LEASE_GC_DONE:${gced}"
+    echo "LEASE_GC_DONE:${gced} LEASE_GC_SKIPPED:${skipped}"
     exit 0
     ;;
 
