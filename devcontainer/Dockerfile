@@ -33,6 +33,15 @@ FROM golang:1.26.5-bookworm
 # expands to empty and silently breaks all architecture mappings below.
 ARG TARGETARCH
 
+# Run every RUN step in this stage under bash with pipefail, so a failure on the
+# LEFT side of a pipe (a curl download feeding `| bash -` / `| sh` / `| gpg`)
+# aborts the build instead of being masked by the default /bin/sh (dash has no
+# pipefail) — which would silently proceed with an empty/partial download (e.g.
+# a 404 on an unpublished Node major would otherwise let apt install Debian's
+# stock Node 18). truffleHog below keeps its explicit `|| true` to stay
+# best-effort by design.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
