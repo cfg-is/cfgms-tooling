@@ -14,9 +14,11 @@
 #   reports the findings a PR *introduces* as check-run annotations on the head
 #   commit. It has three properties we need:
 #     1. New-in-PR only. Inherited develop alerts are NOT annotated on the PR's
-#        checks. (Querying `code-scanning/alerts?ref=refs/pull/<N>/merge` instead
-#        returns the UNION of develop's ~70 open alerts + the PR's new ones,
-#        which would fail every PR. Rejected.)
+#        checks. (A RAW `code-scanning/alerts?ref=refs/pull/<N>/merge` query,
+#        emitting every returned alert, returns the UNION of develop's ~70 open
+#        alerts + the PR's new ones and would fail every PR — rejected for Pass 1.
+#        Pass 2 below DOES query that merge ref but intersects with the lines the
+#        PR adds, so develop's inherited alerts on untouched lines drop out.)
 #     2. Respects human dismissal. When a human dismisses an alert, its check
 #        flips to `success` and it drops out here — preserving the human-sign-off
 #        model with NO agent dismiss path. (Reading inline bot review comments
@@ -33,8 +35,12 @@
 # way). Pass 2 (Issue #2634) closes that: open code-scanning alerts intersected
 # with the lines the PR ADDS. state=open respects human dismissal; the
 # added-line intersection keeps it new-in-PR (inherited develop alerts on
-# untouched lines don't FP — the reason the raw `ref=.../merge` query was
-# rejected above).
+# untouched lines don't FP). Pass 2 queries the PR-MERGE ref
+# (`ref=refs/pull/<N>/merge`, Issue #2913): the default-branch alert set has NO
+# alerts for a file the PR newly ADDS, so a HIGH/CRITICAL CodeQL finding in a
+# new file was invisible — its alert exists only on the merge ref. The
+# added-line intersection is what makes querying that ref safe (it discards the
+# ~70 inherited alerts the raw query above would have emitted).
 #
 # Output: one finding per line, `<path>:<line>:<rule-or-title>`. Empty stdout =
 # no PR-introduced GHAS findings = safe to PASS. Any output = blocking FAIL:
@@ -86,6 +92,7 @@ HEAD_SHA=$(gh pr view "${PR}" --repo "${REPO}" --json headRefOid --jq '.headRefO
     # Catches advisory-mode findings (CodeQL) that Pass 1 misses because their
     # check concludes `success`. state=open respects human dismissal; the
     # added-line intersection keeps it new-in-PR (no inherited-alert FP).
+    # Queries the PR-merge ref (Issue #2913) so new-file alerts are visible.
     python3 - "${REPO}" "${PR}" <<'PYEOF' 2>/dev/null || true
 import json, re, subprocess, sys
 repo, pr = sys.argv[1], sys.argv[2]
@@ -121,7 +128,13 @@ for f in gh_json("api", f"repos/{repo}/pulls/{pr}/files", "--paginate") or []:
             ln += 1  # context line
 
 # Open alerts whose location falls on an added line → new-in-PR finding.
-for a in gh_json("api", f"repos/{repo}/code-scanning/alerts?state=open&per_page=100", "--paginate") or []:
+# Query the PR-MERGE ref (Issue #2913): the default-branch alert set has ZERO
+# alerts for a file the PR newly ADDS (it doesn't exist on develop yet), so a
+# HIGH/CRITICAL finding in a new file was invisible. Alerts for new-file lines
+# live only on refs/pull/<N>/merge. The added-line intersection below still
+# filters develop's inherited alerts on untouched lines, so widening the query
+# to the merge ref adds no false-positives (see header).
+for a in gh_json("api", f"repos/{repo}/code-scanning/alerts?ref=refs/pull/{pr}/merge&state=open&per_page=100", "--paginate") or []:
     loc = ((a.get("most_recent_instance") or {}).get("location")) or {}
     path, start = loc.get("path"), loc.get("start_line")
     if path in added and start in added[path]:
