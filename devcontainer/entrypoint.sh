@@ -154,6 +154,64 @@ gh_api_with_retry() {
     return 1
 }
 
+# _zero_work_retry — handle a zero-work failure retry/escalation.
+# Reads the retry count from the ZeroWorkRetries project field rather than from
+# issue comments, so comment content (or count) cannot influence dispatch state.
+# A read failure is treated conservatively: Blocked, not re-dispatch.
+# Globals used: PROJECT_QUEUE, CFGMS_PROJECT_ITEM_ID, ISSUE_NUM, EXIT_CODE
+_zero_work_retry() {
+    local zw_marker="<!-- cfgms-zero-work-retry -->"
+
+    # Read retry count from the project field. On get-item failure zw_read_ok
+    # stays false — a read failure must never be treated as "count is zero".
+    local zw_item_json zw_read_ok=false
+    if zw_item_json=$(bash "$PROJECT_QUEUE" get-item "$CFGMS_PROJECT_ITEM_ID" 2>/dev/null); then
+        zw_read_ok=true
+    fi
+
+    if [[ "$zw_read_ok" != "true" ]]; then
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
+            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — retry counter unavailable (project field read failed). Status set to Blocked for operator review." \
+            2>/dev/null || true
+        echo "Zero-work failure: retry counter unavailable — set to Blocked (conservative)"
+        return
+    fi
+
+    # Parse ZeroWorkRetries; a missing or empty value means first failure (treat as 0).
+    local zw_count
+    zw_count=$(printf '%s' "$zw_item_json" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); v=d.get("fields",{}).get("ZeroWorkRetries",""); print(v if v and v.strip() else "0")' \
+        2>/dev/null || echo "PARSE_ERROR")
+
+    if [[ "$zw_count" == "PARSE_ERROR" ]] || ! [[ "$zw_count" =~ ^[0-9]+$ ]]; then
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        echo "Zero-work failure: retry counter parse error — set to Blocked (conservative)"
+        return
+    fi
+
+    if [ "$zw_count" -lt 3 ]; then
+        local new_count=$((zw_count + 1))
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" "ZeroWorkRetries" "$new_count" \
+            2>/dev/null || echo "WARN: failed to increment ZeroWorkRetries field"
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Ready" \
+            2>/dev/null || echo "WARN: failed to reset status Ready"
+        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
+            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — no changes produced (likely usage limit / token reauth / early crash). Status reset to Ready for re-dispatch (retry ${new_count}/3)." \
+            2>/dev/null || true
+        echo "Zero-work failure: reset to Ready for re-dispatch (retry ${new_count}/3)"
+    else
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
+            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — 3 re-dispatch retries exhausted with no progress. Status set to Blocked for operator review." \
+            2>/dev/null || true
+        echo "Zero-work failure: retry cap reached — set to Blocked for operator review"
+    fi
+}
+
 # --- Shared prompt sections ---
 # These are appended to ALL mode prompts for consistent quality standards.
 
@@ -916,36 +974,18 @@ else
             # strands it forever (the cron won't re-dispatch In Progress work).
             # Reset it to Ready so the next cron cycle re-dispatches it, capped
             # so a persistent failure escalates instead of looping. The retry
-            # count is the number of marker comments on the story issue.
+            # count is read from the ZeroWorkRetries project field — not from
+            # issue comments — so comment content cannot influence dispatch state.
             if [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
                 echo "Zero-work failure: no project item id — cannot route for re-dispatch"
             elif [[ -z "$ISSUE_NUM" ]]; then
-                # No issue to track retries on — escalate rather than risk an
-                # unbounded re-dispatch loop.
+                # No issue linked — escalate rather than risk dispatch loops without
+                # operator-visible comment history.
                 bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
                     2>/dev/null || echo "WARN: failed to set status Blocked"
-                echo "Zero-work failure (no issue for retry tracking) — set to Blocked"
+                echo "Zero-work failure (no issue linked) — set to Blocked"
             else
-                zw_marker="<!-- cfgms-zero-work-retry -->"
-                zw_count=$(gh issue view "$ISSUE_NUM" --json comments \
-                    --jq "[.comments[] | select(.body | contains(\"$zw_marker\"))] | length" \
-                    2>/dev/null || echo 0)
-                zw_count=${zw_count:-0}
-                if [ "$zw_count" -lt 3 ]; then
-                    bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Ready" \
-                        2>/dev/null || echo "WARN: failed to reset status Ready"
-                    gh issue comment "$ISSUE_NUM" --body \
-                        "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — no changes produced (likely usage limit / token reauth / early crash). Status reset to Ready for re-dispatch (retry $((zw_count + 1))/3)." \
-                        2>/dev/null || true
-                    echo "Zero-work failure: reset to Ready for re-dispatch (retry $((zw_count + 1))/3)"
-                else
-                    bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
-                        2>/dev/null || echo "WARN: failed to set status Blocked"
-                    gh issue comment "$ISSUE_NUM" --body \
-                        "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — 3 re-dispatch retries exhausted with no progress. Status set to Blocked for operator review." \
-                        2>/dev/null || true
-                    echo "Zero-work failure: retry cap reached — set to Blocked for operator review"
-                fi
+                _zero_work_retry
             fi
         fi
     fi
