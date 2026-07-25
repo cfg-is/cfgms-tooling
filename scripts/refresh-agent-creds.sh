@@ -3,6 +3,13 @@
 # Run this script directly in a terminal (requires TTY for interactive login).
 #
 # Usage: ./.claude/scripts/refresh-agent-creds.sh
+#
+# The login runs on exactly the CLI version the image ships (pinned by
+# ARG CLAUDE_CODE_VERSION in .devcontainer/Dockerfile). This deliberately does
+# NOT `npm update -g` first: that upgraded the CLI inside a --rm container that
+# is discarded seconds later, so its only lasting effect was minting
+# credentials with an unpinned version that no dispatched agent ever runs.
+# To move the CLI, bump the pin and rebuild the image.
 
 set -euo pipefail
 
@@ -31,7 +38,7 @@ exec docker run --rm -it \
   --user root \
   --entrypoint bash \
   cfg-agent:latest \
-  -c 'mkdir -p /workspace && npm update -g @anthropic-ai/claude-code && su agent -c '"'"'
+  -c 'mkdir -p /workspace && su agent -c '"'"'
     init-firewall.sh
     echo ""
     echo "Step 1/4: OAuth login..."

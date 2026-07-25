@@ -124,8 +124,15 @@ RUN set -eu; \
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
 RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.95.9/scripts/install.sh | sh -s -- -b /usr/local/bin v3.95.9 || true
 
-# Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+# Claude Code — pinned, never @latest (same supply-chain rule as every other
+# tool here; see dependency-pin-check.yml). An unpinned install also froze
+# silently: the RUN layer cache-hits until something above it changes, so the
+# image kept shipping whatever version was current when the layer was first
+# built while `npm latest` moved on. The pin makes the layer key change with
+# the version, and dependency-pin-check.yml files a weekly issue when npm's
+# dist-tags.latest moves ahead of it.
+ARG CLAUDE_CODE_VERSION=2.1.220
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 # Non-root agent user with sudo for iptables only
 RUN useradd -m -s /bin/bash agent \
@@ -140,11 +147,26 @@ RUN chown -R agent:agent /home/agent/.cache
 
 # Pre-cache Go modules from the project — download as root, then copy to agent
 # user's GOPATH so modules are available without the named volume on first run.
+#
+# `cp -rT` (not plain `cp -r`): the destination is created empty above, so a
+# bare `cp -r SRC DEST` copies SRC *into* DEST and the whole cache lands one
+# level too deep at /home/agent/go/pkg/mod/mod/ — invisible to the runtime
+# GOMODCACHE set below, so every dispatched agent silently re-downloaded all
+# modules from the network. -T treats DEST as the target itself.
+#
+# The GOPROXY=off re-download is the regression gate: it resolves the module
+# graph as the runtime user, at the runtime GOMODCACHE, with the network
+# refused. A misplaced or unreadable cache fails the build here instead of
+# degrading every dispatch.
 WORKDIR /tmp/modcache
 COPY go.mod go.sum ./
 RUN go mod download \
-    && cp -r "$(go env GOPATH)/pkg/mod" /home/agent/go/pkg/mod \
+    && cp -rT "$(go env GOPATH)/pkg/mod" /home/agent/go/pkg/mod \
     && chown -R agent:agent /home/agent/go/pkg/mod \
+    && test ! -d /home/agent/go/pkg/mod/mod \
+    && su agent -c 'cd /tmp/modcache \
+         && GOMODCACHE=/home/agent/go/pkg/mod GOFLAGS=-modcacherw GOPROXY=off \
+            go mod download' \
     && rm go.mod go.sum
 WORKDIR /
 
