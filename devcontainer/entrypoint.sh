@@ -921,6 +921,43 @@ cat > /tmp/agent-result.json <<RESULT_EOF
 }
 RESULT_EOF
 
+# --- Token accounting (Issue #3028) ---
+# Stamp this run's own spend into the result manifest and drop a copy next to
+# the transcript on the host, so the run stays attributable even after the
+# transcript is pruned. Reuses the reporter's cost model rather than
+# duplicating the cache-TTL pricing rules.
+#
+# Entirely best-effort: an older branch may predate .claude/metrics, and no
+# telemetry failure may ever change the agent's exit code.
+CLAUDE_PROJECTS_DIR="${HOME}/.claude/projects"
+TOKEN_REPORT="/workspace/.claude/metrics/token_report.py"
+
+if [ -f "$TOKEN_REPORT" ] && [ -d "$CLAUDE_PROJECTS_DIR" ]; then
+    if python3 "$TOKEN_REPORT" --projects-dir "$CLAUDE_PROJECTS_DIR" \
+            --format totals --quiet > /tmp/agent-usage.json 2>/dev/null; then
+        python3 - <<'USAGE_MERGE' || echo "WARN: could not merge token usage into result"
+import json
+
+with open("/tmp/agent-result.json") as handle:
+    result = json.load(handle)
+with open("/tmp/agent-usage.json") as handle:
+    result["usage"] = json.load(handle)
+with open("/tmp/agent-result.json", "w") as handle:
+    json.dump(result, handle, indent=2)
+USAGE_MERGE
+    else
+        echo "WARN: token report failed — result manifest carries no usage"
+    fi
+else
+    echo "INFO: token reporter unavailable — skipping usage accounting"
+fi
+
+# Copy the manifest beside the transcript. When the host bind-mounts a session
+# directory this lands outside the container; without the mount it is a no-op
+# write into the container's own filesystem.
+cp /tmp/agent-result.json "${CLAUDE_PROJECTS_DIR}/agent-result.json" 2>/dev/null \
+    || echo "INFO: no persisted session directory — result manifest stays in-container"
+
 # Project queue status (In Progress → Done/Failed) is managed by acceptance-reviewer
 # and po-act.sh — decommissioned with pipeline label substrate (Story #1482).
 

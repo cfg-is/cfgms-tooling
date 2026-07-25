@@ -109,11 +109,57 @@ cache. Two implications for optimization work:
   because each additional turn re-reads the whole prefix. Validate against the
   benchmark harness (#3029), not against per-call price.
 
-## Known gap
+## Coverage
 
-Headless dispatch containers (`agent-dispatch.sh launch-generic`, `review-pr`)
-do not mount `~/.claude` and run with `--rm`, so their transcripts are
-destroyed on exit and are **absent from every number above**. Dev agents and PR
-reviewers are therefore unmeasured. Story #3028 fixes this; until it lands,
-treat these figures as the interactive-and-cron portion of spend only, not the
-whole bill.
+The baseline above predates transcript persistence for dispatch containers, so
+it covers the interactive-and-cron portion of spend only — dev agents and PR
+reviewers are absent from it.
+
+Story #3028 closes that gap: `agent-dispatch.sh` now bind-mounts a per-container
+directory under `$HOME/.cache/cfgms-agent-sessions/<container>/` and each run
+stamps its own token totals into `agent-result.json` on exit. To report on
+dispatched agents, point the reporter at that root:
+
+```bash
+.claude/metrics/token_report.py \
+  --projects-dir ~/.cache/cfgms-agent-sessions/cfg-agent-1234 \
+  --format totals
+```
+
+Each directory also carries a `meta.json` recording the container, mode, issue,
+PR, branch, and start time — written *before* launch, so a container that dies
+early is still attributable. Directories are pruned by `cleanup-stale` after
+`CFGMS_AGENT_SESSIONS_RETENTION_DAYS` (default 30); retention bounds them, not
+the container lifecycle, because a transcript is meant to outlive its container.
+
+### Dev-agent telemetry needs an image rebuild
+
+The agent image bakes in `setup-env.sh` and `entrypoint.sh`
+(`.devcontainer/Dockerfile` lines 169-170), and `launch-generic` does **not**
+bind-mount either. So dev and fix agents only produce telemetry once the image
+is rebuilt:
+
+```bash
+docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
+```
+
+| container | scripts come from | rebuild needed |
+|---|---|---|
+| `launch-generic` (dev / fix agents) | the image | **yes** |
+| `review-pr` (acceptance reviewers) | bind-mounted from the repo | no |
+| host side (mount, `meta.json`, retention prune) | host script | no |
+
+Running against a stale image **degrades, it does not break**: the host still
+mounts `/agent-sessions`, but the old `setup-env.sh` never creates the symlink,
+so the transcript stays inside the container and dies with it — exactly the
+behaviour that predates this change. There is therefore no ordering hazard
+between merging this and rebuilding, but until the rebuild happens dev-agent
+spend stays invisible.
+
+**The mount lands at `/agent-sessions`, not directly on `~/.claude/projects`.**
+Docker creates a bind mount's missing parent as root and the image ships no
+`~/.claude`, so mounting inside it leaves `~/.claude` root-owned and breaks the
+credential symlink — which fails authentication for every agent. `setup-env.sh`
+symlinks `~/.claude/projects -> /agent-sessions` instead, which needs no image
+rebuild. `~/.claude` itself is never mounted: it holds `.credentials.json` from
+the `claude-creds` volume and must stay off the host filesystem.

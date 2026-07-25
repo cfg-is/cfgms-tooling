@@ -28,6 +28,7 @@ from token_report import (  # noqa: E402
     collect,
     compute_cost,
     parse_transcript,
+    totals,
     split_cache_write,
 )
 
@@ -310,6 +311,47 @@ class TestBucket(unittest.TestCase):
         self.assertEqual(bucket.unpriced_calls, 1)
         self.assertEqual(bucket.cost_usd, 0.0)
         self.assertGreater(bucket.total_tokens, 0)
+
+
+class TestTotals(unittest.TestCase):
+    """Agent containers stamp this into /tmp/agent-result.json on exit."""
+
+    def _calls(self):
+        path = Path(tempfile.mkdtemp()) / "s.jsonl"
+        path.write_text(
+            assistant_row("req_1", usage=usage(inp=10, w1h=1000, read=5000, out=20))
+            + "\n"
+            + assistant_row("req_2", model="claude-haiku-4-5", usage=usage(out=100))
+            + "\n",
+            encoding="utf-8",
+        )
+        calls, _ = parse_transcript(ref_for(path), Pricing.load(), ParseStats())
+        return [(call, "story-3028") for call in calls]
+
+    def test_aggregates_every_component(self):
+        result = totals(self._calls())
+        self.assertEqual(result["calls"], 2)
+        self.assertEqual(result["input_tokens"], 10)
+        self.assertEqual(result["cache_write_1h"], 1000)
+        self.assertEqual(result["cache_read"], 5000)
+        self.assertEqual(result["output_tokens"], 120)
+        self.assertGreater(result["cost_usd"], 0)
+
+    def test_reports_model_mix_and_span(self):
+        result = totals(self._calls())
+        self.assertEqual(set(result["models"]), {"claude-opus-4-8", "claude-haiku-4-5"})
+        self.assertIsNotNone(result["first_call"])
+        self.assertIsNotNone(result["last_call"])
+
+    def test_is_json_serializable(self):
+        # Written straight into the run manifest, so it must round-trip.
+        json.loads(json.dumps(totals(self._calls())))
+
+    def test_empty_input_does_not_crash(self):
+        result = totals([])
+        self.assertEqual(result["calls"], 0)
+        self.assertEqual(result["cost_usd"], 0)
+        self.assertIsNone(result["first_call"])
 
 
 class TestCollect(unittest.TestCase):

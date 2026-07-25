@@ -641,6 +641,36 @@ def render_composition(calls: list[tuple[Call, str]], pricing: Pricing, out) -> 
     print(f"{'TOTAL':<16}  {_fmt_tokens(sum(tokens.values())):>9}  {total:>9.2f}  100.0%", file=out)
 
 
+def totals(calls: list[tuple[Call, str]]) -> dict[str, Any]:
+    """Aggregate every call into one record.
+
+    Used by agent containers to stamp their own run's spend into
+    /tmp/agent-result.json on exit, so a run is attributable even after its
+    transcript is pruned.
+    """
+    bucket = Bucket()
+    models: dict[str, int] = defaultdict(int)
+    for call, _ in calls:
+        bucket.add(call)
+        models[call.model] += 1
+    span = [c.timestamp for c, _ in calls if c.timestamp]
+    return {
+        "calls": bucket.calls,
+        "input_tokens": bucket.input_tokens,
+        "cache_write_5m": bucket.cache_write_5m,
+        "cache_write_1h": bucket.cache_write_1h,
+        "cache_read": bucket.cache_read,
+        "output_tokens": bucket.output_tokens,
+        "total_tokens": bucket.total_tokens,
+        "cost_usd": round(bucket.cost_usd, 4),
+        "unpriced_calls": bucket.unpriced_calls,
+        "models": dict(sorted(models.items(), key=lambda kv: -kv[1])),
+        "sessions": len(bucket.sessions),
+        "first_call": min(span).isoformat() if span else None,
+        "last_call": max(span).isoformat() if span else None,
+    }
+
+
 def call_to_fact(call: Call, segment: str) -> dict[str, Any]:
     return {
         "project": call.project,
@@ -686,7 +716,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--group-by", default="model", choices=GROUP_KEYS, help="Aggregation key (default: model)."
     )
     parser.add_argument("--top", type=int, default=25, help="Rows to show; 0 for all (default: 25).")
-    parser.add_argument("--format", default="table", choices=("table", "jsonl", "csv"))
+    parser.add_argument(
+        "--format", default="table", choices=("table", "jsonl", "csv", "totals")
+    )
     parser.add_argument("--out", type=Path, help="Write output to a file instead of stdout.")
     parser.add_argument("--pricing", type=Path, default=PRICING_PATH, help="Pricing table path.")
     parser.add_argument(
@@ -715,7 +747,10 @@ def main(argv: list[str] | None = None) -> int:
 
     out = args.out.open("w", encoding="utf-8") if args.out else sys.stdout
     try:
-        if args.format == "jsonl":
+        if args.format == "totals":
+            json.dump(totals(calls), out, indent=2)
+            out.write("\n")
+        elif args.format == "jsonl":
             for call, segment in calls:
                 json.dump(call_to_fact(call, segment), out)
                 out.write("\n")

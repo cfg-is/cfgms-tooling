@@ -100,9 +100,35 @@ cat > /tmp/agent-result.json <<RESULT_EOF
   "pr_num": ${PR_NUM:-null},
   "story_num": ${STORY_NUM:-null},
   "exit_code": ${EXIT_CODE},
+  "model": "claude-sonnet-4-6",
   "timestamp": "$(date -Iseconds)"
 }
 RESULT_EOF
+
+# --- Token accounting (Issue #3028) ---
+# Reviewers were previously unmeasured: the container is --rm, so its transcript
+# and spend vanished on exit. Best-effort throughout; no telemetry failure may
+# change the reviewer's exit code.
+CLAUDE_PROJECTS_DIR="${HOME}/.claude/projects"
+TOKEN_REPORT="/workspace/.claude/metrics/token_report.py"
+
+if [ -f "$TOKEN_REPORT" ] && [ -d "$CLAUDE_PROJECTS_DIR" ]; then
+    if python3 "$TOKEN_REPORT" --projects-dir "$CLAUDE_PROJECTS_DIR" \
+            --format totals --quiet > /tmp/agent-usage.json 2>/dev/null; then
+        python3 - <<'USAGE_MERGE' || echo "WARN: could not merge token usage into result"
+import json
+
+with open("/tmp/agent-result.json") as handle:
+    result = json.load(handle)
+with open("/tmp/agent-usage.json") as handle:
+    result["usage"] = json.load(handle)
+with open("/tmp/agent-result.json", "w") as handle:
+    json.dump(result, handle, indent=2)
+USAGE_MERGE
+    fi
+fi
+
+cp /tmp/agent-result.json "${CLAUDE_PROJECTS_DIR}/agent-result.json" 2>/dev/null || true
 
 if [ "$EXIT_CODE" -eq 0 ]; then
     echo "Acceptance Reviewer completed (pr=${PR_NUM})"

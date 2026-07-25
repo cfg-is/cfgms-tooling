@@ -15,6 +15,21 @@ fi
 # and out, we symlink so that token refreshes persist immediately to the volume.
 mkdir -p ~/.claude
 
+# --- Persisted session transcripts (Issue #3028) ---
+# Agent containers run with --rm, so a transcript written inside the container
+# is destroyed on exit, taking its token accounting with it. The host bind-mounts
+# a per-container directory at /agent-sessions and we point ~/.claude/projects
+# at it.
+#
+# The mount deliberately lands at /agent-sessions rather than directly on
+# ~/.claude/projects: Docker creates a bind mount's missing parent as root, and
+# the image ships no ~/.claude, so mounting inside it would leave ~/.claude
+# root-owned and break the credential symlink below -- failing authentication
+# for every agent. Symlinking needs no image rebuild.
+if [ -d /agent-sessions ] && [ ! -e ~/.claude/projects ]; then
+    ln -sfn /agent-sessions ~/.claude/projects
+fi
+
 if [ -f ~/.claude/.credentials.json ]; then
     : # Credentials already present (e.g. host mount) — nothing to do
 elif [ -f /persist/.credentials.json ]; then

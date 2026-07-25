@@ -11,6 +11,51 @@ WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktree
 # Override CFGMS_TEST_CRED_BASE in hermetic tests.
 AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
 
+# Host directory where agent container session transcripts are persisted
+# (Issue #3028). Containers run with --rm and create ~/.claude inside
+# themselves, so without this bind mount every dev-agent and reviewer
+# transcript dies with the container and its token spend is unmeasurable.
+# Lives under $HOME/.cache rather than /tmp: /tmp permissions do not persist
+# on this host.
+#
+# Mounted at /agent-sessions, NOT directly at ~/.claude/projects. Docker
+# creates a bind mount's missing parent as root, and the image ships no
+# ~/.claude -- mounting inside it would leave ~/.claude root-owned and break
+# setup-env.sh's credential symlink, failing authentication for every agent.
+# setup-env.sh symlinks ~/.claude/projects -> /agent-sessions instead, which
+# needs no image rebuild. ~/.claude itself is never mounted: it holds
+# .credentials.json from the claude-creds volume and must stay off the host.
+AGENT_SESSIONS_BASE="${CFGMS_AGENT_SESSIONS_BASE:-${HOME}/.cache/cfgms-agent-sessions}"
+AGENT_SESSIONS_RETENTION_DAYS="${CFGMS_AGENT_SESSIONS_RETENTION_DAYS:-30}"
+AGENT_SESSIONS_MOUNT="/agent-sessions"
+
+# Prepare the host-side transcript directory for a container and record what the
+# run was for. meta.json is written *before* launch so a container that dies
+# early is still attributable; container labels are gone once it is pruned.
+# Echoes the directory path. Never fatal: telemetry must not block dispatch.
+prepare_session_dir() {
+  local container_name="$1" mode="$2" issue="$3" pr="$4" branch="$5"
+  local dir="${AGENT_SESSIONS_BASE}/${container_name}"
+
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    echo "WARN: could not create session dir ${dir} — transcript will not persist" >&2
+    return 1
+  fi
+
+  cat > "${dir}/meta.json" <<META || true
+{
+  "container": "${container_name}",
+  "mode": "${mode}",
+  "issue": ${issue:-null},
+  "pr": ${pr:-null},
+  "branch": "${branch}",
+  "started_at": "$(date -Iseconds)"
+}
+META
+
+  printf '%s\n' "$dir"
+}  # end prepare_session_dir
+
 # ---------------------------------------------------------------------------
 # Resource-based admission gate (replaces the hand-tuned container count).
 # A new agent container is admitted only if launching one keeps the host within
@@ -914,15 +959,26 @@ case "$cmd" in
     # Derive mode and metadata labels from entrypoint args
     mode_label="branch"
     fix_pr_num=""
+    issue_arg=""
+    branch_arg=""
     extra_labels=()
     for i in "${!entrypoint_args[@]}"; do
       case "${entrypoint_args[$i]}" in
         --fix-pr)          mode_label="fix-pr";          fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
-        --resolve-conflict) mode_label="resolve-conflict";                                           extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
-        --branch)          extra_labels+=(--label "branch=${entrypoint_args[$((i+1))]}") ;;
-        --issue)           extra_labels+=(--label "issue=${entrypoint_args[$((i+1))]}") ;;
+        --resolve-conflict) mode_label="resolve-conflict"; fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
+        --branch)          branch_arg="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "branch=${entrypoint_args[$((i+1))]}") ;;
+        --issue)           issue_arg="${entrypoint_args[$((i+1))]}";  extra_labels+=(--label "issue=${entrypoint_args[$((i+1))]}") ;;
       esac
     done
+
+    # Persist this run's transcript to the host so its token spend survives the
+    # container's --rm (Issue #3028). Degrades to no mount if the dir can't be
+    # created; telemetry never blocks dispatch.
+    session_mount=()
+    if sessions_dir=$(prepare_session_dir \
+        "$container_name" "$mode_label" "$issue_arg" "$fix_pr_num" "$branch_arg"); then
+      session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
+    fi
 
     if container_id=$(docker run -d \
       --name "$container_name" \
@@ -936,6 +992,7 @@ case "$cmd" in
       -v "claude-creds:/persist" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      "${session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AUTONOMOUS=true" \
       "${lease_env[@]}" \
@@ -1811,6 +1868,14 @@ PROMPT_EOF
       review_story_label="0"
     fi
 
+    # Persist the reviewer's transcript to the host (Issue #3028) — review
+    # containers are --rm too, so this is the only record of their spend.
+    review_session_mount=()
+    if review_sessions_dir=$(prepare_session_dir \
+        "$container_name" "review" "${story_num:-}" "$pr_num" "${pr_branch:-}"); then
+      review_session_mount=(-v "${review_sessions_dir}:${AGENT_SESSIONS_MOUNT}")
+    fi
+
     # Launch headless. Mount the review entrypoint at runtime — no image rebuild
     # required when this script changes.
     if container_id=$(docker run -d \
@@ -1828,6 +1893,7 @@ PROMPT_EOF
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
+      "${review_session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AGENT_MODE=true" \
       -e "CFGMS_LEASE_KEY=pr-${pr_num}" \
@@ -1921,6 +1987,23 @@ PROMPT_EOF
     ;;
 
   cleanup-stale)
+    # Prune persisted agent transcripts past the retention window (Issue #3028).
+    # Deliberately independent of container cleanup below: a transcript outlives
+    # its container on purpose, so that spend stays attributable after the
+    # container is gone. Retention is what bounds the directory, not the
+    # container lifecycle.
+    if [[ -d "$AGENT_SESSIONS_BASE" ]]; then
+      pruned_sessions=0
+      while IFS= read -r stale_dir; do
+        [[ -z "$stale_dir" ]] && continue
+        rm -rf "$stale_dir" 2>/dev/null && pruned_sessions=$((pruned_sessions + 1))
+      done < <(find "$AGENT_SESSIONS_BASE" -mindepth 1 -maxdepth 1 -type d \
+                 -mtime "+${AGENT_SESSIONS_RETENTION_DAYS}" 2>/dev/null || true)
+      if [[ "$pruned_sessions" -gt 0 ]]; then
+        echo "PRUNED_SESSION_DIRS:${pruned_sessions}:older_than_${AGENT_SESSIONS_RETENTION_DAYS}d"
+      fi
+    fi
+
     # Find agent containers (running or exited) whose stories no longer need them.
     # A container is stale if its story issue is CLOSED or has project status Failed or Blocked.
     cleaned=0
