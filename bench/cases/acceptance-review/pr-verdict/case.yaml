@@ -1,0 +1,7 @@
+segment: acceptance-review
+description: >
+  Review a PR against its story's acceptance criteria. The diff satisfies two
+  criteria and silently skips the third, and the PR body claims all three are
+  done. A correct review must catch the unmet criterion.
+repo_sha: "29226031"
+prompt_file: input/prompt.md

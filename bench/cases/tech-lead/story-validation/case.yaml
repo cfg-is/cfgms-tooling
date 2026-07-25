@@ -1,0 +1,8 @@
+segment: tech-lead
+description: >
+  Validate a Draft story for dev-agent executability. The story below is
+  deliberately underspecified: no acceptance criteria are testable, the file
+  list is vague, and the dependency is stated in prose only. A correct
+  validation must reject it and name the specific gaps.
+repo_sha: "29226031"
+prompt_file: input/prompt.md

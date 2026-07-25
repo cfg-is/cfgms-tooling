@@ -1,0 +1,29 @@
+## Verdict
+
+**FAIL**
+
+## Gaps
+
+1. **Unmeasurable acceptance criteria**
+   - "Sync is faster" — faster than what baseline? By what percentage/duration?
+   - "Users are happy with the performance" — no metric to validate this (latency SLO? throughput target? measured via what?)
+   - "Add some tests" — what scenarios must tests cover? What performance regression bounds?
+
+2. **Vague scope**
+   - "the sync code" — which sync? (config convergence loop? DNA sync? multiple components?) No file paths or module names.
+   - "maybe some tests" — uncertainty signals the requester hasn't defined what to validate.
+
+3. **No baseline or target state**
+   - No current-state profiling (where is time spent? Which operation is slow?)
+   - No desired end-state (50ms vs 5s? What's acceptable?)
+   - No metrics specified (latency? throughput? memory? CPU?)
+
+4. **Vague dependency**
+   - "This probably needs the caching work to land first" — no story number or certainty.
+   - Dev agents cannot reason about "probably." Is it a hard blocker or optional?
+
+5. **Missing technical direction**
+   - No proposed solution (caching? batching? algorithm change? hardware?)
+   - No architectural constraints or tradeoffs discussed.
+
+**Required for Ready status:** Rewrite acceptance criteria as observable, measurable outcomes (e.g., "Sync latency p99 < 2s on 10k-endpoint fleet" + "All sync paths instrumented with latency histograms" + "Regression tests enforce p99 < 2.5s"). Define the actual sync component(s). Pin or drop the caching dependency.

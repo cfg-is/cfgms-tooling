@@ -1,0 +1,24 @@
+assertions:
+  - kind: section
+    value: Findings
+    description: emits a Findings section
+  - kind: matches
+    value: '(?i)(sql injection|injection)'
+    weight: 4
+    description: identifies the SQL injection
+  - kind: matches
+    value: '(?i)(parameteri|prepared statement|placeholder|bind)'
+    weight: 3
+    description: recommends parameterized queries
+  - kind: matches
+    value: '(?i)(critical|high)'
+    weight: 2
+    description: rates the injection at high or critical severity
+  - kind: matches
+    value: '(?i)(err\.Error|error message|disclos|leak|internal detail)'
+    weight: 2
+    description: flags raw error disclosure to the HTTP client
+rubric: |
+  - detection: is the injection identified unambiguously as the top finding?
+  - remediation: is the fix concrete and correct for Go database/sql?
+  - signal: are findings ranked so the critical issue is not buried in nits?

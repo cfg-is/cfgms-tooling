@@ -1,0 +1,7 @@
+segment: ba
+description: >
+  Decompose a small epic into implementable stories. Correct output splits the
+  work along deliverable boundaries with testable criteria, rather than
+  restating the epic or inventing scope the epic never asked for.
+repo_sha: "29226031"
+prompt_file: input/prompt.md

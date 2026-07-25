@@ -1,0 +1,30 @@
+assertions:
+  - kind: matches
+    value: '###\s*Story:'
+    weight: 2
+    description: emits story headings
+  - kind: matches
+    value: '(?is)(###\s*Story:.*){2,}'
+    weight: 3
+    description: splits the epic into at least two stories
+  - kind: matches
+    value: '(?i)acceptance criteria'
+    weight: 2
+    description: every story carries acceptance criteria
+  - kind: matches
+    value: '(?i)(steward|heartbeat)'
+    description: covers the steward-side reporting
+  - kind: matches
+    value: '(?i)(controller|persist|storage)'
+    description: covers controller-side persistence
+  - kind: matches
+    value: '(?i)(cfg |CLI|command)'
+    description: covers the CLI surface
+  - kind: not_matches
+    value: '(?i)(alerting|dashboard|auto.?remediat)'
+    weight: 3
+    description: respects the stated out-of-scope boundary
+rubric: |
+  - boundaries: are stories split along deliverable seams a single agent can own?
+  - verifiability: is every acceptance criterion objectively checkable?
+  - restraint: is out-of-scope work genuinely excluded, not merely renamed?

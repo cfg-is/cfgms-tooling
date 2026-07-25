@@ -1,0 +1,29 @@
+assertions:
+  - kind: section
+    value: Verdict
+    description: emits a Verdict section
+  - kind: matches
+    value: '\bFAIL\b'
+    weight: 3
+    description: rejects an unexecutable story
+  - kind: not_matches
+    value: '##\s*Verdict\s*\n+\s*PASS'
+    weight: 3
+    description: does not pass an unexecutable story
+  - kind: section
+    value: Gaps
+    description: emits a Gaps section
+  - kind: matches
+    value: '(?i)(measurab|testab|quantif|specific|vague|unmeasur)'
+    weight: 2
+    description: names the untestable acceptance criteria
+  - kind: matches
+    value: '(?i)(file|path|scope)'
+    description: names the vague file scope
+  - kind: matches
+    value: '(?i)(depend|blocker|issue number|#\d+)'
+    description: flags the unresolved prose dependency
+rubric: |
+  - specificity: does it name concrete gaps rather than generic advice?
+  - actionability: could the author fix the story from this feedback alone?
+  - restraint: does it avoid inventing requirements the story never implied?

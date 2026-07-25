@@ -1,0 +1,24 @@
+assertions:
+  - kind: section
+    value: Verdict
+    description: emits a Verdict section
+  - kind: matches
+    value: 'REQUEST_CHANGES'
+    weight: 3
+    description: does not approve a PR with an unmet acceptance criterion
+  - kind: not_matches
+    value: '##\s*Verdict\s*\n+\s*APPROVE'
+    weight: 3
+    description: verdict is not APPROVE
+  - kind: matches
+    value: '(?i)negative'
+    weight: 3
+    description: identifies the unmet negative-value criterion
+  - kind: matches
+    value: '(?i)(no test|not tested|missing.*test|untested|test.*(missing|absent))'
+    weight: 2
+    description: notes the missing negative-value test case
+rubric: |
+  - correctness: is the unmet criterion identified precisely?
+  - evidence: does it cite the diff rather than assert?
+  - proportionality: does it avoid manufacturing unrelated objections?

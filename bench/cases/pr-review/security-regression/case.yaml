@@ -1,0 +1,8 @@
+segment: pr-review
+description: >
+  Six-phase PR review of a diff containing one real injection vulnerability
+  (unparameterized SQL built from a request parameter) alongside a cosmetic
+  change. A correct review must find the injection and must not be distracted
+  into a style debate.
+repo_sha: "29226031"
+prompt_file: input/prompt.md
