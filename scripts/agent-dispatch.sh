@@ -29,6 +29,24 @@ AGENT_SESSIONS_BASE="${CFGMS_AGENT_SESSIONS_BASE:-${HOME}/.cache/cfgms-agent-ses
 AGENT_SESSIONS_RETENTION_DAYS="${CFGMS_AGENT_SESSIONS_RETENTION_DAYS:-30}"
 AGENT_SESSIONS_MOUNT="/agent-sessions"
 
+# Token reporter mount (Issue #3041). Every entrypoint resolves the reporter
+# from ${AGENT_METRICS_MOUNT} only, never from /workspace: the branch under
+# dispatch or review must not be able to disable its own accounting by lacking,
+# editing or deleting .claude/metrics.
+#
+# The image bakes a copy at the same path (.devcontainer/Dockerfile), so this
+# bind mount is not what makes the control exist -- it is what keeps every
+# dispatch path on the *harness checkout's* reporter without waiting for an
+# image rebuild, the same no-rebuild pattern already used for setup-env.sh and
+# review-entrypoint.sh. Mounting is conditional on the source existing: Docker
+# would otherwise create an empty host directory and shadow the baked copy with
+# nothing, turning a working control into reporter_missing.
+AGENT_METRICS_MOUNT="/usr/local/share/cfgms-metrics"
+AGENT_METRICS_MOUNT_ARGS=()
+if [ -d "${REPO_ROOT}/.claude/metrics" ]; then
+  AGENT_METRICS_MOUNT_ARGS=(-v "${REPO_ROOT}/.claude/metrics:${AGENT_METRICS_MOUNT}:ro")
+fi
+
 # Prepare the host-side transcript directory for a container and record what the
 # run was for. meta.json is written *before* launch so a container that dies
 # early is still attributable; container labels are gone once it is pruned.
@@ -917,6 +935,7 @@ case "$cmd" in
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
+      "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AUTONOMOUS=true" \
       -e "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key" \
@@ -992,6 +1011,7 @@ case "$cmd" in
       -v "claude-creds:/persist" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AUTONOMOUS=true" \
@@ -1893,6 +1913,7 @@ PROMPT_EOF
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
+      "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${review_session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AGENT_MODE=true" \

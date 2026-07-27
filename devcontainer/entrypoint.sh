@@ -921,21 +921,37 @@ cat > /tmp/agent-result.json <<RESULT_EOF
 }
 RESULT_EOF
 
-# --- Token accounting (Issue #3028) ---
+# --- Token accounting (Issue #3028, harness-sourced per #3041) ---
 # Stamp this run's own spend into the result manifest and drop a copy next to
 # the transcript on the host, so the run stays attributable even after the
 # transcript is pruned. Reuses the reporter's cost model rather than
 # duplicating the cache-TTL pricing rules.
 #
-# Entirely best-effort: an older branch may predate .claude/metrics, and no
-# telemetry failure may ever change the agent's exit code.
+# The reporter is baked into the image at /usr/local/share/cfgms-metrics (see
+# Dockerfile) rather than read from /workspace — the PR branch under dispatch
+# must never be able to disable its own accounting by lacking, editing, or
+# deleting the reporter. Entirely best-effort: no telemetry failure may ever
+# change the agent's exit code, but a failure to record usage must be loud
+# (stdout WARN + an explicit usage_error marker in the manifest), never a
+# silently-absent "usage" key.
 CLAUDE_PROJECTS_DIR="${HOME}/.claude/projects"
-TOKEN_REPORT="/workspace/.claude/metrics/token_report.py"
+TOKEN_REPORT="/usr/local/share/cfgms-metrics/token_report.py"
 
-if [ -f "$TOKEN_REPORT" ] && [ -d "$CLAUDE_PROJECTS_DIR" ]; then
-    if python3 "$TOKEN_REPORT" --projects-dir "$CLAUDE_PROJECTS_DIR" \
-            --format totals --quiet > /tmp/agent-usage.json 2>/dev/null; then
-        python3 - <<'USAGE_MERGE' || echo "WARN: could not merge token usage into result"
+usage_status="ok"
+if [ ! -f "$TOKEN_REPORT" ]; then
+    usage_status="reporter_missing"
+    echo "WARN: token reporter not found at ${TOKEN_REPORT} — result manifest carries no usage"
+elif [ ! -d "$CLAUDE_PROJECTS_DIR" ]; then
+    usage_status="no_projects_dir"
+    echo "WARN: no persisted session directory at ${CLAUDE_PROJECTS_DIR} — result manifest carries no usage"
+elif ! python3 "$TOKEN_REPORT" --projects-dir "$CLAUDE_PROJECTS_DIR" \
+        --format totals --quiet > /tmp/agent-usage.json 2>/dev/null; then
+    usage_status="reporter_failed"
+    echo "WARN: token report failed — result manifest carries no usage"
+fi
+
+if [ "$usage_status" = "ok" ]; then
+    if ! python3 - <<'USAGE_MERGE'
 import json
 
 with open("/tmp/agent-result.json") as handle:
@@ -945,11 +961,23 @@ with open("/tmp/agent-usage.json") as handle:
 with open("/tmp/agent-result.json", "w") as handle:
     json.dump(result, handle, indent=2)
 USAGE_MERGE
-    else
-        echo "WARN: token report failed — result manifest carries no usage"
+    then
+        usage_status="merge_failed"
+        echo "WARN: could not merge token usage into result"
     fi
-else
-    echo "INFO: token reporter unavailable — skipping usage accounting"
+fi
+
+if [ "$usage_status" != "ok" ]; then
+    python3 - "$usage_status" <<'USAGE_MARK' || echo "WARN: could not write usage_error marker into result"
+import json, sys
+
+with open("/tmp/agent-result.json") as handle:
+    result = json.load(handle)
+result["usage"] = None
+result["usage_error"] = sys.argv[1]
+with open("/tmp/agent-result.json", "w") as handle:
+    json.dump(result, handle, indent=2)
+USAGE_MARK
 fi
 
 # Copy the manifest beside the transcript. When the host bind-mounts a session

@@ -194,6 +194,16 @@ COPY .devcontainer/agent-context.sh /usr/local/bin/agent-context.sh
 COPY .devcontainer/dnsmasq-allowlist.conf /etc/dnsmasq-allowlist.conf
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/local/bin/entrypoint.sh
 
+# Token reporter (Issue #3028/#3041) — baked into the harness so accounting is a
+# property of the image, never of the branch under dispatch/review. A PR branch
+# that predates this reporter (or edits/deletes it) must not disable its own
+# telemetry. The review dispatch path additionally bind-mounts .claude/metrics
+# fresh from the host at runtime (see agent-dispatch.sh review-pr), the same
+# no-rebuild-required pattern already used for review-entrypoint.sh; this bake
+# covers the entrypoint.sh dev/fix/branch paths, which only pick up script
+# changes on image rebuild anyway.
+COPY .claude/metrics/token_report.py .claude/metrics/pricing.json /usr/local/share/cfgms-metrics/
+
 # Agent environment — 4GB RAM is sufficient for go test/build + Claude API calls
 ENV CFGMS_AGENT_MODE=true
 ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy

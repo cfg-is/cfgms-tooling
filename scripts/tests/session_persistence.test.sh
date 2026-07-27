@@ -159,7 +159,99 @@ for entry in "${SCRIPT_DIR}/../../../.devcontainer/entrypoint.sh" \
   check_contains "${name} copies the manifest to the mount" "$src" \
     'cp /tmp/agent-result.json "${CLAUDE_PROJECTS_DIR}/agent-result.json"'
   if bash -n "$entry" 2>/dev/null; then ok "${name} parses"; else bad "${name} parses" "bash -n failed"; fi
+
+  # Regression guard for #3041: the reporter must resolve from the harness,
+  # never from the PR checkout under /workspace -- a branch that lacks, edits,
+  # or deletes .claude/metrics must not be able to disable its own accounting.
+  if grep -qE 'TOKEN_REPORT="/workspace' "$entry"; then
+    bad "${name} reporter never resolved from /workspace" "found a /workspace-rooted TOKEN_REPORT assignment"
+  else
+    ok "${name} reporter never resolved from /workspace"
+  fi
+  check_contains "${name} reporter resolves from the harness path" "$src" \
+    'TOKEN_REPORT="/usr/local/share/cfgms-metrics/token_report.py"'
+
+  # A failure to record usage must be loud, never a silently-absent key.
+  check_contains "${name} records an explicit marker on accounting failure" "$src" '"usage_error"'
+  check_contains "${name} warns on stdout when the reporter is missing" "$src" \
+    'WARN: token reporter not found'
 done
+
+printf '\n== harness-baked reporter (image + Dockerfile) ==\n'
+
+DOCKERFILE="${SCRIPT_DIR}/../../../.devcontainer/Dockerfile"
+DOCKERIGNORE="${SCRIPT_DIR}/../../../.dockerignore"
+dockerfile_src="$(cat "$DOCKERFILE")"
+check_contains "Dockerfile bakes token_report.py into the harness path" "$dockerfile_src" \
+  '/usr/local/share/cfgms-metrics/'
+check_contains "Dockerfile bakes pricing.json alongside it" "$dockerfile_src" \
+  '.claude/metrics/pricing.json'
+
+# The bake COPYs out of .claude, which .dockerignore excludes wholesale for
+# every image in the repo. Without a per-file negation BuildKit warns
+# CopyIgnoredFile and then fails the build ("failed to compute cache key: not
+# found"), so cfg-agent:latest cannot be rebuilt at all -- and that rebuild is
+# the path that ships harness security updates (entrypoint.sh, init-firewall.sh,
+# pinned tool versions). Assert every .claude source the Dockerfile copies is
+# re-included.
+mapfile -t baked_sources < <(grep -E '^COPY ' "$DOCKERFILE" \
+  | grep -oE '\.claude/[^[:space:]]+' | sort -u)
+check_eq "Dockerfile bakes exactly the two reporter files" "${#baked_sources[@]}" "2"
+for baked in "${baked_sources[@]}"; do
+  if grep -qxF -- "!${baked}" "$DOCKERIGNORE"; then
+    ok ".dockerignore re-includes ${baked} into the build context"
+  else
+    bad ".dockerignore re-includes ${baked} into the build context" \
+        "COPY source is excluded by .dockerignore — the agent image cannot build"
+  fi
+done
+
+# ...but only those files. Stage 0 does `COPY . .`, so un-ignoring .claude
+# wholesale would bake session transcripts, worktree checkouts and
+# credential-adjacent state into an image layer.
+if grep -qxF -- '.claude' "$DOCKERIGNORE"; then
+  ok ".dockerignore still excludes the .claude tree itself"
+else
+  bad ".dockerignore still excludes the .claude tree itself" \
+      "agent state would be baked into the image by stage 0's COPY . ."
+fi
+if grep -qxE -- '!\.claude/?' "$DOCKERIGNORE"; then
+  bad "no blanket re-include of .claude" \
+      "a bare '!.claude' negation bakes the whole agent-state tree into a layer"
+else
+  ok "no blanket re-include of .claude"
+fi
+
+printf '\n== harness reporter mount (all accounting dispatch paths) ==\n'
+
+check_contains "harness mount targets the image's baked reporter path" "$dispatch_src" \
+  'AGENT_METRICS_MOUNT="/usr/local/share/cfgms-metrics"'
+check_contains "dispatch bind-mounts .claude/metrics from the harness checkout" "$dispatch_src" \
+  '-v "${REPO_ROOT}/.claude/metrics:${AGENT_METRICS_MOUNT}:ro"'
+# An absent source must fall through to the baked copy: Docker would otherwise
+# create an empty host dir and shadow a working reporter with nothing.
+check_contains "mount is skipped when the harness copy is absent" "$dispatch_src" \
+  'if [ -d "${REPO_ROOT}/.claude/metrics" ]; then'
+
+# Baking alone leaves the control inoperative until someone rebuilds a ~10GB
+# image, so every container that runs an accounting entrypoint must also carry
+# the mount. Interactive sessions are exempt: they override the entrypoint with
+# a bash shell that writes no result manifest.
+mapfile -t unmounted < <(awk '
+  /docker run -d/                 { in_block = 1; block = ""; start = NR }
+  in_block                        { block = block $0 "\n" }
+  in_block && /cfg-agent:latest/  {
+    in_block = 0
+    if (block ~ /--entrypoint \/bin\/bash/) next
+    if (block !~ /AGENT_METRICS_MOUNT_ARGS/) print start
+  }
+' "$DISPATCH")
+if [[ "${#unmounted[@]}" -eq 0 ]]; then
+  ok "every accounting dispatch path mounts the harness reporter"
+else
+  bad "every accounting dispatch path mounts the harness reporter" \
+      "docker run at line(s) ${unmounted[*]} would record usage_error=reporter_missing"
+fi
 
 printf '\n%s\n' "-----------------------------------------"
 if [[ "$fail" -eq 0 ]]; then
