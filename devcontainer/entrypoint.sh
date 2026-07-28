@@ -820,15 +820,23 @@ rm -f /tmp/agent-validation-passed
 # Capture pre-run HEAD SHA so fix-pr mode can detect silent no-ops.
 PRE_FIX_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-# All agent modes run on Sonnet 4.6. fix-pr briefly ran on Opus 4.7 (#1580) on
-# the hypothesis that stronger reasoning would compress multi-attempt fix loops,
-# but multi-round fix loops were already rare (~8% of fix-loop PRs) and the Opus
-# token cost was not justified once the pipeline was kept full ahead of the
-# cron. agent-result.json now records model + duration so this trade can be
-# revisited with real data rather than a hypothesis.
-AGENT_MODEL="claude-sonnet-4-6"
+# Model/effort is resolved per-segment from .claude/model-routing.yaml
+# (Issue #3030) rather than hardcoded, so a benchmarked change is a config
+# edit. fix-pr briefly ran on Opus 4.7 (#1580) on the hypothesis that stronger
+# reasoning would compress multi-attempt fix loops, but multi-round fix loops
+# were already rare (~8% of fix-loop PRs) and the Opus token cost was not
+# justified once the pipeline was kept full ahead of the cron. agent-result.json
+# records model + effort + duration so this trade can be revisited with real
+# data rather than a hypothesis.
+case "$MODE" in
+    fix-pr|resolve-conflict) MODEL_SEGMENT="fix-agent" ;;
+    *)                       MODEL_SEGMENT="dev-agent" ;;
+esac
+mapfile -t RESOLVED_MODEL < <(ac_resolve_agent_model "$MODEL_SEGMENT")
+AGENT_MODEL="${RESOLVED_MODEL[0]}"
+AGENT_EFFORT="${RESOLVED_MODEL[1]}"
 
-echo "Starting Claude agent (mode=${MODE}, model=${AGENT_MODEL})..."
+echo "Starting Claude agent (mode=${MODE}, segment=${MODEL_SEGMENT}, model=${AGENT_MODEL}, effort=${AGENT_EFFORT})..."
 EXIT_CODE=0
 # Wait indefinitely for background tasks (the story-complete / fix-pr review team
 # runs qa-test-runner etc. as background Task tool invocations). The CLI default
@@ -910,6 +918,7 @@ cat > /tmp/agent-result.json <<RESULT_EOF
   "pr_num": ${PR_NUM:-null},
   "exit_code": ${EXIT_CODE},
   "model": "${AGENT_MODEL}",
+  "effort": "${AGENT_EFFORT}",
   "agent_duration_seconds": ${AGENT_DURATION_SECONDS:-null},
   "pr_url": "${PR_URL}",
   "branch": "${CURRENT_BRANCH}",

@@ -204,6 +204,16 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/lo
 # changes on image rebuild anyway.
 COPY .claude/metrics/token_report.py .claude/metrics/pricing.json /usr/local/share/cfgms-metrics/
 
+# Per-segment model routing (Issue #3030) — same rule as the reporter above:
+# baked into the harness so the model an agent runs on is a property of the
+# image, never of the branch under dispatch/review. Reading this from
+# /workspace would let a PR branch select the model of the acceptance reviewer
+# deciding whether that branch merges (self-weakening of a merge gate), and dev
+# and fix agents consume untrusted issue/PR text. The dispatch paths additionally
+# bind-mount the harness checkout's copy over this path at runtime
+# (agent-dispatch.sh) so routing edits need no image rebuild.
+COPY .claude/model-routing.yaml /usr/local/share/cfgms-agent/model-routing.yaml
+
 # Agent environment — 4GB RAM is sufficient for go test/build + Claude API calls
 ENV CFGMS_AGENT_MODE=true
 ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy

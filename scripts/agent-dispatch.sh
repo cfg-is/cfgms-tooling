@@ -47,6 +47,23 @@ if [ -d "${REPO_ROOT}/.claude/metrics" ]; then
   AGENT_METRICS_MOUNT_ARGS=(-v "${REPO_ROOT}/.claude/metrics:${AGENT_METRICS_MOUNT}:ro")
 fi
 
+# Model-routing mount (Issue #3030), same rule as the reporter above:
+# ac_resolve_agent_model reads ${AGENT_MODEL_ROUTING_MOUNT} only, never
+# /workspace. /workspace is a checkout of the branch under dispatch or review,
+# so reading routing from there would let a PR branch pick the model of the
+# acceptance reviewer deciding whether it merges, and dev/fix agents run on
+# untrusted issue/PR text. The image bakes a copy at the same path
+# (.devcontainer/Dockerfile); this bind mount keeps every dispatch path on the
+# *harness checkout's* routing config without waiting for an image rebuild.
+# Conditional on the source existing as a file: Docker would otherwise create an
+# empty host directory at that path and shadow the baked config, silently
+# dropping every dispatch to the hardcoded fallback.
+AGENT_MODEL_ROUTING_MOUNT="/usr/local/share/cfgms-agent/model-routing.yaml"
+AGENT_MODEL_ROUTING_MOUNT_ARGS=()
+if [ -f "${REPO_ROOT}/.claude/model-routing.yaml" ]; then
+  AGENT_MODEL_ROUTING_MOUNT_ARGS=(-v "${REPO_ROOT}/.claude/model-routing.yaml:${AGENT_MODEL_ROUTING_MOUNT}:ro")
+fi
+
 # Prepare the host-side transcript directory for a container and record what the
 # run was for. meta.json is written *before* launch so a container that dies
 # early is still attributable; container labels are gone once it is pruned.
@@ -936,12 +953,14 @@ case "$cmd" in
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
+      "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AUTONOMOUS=true" \
       -e "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key" \
       -e "CFGMS_TENANT=agent-test/${num}" \
       -e "CFGMS_TIER1_URL=${tier1_url}" \
       -e "CFGMS_ADMIN_BUNDLE=" \
+      -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
       --cap-add NET_ADMIN \
       cfg-agent:latest \
       "${num}" 2>&1); then
@@ -1012,9 +1031,11 @@ case "$cmd" in
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
+      "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
       "${session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AUTONOMOUS=true" \
+      -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
       "${lease_env[@]}" \
       --cap-add NET_ADMIN \
       cfg-agent:latest \
@@ -1914,10 +1935,12 @@ PROMPT_EOF
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
+      "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
       "${review_session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AGENT_MODE=true" \
       -e "CFGMS_LEASE_KEY=pr-${pr_num}" \
+      -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
       --cap-add NET_ADMIN \
       --entrypoint /usr/local/bin/review-entrypoint.sh \
       cfg-agent:latest 2>&1); then

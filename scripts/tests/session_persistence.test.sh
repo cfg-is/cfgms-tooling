@@ -196,7 +196,11 @@ check_contains "Dockerfile bakes pricing.json alongside it" "$dockerfile_src" \
 # re-included.
 mapfile -t baked_sources < <(grep -E '^COPY ' "$DOCKERFILE" \
   | grep -oE '\.claude/[^[:space:]]+' | sort -u)
-check_eq "Dockerfile bakes exactly the two reporter files" "${#baked_sources[@]}" "2"
+# Exactly the harness-owned config the image is allowed to bake: the two
+# reporter files (Issue #3041) plus the model-routing config (Issue #3030).
+# Any further .claude source added to a COPY is a deliberate decision that must
+# update this count — the tree holds session transcripts and worktree checkouts.
+check_eq "Dockerfile bakes exactly the harness-owned .claude files" "${#baked_sources[@]}" "3"
 for baked in "${baked_sources[@]}"; do
   if grep -qxF -- "!${baked}" "$DOCKERIGNORE"; then
     ok ".dockerignore re-includes ${baked} into the build context"

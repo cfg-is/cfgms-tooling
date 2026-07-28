@@ -16,6 +16,19 @@
 
 set -euo pipefail
 
+# Helper library for prompt context assembly, incl. ac_resolve_agent_model
+# (Issue #3030). Layout differs between the source tree (this script lives
+# under .devcontainer/scripts/, agent-context.sh under .devcontainer/) and the
+# container (both flattened as siblings under /usr/local/bin/ — see Dockerfile
+# COPY + the runtime -v mount in agent-dispatch.sh) — try the flattened path
+# first since that's the hot path in production.
+_AC_DIR="$(dirname "${BASH_SOURCE[0]}")"
+if [[ -f "${_AC_DIR}/agent-context.sh" ]]; then
+    source "${_AC_DIR}/agent-context.sh"
+else
+    source "${_AC_DIR}/../agent-context.sh"
+fi
+
 PROMPT_FILE="/workspace/.acceptance-review-prompt.md"
 
 # Distributed-lease release (multi-host cron coordination). agent-dispatch.sh
@@ -72,11 +85,17 @@ PR_NUM=$(grep -oP 'pr:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 STORY_NUM=$(grep -oP 'story:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 ITEM_ID=$(grep -oP -- '--project-item \K\S+' "$PROMPT_FILE" | head -1 || echo "")
 PROJECT_QUEUE="/workspace/scripts/project-queue.sh"
-echo "Starting Acceptance Reviewer (pr=${PR_NUM} story=${STORY_NUM} item=${ITEM_ID})..."
+# Model/effort resolved from .claude/model-routing.yaml (Issue #3030) —
+# see ac_resolve_agent_model in agent-context.sh.
+mapfile -t RESOLVED_MODEL < <(ac_resolve_agent_model "acceptance-review")
+AGENT_MODEL="${RESOLVED_MODEL[0]}"
+AGENT_EFFORT="${RESOLVED_MODEL[1]}"
+
+echo "Starting Acceptance Reviewer (pr=${PR_NUM} story=${STORY_NUM} item=${ITEM_ID} model=${AGENT_MODEL} effort=${AGENT_EFFORT})..."
 
 EXIT_CODE=0
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
-claude --dangerously-skip-permissions --model claude-sonnet-4-6 -p "$PROMPT_CONTENT" || EXIT_CODE=$?
+claude --dangerously-skip-permissions --model "$AGENT_MODEL" -p "$PROMPT_CONTENT" || EXIT_CODE=$?
 
 # --- Phase 2: Failsafe project status reset ---
 # The agent is instructed to update project status before exiting.
@@ -100,7 +119,8 @@ cat > /tmp/agent-result.json <<RESULT_EOF
   "pr_num": ${PR_NUM:-null},
   "story_num": ${STORY_NUM:-null},
   "exit_code": ${EXIT_CODE},
-  "model": "claude-sonnet-4-6",
+  "model": "${AGENT_MODEL}",
+  "effort": "${AGENT_EFFORT}",
   "timestamp": "$(date -Iseconds)"
 }
 RESULT_EOF
