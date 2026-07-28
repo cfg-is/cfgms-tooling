@@ -688,6 +688,13 @@ EOF
   exit 1
 }
 
+# Guard so po-act.sh can `source` this file to reuse prepare_session_dir and
+# the AGENT_SESSIONS_* config (Issue #3051) without also executing this
+# script's own command dispatch against po-act.sh's positional args.
+# BASH_SOURCE[0] is this file whenever it's sourced; $0 stays the top-level
+# script (po-act.sh) — they match only when agent-dispatch.sh is run directly.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+
 [[ $# -ge 1 ]] || usage
 
 cmd="$1"; shift
@@ -939,6 +946,16 @@ case "$cmd" in
 
     tier1_url="${CFGMS_TIER1_URL:-}"
 
+    # Persist this run's transcript to the host so its token spend survives the
+    # container's --rm (Issue #3028; extended to this launch path in #3051 —
+    # `launch` was the one dev-agent path prepare_session_dir never reached).
+    # Degrades to no mount if the dir can't be created; telemetry never blocks
+    # dispatch.
+    session_mount=()
+    if sessions_dir=$(prepare_session_dir "cfg-agent-${num}" "issue" "${num}" "" ""); then
+      session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
+    fi
+
     if container_id=$(docker run -d \
       --name "cfg-agent-${num}" \
       --label "cfg-agent=true" \
@@ -954,6 +971,7 @@ case "$cmd" in
       -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
+      "${session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_AUTONOMOUS=true" \
       -e "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key" \
@@ -2202,3 +2220,5 @@ PROMPT_EOF
     usage
     ;;
 esac
+
+fi  # BASH_SOURCE[0] == $0

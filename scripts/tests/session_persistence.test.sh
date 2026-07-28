@@ -132,6 +132,79 @@ fi
 check_contains "sessions base is under \$HOME/.cache, not /tmp" "$dispatch_src" \
   'AGENT_SESSIONS_BASE="${CFGMS_AGENT_SESSIONS_BASE:-${HOME}/.cache/cfgms-agent-sessions}"'
 
+printf '\n== docker run enumeration (Issue #3051) ==\n'
+
+# Enumerate every detached `docker run -d ... cfg-agent:latest` block in BOTH
+# scripts and assert each one bind-mounts the session dir, rather than
+# asserting the mount string appears somewhere in the file. A file-wide
+# substring check (as used above for launch-generic/review-pr) would have
+# stayed green while `po-act.sh dispatch` and `agent-dispatch.sh launch` had
+# no mount at all -- launch-generic's own mount was enough to satisfy a
+# "contains somewhere" check on the whole file. That blind spot is exactly how
+# the regression this story fixes went undetected.
+#
+# mode=interactive (launch-interactive) is deliberately exempt: it is a
+# human-attached remote-control session, not an autonomous dev-agent run, so
+# it never runs the manifest-writing entrypoint.sh and has nothing to persist.
+enum_out="$(python3 - "$DISPATCH" "${SCRIPT_DIR}/../po-act.sh" <<'PY'
+import sys
+
+# The docker run block itself references the *array* built from
+# prepare_session_dir's output ("${session_mount[@]}" / "${review_session_mount[@]}"),
+# not the literal AGENT_SESSIONS_MOUNT constant -- that only appears where the
+# array is assigned, outside the block. "session_mount[@]" is a substring of
+# both array names, so one marker covers both.
+MOUNT_MARKER = "session_mount[@]"
+EXEMPT_MARKER = 'mode=interactive'
+
+fails = []
+total = 0
+for path in sys.argv[1:]:
+    lines = open(path).read().splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith('#') or 'docker run -d' not in line:
+            continue
+        # Block runs from this line through the one naming the image -- every
+        # session-mount `-v` arg (if present) sits somewhere in between.
+        block = [line]
+        j = i
+        while j < len(lines) - 1 and 'cfg-agent:latest' not in lines[j]:
+            j += 1
+            block.append(lines[j])
+        block_text = '\n'.join(block)
+        total += 1
+        label = f"{path}:{i + 1}"
+        if EXEMPT_MARKER in block_text:
+            continue
+        if MOUNT_MARKER not in block_text:
+            fails.append(label)
+
+print(f"TOTAL:{total}")
+for f in fails:
+    print(f"MISSING:{f}")
+PY
+)"
+
+total_blocks="$(echo "$enum_out" | grep -oP '^TOTAL:\K[0-9]+' || echo 0)"
+missing_blocks="$(echo "$enum_out" | grep '^MISSING:' || true)"
+
+# Sanity floor on the enumeration itself: 5 known blocks exist today (po-act.sh
+# dispatch, agent-dispatch.sh launch, launch-generic, launch-interactive,
+# review-pr). Fewer than that means the parser silently stopped matching a
+# call site -- e.g. a `docker run -d` rewritten to a different form -- which
+# would make the assertion below vacuously pass.
+if [[ "$total_blocks" -ge 5 ]]; then
+  ok "enumeration found ${total_blocks} docker run -d cfg-agent:latest blocks (>=5 expected)"
+else
+  bad "enumeration found docker run -d cfg-agent:latest blocks" "expected >=5, found ${total_blocks} -- a launch call site may have gone undetected"
+fi
+
+if [[ -z "$missing_blocks" ]]; then
+  ok "every non-interactive docker run -d block mounts the session dir"
+else
+  bad "every non-interactive docker run -d block mounts the session dir" "$missing_blocks"
+fi
+
 printf '\n== retention sweep ==\n'
 
 mkdir -p "${AGENT_SESSIONS_BASE}/old-run" "${AGENT_SESSIONS_BASE}/fresh-run"

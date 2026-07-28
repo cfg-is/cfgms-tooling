@@ -28,12 +28,28 @@
 set -euo pipefail
 
 REPO="cfg-is/cfgms"
+DISPATCH="${CFGMS_TEST_DISPATCH:-$(dirname "$0")/agent-dispatch.sh}"
+
+# Reuse prepare_session_dir + AGENT_SESSIONS_* config from agent-dispatch.sh
+# (Issue #3051) instead of duplicating the session-dir logic for the docker run
+# this script inlines below. Sourcing (not shelling out) is required because
+# the dispatch case below builds its own `docker run` rather than calling
+# agent-dispatch.sh launch — see the "Inlined from agent-dispatch.sh launch"
+# comment there. agent-dispatch.sh guards its own command dispatch behind a
+# BASH_SOURCE[0]==$0 check, so sourcing it only defines functions/vars and does
+# not execute its case statement against our args. Deliberately sources the
+# REAL file, not "$DISPATCH": tests set CFGMS_TEST_DISPATCH to a throwaway mock
+# with no such guard, and sourcing that would run the mock's case statement
+# against po-act.sh's own args instead. Source BEFORE setting WORKTREE_BASE
+# below so this script's own value (not agent-dispatch.sh's) wins.
+# shellcheck source=agent-dispatch.sh
+source "$(dirname "$0")/agent-dispatch.sh"
+
 WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-}"
 if [[ -z "$WORKTREE_BASE" ]]; then
   WORKTREE_BASE="$(cd "$(dirname "$0")/../.." && pwd)/../worktrees"
   WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
 fi
-DISPATCH="${CFGMS_TEST_DISPATCH:-$(dirname "$0")/agent-dispatch.sh}"
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
 PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
 PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/pipeline-helper.sh}"
@@ -314,6 +330,17 @@ except Exception: print('')" 2>/dev/null || echo "")
         -c "cp /host-creds.json /persist/.credentials.json" 2>/dev/null || true
     fi
     gh_token=$(gh auth token)
+
+    # Persist this run's transcript to the host so its token spend survives the
+    # container's --rm (Issue #3028; extended to this dispatch path in #3051 —
+    # this inlined docker run was the dev-agent path prepare_session_dir never
+    # reached). Degrades to no mount if the dir can't be created; telemetry
+    # never blocks dispatch.
+    session_mount=()
+    if sessions_dir=$(prepare_session_dir "$container_name" "issue" "${story:-}" "" ""); then
+      session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
+    fi
+
     if container_id=$(docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
@@ -326,6 +353,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       -v "claude-creds:/persist" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
+      "${session_mount[@]}" \
       -e "GH_TOKEN=${gh_token}" \
       -e "CFGMS_PROJECT_ITEM_ID=${item_id}" \
       -e "CFGMS_LEASE_KEY=story-${item_id}" \
