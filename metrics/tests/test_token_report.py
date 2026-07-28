@@ -25,10 +25,13 @@ from token_report import (  # noqa: E402
     Pricing,
     SessionMeta,
     TranscriptRef,
+    build_parser,
+    call_to_fact,
     collect,
     compute_cost,
     correlate_cycle_manifest,
     extract_agent_spawns,
+    group_key,
     parse_transcript,
     totals,
     split_cache_write,
@@ -377,6 +380,104 @@ class TestCollect(unittest.TestCase):
         calls, _ = collect([root], Pricing.load(), None, ["proj-a"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0].project, "proj-a")
+
+
+class TestRoleAttribution(unittest.TestCase):
+    """Every fact record carries a role, sourced from transcript data (Issue #3054).
+
+    Confirmed empirically against a real transcript tree before writing this
+    code (per the issue's own Implementation Notes -- "do not let an
+    implementer guess a field name"): `attributionAgent` carries the exact
+    subagent_type ("acceptance-checker", "developer", ...) on every row of an
+    Agent/Task-spawned nested transcript; a Skill that forks into its own
+    agent carries `attributionSkill` instead (the same field already read
+    into `call.skill`) with no `attributionAgent` at all. Both were observed
+    on real transcripts from this repo's own pipeline runs.
+    """
+
+    def _corpus(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        project = root / "-workspace"
+        (project / "sess1" / "subagents" / "workflows" / "wf_abc").mkdir(parents=True)
+        (project / "sess1.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": "<command-name>/po</command-name>"},
+                }
+            )
+            + "\n"
+            + assistant_row("req_main")
+            + "\n",
+            encoding="utf-8",
+        )
+        # Agent/Task spawn: attributionAgent carries the role verbatim.
+        (project / "sess1" / "subagents" / "sub_role.jsonl").write_text(
+            assistant_row("req_sub_role", attributionAgent="acceptance-checker") + "\n",
+            encoding="utf-8",
+        )
+        # Skill fork: attributionAgent absent, attributionSkill carries it instead.
+        (project / "sess1" / "subagents" / "sub_skill.jsonl").write_text(
+            assistant_row("req_sub_skill", attributionSkill="doc-review") + "\n",
+            encoding="utf-8",
+        )
+        # Nested with neither field -- the genuine "cannot be determined" case.
+        (project / "sess1" / "subagents" / "sub_bare.jsonl").write_text(
+            assistant_row("req_sub_bare") + "\n", encoding="utf-8"
+        )
+        # Workflow-nested lens, same attributionAgent mechanism.
+        (project / "sess1" / "subagents" / "workflows" / "wf_abc" / "w1.jsonl").write_text(
+            assistant_row("req_wf", attributionAgent="security-engineer") + "\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def test_agent_spawn_role_is_the_subagent_type(self):
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        by_req = {c.request_id: c for c, _ in calls}
+        self.assertEqual(by_req["req_sub_role"].role, "acceptance-checker")
+
+    def test_skill_fork_role_falls_back_to_attribution_skill(self):
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        by_req = {c.request_id: c for c, _ in calls}
+        self.assertEqual(by_req["req_sub_skill"].role, "doc-review")
+
+    def test_workflow_nested_lens_role(self):
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        by_req = {c.request_id: c for c, _ in calls}
+        self.assertEqual(by_req["req_wf"].role, "security-engineer")
+
+    def test_main_loop_role_is_main_not_unknown(self):
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        by_req = {c.request_id: c for c, _ in calls}
+        self.assertEqual(by_req["req_main"].role, "main")
+
+    def test_undeterminable_nested_role_is_unknown_not_dropped(self):
+        # AC4: never silently dropped, never merged into a neighbouring role.
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        by_req = {c.request_id: c for c, _ in calls}
+        self.assertIn("req_sub_bare", by_req)
+        self.assertEqual(by_req["req_sub_bare"].role, "unknown")
+
+    def test_group_by_role_covers_a_full_tree(self):
+        # AC5: a transcript tree containing main, subagent, and workflow-agent
+        # calls, sliced by role in one pass.
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        roles = sorted({group_key(call, segment, "role") for call, segment in calls})
+        self.assertEqual(
+            roles, ["acceptance-checker", "doc-review", "main", "security-engineer", "unknown"]
+        )
+
+    def test_role_is_in_the_fact_record(self):
+        calls, _ = collect([self._corpus()], Pricing.load(), None, None)
+        by_req = {c.request_id: c for c, _ in calls}
+        fact = call_to_fact(by_req["req_sub_role"], "some-segment")
+        self.assertEqual(fact["role"], "acceptance-checker")
+
+    def test_role_is_a_valid_group_by_choice(self):
+        parser = build_parser()
+        args = parser.parse_args(["--group-by", "role"])
+        self.assertEqual(args.group_by, "role")
 
 
 class TestCycleManifestCorrelation(unittest.TestCase):

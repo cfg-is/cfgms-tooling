@@ -20,12 +20,27 @@ Part of epic #3026 (pipeline cost engineering); this directory is story #3027.
 # Main loop vs subagents vs workflow agents
 .claude/metrics/token_report.py --group-by agent
 
+# Which review lens (or Tech Lead, BA, fix round...) actually costs what
+.claude/metrics/token_report.py --group-by role
+
 # One record per API call, for downstream tooling and benchmarks
 .claude/metrics/token_report.py --format jsonl --out facts.jsonl
 ```
 
 Group keys: `model`, `segment`, `session`, `day`, `skill`, `agent`, `project`,
-`workflow`.
+`workflow`, `role`.
+
+`role` (story #3054) is who a call ran *as* — `acceptance-checker`,
+`developer`, `security-engineer`, `tech-lead`, a Skill name like
+`doc-review`, or `main` for the top-level session. Sourced from transcript
+data only, never inferred from a filename or self-reported: an Agent/Task
+spawn stamps every row of its own transcript with `attributionAgent` set to
+the exact `subagent_type`; a Skill that forks into its own agent stamps
+`attributionSkill` instead. A nested call with neither field is `unknown` —
+reported explicitly, never dropped or folded into a neighbouring role.
+Combine with `--group-by workflow` or the `session`/`transcript` fields in
+`--format jsonl` to separate spend per review lens *and* per fix round for a
+single dev-agent run, or per role across a whole cron cycle.
 
 Prices live in `pricing.json`, not in code. A model absent from that table is
 reported as `UNPRICED`: its tokens are counted and its dollars are **not**

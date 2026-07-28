@@ -59,7 +59,7 @@ BUILTIN_COMMANDS = frozenset(
     }
 )
 
-GROUP_KEYS = ("model", "segment", "session", "day", "skill", "agent", "project", "workflow")
+GROUP_KEYS = ("model", "segment", "session", "day", "skill", "agent", "project", "workflow", "role")
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +170,7 @@ class Call:
     model: str
     effort: str | None
     skill: str | None
+    attribution_agent: str | None
     is_sidechain: bool
     git_branch: str | None
     cwd: str | None
@@ -190,6 +191,27 @@ class Call:
             + self.cache_read
             + self.output_tokens
         )
+
+    @property
+    def role(self) -> str:
+        """Who this call ran as, sourced from transcript data (Issue #3054).
+
+        Never inferred from a filename or self-reported: Agent/Task spawns
+        stamp every row with `attributionAgent` set to the exact
+        `subagent_type` (e.g. "acceptance-checker", "developer"); a Skill
+        forked into its own agent stamps `attributionSkill` instead (the same
+        field this reporter already reads into `skill` for segment
+        attribution) -- confirmed empirically against a real transcript tree,
+        not assumed (see extract_agent_spawns' fixture and the epic's own
+        Implementation Notes, which required this before any code was
+        written). A main-loop call has neither field and is not nested, so it
+        is labeled "main" rather than falling into "unknown" -- only a nested
+        call with genuinely neither field earns that bucket, and it is never
+        merged into a neighbouring role.
+        """
+        if self.agent_kind == "main":
+            return "main"
+        return self.attribution_agent or self.skill or "unknown"
 
 
 @dataclass
@@ -407,6 +429,7 @@ def parse_transcript(
                 model=model,
                 effort=row.get("effort"),
                 skill=row.get("attributionSkill"),
+                attribution_agent=row.get("attributionAgent"),
                 is_sidechain=bool(row.get("isSidechain")),
                 git_branch=row.get("gitBranch") or meta.branch,
                 cwd=row.get("cwd") or meta.cwd,
@@ -489,6 +512,8 @@ def group_key(call: Call, segment: str, key: str) -> str:
         return call.project
     if key == "workflow":
         return call.workflow or "(none)"
+    if key == "role":
+        return call.role
     raise ValueError(f"unknown group key: {key}")
 
 
@@ -900,6 +925,7 @@ def call_to_fact(call: Call, segment: str) -> dict[str, Any]:
         "effort": call.effort,
         "skill": call.skill,
         "agent": call.agent_kind,
+        "role": call.role,
         "workflow": call.workflow,
         "git_branch": call.git_branch,
         "input_tokens": call.input_tokens,
