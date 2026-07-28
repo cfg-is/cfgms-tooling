@@ -341,6 +341,8 @@ except Exception: print('')" 2>/dev/null || echo "")
       session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
     fi
 
+    ledger_append_launch "$container_name" "issue" "${story:-}" "" "" "dev-agent" "story-${item_id}"
+
     if container_id=$(docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
@@ -366,6 +368,7 @@ except Exception: print('')" 2>/dev/null || echo "")
     else
       trap - ERR
       echo "LAUNCH_FAILED:${first_arg}:${container_id}"
+      ledger_append_launch_failed "$container_name" "issue"
       rm -rf "$clone_path"
       echo "CLEANED:clone:${clone_path}"
       # Release the claim + lease: launch never happened, so return the story to

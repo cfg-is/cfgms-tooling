@@ -7,6 +7,21 @@ set -euo pipefail
 REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktrees}"
 
+# Reuse ac_resolve_agent_model (Issue #3030) to predict the model a dispatched
+# container will resolve to, for the ledger's launch record below. Pure
+# function definitions only — see agent-context.sh's own "do not exit from
+# here" docstring — safe to source unconditionally.
+#
+# Resolved from THIS SCRIPT's own real location (BASH_SOURCE[0]), never from
+# REPO_ROOT: hermetic tests point CFGMS_TEST_REPO_ROOT at a throwaway bare
+# repo with no .devcontainer/ tree, and this file must still source cleanly
+# when they do (verified by scripts/test-scripts.sh's create-clone fixtures).
+_agent_dispatch_self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ -f "${_agent_dispatch_self_root}/.devcontainer/agent-context.sh" ]]; then
+  # shellcheck source=../../.devcontainer/agent-context.sh
+  source "${_agent_dispatch_self_root}/.devcontainer/agent-context.sh"
+fi
+
 # Base directory for per-agent API key tmpfs files.
 # Override CFGMS_TEST_CRED_BASE in hermetic tests.
 AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
@@ -90,6 +105,186 @@ META
 
   printf '%s\n' "$dir"
 }  # end prepare_session_dir
+
+# ---------------------------------------------------------------------------
+# Durable dispatch ledger (Issue #3052).
+#
+# Every container launch and exit appends one JSON line here, so agent counts
+# and per-run outcomes outlive both session-transcript retention (Issue #3028's
+# 30-day prune) and every cleanup routine below. Lives in its own directory,
+# deliberately never touched by cleanup-issue/cleanup-container/cleanup-stale/
+# cleanup-stale-reviews or AGENT_SESSIONS_RETENTION_DAYS pruning — this is an
+# execution log, not a queue, and not backfilled for historical runs.
+#
+# Who writes the exit record: the HOST always does (a container that dies
+# mid-run — hard-killed, OOM, host reboot — cannot be relied on to write its
+# own record), reading whatever the container itself already left behind in
+# its session-mounted agent-result.json (Issue #3028/#3051) when a caller
+# passes one in (source=agent-result: exit code, duration, PR URL, validation
+# outcome, head-advanced flag, token usage), falling back to `docker inspect`
+# alone otherwise (source=docker-inspect-only). That fallback is what makes a
+# hard-killed run distinguishable from one that reported cleanly — the
+# documented hybrid: the container supplies the rich fields when it can, the
+# host reconciles what's missing when it can't.
+#
+# Best-effort throughout — every function here degrades to a silent no-op
+# rather than propagate a failure; a ledger write must never block or fail a
+# dispatch.
+AGENT_LEDGER_DIR="${CFGMS_AGENT_LEDGER_DIR:-${HOME}/.cache/cfgms-agent-ledger}"
+AGENT_LEDGER_FILE="${AGENT_LEDGER_DIR}/ledger.jsonl"
+
+# _ledger_write_line <json_line>
+# Appends one already-serialized JSON line, lock-guarded against concurrent
+# writers on this host (JSONL lines are small enough for an atomic O_APPEND
+# write, but flock removes any doubt). Not shared cross-host by default —
+# CFGMS_AGENT_LEDGER_DIR would need to point at shared storage for that, which
+# this story does not assume.
+_ledger_write_line() {
+  local line="$1"
+  [[ -n "$line" ]] || return 0
+  mkdir -p "$AGENT_LEDGER_DIR" 2>/dev/null || return 0
+  (
+    flock -w 2 200 || exit 0
+    printf '%s\n' "$line" >> "$AGENT_LEDGER_FILE"
+  ) 200>>"${AGENT_LEDGER_FILE}.lock" 2>/dev/null || true
+}
+
+# ledger_resolve_model <segment>
+# Predicts the model a dispatched container will resolve to: reads the SAME
+# harness-checkout routing file the container gets baked/mounted from (Issue
+# #3030), a host-side prediction rather than a live read of the container.
+ledger_resolve_model() {
+  local segment="$1"
+  CFGMS_MODEL_ROUTING_FILE="${REPO_ROOT}/.claude/model-routing.yaml" \
+    ac_resolve_agent_model "$segment" 2>/dev/null | sed -n '1p'
+}
+
+# ledger_append_launch <container> <mode> <issue> <pr> <branch> <segment> <lease_key>
+# Appends a launch record. Called right before `docker run`, so a launch
+# record exists even when the run itself then fails — see
+# ledger_append_launch_failed for that terminal case.
+ledger_append_launch() {
+  local container="$1" mode="$2" issue="$3" pr="$4" branch="$5" segment="$6" lease_key="$7"
+  local model
+  model=$(ledger_resolve_model "$segment")
+  local line
+  line=$(python3 -c '
+import json, sys
+ts, container, mode, issue, pr, branch, model, lease_key = sys.argv[1:9]
+def num(v):
+    return int(v) if v.isdigit() else None
+print(json.dumps({
+    "event": "launch", "ts": ts, "container": container, "mode": mode,
+    "issue": num(issue), "pr": num(pr), "branch": (branch or None),
+    "model": (model or None), "lease_key": (lease_key or None),
+}, separators=(",", ":")))
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$container" "$mode" "${issue:-}" "${pr:-}" \
+    "${branch:-}" "${model:-}" "${lease_key:-}" 2>/dev/null) || return 0
+  _ledger_write_line "$line"
+}
+
+# ledger_append_launch_failed <container> <mode>
+# `docker run` itself returned nonzero — no container ever existed, so no exit
+# path will ever fire for it. Writes the terminal record directly so this run
+# is distinguishable from both a clean exit and a hard-killed one.
+ledger_append_launch_failed() {
+  local container="$1" mode="$2"
+  local line
+  line=$(python3 -c '
+import json, sys
+ts, container, mode = sys.argv[1:4]
+print(json.dumps({
+    "event": "exit", "ts": ts, "container": container, "mode": mode,
+    "exit_code": None, "source": "launch-failed",
+}, separators=(",", ":")))
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$container" "$mode" 2>/dev/null) || return 0
+  _ledger_write_line "$line"
+}
+
+# ledger_has_exit <container>
+# True if an exit record for this container name already exists. Guards
+# ledger_reconcile_exit against duplicate records when a cleanup routine
+# inspects the same exited container more than once before it is removed.
+ledger_has_exit() {
+  local container="$1"
+  [[ -f "$AGENT_LEDGER_FILE" ]] || return 1
+  python3 -c '
+import json, sys
+container, path = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("event") == "exit" and rec.get("container") == container:
+                sys.exit(0)
+except FileNotFoundError:
+    pass
+sys.exit(1)
+' "$container" "$AGENT_LEDGER_FILE"
+}
+
+# _ledger_docker_inspect <go_template> <container>
+# Thin wrapper around `docker inspect` so tests can stub it without a real
+# container.
+_ledger_docker_inspect() {
+  docker inspect --format "$1" "$2" 2>/dev/null || echo ""
+}
+
+# ledger_reconcile_exit <container> [result_json_path]
+# The host-side reaper half of the hybrid. Called by every cleanup routine at
+# the point it already inspects/removes an exited container. Idempotent
+# (skips if an exit record already exists for this container). Reads
+# `docker inspect` for exit code + finish time — always available, even for a
+# hard-killed container — and layers in the container's own agent-result.json
+# when the caller found one on disk.
+ledger_reconcile_exit() {
+  local container="$1" result_file="${2:-}"
+  ledger_has_exit "$container" && return 0
+
+  local exit_code finished_at
+  exit_code=$(_ledger_docker_inspect '{{.State.ExitCode}}' "$container")
+  finished_at=$(_ledger_docker_inspect '{{.State.FinishedAt}}' "$container")
+
+  local result_json="{}"
+  local source="docker-inspect-only"
+  if [[ -n "$result_file" ]] && [[ -s "$result_file" ]]; then
+    if result_json=$(cat "$result_file" 2>/dev/null) && [[ -n "$result_json" ]]; then
+      source="agent-result"
+    else
+      result_json="{}"
+    fi
+  fi
+
+  local line
+  line=$(python3 -c '
+import json, sys
+container, exit_code, finished_at, source, result_raw = sys.argv[1:6]
+try:
+    result = json.loads(result_raw) if result_raw.strip() else {}
+    if not isinstance(result, dict):
+        result = {}
+except Exception:
+    result = {}
+rec = {
+    "event": "exit",
+    "ts": finished_at or None,
+    "container": container,
+    "mode": result.get("mode"),
+    "exit_code": int(exit_code) if exit_code.lstrip("-").isdigit() else None,
+    "source": source,
+    "duration_seconds": result.get("agent_duration_seconds"),
+    "pr_url": result.get("pr_url") or None,
+    "validation_passed": result.get("validation_passed"),
+    "head_advanced": result.get("head_advanced"),
+    "usage": result.get("usage"),
+}
+print(json.dumps(rec, separators=(",", ":")))
+' "$container" "${exit_code:-}" "${finished_at:-}" "$source" "$result_json" 2>/dev/null) || return 0
+  _ledger_write_line "$line"
+}
 
 # ---------------------------------------------------------------------------
 # Resource-based admission gate (replaces the hand-tuned container count).
@@ -956,6 +1151,8 @@ case "$cmd" in
       session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
     fi
 
+    ledger_append_launch "cfg-agent-${num}" "issue" "${num}" "" "" "dev-agent" ""
+
     if container_id=$(docker run -d \
       --name "cfg-agent-${num}" \
       --label "cfg-agent=true" \
@@ -986,6 +1183,7 @@ case "$cmd" in
     else
       # Launch failed — revoke creds and clean up to prevent orphaned resources.
       echo "LAUNCH_FAILED:${num}:${container_id}"
+      ledger_append_launch_failed "cfg-agent-${num}" "issue"
       revoke_agent_creds "$num" || true
       rm -rf "${cred_dir}" 2>/dev/null || true
       rm -rf "$clone_path"
@@ -1036,6 +1234,13 @@ case "$cmd" in
       session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
     fi
 
+    ledger_segment="dev-agent"
+    if [[ "$mode_label" == "fix-pr" || "$mode_label" == "resolve-conflict" ]]; then
+      ledger_segment="fix-agent"
+    fi
+    ledger_append_launch "$container_name" "$mode_label" "${issue_arg:-}" "${fix_pr_num:-}" \
+      "${branch_arg:-}" "$ledger_segment" "${CFGMS_LEASE_KEY:-}"
+
     if container_id=$(docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
@@ -1071,6 +1276,7 @@ case "$cmd" in
       fi
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
+      ledger_append_launch_failed "$container_name" "$mode_label"
       rm -rf "$clone_dir"
       echo "CLEANED:clone:${clone_dir}"
       exit 1
@@ -1448,6 +1654,7 @@ else:
       revoke_agent_creds "$num" || true
       rm -rf "${AGENT_CRED_BASE}/${num}" 2>/dev/null || true
       docker cp "cfg-agent-${num}:/tmp/agent-result.json" "/tmp/agent-result-${num}.json" 2>/dev/null || true
+      ledger_reconcile_exit "cfg-agent-${num}" "/tmp/agent-result-${num}.json"
       if docker rm -f "cfg-agent-${num}" >/dev/null 2>&1; then
         echo "CLEANED:container:cfg-agent-${num}"
       else
@@ -1464,6 +1671,8 @@ else:
       # Item mode (non-numeric item_id): derive LAST12 and clean item resources
       item_last12=$(echo "$num" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
       item_container="cfg-agent-item-${item_last12}"
+      docker cp "${item_container}:/tmp/agent-result.json" "/tmp/agent-result-${item_container}.json" 2>/dev/null || true
+      ledger_reconcile_exit "$item_container" "/tmp/agent-result-${item_container}.json"
       if docker rm -f "$item_container" >/dev/null 2>&1; then
         echo "CLEANED:container:${item_container}"
       else
@@ -1485,6 +1694,7 @@ else:
     container_name="$1"
     # Copy result file (best-effort)
     docker cp "${container_name}:/tmp/agent-result.json" "/tmp/agent-result-${container_name}.json" 2>/dev/null || true
+    ledger_reconcile_exit "$container_name" "/tmp/agent-result-${container_name}.json"
     # Remove container
     if docker rm -f "$container_name" >/dev/null 2>&1; then
       echo "CLEANED:container:${container_name}"
@@ -1536,6 +1746,67 @@ else:
   inspect-exit)
     [[ $# -eq 1 ]] || { echo "inspect-exit requires exactly one issue number"; exit 1; }
     docker inspect --format "{{.State.ExitCode}}" "cfg-agent-$1"
+    ;;
+
+  ledger-report)
+    # Answers "how many agents of each mode ran in the last N days, and what
+    # did they cost" from the durable ledger (Issue #3052) — no docker/GitHub
+    # history cross-referencing required.
+    #   ./.claude/scripts/agent-dispatch.sh ledger-report [DAYS]
+    days="${1:-7}"
+    if [[ ! -f "$AGENT_LEDGER_FILE" ]]; then
+      echo "No ledger yet at ${AGENT_LEDGER_FILE}"
+      exit 0
+    fi
+    python3 - "$AGENT_LEDGER_FILE" "$days" <<'PYEOF'
+import json, sys
+from datetime import datetime, timedelta, timezone
+
+path, days = sys.argv[1], int(sys.argv[2])
+cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+def parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+launch_modes = {}
+by_mode = {}
+with open(path) as f:
+    for line in f:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        ts = parse_ts(rec.get("ts"))
+        if ts is None or ts < cutoff:
+            continue
+        if rec.get("event") == "launch":
+            launch_modes[rec.get("container")] = rec.get("mode")
+        elif rec.get("event") == "exit":
+            mode = rec.get("mode") or launch_modes.get(rec.get("container")) or "unknown"
+            bucket = by_mode.setdefault(mode, {"runs": 0, "failed": 0, "cost_usd": 0.0, "no_usage": 0})
+            bucket["runs"] += 1
+            if rec.get("source") == "launch-failed" or rec.get("exit_code") not in (0, None):
+                bucket["failed"] += 1
+            usage = rec.get("usage")
+            if usage and usage.get("cost_usd") is not None:
+                bucket["cost_usd"] += usage["cost_usd"]
+            else:
+                bucket["no_usage"] += 1
+
+print(f"Ledger report -- last {days}d ({path})")
+print(f"{'mode':<18} {'runs':>5} {'failed':>7} {'cost_usd':>10} {'no_usage':>9}")
+for mode, b in sorted(by_mode.items()):
+    print(f"{mode:<18} {b['runs']:>5} {b['failed']:>7} {b['cost_usd']:>10.2f} {b['no_usage']:>9}")
+total_runs = sum(b["runs"] for b in by_mode.values())
+total_failed = sum(b["failed"] for b in by_mode.values())
+total_cost = sum(b["cost_usd"] for b in by_mode.values())
+print(f"{'TOTAL':<18} {total_runs:>5} {total_failed:>7} {total_cost:>10.2f}")
+PYEOF
     ;;
 
   inspect-detail)
@@ -1935,6 +2206,9 @@ PROMPT_EOF
       review_session_mount=(-v "${review_sessions_dir}:${AGENT_SESSIONS_MOUNT}")
     fi
 
+    ledger_append_launch "$container_name" "review" "${story_num:-}" "$pr_num" \
+      "${pr_branch:-}" "acceptance-review" "pr-${pr_num}"
+
     # Launch headless. Mount the review entrypoint at runtime — no image rebuild
     # required when this script changes.
     if container_id=$(docker run -d \
@@ -1972,6 +2246,7 @@ PROMPT_EOF
     else
       # Launch failed — the EXIT trap releases the lease.
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
+      ledger_append_launch_failed "$container_name" "review"
       rm -rf "$clone_dir"
       echo "CLEANED:clone:${clone_dir}"
       exit 1
@@ -2018,6 +2293,7 @@ PROMPT_EOF
 
       # Archive the result JSON for forensics.
       docker cp "${container_name}:/tmp/agent-result.json" "/tmp/agent-result-review-${pr_num:-${container_name}}.json" 2>/dev/null || true
+      ledger_reconcile_exit "$container_name" "/tmp/agent-result-review-${pr_num:-${container_name}}.json"
 
       # Remove the container and clone.
       if docker rm -f "$container_name" >/dev/null 2>&1; then
@@ -2119,6 +2395,7 @@ PROMPT_EOF
         revoke_agent_creds "$num" || true
         rm -rf "${AGENT_CRED_BASE}/${num}" 2>/dev/null || true
         docker cp "cfg-agent-${num}:/tmp/agent-result.json" "/tmp/agent-result-${num}.json" 2>/dev/null || true
+        ledger_reconcile_exit "cfg-agent-${num}" "/tmp/agent-result-${num}.json"
         if docker rm -f "cfg-agent-${num}" >/dev/null 2>&1; then
           echo "CLEANED:container:cfg-agent-${num}"
         fi
