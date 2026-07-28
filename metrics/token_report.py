@@ -778,6 +778,145 @@ def correlate_cycle_manifest(
 
 
 # --------------------------------------------------------------------------
+# Per-story cost (Issue #3055)
+# --------------------------------------------------------------------------
+
+DEFAULT_SESSIONS_DIR = Path.home() / ".cache" / "cfgms-agent-sessions"
+
+#: Dispatch mode (Issue #3052's launch ledger / #3051's meta.json) -> cost bucket.
+_MODE_BUCKET = {
+    "issue": "dev",
+    "branch": "dev",
+    "fix-pr": "fix",
+    "resolve-conflict": "fix",
+    "review": "review",
+}
+
+
+def story_cost_report(
+    sessions_base: Path, pricing: Pricing, since: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Cost per story: dev vs fix-round vs review, from real container sessions.
+
+    Answers the epic's own framing question's denominator -- "which segment
+    consumes the most tokens per unit of DELIVERED WORK" needs a dollar figure
+    per story, not just per segment. Every fact record already carries
+    git_branch, and dev branches follow feature/story-<N>-*, so joining a
+    container to its story is mechanically the story number in that branch
+    name -- confirmed here against meta.json (Issue #3051), which records it
+    host-side at launch time, never self-reported by the agent.
+
+    Cost per container is computed FRESH from that container's own persisted
+    transcript (the same session mount Issue #3051 added) via this reporter's
+    normal per-call accounting -- never agent-result.json's own pre-baked
+    cost_usd, even though that number was computed the same way. Reusing a
+    downstream artifact's number is not "measuring it here", and this story's
+    entire premise is the same one every story in this epic shares: figures
+    must be measured, not narrated or trusted secondhand.
+
+    Explicitly excludes the cron orchestration's own share of a story's cost
+    (AC3 allows stating exclusions instead of attributing an inherently
+    arbitrary split across however many stories one cycle happened to touch
+    on a given run) -- every returned record carries this in `excludes`.
+
+    A story is "partial" when: a container's session directory exists (so a
+    launch was recorded) but no transcript was ever captured for it -- a
+    crash before persistence, or a pruned session; no story number could be
+    resolved at all; or the story has fix and/or review cost but no dev
+    launch was ever found for it -- the single largest component of a
+    story's cost is then silently absent rather than genuinely zero (this is
+    the common case for every story dispatched before #3051's session
+    persistence landed: fix/review costs are measured, dev cost reads $0.00
+    but is not $0.00). Flagged explicitly in every such case, never reported
+    as though the figure were complete (AC4).
+    """
+    stories: dict[str, dict[str, Any]] = {}
+    if not sessions_base.is_dir():
+        return []
+
+    for container_dir in sorted(p for p in sessions_base.iterdir() if p.is_dir()):
+        meta_path = container_dir / "meta.json"
+        if not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        result: dict[str, Any] = {}
+        result_path = container_dir / "agent-result.json"
+        if result_path.is_file():
+            try:
+                result = json.loads(result_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                result = {}
+
+        started_at = _parse_time(meta.get("started_at"))
+        if since is not None and started_at is not None and started_at < since:
+            continue
+
+        mode = meta.get("mode") or result.get("mode")
+        branch = meta.get("branch") or result.get("branch") or ""
+        issue = meta.get("issue") or result.get("issue")
+        if not issue:
+            match = _STORY_BRANCH_RE.search(branch)
+            if match:
+                issue = int(match.group(1))
+        pr = meta.get("pr") or result.get("pr_num")
+
+        # Measured, not self-reported: scan this container's own persisted
+        # transcript directory the same way every other report in this tool
+        # does, rather than trusting agent-result.json's own totals.
+        container_calls, _ = collect([container_dir], pricing, None, None)
+        cost = sum((c.cost_usd or 0.0) for c, _ in container_calls)
+        has_transcript = len(container_calls) > 0
+
+        key = str(issue) if issue else (f"pr-{pr}" if pr else f"container:{container_dir.name}")
+        story = stories.setdefault(
+            key,
+            {
+                "story": issue,
+                "pr": pr,
+                "dev_cost_usd": 0.0,
+                "fix_cost_usd": 0.0,
+                "review_cost_usd": 0.0,
+                "fix_rounds": 0,
+                "containers": 0,
+                "has_dev": False,
+                "partial": False,
+                "excludes": ["cron-orchestration-share"],
+            },
+        )
+        if pr and not story["pr"]:
+            story["pr"] = pr
+        story["containers"] += 1
+        if not has_transcript:
+            story["partial"] = True
+
+        bucket = _MODE_BUCKET.get(mode, "fix")
+        story[f"{bucket}_cost_usd"] = round(story[f"{bucket}_cost_usd"] + cost, 4)
+        if bucket == "dev":
+            story["has_dev"] = True
+        if bucket == "fix":
+            story["fix_rounds"] += 1
+
+    for story in stories.values():
+        story["total_cost_usd"] = round(
+            story["dev_cost_usd"] + story["fix_cost_usd"] + story["review_cost_usd"], 4
+        )
+        if story["story"] is None:
+            # No issue number resolvable at all -- reported under its PR (or
+            # container name) rather than dropped, but the figure can't be
+            # trusted as "this story's cost" without one.
+            story["partial"] = True
+        if not story.pop("has_dev"):
+            # The largest component of a story's cost is missing, not zero.
+            story["partial"] = True
+
+    return sorted(stories.values(), key=lambda s: -s["total_cost_usd"])
+
+
+# --------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------
 
@@ -883,6 +1022,29 @@ def render_composition(calls: list[tuple[Call, str]], pricing: Pricing, out) -> 
     print(f"{'TOTAL':<16}  {_fmt_tokens(sum(tokens.values())):>9}  {total:>9.2f}  100.0%", file=out)
 
 
+def render_story_report(stories: list[dict[str, Any]], out) -> None:
+    """Human-readable form of story_cost_report's output (Issue #3055)."""
+    print(
+        f"\n{'story':>7}  {'pr':>7}  {'dev $':>8}  {'fix $':>8}  {'review $':>9}  "
+        f"{'total $':>8}  {'rounds':>6}  {'partial':>7}",
+        file=out,
+    )
+    print("-" * 76, file=out)
+    for story in stories:
+        print(
+            f"{str(story['story'] or '-'):>7}  {str(story['pr'] or '-'):>7}  "
+            f"{story['dev_cost_usd']:>8.2f}  {story['fix_cost_usd']:>8.2f}  "
+            f"{story['review_cost_usd']:>9.2f}  {story['total_cost_usd']:>8.2f}  "
+            f"{story['fix_rounds']:>6}  {('yes' if story['partial'] else ''):>7}",
+            file=out,
+        )
+    print("-" * 76, file=out)
+    total = sum(s["total_cost_usd"] for s in stories)
+    partial_count = sum(1 for s in stories if s["partial"])
+    print(f"{len(stories)} stories, ${total:.2f} total, {partial_count} partial", file=out)
+    print("excludes: cron orchestration's own share of cost", file=out)
+
+
 def totals(calls: list[tuple[Call, str]]) -> dict[str, Any]:
     """Aggregate every call into one record.
 
@@ -979,18 +1141,51 @@ def build_parser() -> argparse.ArgumentParser:
             "cost/tokens back into that file, instead of the normal report."
         ),
     )
+    parser.add_argument(
+        "--story-report",
+        action="store_true",
+        help=(
+            "Report cost per story: dev vs fix-round vs review, joined from "
+            "persisted dev-agent container sessions (Issue #3055), instead of "
+            "the normal per-call report. --format jsonl for machine-readable "
+            "output, otherwise a table."
+        ),
+    )
+    parser.add_argument(
+        "--sessions-dir",
+        type=Path,
+        default=DEFAULT_SESSIONS_DIR,
+        help=f"Persisted dev-agent session root for --story-report. Default: {DEFAULT_SESSIONS_DIR}",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    pricing = Pricing.load(args.pricing)
+
+    if args.story_report:
+        since = (
+            datetime.now(timezone.utc) - timedelta(days=args.since) if args.since is not None else None
+        )
+        stories = story_cost_report(args.sessions_dir, pricing, since)
+        out = args.out.open("w", encoding="utf-8") if args.out else sys.stdout
+        try:
+            if args.format == "jsonl":
+                for story in stories:
+                    json.dump(story, out)
+                    out.write("\n")
+            else:
+                render_story_report(stories, out)
+        finally:
+            if args.out:
+                out.close()
+        return 0
 
     roots = args.projects_dir or [DEFAULT_PROJECTS_DIR]
     if not any(root.is_dir() for root in roots):
         print(f"No transcript directory found in: {[str(r) for r in roots]}", file=sys.stderr)
         return 2
-
-    pricing = Pricing.load(args.pricing)
 
     if args.cycle_manifest is not None:
         try:

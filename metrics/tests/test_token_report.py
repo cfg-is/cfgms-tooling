@@ -33,6 +33,7 @@ from token_report import (  # noqa: E402
     extract_agent_spawns,
     group_key,
     parse_transcript,
+    story_cost_report,
     totals,
     split_cache_write,
 )
@@ -816,6 +817,155 @@ class TestNestedAgentSpawns(unittest.TestCase):
         agent_cost = sum(a["cost_usd"] for a in result["agents"])
         self.assertGreater(agent_cost, 0)
         self.assertGreaterEqual(result["cycle_cost_usd"], agent_cost)
+
+
+class TestStoryCostReport(unittest.TestCase):
+    """Cost per story: dev vs fix-round vs review (Issue #3055).
+
+    The join is issue number (or branch-parsed story number) from meta.json
+    (Issue #3051), written host-side at launch -- never self-reported. Cost
+    itself is always computed fresh from the container's own persisted
+    transcript, the same measured accounting every other report in this tool
+    uses, even when agent-result.json already carries a pre-baked number.
+    """
+
+    def _container(
+        self,
+        sessions_base: Path,
+        name: str,
+        mode: str,
+        issue=None,
+        pr=None,
+        branch="",
+        started_at="2026-07-28T10:00:00Z",
+        usage_tokens: int | None = 1000,
+        write_transcript: bool = True,
+    ) -> Path:
+        container_dir = sessions_base / name
+        container_dir.mkdir(parents=True)
+        meta = {"container": name, "mode": mode, "issue": issue, "pr": pr, "branch": branch, "started_at": started_at}
+        (container_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        # agent-result.json deliberately claims an absurd, wrong cost -- the
+        # report must never trust it; only the transcript's own measured
+        # usage may produce a dollar figure.
+        (container_dir / "agent-result.json").write_text(
+            json.dumps({"mode": mode, "usage": {"cost_usd": 99999.0}}), encoding="utf-8"
+        )
+        if write_transcript:
+            workspace = container_dir / "-workspace"
+            workspace.mkdir()
+            (workspace / "sess.jsonl").write_text(
+                assistant_row("req_1", usage=usage(inp=usage_tokens, out=usage_tokens)) + "\n",
+                encoding="utf-8",
+            )
+        return container_dir
+
+    def test_dev_fix_review_sum_into_separate_buckets(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-42", "issue", issue=42)
+        self._container(sessions, "cfg-agent-pr-fix-42", "fix-pr", issue=42, pr=100)
+        self._container(sessions, "cfg-agent-review-pr-42", "review", issue=42, pr=100)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertEqual(len(stories), 1)
+        story = stories[0]
+        self.assertEqual(story["story"], 42)
+        self.assertEqual(story["pr"], 100)
+        self.assertGreater(story["dev_cost_usd"], 0)
+        self.assertGreater(story["fix_cost_usd"], 0)
+        self.assertGreater(story["review_cost_usd"], 0)
+        self.assertAlmostEqual(
+            story["total_cost_usd"],
+            story["dev_cost_usd"] + story["fix_cost_usd"] + story["review_cost_usd"],
+            places=4,
+        )
+
+    def test_cost_is_measured_not_taken_from_agent_result(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-7", "issue", issue=7)
+        stories = story_cost_report(sessions, Pricing.load())
+        # agent-result.json claimed cost_usd=99999.0; the real transcript's
+        # usage is tiny by comparison.
+        self.assertLess(stories[0]["dev_cost_usd"], 100.0)
+        self.assertGreater(stories[0]["dev_cost_usd"], 0.0)
+
+    def test_story_resolved_from_branch_when_issue_field_absent(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(
+            sessions, "cfg-agent-branch-x", "branch", issue=None, branch="feature/story-88-x"
+        )
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertEqual(stories[0]["story"], 88)
+
+    def test_multiple_fix_rounds_counted_and_summed(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-pr-fix-9-a", "fix-pr", issue=9, pr=200)
+        self._container(sessions, "cfg-agent-pr-fix-9-b", "fix-pr", issue=9, pr=200)
+        self._container(sessions, "cfg-agent-resolve-conflict-9", "resolve-conflict", issue=9, pr=200)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertEqual(stories[0]["fix_rounds"], 3)
+
+    def test_missing_dev_container_is_flagged_partial(self):
+        # AC4: the largest cost component is silently missing, not zero.
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-review-pr-5", "review", issue=5, pr=50)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertTrue(stories[0]["partial"])
+        self.assertEqual(stories[0]["dev_cost_usd"], 0.0)
+
+    def test_dev_container_present_is_not_flagged_partial_for_that_reason(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-6", "issue", issue=6)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertFalse(stories[0]["partial"])
+
+    def test_session_dir_with_no_transcript_is_flagged_partial(self):
+        # meta.json exists (a launch was recorded) but the transcript was
+        # never captured -- a crash before persistence, or a pruned session.
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-11", "issue", issue=11, write_transcript=False)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertTrue(stories[0]["partial"])
+        self.assertEqual(stories[0]["dev_cost_usd"], 0.0)
+
+    def test_unresolvable_story_is_grouped_by_container_and_flagged_partial(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-interactive-scratch", "branch", issue=None, branch="")
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertEqual(len(stories), 1)
+        self.assertIsNone(stories[0]["story"])
+        self.assertTrue(stories[0]["partial"])
+
+    def test_since_filters_by_launch_time(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-old", "issue", issue=1, started_at="2020-01-01T00:00:00Z")
+        self._container(sessions, "cfg-agent-new", "issue", issue=2, started_at="2026-07-28T00:00:00Z")
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        stories = story_cost_report(sessions, Pricing.load(), since=since)
+        self.assertEqual({s["story"] for s in stories}, {2})
+
+    def test_excludes_field_names_cron_orchestration(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-3", "issue", issue=3)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertIn("cron-orchestration-share", stories[0]["excludes"])
+
+    def test_missing_sessions_dir_returns_empty_not_an_error(self):
+        stories = story_cost_report(Path("/nonexistent/path"), Pricing.load())
+        self.assertEqual(stories, [])
+
+    def test_sorted_by_total_cost_descending(self):
+        sessions = Path(tempfile.mkdtemp())
+        self._container(sessions, "cfg-agent-small", "issue", issue=1, usage_tokens=10)
+        self._container(sessions, "cfg-agent-big", "issue", issue=2, usage_tokens=100000)
+        stories = story_cost_report(sessions, Pricing.load())
+        self.assertEqual(stories[0]["story"], 2)
+        self.assertEqual(stories[1]["story"], 1)
+
+    def test_cli_flags_exist(self):
+        parser = build_parser()
+        args = parser.parse_args(["--story-report", "--sessions-dir", "/tmp/x"])
+        self.assertTrue(args.story_report)
+        self.assertEqual(str(args.sessions_dir), "/tmp/x")
 
 
 if __name__ == "__main__":

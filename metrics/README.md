@@ -25,10 +25,32 @@ Part of epic #3026 (pipeline cost engineering); this directory is story #3027.
 
 # One record per API call, for downstream tooling and benchmarks
 .claude/metrics/token_report.py --format jsonl --out facts.jsonl
+
+# What did delivered work actually cost -- per story, dev vs fix vs review
+.claude/metrics/token_report.py --story-report
+.claude/metrics/token_report.py --story-report --format jsonl --out stories.jsonl
 ```
 
 Group keys: `model`, `segment`, `session`, `day`, `skill`, `agent`, `project`,
 `workflow`, `role`.
+
+`--story-report` (story #3055) answers the epic's own framing question's
+denominator — cost per story and per PR, dev cost separated from fix-round
+cost so the price of rework is visible on its own. Joined on the issue
+number in each persisted container's `meta.json` (`~/.cache/cfgms-agent-sessions`
+by default, `--sessions-dir` to override), falling back to the story number
+in `feature/story-<N>-*` when `meta.json` has none — never from a filename
+elsewhere or from `agent-result.json`'s own totals: every dollar is computed
+fresh from that container's own persisted transcript, the same measured
+accounting as every other report here. Explicitly excludes the cron
+orchestration's own share of a story's cost (an inherently arbitrary split
+across however many stories one cycle happened to touch) — every row's
+`excludes` field says so. A story is `partial` when its transcript is
+missing, its story number couldn't be resolved, or — the common case for
+anything dispatched before dev-agent session persistence (story #3051)
+landed — no dev-mode launch was ever found for it, so the largest component
+of its cost is silently absent rather than genuinely zero. Never reported as
+though the figure were complete.
 
 `role` (story #3054) is who a call ran *as* — `acceptance-checker`,
 `developer`, `security-engineer`, `tech-lead`, a Skill name like
