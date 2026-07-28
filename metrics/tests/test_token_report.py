@@ -27,6 +27,8 @@ from token_report import (  # noqa: E402
     TranscriptRef,
     collect,
     compute_cost,
+    correlate_cycle_manifest,
+    extract_agent_spawns,
     parse_transcript,
     totals,
     split_cache_write,
@@ -375,6 +377,344 @@ class TestCollect(unittest.TestCase):
         calls, _ = collect([root], Pricing.load(), None, ["proj-a"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0].project, "proj-a")
+
+
+class TestCycleManifestCorrelation(unittest.TestCase):
+    """Bucketing a cycle's measured calls into its recorded step boundaries.
+
+    The core claim under test (Issue #3053): every dollar attributed to a step
+    comes from parse_transcript's per-message usage accounting, never from a
+    step's own self-reported count -- the story exists because self-reporting
+    understated real cost by 31.5x on a real cycle.
+    """
+
+    def _corpus(self, session: str = "cycle-session") -> Path:
+        # A session is identified by its transcript's FILE NAME (see
+        # TranscriptRef.classify), not by any `sessionId` field inside a row --
+        # so the "different session" fixture below must live in its own file.
+        root = Path(tempfile.mkdtemp())
+        project = root / "-workspace"
+        project.mkdir()
+        rows = "\n".join(
+            [
+                # Before any step boundary -> unattributed.
+                assistant_row("req_pre", timestamp="2026-07-28T10:00:00.000Z"),
+                # Falls in step 0 [10:01, 10:05).
+                assistant_row("req_s0a", timestamp="2026-07-28T10:01:00.000Z"),
+                assistant_row("req_s0b", timestamp="2026-07-28T10:03:00.000Z"),
+                # Falls in step 1 [10:05, end).
+                assistant_row("req_s1a", timestamp="2026-07-28T10:06:00.000Z"),
+            ]
+        )
+        (project / f"{session}.jsonl").write_text(rows + "\n", encoding="utf-8")
+        # A different session, in its own transcript file, inside the same
+        # project directory -- must never be counted for this cycle.
+        (project / "other-session.jsonl").write_text(
+            assistant_row("req_other", timestamp="2026-07-28T10:02:00.000Z") + "\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _manifest(self, tmp_path: Path, session: str = "cycle-session") -> Path:
+        manifest = {
+            "cycle_id": "cycle-test",
+            "mode": "cron",
+            "session": session,
+            "host": "test-host",
+            "start": "2026-07-28T09:59:00Z",
+            "end": "2026-07-28T10:10:00Z",
+            "steps": [
+                {"ts": "2026-07-28T10:01:00Z", "subcommand": "dispatch", "args": "3060"},
+                {"ts": "2026-07-28T10:05:00Z", "subcommand": "enqueue", "args": "3061 3053"},
+            ],
+            "leases": [],
+            "containers": [],
+        }
+        path = tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def test_calls_bucket_into_the_right_step(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        self.assertEqual(result["steps"][0]["calls"], 2)  # req_s0a, req_s0b
+        self.assertEqual(result["steps"][1]["calls"], 1)  # req_s1a
+
+    def test_calls_before_first_boundary_are_unattributed(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        self.assertEqual(result["unattributed"]["calls"], 1)  # req_pre
+
+    def test_other_sessions_never_counted(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        total_calls = (
+            result["steps"][0]["calls"] + result["steps"][1]["calls"] + result["unattributed"]["calls"]
+        )
+        self.assertEqual(total_calls, 4)  # req_pre + 2 in step0 + 1 in step1, never req_other/req_other2
+
+    def test_step_and_unattributed_cost_sums_to_cycle_cost(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        summed = (
+            result["steps"][0]["cost_usd"] + result["steps"][1]["cost_usd"] + result["unattributed"]["cost_usd"]
+        )
+        # Each bucket rounds independently, so the sum of rounded buckets can
+        # drift from the once-rounded cycle total by a unit in the last
+        # decimal place -- that's float rounding, not a mis-attributed call.
+        self.assertAlmostEqual(summed, result["cycle_cost_usd"], places=3)
+        self.assertGreater(result["cycle_cost_usd"], 0)
+
+    def test_cost_is_measured_not_self_reported(self):
+        # The whole point of this story: a step's cost_usd comes from real
+        # per-message usage accounting on the transcript, not from any field
+        # an agent wrote into the manifest itself. Assert the input manifest
+        # carried no cost data at all, and the output carries real numbers
+        # derived purely from the fixture transcript's usage tokens.
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        before = json.loads(manifest_path.read_text())
+        self.assertNotIn("cost_usd", before["steps"][0])
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        after = json.loads(manifest_path.read_text())
+        self.assertIn("cost_usd", after["steps"][0])
+        self.assertIn("total_tokens", after["steps"][0])
+        self.assertGreater(after["steps"][0]["total_tokens"], 0)
+
+    def test_missing_session_skips_without_writing(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root, session="")
+        # No "session" recorded (e.g. a cycle started outside Claude Code) --
+        # correlation must decline rather than guess, and must not touch the
+        # file (a human can still read the raw steps by hand).
+        manifest = json.loads(manifest_path.read_text())
+        manifest["session"] = None
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        before_mtime = manifest_path.stat().st_mtime_ns
+        call_count, note = correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        self.assertEqual(call_count, 0)
+        self.assertIn("no session", note)
+        self.assertEqual(manifest_path.stat().st_mtime_ns, before_mtime)
+
+    def test_malformed_manifest_raises_for_caller_to_handle(self):
+        root = self._corpus()
+        path = root / "bad-manifest.json"
+        path.write_text("{not valid json", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            correlate_cycle_manifest(path, [root], Pricing.load())
+
+    def test_incomplete_cycle_manifest_still_correlates(self):
+        # AC4: a cycle that fails partway leaves a manifest describing how far
+        # it got. Correlation must not require "end" to be set.
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["end"] = None
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        self.assertIsNotNone(result["cycle_cost_usd"])
+
+
+def agent_spawn_rows(
+    tool_use_id: str,
+    role: str,
+    agent_id: str,
+    ts: str,
+    description: str = "do the thing",
+    tool: str = "Agent",
+    model: str = "claude-sonnet-5",
+) -> list[str]:
+    """The two transcript rows Claude Code writes for one nested agent spawn."""
+    use_input = {"description": description, "subagent_type": role}
+    if tool == "Skill":
+        use_input = {"skill": role, "args": description}
+    return [
+        json.dumps({
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": tool_use_id, "name": tool, "input": use_input}
+                ],
+            },
+        }),
+        json.dumps({
+            "type": "user",
+            "timestamp": ts,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "content": "launched"}
+                ],
+            },
+            "toolUseResult": {
+                "agentId": agent_id,
+                "description": description,
+                "resolvedModel": model,
+                "status": "async_launched",
+                "commandName": role,
+            },
+        }),
+    ]
+
+
+class TestNestedAgentSpawns(unittest.TestCase):
+    """AC1: the manifest records nested agents spawned, with their roles.
+
+    A cron cycle's nested agents (Tech Lead, BA, pin-refresh-runner,
+    pipeline-sweep-runner, reviewers) are spawned by the orchestrator's own
+    tool calls, so no helper script sees that boundary -- but the transcript
+    records both the role (`subagent_type`) and the agentId naming the nested
+    transcript, which is what makes the role's cost measurable rather than
+    narrated.
+    """
+
+    def _corpus(self, session: str = "cycle-session") -> Path:
+        root = Path(tempfile.mkdtemp())
+        project = root / "-workspace"
+        project.mkdir()
+        rows = [
+            assistant_row("req_main", timestamp="2026-07-28T10:01:00.000Z"),
+            *agent_spawn_rows(
+                "toolu_tl", "tech-lead", "aaa111", "2026-07-28T10:02:00.000Z",
+                description="Draft tech notes for 3053",
+            ),
+            *agent_spawn_rows(
+                "toolu_ba", "business-analyst", "bbb222", "2026-07-28T10:06:00.000Z",
+                description="Groom the backlog",
+            ),
+        ]
+        (project / f"{session}.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+        nested = project / session / "subagents"
+        nested.mkdir(parents=True)
+        (nested / "agent-aaa111.jsonl").write_text(
+            assistant_row(
+                "req_tl", timestamp="2026-07-28T10:02:30.000Z", usage=usage(inp=5000, out=900)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (nested / "agent-bbb222.jsonl").write_text(
+            assistant_row(
+                "req_ba", timestamp="2026-07-28T10:06:30.000Z", usage=usage(inp=1000, out=100)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _manifest(self, root: Path, **overrides) -> Path:
+        manifest = {
+            "cycle_id": "cycle-test",
+            "mode": "cron",
+            "session": "cycle-session",
+            "host": "test-host",
+            "start": "2026-07-28T10:00:00Z",
+            "end": "2026-07-28T10:10:00Z",
+            "steps": [
+                {"ts": "2026-07-28T10:01:00Z", "subcommand": "preflight", "args": ""},
+                {"ts": "2026-07-28T10:05:00Z", "subcommand": "state", "args": ""},
+            ],
+            "leases": [],
+            "containers": [],
+            "agents": [],
+        }
+        manifest.update(overrides)
+        path = root / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def test_extract_reads_role_and_agent_id(self):
+        root = self._corpus()
+        spawns = extract_agent_spawns(root / "-workspace" / "cycle-session.jsonl")
+        self.assertEqual(
+            [(s["role"], s["agent_id"]) for s in spawns],
+            [("tech-lead", "aaa111"), ("business-analyst", "bbb222")],
+        )
+
+    def test_skill_fork_records_the_skill_as_the_role(self):
+        root = Path(tempfile.mkdtemp())
+        path = root / "s.jsonl"
+        path.write_text(
+            "\n".join(
+                agent_spawn_rows(
+                    "toolu_sk", "pipeline-sweep", "ccc333", "2026-07-28T10:02:00.000Z",
+                    tool="Skill",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        spawns = extract_agent_spawns(path)
+        self.assertEqual([(s["tool"], s["role"]) for s in spawns], [("Skill", "pipeline-sweep")])
+
+    def test_inline_tool_call_is_not_a_spawn(self):
+        # A Skill that ran inline (no agentId in its result) never became a
+        # nested agent and must not appear as one.
+        root = Path(tempfile.mkdtemp())
+        path = root / "s.jsonl"
+        rows = agent_spawn_rows(
+            "toolu_inline", "story-start", "unused", "2026-07-28T10:02:00.000Z", tool="Skill"
+        )
+        result_row = json.loads(rows[1])
+        result_row["toolUseResult"] = {"success": True, "commandName": "story-start"}
+        path.write_text(rows[0] + "\n" + json.dumps(result_row) + "\n", encoding="utf-8")
+        self.assertEqual(extract_agent_spawns(path), [])
+
+    def test_manifest_records_agents_with_roles_and_measured_cost(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        roles = [a["role"] for a in result["agents"]]
+        self.assertEqual(roles, ["tech-lead", "business-analyst"])
+        tech_lead = result["agents"][0]
+        self.assertEqual(tech_lead["agent_id"], "aaa111")
+        self.assertEqual(tech_lead["model"], "claude-sonnet-5")
+        self.assertEqual(tech_lead["calls"], 1)
+        # Measured from the nested transcript's own usage rows: the Tech Lead
+        # fixture spends 5x the BA's input tokens, so its cost must be larger.
+        self.assertGreater(tech_lead["cost_usd"], result["agents"][1]["cost_usd"])
+
+    def test_agent_is_attributed_to_the_step_that_spawned_it(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        # 10:02 falls in step 0 [10:01, 10:05); 10:06 falls in step 1.
+        self.assertEqual([a["step"] for a in result["agents"]], [0, 1])
+
+    def test_spawns_outside_the_cycle_window_are_excluded(self):
+        # One long-lived session can run several cycles back to back; each
+        # cycle must claim only the agents it actually spawned.
+        root = self._corpus()
+        manifest_path = self._manifest(
+            root, start="2026-07-28T10:04:00Z", end="2026-07-28T10:10:00Z",
+            steps=[{"ts": "2026-07-28T10:05:00Z", "subcommand": "state", "args": ""}],
+        )
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        self.assertEqual([a["role"] for a in result["agents"]], ["business-analyst"])
+
+    def test_nested_agent_cost_rolls_into_the_cycle_total(self):
+        root = self._corpus()
+        manifest_path = self._manifest(root)
+        correlate_cycle_manifest(manifest_path, [root], Pricing.load())
+        result = json.loads(manifest_path.read_text())
+        agent_cost = sum(a["cost_usd"] for a in result["agents"])
+        self.assertGreater(agent_cost, 0)
+        self.assertGreaterEqual(result["cycle_cost_usd"], agent_cost)
 
 
 if __name__ == "__main__":
