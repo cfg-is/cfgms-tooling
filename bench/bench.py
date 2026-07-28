@@ -30,6 +30,7 @@ be used to evaluate models.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import shutil
@@ -61,9 +62,18 @@ except ImportError:  # pragma: no cover - only when metrics tooling is absent
 # --------------------------------------------------------------------------
 
 
+DIFF_KIND_PREFIX = "diff_"
+
+
 @dataclass
 class Assertion:
-    """One deterministic check against the segment's output."""
+    """One deterministic check against the segment's output.
+
+    A kind prefixed ``diff_`` checks the case's captured diff (what a
+    dev-agent style case actually changed on disk) instead of the model's
+    text output -- see ``diff_contains`` / ``diff_not_contains`` /
+    ``diff_matches`` / ``diff_not_matches``. Everything else is unchanged.
+    """
 
     kind: str
     value: str
@@ -79,15 +89,17 @@ class Assertion:
             description=raw.get("description", ""),
         )
 
-    def check(self, output: str) -> bool:
-        text = output
-        if self.kind == "contains":
+    def check(self, output: str, diff: str = "") -> bool:
+        against_diff = self.kind.startswith(DIFF_KIND_PREFIX)
+        text = diff if against_diff else output
+        base = self.kind[len(DIFF_KIND_PREFIX):] if against_diff else self.kind
+        if base == "contains":
             return self.value in text
-        if self.kind == "not_contains":
+        if base == "not_contains":
             return self.value not in text
-        if self.kind == "matches":
+        if base == "matches":
             return re.search(self.value, text, re.MULTILINE) is not None
-        if self.kind == "not_matches":
+        if base == "not_matches":
             return re.search(self.value, text, re.MULTILINE) is None
         if self.kind == "section":
             # A required markdown heading, at any level.
@@ -127,6 +139,8 @@ class Case:
     assertions: list[Assertion] = field(default_factory=list)
     rubric: str | None = None
     path: Path | None = None
+    checkout: bool = False
+    allowed_tools: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, case_dir: Path) -> "Case":
@@ -147,6 +161,8 @@ class Case:
             assertions=[Assertion.parse(a) for a in (expect.get("assertions") or [])],
             rubric=expect.get("rubric"),
             path=case_dir,
+            checkout=bool(spec.get("checkout", False)),
+            allowed_tools=list(spec.get("allowed_tools") or []),
         )
 
 
@@ -181,12 +197,12 @@ class Score:
         return (self.weighted / self.weight_total) if self.weight_total else 1.0
 
 
-def score_deterministic(case: Case, output: str) -> Score:
+def score_deterministic(case: Case, output: str, diff: str = "") -> Score:
     passed = weighted = weight_total = 0
     failures: list[str] = []
     for assertion in case.assertions:
         weight_total += assertion.weight
-        if assertion.check(output):
+        if assertion.check(output, diff):
             passed += 1
             weighted += assertion.weight
         else:
@@ -255,17 +271,92 @@ def _usage_from_transcripts(projects_dir: Path) -> dict[str, Any]:
     return totals(collected)
 
 
+def _repo_root() -> Path:
+    completed = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=str(BENCH_DIR), capture_output=True, text=True, check=True,
+    )
+    return Path(completed.stdout.strip())
+
+
+@contextlib.contextmanager
+def checkout_worktree(repo_sha: str, repo_root: Path | None = None):
+    """Check out a case's pinned commit into an isolated, disposable worktree.
+
+    A case that needs real tool use (Read/Grep/Edit against actual files,
+    not a prompt-embedded excerpt) runs here instead of in the caller's own
+    working tree, so it cannot see or touch anything but the pinned commit.
+    Always removed on exit, even if the run inside it fails.
+    """
+    root = repo_root or _repo_root()
+    worktree = Path(tempfile.mkdtemp(prefix="bench-worktree-"))
+    shutil.rmtree(worktree)  # `git worktree add` creates the directory itself.
+    added = subprocess.run(
+        ["git", "worktree", "add", "--detach", str(worktree), repo_sha],
+        cwd=str(root), capture_output=True, text=True,
+    )
+    if added.returncode != 0:
+        raise SystemExit(f"failed to check out {repo_sha}: {added.stderr.strip()}")
+    try:
+        yield worktree
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=str(root), capture_output=True, text=True,
+        )
+        shutil.rmtree(worktree, ignore_errors=True)
+
+
+def apply_fixture_overlay(case: Case, worktree: Path) -> None:
+    """Copy a case's bundled fixture/ files on top of the checked-out worktree.
+
+    Lets a case pin the exact file it wants edited or inspected without that
+    file needing to already exist -- and stay unchanged -- at the pinned
+    repo_sha, so a dev-agent case does not depend on its own fixture having
+    been merged upstream first.
+    """
+    if case.path is None:
+        return
+    fixture_dir = case.path / "fixture"
+    if not fixture_dir.is_dir():
+        return
+    for src in fixture_dir.rglob("*"):
+        if src.is_dir():
+            continue
+        dest = worktree / src.relative_to(fixture_dir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+
+
+def _stage_baseline(worktree: Path) -> None:
+    """Stage the checked-out(+overlaid) tree so a later diff shows only what
+    the case's run actually changed, not the checkout or overlay itself."""
+    subprocess.run(["git", "-C", str(worktree), "add", "-A"], capture_output=True, text=True)
+
+
+def _capture_diff(worktree: Path) -> str:
+    result = subprocess.run(["git", "-C", str(worktree), "diff"], capture_output=True, text=True)
+    return result.stdout
+
+
 def run_case(
     case: Case,
     model: str,
     effort: str | None = None,
     timeout: int = 1800,
     workdir: Path | None = None,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """Execute a case live against a model and capture output plus usage.
 
     The transcript is written to an isolated projects directory so the run's
     token usage can be priced exactly, without picking up unrelated sessions.
+    A case with ``checkout: true`` runs inside a disposable git worktree
+    pinned to its ``repo_sha`` instead of the caller's cwd, with tool access
+    scoped to ``allowed_tools`` -- this is what makes multi-turn, tool-using
+    cases (a dev agent editing a real file, a reviewer reading one) possible.
+    The diff captured from that worktree, if any, is returned alongside the
+    output so diff-based assertions can grade what actually changed on disk.
     """
     if shutil.which("claude") is None:
         raise SystemExit("claude CLI not found on PATH — cannot run live mode")
@@ -286,26 +377,36 @@ def run_case(
     cmd = ["claude", "-p", case.prompt, "--model", model]
     if effort:
         cmd += ["--effort", effort]
+    if case.allowed_tools:
+        cmd += ["--allowedTools", *case.allowed_tools]
 
     import os
 
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(env_home / ".claude")
 
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(workdir or Path.cwd()),
-            env=env,
-        )
-        output, exit_code = completed.stdout, completed.returncode
-    except subprocess.TimeoutExpired:
-        output, exit_code = "", 124
-    elapsed = time.monotonic() - started
+    def _execute(cwd: Path) -> tuple[str, int, float]:
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, cwd=str(cwd), env=env,
+            )
+            out, code = completed.stdout, completed.returncode
+        except subprocess.TimeoutExpired:
+            out, code = "", 124
+        return out, code, time.monotonic() - started
+
+    diff = ""
+    if case.checkout:
+        if not case.repo_sha:
+            raise SystemExit(f"{case.case_id} sets checkout: true but has no repo_sha")
+        with checkout_worktree(case.repo_sha, repo_root) as worktree:
+            apply_fixture_overlay(case, worktree)
+            _stage_baseline(worktree)
+            output, exit_code, elapsed = _execute(worktree)
+            diff = _capture_diff(worktree)
+    else:
+        output, exit_code, elapsed = _execute(workdir or Path.cwd())
 
     usage = _usage_from_transcripts(projects)
     shutil.rmtree(sandbox, ignore_errors=True)
@@ -315,6 +416,7 @@ def run_case(
         "exit_code": exit_code,
         "wall_clock_s": round(elapsed, 1),
         "usage": usage,
+        "diff": diff,
     }
 
 
@@ -347,6 +449,22 @@ def save_output(run_id: str, case: Case, output: str, results_dir: Path = RESULT
     return path
 
 
+def save_diff(run_id: str, case: Case, diff: str, results_dir: Path = RESULTS_DIR) -> Path | None:
+    """Persist the graded diff verbatim, mirroring save_output.
+
+    A dev-agent style case is scored against what changed on disk, not just
+    text output. Without this, rescoring it later would mean re-running the
+    agent -- the same reason save_output exists.
+    """
+    if not diff:
+        return None
+    out_dir = results_dir / run_id / "diffs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{case.case_id.replace('/', '__')}.diff"
+    path.write_text(diff, encoding="utf-8")
+    return path
+
+
 def build_record(
     case: Case,
     mode: str,
@@ -357,6 +475,7 @@ def build_record(
     wall_clock: float | None,
     run_id: str,
     output_path: Path | None = None,
+    diff_path: Path | None = None,
 ) -> dict[str, Any]:
     cost = float(usage.get("cost_usd") or 0.0)
     record = {
@@ -379,6 +498,7 @@ def build_record(
         "cost_usd": round(cost, 4),
         "wall_clock_s": wall_clock,
         "output_path": str(output_path) if output_path else None,
+        "diff_path": str(diff_path) if diff_path else None,
     }
     # The metric the whole harness exists to produce. Undefined at zero cost
     # (replay mode), and left null rather than divided by zero.
@@ -475,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Transcript .jsonl, or a text file holding the output to score.")
     replay.add_argument("--run-id", default="baseline")
     replay.add_argument("--judge-model", default=None, help="Enable rubric scoring with this model.")
+    replay.add_argument("--diff", default=None, type=Path,
+                        help="Diff file to score alongside the transcript, for diff_* assertions.")
 
     run = sub.add_parser("run", help="Execute a case live against a model. Spends tokens.")
     run.add_argument("--case", required=True)
@@ -510,11 +632,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "replay":
         case = load_case(args.case)
         output = extract_output(args.transcript)
-        deterministic = score_deterministic(case, output)
+        diff_text = args.diff.read_text(encoding="utf-8") if args.diff else ""
+        deterministic = score_deterministic(case, output, diff_text)
         rubric = score_rubric(case, output, args.judge_model) if args.judge_model else None
         saved = save_output(args.run_id, case, output)
+        diff_saved = save_diff(args.run_id, case, diff_text)
         record = build_record(
-            case, "replay", "(replayed)", deterministic, rubric, {}, None, args.run_id, saved
+            case, "replay", "(replayed)", deterministic, rubric, {}, None, args.run_id, saved, diff_saved
         )
         append_result(record)
         _print_result(record)
@@ -523,12 +647,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         case = load_case(args.case)
         outcome = run_case(case, args.model, args.effort, args.timeout)
-        deterministic = score_deterministic(case, outcome["output"])
+        deterministic = score_deterministic(case, outcome["output"], outcome.get("diff", ""))
         rubric = score_rubric(case, outcome["output"], args.judge_model) if args.judge_model else None
         saved = save_output(args.run_id, case, outcome["output"])
+        diff_saved = save_diff(args.run_id, case, outcome.get("diff", ""))
         record = build_record(
             case, "live", args.model, deterministic, rubric,
-            outcome["usage"], outcome["wall_clock_s"], args.run_id, saved,
+            outcome["usage"], outcome["wall_clock_s"], args.run_id, saved, diff_saved,
         )
         append_result(record)
         _print_result(record)
@@ -540,7 +665,9 @@ def main(argv: list[str] | None = None) -> int:
         if not stored.is_file():
             raise SystemExit(f"No stored output for {case.case_id} in run {args.from_run}")
         output = stored.read_text(encoding="utf-8")
-        deterministic = score_deterministic(case, output)
+        diff_path = RESULTS_DIR / args.from_run / "diffs" / f"{case.case_id.replace('/', '__')}.diff"
+        diff_text = diff_path.read_text(encoding="utf-8") if diff_path.is_file() else ""
+        deterministic = score_deterministic(case, output, diff_text)
         rubric = score_rubric(case, output, args.judge_model) if args.judge_model else None
         # Carry the original run's cost forward: re-scoring spends nothing, but
         # quality-per-dollar must still reflect what the output actually cost.
@@ -550,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
         record = build_record(
             case, "rescore", prior.get("model", "(unknown)"), deterministic, rubric,
             prior.get("usage", {}), prior.get("wall_clock_s"), args.run_id, stored,
+            diff_path if diff_path.is_file() else None,
         )
         append_result(record)
         _print_result(record)

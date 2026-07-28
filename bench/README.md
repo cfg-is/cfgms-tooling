@@ -53,6 +53,7 @@ cases/<segment>/<case-id>/
   case.yaml          # segment, description, repo_sha, prompt_file
   input/prompt.md    # the frozen input
   expect.yaml        # assertions[] + rubric
+  fixture/           # optional -- see "Multi-turn, tool-using cases" below
 ```
 
 Every case pins the `repo_sha` it was captured against, so a fixture does not
@@ -67,6 +68,37 @@ embed a specific trap:
 | `acceptance-review/pr-verdict` | acceptance-review | PR body claims 3 ACs met, diff meets 2 |
 | `pr-review/security-regression` | pr-review | SQL injection beside a cosmetic change |
 | `ba/epic-decomposition` | ba | epic states explicit out-of-scope work |
+| `dev-agent/backoff-negative` | dev-agent | fix clamps a negative value to zero instead of erroring |
+| `story-review/log-sanitize-claim` | story-review | criterion's threshold and suffix are both wrong; skimming it approves anyway |
+
+### Multi-turn, tool-using cases
+
+Set `checkout: true` and `allowed_tools: [...]` in `case.yaml` to run a case
+against a real, disposable git worktree checked out at `repo_sha` instead of
+only the prompt text. `bench.py run` then invokes the CLI with `cwd` set to
+that worktree and `--allowedTools` scoped to the case's list, so a dev-agent
+case can really `Edit` a file and a story-review case can really `Read` or
+`Grep` one -- this is what makes a case genuinely multi-turn: the CLI's own
+agentic loop runs as many tool-call turns as the model needs, all inside one
+scored run, and `bench.py` totals cost across the whole thing exactly as it
+already did for single-turn cases.
+
+A case that supplies a `fixture/` directory has that tree copied onto the
+worktree *after* checkout and staged as the diff baseline, so the file a
+dev-agent case edits does not need to already exist -- or stay unchanged --
+at the pinned `repo_sha`. Assertion kinds prefixed `diff_` (`diff_contains`,
+`diff_not_contains`, `diff_matches`, `diff_not_matches`) check `git diff` in
+the worktree afterward instead of the model's text output, so a fixture can
+fail an answer that *claims* success in prose but never actually made the
+edit, or made the wrong one.
+
+The worktree is always removed when the run ends, success or failure. Every
+case's tool access is explicit and scoped per-case via `allowed_tools` --
+nothing here runs with broad or bypassed permissions.
+
+`run` captures and persists the diff the same way it already persists the
+output, so `rescore` stays free for diff-based cases too. `replay` accepts an
+optional `--diff <path>` for scoring a diff alongside an existing transcript.
 
 ## Results
 
@@ -108,10 +140,10 @@ capability, not a routing recommendation.
 
 ## Known limitations
 
-- **Fixtures are single-turn.** Real segments run agentic loops with tool use;
-  a single prompt/response underestimates both cost and failure modes.
-- **No repo checkout yet.** `repo_sha` is recorded for provenance but the
-  runner does not check it out, so cases must be self-contained. Cases needing
-  real repo state will need that added.
+- **Most fixtures are still single-turn.** `dev-agent/backoff-negative` and
+  `story-review/log-sanitize-claim` now run multi-turn against a real
+  checkout (see "Multi-turn, tool-using cases" above); the four originals
+  remain self-contained prompt/response cases and were left that way
+  deliberately -- they don't need real repo state to discriminate.
 - **Judge is single-vote.** A stronger design runs several judges with distinct
   lenses and takes a majority.

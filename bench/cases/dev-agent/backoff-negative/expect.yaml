@@ -1,0 +1,23 @@
+assertions:
+  - kind: diff_matches
+    value: 'seconds\s*<\s*0'
+    description: adds a negative-value guard
+  - kind: diff_contains
+    value: fmt.Errorf
+    weight: 3
+    description: rejects with an error rather than silently clamping
+  - kind: diff_matches
+    value: '(?i)negative'
+    weight: 2
+    description: names the actual problem in the error message
+  - kind: diff_not_matches
+    value: 'seconds\s*=\s*0\b'
+    weight: 2
+    description: does not silently clamp to zero instead of erroring
+rubric: |
+  - root-cause: does the fix reject the invalid input rather than
+    normalizing it away?
+  - minimalism: does it touch only ClampRetryBackoff (and its import), not
+    unrelated code?
+  - clarity: would the error message tell an operator what config value was
+    wrong?

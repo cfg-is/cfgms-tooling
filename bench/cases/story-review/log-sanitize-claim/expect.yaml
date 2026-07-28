@@ -1,0 +1,28 @@
+assertions:
+  - kind: section
+    value: Verdict
+    description: emits a Verdict section
+  - kind: matches
+    value: '\bNOT_MET\b'
+    weight: 3
+    description: correctly refutes the criterion
+  - kind: not_matches
+    value: '##\s*Verdict\s*\n+\s*MET\b'
+    weight: 3
+    description: does not approve a criterion the code does not meet
+  - kind: section
+    value: Evidence
+    description: emits an Evidence section
+  - kind: matches
+    value: '1024'
+    weight: 2
+    description: names the actual threshold, not the claimed one
+  - kind: matches
+    value: '(?i)\[truncated\]'
+    weight: 2
+    description: names the actual suffix, not the claimed one
+rubric: |
+  - grounding: does the verdict cite the real file content rather than
+    restating the criterion's own wording?
+  - precision: does it name the specific numeric/string mismatch instead of
+    a vague "doesn't match"?

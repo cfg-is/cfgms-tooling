@@ -1,0 +1,16 @@
+segment: dev-agent
+description: >
+  Fix a real bug via real tool use against a real repo checkout, not a
+  prompt-embedded excerpt. ClampRetryBackoff's own doc comment requires
+  rejecting a negative backoff with an error; the implementation silently
+  accepts it instead. A plausible wrong answer clamps the value to zero --
+  it looks like a fix but violates the explicit no-silent-failure
+  requirement the comment states.
+# repo_sha pins the ambient repo state the agent can read around the fix;
+# the file actually being edited comes from fixture/, overlaid onto the
+# checkout at run time, so this case does not depend on that file having
+# been merged upstream first.
+repo_sha: "86a5a70f"
+checkout: true
+allowed_tools: [Read, Edit]
+prompt_file: input/prompt.md

@@ -1,0 +1,13 @@
+segment: story-review
+description: >
+  Verify a claimed acceptance criterion against the real, checked-out
+  implementation rather than trusting the criterion's own wording. The
+  claim states two specific behaviors of SanitizeLogValue; only the
+  function's existence is true -- both the threshold and the truncation
+  suffix it names are wrong. A reviewer that skims the prose without
+  reading pkg/logging/sanitize.go approves a criterion the implementation
+  does not meet.
+repo_sha: "86a5a70f"
+checkout: true
+allowed_tools: [Read, Grep, Glob]
+prompt_file: input/prompt.md
