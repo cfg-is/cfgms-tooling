@@ -290,7 +290,7 @@ print(json.dumps(rec, separators=(",", ":")))
 # A new agent container is admitted only if launching one keeps the host within
 # its ceilings: RAM and disk under 90% utilization (reservation-based — a
 # container holds its memory/disk for its whole life), and the measured 1-min
-# CPU load average under 75% of cores (utilization-based — agents are bursty, so
+# CPU load average under 90% of cores (utilization-based — agents are bursty, so
 # a static per-core reservation caps the host far below real capacity). Per-host
 # and self-tuning — a big box runs more, a laptop fewer, and it adapts to
 # whatever else is already running. A coarse 2×ncpu count ceiling is a
@@ -320,7 +320,7 @@ per_cpu  = f("CFGMS_AGENT_CPUS", 4)
 per_disk = f("CFGMS_AGENT_DISK_GB", 8) * 1024**3
 mem_ceil  = f("CFGMS_AGENT_MEM_CEIL", 0.90)
 disk_ceil = f("CFGMS_AGENT_DISK_CEIL", 0.90)
-cpu_ceil  = f("CFGMS_AGENT_CPU_CEIL", 0.75)
+cpu_ceil  = f("CFGMS_AGENT_CPU_CEIL", 0.90)
 running = int(float(os.environ.get("CAP_RUNNING", "0") or 0))
 ncpu = os.cpu_count() or 1
 
@@ -1714,7 +1714,7 @@ else:
     # Resource admission gate. `capacity` → CAPACITY_OK:slots=<n> (rc0) or
     # CAPACITY_FULL:<binding>:slots=0 (rc1). `capacity --json` → full detail for
     # the preflight. Used by every launch path to bound host resource use without
-    # a hand-tuned container count (RAM/disk 90%, CPU 75%, 2×ncpu backstop).
+    # a hand-tuned container count (RAM/disk 90%, CPU 90%, 2×ncpu backstop).
     if [[ "${1:-}" == "--json" ]]; then
       _capacity_compute json
     else
