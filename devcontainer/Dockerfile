@@ -139,7 +139,8 @@ RUN useradd -m -s /bin/bash agent \
     && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
     && mkdir -p /persist && chown agent:agent /persist \
     && mkdir -p /home/agent/.cache/go-build /home/agent/go/pkg/mod \
-    && chown -R agent:agent /home/agent/.cache /home/agent/go
+    && chown -R agent:agent /home/agent/.cache /home/agent/go \
+    && mkdir -p /home/agent/.claude && chown agent:agent /home/agent/.claude
 
 # Pre-download Trivy vulnerability DB (avoids runtime download behind firewall)
 RUN trivy fs --download-db-only --cache-dir /home/agent/.cache/trivy 2>/dev/null || true

@@ -198,5 +198,6 @@ Docker creates a bind mount's missing parent as root and the image ships no
 `~/.claude`, so mounting inside it leaves `~/.claude` root-owned and breaks the
 credential symlink — which fails authentication for every agent. `setup-env.sh`
 symlinks `~/.claude/projects -> /agent-sessions` instead, which needs no image
-rebuild. `~/.claude` itself is never mounted: it holds `.credentials.json` from
-the `claude-creds` volume and must stay off the host filesystem.
+rebuild. The session mount targets `/agent-sessions`, never `~/.claude`
+directly — `~/.claude/.credentials.json` is bind-mounted separately from the
+host's live credentials file, and the session mount must never collide with it.

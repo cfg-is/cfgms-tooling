@@ -36,10 +36,9 @@ AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
 # Mounted at /agent-sessions, NOT directly at ~/.claude/projects. Docker
 # creates a bind mount's missing parent as root, and the image ships no
 # ~/.claude -- mounting inside it would leave ~/.claude root-owned and break
-# setup-env.sh's credential symlink, failing authentication for every agent.
-# setup-env.sh symlinks ~/.claude/projects -> /agent-sessions instead, which
-# needs no image rebuild. ~/.claude itself is never mounted: it holds
-# .credentials.json from the claude-creds volume and must stay off the host.
+# the bind-mounted ~/.claude/.credentials.json below, failing authentication
+# for every agent. setup-env.sh symlinks ~/.claude/projects -> /agent-sessions
+# instead, which needs no image rebuild.
 AGENT_SESSIONS_BASE="${CFGMS_AGENT_SESSIONS_BASE:-${HOME}/.cache/cfgms-agent-sessions}"
 AGENT_SESSIONS_RETENTION_DAYS="${CFGMS_AGENT_SESSIONS_RETENTION_DAYS:-30}"
 AGENT_SESSIONS_MOUNT="/agent-sessions"
@@ -705,24 +704,6 @@ check_existing_prs_for_issue() {
   return 0
 }
 
-# Refresh agent credentials from the host's Claude session.
-# Copies ~/.claude/.credentials.json into the claude-creds Docker volume
-# so agents always start with a fresh token. No interactive OAuth needed.
-refresh_creds_from_host() {
-  local host_creds="$HOME/.claude/.credentials.json"
-  if [ ! -f "$host_creds" ]; then
-    echo "WARN: No host credentials at $host_creds — agents may fail auth"
-    return 0
-  fi
-  docker run --rm --entrypoint bash \
-    -v claude-creds:/persist \
-    -v "$host_creds:/host-creds.json:ro" \
-    cfg-agent:latest \
-    -c "cp /host-creds.json /persist/.credentials.json" 2>/dev/null \
-    && echo "Refreshed agent credentials from host session" \
-    || echo "WARN: Failed to refresh credentials from host"
-}
-
 # ---------------------------------------------------------------------------
 # External-author trust gate helpers (Issue #1786)
 # ---------------------------------------------------------------------------
@@ -807,10 +788,19 @@ _post_quarantine_comment() {
     2>/dev/null || true
 }
 
-# Gate on credential validity before launching any agent container.
-# Threshold: 30 minutes (raised from 15; a 401 was observed at 27 min remaining).
+# Gate on credential availability before launching any agent container.
+#
+# Agent containers bind-mount the host's live ~/.claude/.credentials.json
+# (see the launch paths) — the same file the host and po-live use. They track
+# host token rotations live and refresh the token in place, exactly like an
+# interactive session. So a LOW or even EXPIRED token is NOT a launch blocker:
+# the agent's entrypoint refreshes it on startup and stays current thereafter.
+# Only a genuinely missing or unparseable creds file actually blocks a launch.
+#
+# This replaces the old copy-into-claude-creds-volume model, where a launched
+# agent held a frozen copy that the host's next token rotation silently
+# invalidated — the 401s observed on cfg-agent-1570 / review-pr-1589 (#1594).
 # Sets CFGMS_TEST_CREDS_STATUS to inject a synthetic result in hermetic tests.
-# Exits 10 with DISPATCH_DEFERRED:creds_low:<result> if creds are insufficient.
 gate_credentials_for_launch() {
   local creds_status
   if [[ -n "${CFGMS_TEST_CREDS_STATUS:-}" ]]; then
@@ -819,13 +809,13 @@ gate_credentials_for_launch() {
     creds_status=$(bash "$0" check-creds 2>/dev/null)
   fi
   case "$creds_status" in
-    CREDS_OK:*) ;;
-    CREDS_LOW:*|CREDS_EXPIRED:*|CREDS_MISSING:*|CREDS_ERROR:*)
-      echo "DISPATCH_DEFERRED:creds_low:${creds_status}"
+    CREDS_OK:*|CREDS_LOW:*|CREDS_EXPIRED:*) ;;
+    CREDS_MISSING:*|CREDS_ERROR:*)
+      echo "DISPATCH_DEFERRED:creds_missing:${creds_status}"
       exit 10
       ;;
     *)
-      echo "DISPATCH_DEFERRED:creds_low:check_creds_unknown:${creds_status}"
+      echo "DISPATCH_DEFERRED:creds_missing:check_creds_unknown:${creds_status}"
       exit 10
       ;;
   esac
@@ -1162,7 +1152,7 @@ case "$cmd" in
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "claude-creds:/persist" \
+      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
@@ -1250,7 +1240,7 @@ case "$cmd" in
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "claude-creds:/persist" \
+      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
@@ -1335,7 +1325,6 @@ case "$cmd" in
     fi
 
     real_path=$(realpath "$clone_dir")
-    refresh_creds_from_host
     gh_token=$(gh auth token)
 
     # Remove stale container with the same name if it exists
@@ -1438,7 +1427,6 @@ case "$cmd" in
     fi
 
     real_path=$(realpath "$clone_dir")
-    refresh_creds_from_host
     gh_token=$(gh auth token)
 
     # Remove stale container with the same name (only one PO live at a time)
@@ -1553,7 +1541,6 @@ case "$cmd" in
     sanitized=$(sanitize_branch "$branch")
     clone_dir="${2:-${WORKTREE_BASE}/${sanitized}}"
     real_path=$(realpath "$clone_dir")
-    refresh_creds_from_host
     gh_token=$(gh auth token)
     container_name="cfg-agent-interactive-${sanitized}"
 
@@ -1582,7 +1569,7 @@ case "$cmd" in
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "claude-creds:/persist" \
+      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -e "GH_TOKEN=${gh_token}" \
@@ -1612,29 +1599,26 @@ case "$cmd" in
     ;;
 
   wait-for-auth)
-    # Deprecated: credentials are now pre-validated via check-creds and copied
-    # from the host via refresh_creds_from_host before launch. This no-op
-    # preserves backward compatibility for any callers that still invoke it.
+    # Deprecated no-op. Credentials are no longer copied per-agent — containers
+    # bind-mount the host credentials file directly. Kept for backward compat.
     echo "WAIT_DONE"
     ;;
 
   check-creds)
-    # Refresh from host session first so we check what agents will actually use
-    refresh_creds_from_host >/dev/null 2>&1
-    # Then check OAuth credential validity in the shared volume
-    if ! docker volume inspect claude-creds >/dev/null 2>&1; then
-      echo "CREDS_MISSING:no claude-creds volume"
-    elif ! docker run --rm -v claude-creds:/persist --entrypoint test cfg-agent:latest -f /persist/.credentials.json 2>/dev/null; then
-      echo "CREDS_MISSING:no credentials file"
+    # Report OAuth token validity by reading the host credentials file directly
+    # — agent containers bind-mount this exact file, so it is what they use.
+    # CREDS_LOW / CREDS_EXPIRED are advisory only: agents refresh the live file
+    # in place (see gate_credentials_for_launch). Only MISSING / ERROR block.
+    host_creds="$HOME/.claude/.credentials.json"
+    if [[ ! -f "$host_creds" ]]; then
+      echo "CREDS_MISSING:no host credentials file at ${host_creds}"
     else
-      result=$(docker run --rm -v claude-creds:/persist --entrypoint python3 cfg-agent:latest -c "
-import json, time
-d = json.load(open('/persist/.credentials.json'))
+      result=$(CFGMS_HOST_CREDS="$host_creds" python3 -c "
+import json, os, time
+d = json.load(open(os.environ['CFGMS_HOST_CREDS']))
 oauth = d.get('claudeAiOauth', {})
 exp_ms = oauth.get('expiresAt', 0)
-exp_s = exp_ms / 1000
-now = time.time()
-remaining_min = int((exp_s - now) / 60)
+remaining_min = int((exp_ms / 1000 - time.time()) / 60)
 if remaining_min < 0:
     print(f'CREDS_EXPIRED:{remaining_min}')
 elif remaining_min < 30:
@@ -1923,9 +1907,9 @@ PYEOF
       warnings=$((warnings + 1))
     fi
 
-    # Credentials check
-    if docker run --rm -v claude-creds:/persist --entrypoint test cfg-agent:latest -f /persist/.credentials.json 2>/dev/null; then
-      echo "INFO:creds:Credentials present in claude-creds volume"
+    # Credentials check — agents bind-mount the host credentials file directly.
+    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+      echo "INFO:creds:Host credentials file present (bind-mounted into agents)"
     else
       echo "WARN:creds:No credentials found — run /agent-setup creds"
       warnings=$((warnings + 1))
@@ -2221,7 +2205,7 @@ PROMPT_EOF
       --cpus=4 \
       --stop-timeout=1800 \
       -v "${real_path}:/workspace" \
-      -v "claude-creds:/persist" \
+      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \

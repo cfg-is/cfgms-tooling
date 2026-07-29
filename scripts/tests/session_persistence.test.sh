@@ -120,9 +120,10 @@ else
   bad "setup-env still creates ~/.claude itself" "credential symlink target missing"
 fi
 
-# Credentials must never reach the host: .credentials.json is symlinked into
-# ~/.claude from the claude-creds volume, so no mount may target that directory
-# by any spelling.
+# The session-persistence mount (sessions_dir, Issue #3051) must never target
+# ~/.claude by any spelling: ~/.claude/.credentials.json is a separate,
+# deliberate bind-mount of the host's live credentials file, and a session
+# mount landing there would clobber it.
 if grep -qE -- '-v "[^"]*sessions_dir[^"]*:[^"]*\.claude' "$DISPATCH"; then
   bad "no mount targets ~/.claude by any path" "a session mount points inside the credential directory"
 else

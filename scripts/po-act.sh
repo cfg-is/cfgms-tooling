@@ -563,15 +563,6 @@ except Exception: print('')" 2>/dev/null || echo "")
     # Inlined from agent-dispatch.sh launch to pass the extra env var without editing
     # that file.
     real_path=$(realpath "$clone_path")
-    # Refresh credentials from host session (mirrors refresh_creds_from_host in agent-dispatch.sh).
-    host_creds="$HOME/.claude/.credentials.json"
-    if [ -f "$host_creds" ]; then
-      docker run --rm --entrypoint bash \
-        -v claude-creds:/persist \
-        -v "${host_creds}:/host-creds.json:ro" \
-        cfg-agent:latest \
-        -c "cp /host-creds.json /persist/.credentials.json" 2>/dev/null || true
-    fi
     gh_token=$(gh auth token)
 
     # Persist this run's transcript to the host so its token spend survives the
@@ -595,7 +586,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "claude-creds:/persist" \
+      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       "${session_mount[@]}" \
