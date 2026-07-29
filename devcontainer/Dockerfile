@@ -251,7 +251,7 @@ RUN set -eu; \
 RUN go install golang.org/x/tools/gopls@v0.22.0 \
     && install -m 0755 "$(go env GOPATH)/bin/gopls" /usr/local/bin/gopls
 
-# Install serena (pinned v1.6.0) as a self-contained tool for the agent user.
+# Install serena (pinned v1.6.1) as a self-contained tool for the agent user.
 # This bakes serena + all its Python deps into the image (~/.local/share/uv +
 # the `serena` launcher on ~/.local/bin), so at runtime serena starts directly
 # from the binary with no uvx git re-resolution and no pypi/astral egress.
@@ -259,7 +259,7 @@ RUN go install golang.org/x/tools/gopls@v0.22.0 \
 ENV UV_CACHE_DIR=/home/agent/.cache/uv
 RUN install -d -o agent -g agent /home/agent/.cache/uv /home/agent/.local \
     && su agent -c 'set -e; export UV_CACHE_DIR=/home/agent/.cache/uv; \
-         uv tool install --from git+https://github.com/oraios/serena@v1.6.0 serena-agent' \
+         uv tool install --from git+https://github.com/oraios/serena@v1.6.1 serena-agent' \
     && chown -R agent:agent /home/agent/.cache/uv /home/agent/.local
 # Defense-in-depth: keep any stray uv invocation offline behind the firewall.
 ENV UV_OFFLINE=1
