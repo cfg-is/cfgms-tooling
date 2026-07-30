@@ -47,7 +47,7 @@ _yaml_get() {
 import re, os, sys
 key = os.environ["YAML_KEY"]
 pattern = re.compile(r"^" + re.escape(key) + r":\s*(.*)")
-with open(os.environ["YAML_FILE"]) as _f:
+with open(os.environ["YAML_FILE"], encoding="utf-8") as _f:
     for _line in _f:
         _m = pattern.match(_line.rstrip())
         if _m:
@@ -123,7 +123,7 @@ body_file = os.environ['GQ_BODY_FILE']
 field_id = os.environ['GQ_FIELD_ID']
 option_id = os.environ['GQ_OPTION_ID']
 story_num = int(os.environ['GQ_STORY_NUM'])
-body = open(body_file).read()
+body = open(body_file, encoding='utf-8').read()
 
 data = graphql({
     'query': (
@@ -377,7 +377,7 @@ yaml_path = os.environ['GQ_PIPELINE_YAML']
 # Parse simple key: value YAML using stdlib only (no PyYAML required)
 import re as _re
 cfg = {}
-with open(yaml_path) as _f:
+with open(yaml_path, encoding='utf-8') as _f:
     for _line in _f:
         _m = _re.match(r'^([A-Za-z0-9_]+):\s*(.*)', _line.rstrip())
         if _m:
