@@ -51,7 +51,7 @@ echo "----------------------"
 
 printf '\n== .claude/model-routing.yaml ==\n'
 routing_src="$(cat "$ROUTING_FILE")"
-check_contains "declares defaults model" "$routing_src" "model: claude-sonnet-4-6"
+check_contains "declares defaults model" "$routing_src" "model: sonnet"
 check_contains "declares defaults effort" "$routing_src" "effort: high"
 for seg in dev-agent fix-agent pr-review acceptance-review; do
   check_contains "declares segment ${seg}" "$routing_src" "${seg}:"
