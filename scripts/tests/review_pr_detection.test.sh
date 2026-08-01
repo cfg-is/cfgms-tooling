@@ -185,5 +185,71 @@ assert_author_trust_with_release \
   "external:"
 
 echo
+echo "--- review-pr: container-conflict classification (already_in_flight vs container_exists) ---"
+
+assert_container_classification() {
+  local description="$1"
+  local docker_state="$2"
+  local expected="$3"
+  ran=$((ran + 1))
+  local actual
+  actual=$("$DISPATCH" _test-classify-container-state "$docker_state")
+  if [[ "$actual" == "$expected" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n        state=%q\n        expected=%q\n        actual=%q\n' \
+      "$description" "$docker_state" "$expected" "$actual"
+    fail=$((fail + 1))
+  fi
+}
+
+# Still alive — the caller should wait, not clean up.
+assert_container_classification "running container → already_in_flight" \
+  "running" "already_in_flight"
+assert_container_classification "restarting container → already_in_flight" \
+  "restarting" "already_in_flight"
+assert_container_classification "created (not yet started) → already_in_flight" \
+  "created" "already_in_flight"
+
+# Leftover from a crash — the caller should run cleanup-stale-reviews.
+assert_container_classification "exited container → container_exists" \
+  "exited" "container_exists"
+assert_container_classification "dead container → container_exists" \
+  "dead" "container_exists"
+assert_container_classification "paused container → container_exists" \
+  "paused" "container_exists"
+
+echo
+echo "--- review-pr: refusal-reason hint coverage (every emitted reason has a hint) ---"
+
+assert_has_hint() {
+  local description="$1"
+  local reason="$2"
+  ran=$((ran + 1))
+  local actual
+  actual=$("$DISPATCH" _test-review-refusal-hint "$reason")
+  if [[ -n "$actual" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n        reason=%q\n        expected a non-empty hint, got none\n' \
+      "$description" "$reason"
+    fail=$((fail + 1))
+  fi
+}
+
+# One assertion per reason token review-pr can actually emit (agent-dispatch.sh
+# REVIEW_REFUSED sites) — catches a new refusal reason landing without a hint.
+assert_has_hint "pr_not_found" "pr_not_found"
+assert_has_hint "pr_state_<X> (wildcard)" "pr_state_CLOSED"
+assert_has_hint "fork_branch_<owner> (wildcard)" "fork_branch_someuser"
+assert_has_hint "external_author_<login>:<trust> (wildcard)" "external_author_bob:external"
+assert_has_hint "no_story_link" "no_story_link"
+assert_has_hint "no_project_item_for_story_<N> (wildcard)" "no_project_item_for_story_1234"
+assert_has_hint "already_in_flight" "already_in_flight"
+assert_has_hint "container_exists" "container_exists"
+assert_has_hint "lease_held" "lease_held"
+assert_has_hint "lease_error" "lease_error"
+
+echo
 echo "ran ${ran} assertions; failures: ${fail}"
 exit "$fail"
