@@ -665,9 +665,64 @@ _review_refusal_hint() {
       echo "another host holds the pr-<N> lease (reviewing/fixing/rebasing this PR) — wait for it to release." ;;
     lease_error)
       echo "lease acquisition failed unexpectedly — check './scripts/pipeline-helper.sh lease-acquire' directly." ;;
+    no_new_commit_since_review)
+      echo "head is unchanged since the last acceptance review — a re-review would re-reach the same verdict. Dispatch a fix (po-act.sh dispatch-fix <PR>) so a commit lands first, or pass --force if the acceptance criteria changed rather than the code." ;;
     *)
       echo "" ;;
   esac
+}
+
+# _review_is_stale <pr_num>
+#   Exit 0 when the PR already carries an acceptance-review comment and no
+#   commit has landed since it — i.e. a re-review would evaluate the exact same
+#   tree and necessarily reach the same verdict. Exit 1 otherwise (reviewable).
+#
+# Why this lives here and not only in the preflight: po-cycle-preflight.py
+# already skips this case, but it is advisory — a direct `review-pr <N>` call
+# bypasses it entirely. Three of six review dispatches in one cron cycle
+# re-confirmed an identical FAIL on an unmoved head because of exactly that
+# bypass, and each wasted review also risks tripping the reviewer's
+# second-failure escalation to Blocked. The dispatcher is the enforcement point.
+#
+# Staleness is decided by comparing the newest commit's committedDate against
+# the newest trusted review comment's createdAt — the same signal
+# fix_landed_after_review() uses in the preflight, kept deliberately identical
+# so the two layers cannot disagree. Trust requires BOTH the machine sentinel
+# (or the legacy '## Acceptance Review' heading) AND a push+ author, mirroring
+# is_trusted_review_comment(): a text match alone would let any commenter forge
+# a review and permanently wedge a PR out of review.
+#
+# Fails OPEN (returns "not stale") whenever the data is missing or unparseable.
+# A wrongly-allowed review costs one cycle; a wrongly-refused one strands a PR.
+_review_is_stale() {
+  local pr_num="$1"
+  local pr_json latest_commit latest_review
+
+  pr_json=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
+    --json comments,commits 2>/dev/null) || return 1
+  [[ -n "$pr_json" ]] || return 1
+
+  latest_commit=$(echo "$pr_json" | jq -r '[.commits[].committedDate] | max // empty' 2>/dev/null || echo "")
+  [[ -n "$latest_commit" ]] || return 1
+
+  # Newest comment that is both sentinel/heading-matched and push+ authored.
+  latest_review=""
+  local c_date c_author c_body
+  while IFS=$'\t' read -r c_date c_author c_body; do
+    [[ -n "$c_date" ]] || continue
+    case "$c_body" in
+      *"<!-- cfgms-acceptance-review -->"*|*"## acceptance review"*) ;;
+      *) continue ;;
+    esac
+    [[ "$(_check_author_permission "$c_author" "$pr_num" "")" == "internal" ]] || continue
+    [[ "$c_date" > "$latest_review" ]] && latest_review="$c_date"
+  done < <(echo "$pr_json" | jq -r '.comments[] | [.createdAt, (.author.login // ""), (.body | ascii_downcase | gsub("\t|\n";" "))] | @tsv' 2>/dev/null)
+
+  [[ -n "$latest_review" ]] || return 1
+
+  # ISO-8601 UTC sorts lexicographically. Stale when no commit is newer.
+  [[ "$latest_commit" > "$latest_review" ]] && return 1
+  return 0
 }
 
 # _emit_review_refused <pr_num> <reason>
@@ -2015,6 +2070,18 @@ PYEOF
     # returns immediately after `docker run -d`; the container does the review
     # and exits when done. Replaces the inline subagent spawn that was hanging
     # on per-tool approval prompts in the host /po cron session.
+    # --force re-reviews a PR whose head has not moved since the last review.
+    # Legitimate when the *criteria* changed rather than the code (e.g. a story's
+    # AC was amended), which the staleness guard below cannot detect.
+    review_force=false
+    review_args=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --force) review_force=true; shift ;;
+        *)       review_args+=("$1"); shift ;;
+      esac
+    done
+    set -- "${review_args[@]}"
     [[ $# -eq 1 ]] || { echo "review-pr requires exactly one PR number"; exit 1; }
     pr_num="$1"
     if [[ ! "$pr_num" =~ ^[0-9]+$ ]]; then
@@ -2052,6 +2119,13 @@ PYEOF
     fi
 
     validate_branch "$pr_branch"
+
+    # Stale-head guard: refuse a re-review when no commit has landed since the
+    # last acceptance review. Runs before story resolution / capacity / lease so
+    # a no-op review costs one API call instead of a container.
+    if [[ "$review_force" != "true" ]] && _review_is_stale "$pr_num"; then
+      _emit_review_refused "$pr_num" "no_new_commit_since_review"
+    fi
 
     # Resolve story/item from the branch (authoritative) or, for legacy
     # branches, the body. See resolve_pr_story_or_item() comment header for

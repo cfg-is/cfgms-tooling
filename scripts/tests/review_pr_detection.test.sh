@@ -249,6 +249,71 @@ assert_has_hint "already_in_flight" "already_in_flight"
 assert_has_hint "container_exists" "container_exists"
 assert_has_hint "lease_held" "lease_held"
 assert_has_hint "lease_error" "lease_error"
+assert_has_hint "no_new_commit_since_review" "no_new_commit_since_review"
+
+echo
+echo "--- review-pr: stale-head guard (_review_is_stale) ---"
+
+# _review_is_stale reads `gh pr view --json comments,commits`. Stub `gh` on PATH
+# so the guard is exercised against fixture payloads, no network.
+STALE_STUB_DIR=$(mktemp -d)
+trap 'rm -rf "$STALE_STUB_DIR"' EXIT
+cat > "$STALE_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+# Only `gh pr view ... --json comments,commits` is used by _review_is_stale.
+cat "$GH_FIXTURE"
+STUB
+chmod +x "$STALE_STUB_DIR/gh"
+
+assert_staleness() {
+  local description="$1" fixture="$2" expected="$3"
+  ran=$((ran + 1))
+  local actual
+  # NOTE: agent-dispatch.sh guards its main dispatch with BASH_SOURCE[0] == $0.
+  # The script path must therefore be interpolated into the command string, NOT
+  # passed as bash -c's $0 argument — doing the latter makes the guard true and
+  # runs the CLI (usage + exit 1) instead of just defining functions.
+  actual=$(GH_FIXTURE="$fixture" PATH="$STALE_STUB_DIR:$PATH" \
+    bash -c "source '$DISPATCH' 2>/dev/null
+             _check_author_permission() { echo internal; }
+             if _review_is_stale 1; then echo stale; else echo reviewable; fi" \
+    2>/dev/null | tail -1) || true
+  if [[ "$actual" == "$expected" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n        expected=%q got=%q\n' "$description" "$expected" "$actual"
+    fail=$((fail + 1))
+  fi
+}
+
+write_fixture() {
+  printf '%s' "$2" > "$STALE_STUB_DIR/$1.json"
+  echo "$STALE_STUB_DIR/$1.json"
+}
+
+# Review present, no commit after it → stale (the #3115/#3117/#3121 waste case).
+f=$(write_fixture stale '{"comments":[{"createdAt":"2026-07-30T10:00:00Z","author":{"login":"jrdnr"},"body":"<!-- cfgms-acceptance-review -->\n## Acceptance Review — FAIL"}],"commits":[{"committedDate":"2026-07-30T09:00:00Z"}]}')
+assert_staleness "review present, no newer commit → stale" "$f" "stale"
+
+# Commit landed after the review → reviewable (the normal fix-cycle re-review).
+f=$(write_fixture fresh '{"comments":[{"createdAt":"2026-07-30T10:00:00Z","author":{"login":"jrdnr"},"body":"<!-- cfgms-acceptance-review -->\n## Acceptance Review — FAIL"}],"commits":[{"committedDate":"2026-07-30T11:00:00Z"}]}')
+assert_staleness "commit newer than review → reviewable" "$f" "reviewable"
+
+# No review comment yet → reviewable (first review must never be blocked).
+f=$(write_fixture noreview '{"comments":[],"commits":[{"committedDate":"2026-07-30T09:00:00Z"}]}')
+assert_staleness "no acceptance review yet → reviewable" "$f" "reviewable"
+
+# Non-review chatter must not count as a review (else any comment wedges the PR).
+f=$(write_fixture chatter '{"comments":[{"createdAt":"2026-07-30T10:00:00Z","author":{"login":"jrdnr"},"body":"Acceptance Reviewer — skipping draft PR."}],"commits":[{"committedDate":"2026-07-30T09:00:00Z"}]}')
+assert_staleness "non-review comment ignored → reviewable" "$f" "reviewable"
+
+# Latest of several commits wins, not document order.
+f=$(write_fixture multi '{"comments":[{"createdAt":"2026-07-30T10:00:00Z","author":{"login":"jrdnr"},"body":"<!-- cfgms-acceptance-review -->"}],"commits":[{"committedDate":"2026-07-30T11:30:00Z"},{"committedDate":"2026-07-30T08:00:00Z"}]}')
+assert_staleness "newest commit compared, not last listed → reviewable" "$f" "reviewable"
+
+# Malformed payload → fails open rather than stranding the PR.
+f=$(write_fixture broken '{"comments":[],"commits":[]}')
+assert_staleness "missing commit data → fails open (reviewable)" "$f" "reviewable"
 
 echo
 echo "ran ${ran} assertions; failures: ${fail}"
