@@ -660,7 +660,7 @@ _review_refusal_hint() {
     already_in_flight)
       echo "a review container for this PR is still running — another review is genuinely in progress. Check /isoagents; no action needed." ;;
     container_exists)
-      echo "a review container for this PR exists but has exited — run './.claude/scripts/agent-dispatch.sh cleanup-stale-reviews', then retry." ;;
+      echo "a review container for this PR exited NON-ZERO (crashed) and is kept for diagnosis — inspect it with './.claude/scripts/agent-dispatch.sh inspect-container cfg-agent-review-pr-<PR>', then clear it with 'cleanup-container cfg-agent-review-pr-<PR>' and retry. (A cleanly-exited container is reaped automatically and never reaches this refusal.)" ;;
     lease_held)
       echo "another host holds the pr-<N> lease (reviewing/fixing/rebasing this PR) — wait for it to release." ;;
     lease_error)
@@ -743,18 +743,37 @@ _emit_review_refused() {
 # Classify an existing cfg-agent-review-pr-<N> container's `docker ps`
 # `.State` value into the REVIEW_REFUSED reason review-pr should emit.
 #
-# Args: <docker_state>  (e.g. "running", "exited", "restarting", "created")
-# Stdout: "already_in_flight" (still alive — caller should just wait) or
-#   "container_exists" (leftover from a crash — caller should run
-#   `cleanup-stale-reviews` first)
+# Args: <docker_state> [exit_code]
+#   docker_state — e.g. "running", "exited", "restarting", "created"
+#   exit_code    — the container's `.State.ExitCode`; optional. Omit it (or pass
+#                  a non-zero/unknown value) to get the conservative answer.
+# Stdout, one of:
+#   already_in_flight — still alive; the caller should wait, not act
+#   reap_clean        — exited 0: finished its review, posted its comment, and
+#                       released its lease. Nothing to preserve — the caller
+#                       should remove it and proceed.
+#   container_exists  — exited non-zero (or state unknown): a crash. Preserve it
+#                       for inspection and refuse.
 #
-# Split out so the running-vs-leftover distinction is a plain lookup instead
-# of an inline conditional a caller has to re-derive from `docker ps` output —
-# and so it's unit-testable without a live docker daemon.
+# Why `reap_clean` exists: `cleanup-stale-reviews` only reaps review containers
+# that exited more than 30 minutes ago, so for 30 minutes after ANY successful
+# review the same PR could not be re-reviewed — and the `container_exists` hint
+# pointed at `cleanup-stale-reviews`, which is guaranteed to no-op inside that
+# window. During an active drain a PR routinely gets a fix or rebase well inside
+# 30 minutes, so this blocked legitimate re-reviews (hit on PR #3150). The
+# 30-minute grace exists to keep a *crashed* container around for diagnosis; a
+# clean exit has already produced its artifact and has nothing to diagnose.
+#
+# Split out so the distinction is a plain lookup instead of an inline
+# conditional a caller has to re-derive from `docker ps` output — and so it's
+# unit-testable without a live docker daemon.
 _classify_review_container_state() {
   local state="$1"
+  local exit_code="${2-}"
   case "$state" in
     running|restarting|created) echo "already_in_flight" ;;
+    exited)
+      if [[ "$exit_code" == "0" ]]; then echo "reap_clean"; else echo "container_exists"; fi ;;
     *)                          echo "container_exists" ;;
   esac
 }
@@ -2150,11 +2169,23 @@ PYEOF
     container_name="cfg-agent-review-pr-${pr_num}"
     clone_dir="${WORKTREE_BASE}/review-pr-${pr_num}"
 
-    # Container conflict gate: refuse if the review container already exists.
+    # Container conflict gate. A live container means wait; a crashed one is
+    # preserved for diagnosis and refuses; a cleanly-exited one is reaped here
+    # and we proceed (see _classify_review_container_state for why).
     # (Same-host fast path; the cross-host interlock is the pr-<N> lease below.)
     existing_state=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.State}}" 2>/dev/null | head -1)
     if [[ -n "$existing_state" ]]; then
-      _emit_review_refused "$pr_num" "$(_classify_review_container_state "$existing_state")"
+      existing_exit=$(docker inspect "$container_name" --format '{{.State.ExitCode}}' 2>/dev/null || echo "")
+      case "$(_classify_review_container_state "$existing_state" "$existing_exit")" in
+        reap_clean)
+          echo "REAPED_CLEAN_REVIEW_CONTAINER:${pr_num}:${container_name}"
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
+          rm -rf "$clone_dir" 2>/dev/null || true
+          ;;
+        *)
+          _emit_review_refused "$pr_num" "$(_classify_review_container_state "$existing_state" "$existing_exit")"
+          ;;
+      esac
     fi
 
     PROJECT_QUEUE="${REPO_ROOT}/scripts/project-queue.sh"
@@ -2606,9 +2637,10 @@ PROMPT_EOF
   _test-classify-container-state)
     # Hidden test hook for review_pr_detection.test.sh. Calls
     # _classify_review_container_state() with the supplied docker `.State`
-    # value and prints its result. Safe (no docker, no gh, no writes).
-    [[ $# -eq 1 ]] || { echo "_test-classify-container-state requires <state>"; exit 1; }
-    _classify_review_container_state "$1"
+    # value and optional exit code, and prints its result.
+    # Safe (no docker, no gh, no writes).
+    [[ $# -ge 1 ]] || { echo "_test-classify-container-state requires <state> [exit_code]"; exit 1; }
+    _classify_review_container_state "$1" "${2-}"
     ;;
 
   _test-review-refusal-hint)

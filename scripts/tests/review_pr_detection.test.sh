@@ -191,9 +191,10 @@ assert_container_classification() {
   local description="$1"
   local docker_state="$2"
   local expected="$3"
+  local exit_code="${4-}"
   ran=$((ran + 1))
   local actual
-  actual=$("$DISPATCH" _test-classify-container-state "$docker_state")
+  actual=$("$DISPATCH" _test-classify-container-state "$docker_state" "$exit_code")
   if [[ "$actual" == "$expected" ]]; then
     printf '  ok    %s\n' "$description"
   else
@@ -211,13 +212,28 @@ assert_container_classification "restarting container → already_in_flight" \
 assert_container_classification "created (not yet started) → already_in_flight" \
   "created" "already_in_flight"
 
-# Leftover from a crash — the caller should run cleanup-stale-reviews.
-assert_container_classification "exited container → container_exists" \
+# Exited 0 — review finished, comment posted, lease released. Nothing to
+# preserve, so the caller reaps it and proceeds instead of refusing. Without
+# this, cleanup-stale-reviews' 30-minute threshold made a PR un-re-reviewable
+# for 30 minutes after every successful review (hit on PR #3150).
+assert_container_classification "exited 0 → reap_clean" \
+  "exited" "reap_clean" "0"
+
+# Exited non-zero — a crash. Keep it for diagnosis and refuse.
+assert_container_classification "exited 1 → container_exists" \
+  "exited" "container_exists" "1"
+assert_container_classification "exited 137 (OOM-kill) → container_exists" \
+  "exited" "container_exists" "137"
+# Unknown exit code must fall back to the conservative answer, never reap.
+assert_container_classification "exited, exit code unknown → container_exists" \
   "exited" "container_exists"
 assert_container_classification "dead container → container_exists" \
   "dead" "container_exists"
 assert_container_classification "paused container → container_exists" \
   "paused" "container_exists"
+# A live container is never reaped, whatever stale exit code docker reports.
+assert_container_classification "running with stale exit code 0 → already_in_flight" \
+  "running" "already_in_flight" "0"
 
 echo
 echo "--- review-pr: refusal-reason hint coverage (every emitted reason has a hint) ---"
