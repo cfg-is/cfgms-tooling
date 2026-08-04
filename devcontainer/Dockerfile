@@ -86,7 +86,7 @@ RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
     && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
        | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
 
-# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.71.0 is the
+# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.72.0 is the
 # post-incident clean release. We download the project's release archive and
 # verify its SHA-256 against a pinned value before extraction, rather than
 # piping the trivy main branch's install.sh through `sh` (whose contents are
