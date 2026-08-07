@@ -20,9 +20,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from token_report import (  # noqa: E402
+    CACHE_READ_MULT,
     Bucket,
     ParseStats,
     Pricing,
+    read_carry_cost_est,
     SessionMeta,
     TranscriptRef,
     build_parser,
@@ -966,6 +968,139 @@ class TestStoryCostReport(unittest.TestCase):
         args = parser.parse_args(["--story-report", "--sessions-dir", "/tmp/x"])
         self.assertTrue(args.story_report)
         self.assertEqual(str(args.sessions_dir), "/tmp/x")
+
+
+
+
+class TestReadCarryCostEstimate(unittest.TestCase):
+    """A Read's real price is its size times the calls that follow it.
+
+    A tool result stays in the conversation and is re-sent as cache-read input on
+    every later call in the session, so the same read costs far more early in a
+    long session than late in a short one. That is invisible per-call, and it is
+    the largest single component of dev-agent spend.
+
+    Every factor here is exact except the token count of the read itself
+    (transcripts record the text, not a per-tool token count) — which is why the
+    figure is labelled `_est` wherever it surfaces.
+    """
+
+    def _tree(self, rows: list[str]) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "sess.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return root
+
+    @staticmethod
+    def _read_use(tool_id: str) -> str:
+        return json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tool_id, "name": "Read",
+                 "input": {"file_path": "/workspace/big.go"}}]},
+        })
+
+    @staticmethod
+    def _read_result(tool_id: str, text: str) -> str:
+        return json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": text}]},
+        })
+
+    @staticmethod
+    def _call(request_id: str, model: str = "claude-opus-5") -> str:
+        return json.dumps({
+            "type": "assistant", "requestId": request_id,
+            "timestamp": "2026-08-07T10:00:00Z",
+            "message": {"model": model, "usage": {
+                "input_tokens": 1, "cache_read_input_tokens": 0, "output_tokens": 1}},
+        })
+
+    def test_carry_equals_tokens_times_following_call_rates(self):
+        # 3700 chars / 3.7 = 1000 tokens. The result lands after call 1, so it is
+        # carried by calls 2 and 3 — two opus-5 cache reads, nothing else.
+        text = "x" * 3700
+        root = self._tree([
+            self._call("req_1"),
+            self._read_use("toolu_1"),
+            self._read_result("toolu_1", text),
+            self._call("req_2"),
+            self._call("req_3"),
+        ])
+        carry, reads = read_carry_cost_est([root], Pricing.load())
+        self.assertEqual(reads, 1)
+        opus_input = 5.0  # pricing.json, claude-opus-5
+        expected = 1000 * 2 * (opus_input * CACHE_READ_MULT / 1_000_000)
+        self.assertAlmostEqual(carry, expected, places=10)
+
+    def test_a_read_on_the_last_call_carries_nothing(self):
+        # Nothing follows it, so it is billed once as part of that call and never
+        # re-read. Charging for it here would inflate every short session.
+        root = self._tree([
+            self._call("req_1"),
+            self._read_use("toolu_1"),
+            self._read_result("toolu_1", "y" * 3700),
+        ])
+        carry, reads = read_carry_cost_est([root], Pricing.load())
+        self.assertEqual(reads, 1)
+        self.assertEqual(carry, 0.0)
+
+    def test_each_following_call_is_priced_at_its_own_model_rate(self):
+        # A transcript can mix models (a sonnet subagent under an opus parent) and
+        # they differ several-fold, so one blended rate would be wrong. sonnet-4-6
+        # input is 3.0, opus-5 is 5.0.
+        root = self._tree([
+            self._call("req_1"),
+            self._read_use("toolu_1"),
+            self._read_result("toolu_1", "z" * 3700),
+            self._call("req_2", model="claude-sonnet-4-6"),
+            self._call("req_3", model="claude-opus-5"),
+        ])
+        carry, _ = read_carry_cost_est([root], Pricing.load())
+        expected = 1000 * ((3.0 + 5.0) * CACHE_READ_MULT / 1_000_000)
+        self.assertAlmostEqual(carry, expected, places=10)
+
+    def test_non_read_tool_results_are_not_counted(self):
+        # The figure is specifically about Read. Bash output carries too, but is
+        # reported separately; conflating them would misdirect the fix.
+        bash_use = json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_b", "name": "Bash",
+                 "input": {"command": "ls"}}]},
+        })
+        root = self._tree([
+            self._call("req_1"),
+            bash_use,
+            self._read_result("toolu_b", "q" * 3700),
+            self._call("req_2"),
+        ])
+        carry, reads = read_carry_cost_est([root], Pricing.load())
+        self.assertEqual((carry, reads), (0.0, 0))
+
+    def test_transcript_with_no_reads_is_skipped_cheaply(self):
+        root = self._tree([self._call("req_1"), self._call("req_2")])
+        self.assertEqual(read_carry_cost_est([root], Pricing.load()), (0.0, 0))
+
+    def test_malformed_and_missing_input_never_raises(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "broken.jsonl").write_text("not json\n{}\n", encoding="utf-8")
+        (root / "empty.jsonl").write_text("", encoding="utf-8")
+        carry, reads = read_carry_cost_est([root, Path("/nonexistent-path")], Pricing.load())
+        self.assertEqual((carry, reads), (0.0, 0))
+
+    def test_unpriced_model_contributes_zero_not_a_crash(self):
+        # Consistent with the rest of the tool: an unpriced model's tokens are
+        # counted, its dollars are never guessed.
+        root = self._tree([
+            self._call("req_1"),
+            self._read_use("toolu_1"),
+            self._read_result("toolu_1", "w" * 3700),
+            self._call("req_2", model="some-local-model:27b"),
+        ])
+        carry, reads = read_carry_cost_est([root], Pricing.load())
+        self.assertEqual(reads, 1)
+        self.assertEqual(carry, 0.0)
 
 
 if __name__ == "__main__":

@@ -834,6 +834,108 @@ _MODE_BUCKET = {
 }
 
 
+#: Characters per token. Only used by read_carry_cost_est below, and the reason
+#: that figure is labelled `_est` everywhere it surfaces: transcripts record a
+#: tool result's text but no per-tool token count, so its size has to be
+#: approximated. Every other number this tool reports comes from a recorded
+#: `usage` object and is exact.
+_CHARS_PER_TOKEN = 3.7
+
+
+def read_carry_cost_est(roots: list[Path], pricing: Pricing) -> tuple[float, int]:
+    """Estimated dollars spent re-reading `Read` output that is already in context.
+
+    Returns (dollars, number_of_reads).
+
+    A tool result is not billed once. It stays in the conversation and is re-sent
+    as cache-read input on every later call in that session, so a read's real
+    price is its size times the calls that follow it -- which makes an early read
+    in a long session far more expensive than the same read at the end. That is
+    invisible in a per-call view, and it is the largest single component of
+    dev-agent spend: measured at $145.55 across 611 container transcripts, of
+    which $108.76 was first reads of a path and $36.79 re-reads of one already
+    read in that session.
+
+    Each following call's OWN rate is used, via a suffix sum, rather than one
+    blended rate for the session: a transcript can mix models (a sonnet subagent
+    under an opus parent), and pricing differs several-fold between them.
+
+    Exact in every factor except the token count of the read itself -- hence
+    `_est`. Reported separately from the cost columns rather than folded into
+    them, so an estimate is never summed with measured dollars.
+    """
+    total = 0.0
+    reads = 0
+    for root in roots:
+        for transcript in sorted(root.rglob("*.jsonl")):
+            try:
+                rows = [
+                    json.loads(line)
+                    for line in transcript.read_text(errors="replace").splitlines()
+                    if line.strip()
+                ]
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            # Which tool_use ids were Reads, so results can be attributed.
+            read_ids: set[str] = set()
+            for row in rows:
+                content = (row.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("name") == "Read"
+                        and block.get("id")
+                    ):
+                        read_ids.add(block["id"])
+            if not read_ids:
+                continue
+
+            # Per-call cache-read rate, in call order, deduped on requestId.
+            rates: list[float] = []
+            seen: set[str] = set()
+            for row in rows:
+                rid = row.get("requestId")
+                if not rid or rid in seen:
+                    continue
+                seen.add(rid)
+                message = row.get("message") or {}
+                usage = message.get("usage") or {}
+                model = message.get("model") or ""
+                resolved = pricing.rates(model, _parse_time(row.get("timestamp")), usage.get("speed"))
+                rates.append((resolved[0] * CACHE_READ_MULT / 1_000_000) if resolved else 0.0)
+
+            # suffix[k] = cost per token of being in context for calls k..end.
+            suffix = [0.0] * (len(rates) + 1)
+            for i in range(len(rates) - 1, -1, -1):
+                suffix[i] = suffix[i + 1] + rates[i]
+
+            k = 0
+            seen.clear()
+            for row in rows:
+                rid = row.get("requestId")
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    k += 1
+                content = (row.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                        continue
+                    if block.get("tool_use_id") not in read_ids:
+                        continue
+                    payload = block.get("content")
+                    text = payload if isinstance(payload, str) else json.dumps(payload)
+                    tokens = len(text) / _CHARS_PER_TOKEN
+                    total += tokens * suffix[min(k, len(rates))]
+                    reads += 1
+    return total, reads
+
+
 def story_cost_report(
     sessions_base: Path, pricing: Pricing, since: datetime | None = None
 ) -> list[dict[str, Any]]:
@@ -911,6 +1013,7 @@ def story_cost_report(
         container_calls, _ = collect([container_dir], pricing, None, None)
         cost = sum((c.cost_usd or 0.0) for c, _ in container_calls)
         has_transcript = len(container_calls) > 0
+        carry, n_reads = read_carry_cost_est([container_dir], pricing)
 
         key = str(issue) if issue else (f"pr-{pr}" if pr else f"container:{container_dir.name}")
         story = stories.setdefault(
@@ -922,6 +1025,8 @@ def story_cost_report(
                 "fix_cost_usd": 0.0,
                 "review_cost_usd": 0.0,
                 "fix_rounds": 0,
+                "read_carry_usd_est": 0.0,
+                "reads": 0,
                 "containers": 0,
                 "has_dev": False,
                 "partial": False,
@@ -931,6 +1036,8 @@ def story_cost_report(
         if pr and not story["pr"]:
             story["pr"] = pr
         story["containers"] += 1
+        story["read_carry_usd_est"] = round(story["read_carry_usd_est"] + carry, 4)
+        story["reads"] += n_reads
         if not has_transcript:
             story["partial"] = True
 
@@ -1067,22 +1174,33 @@ def render_story_report(stories: list[dict[str, Any]], out) -> None:
     """Human-readable form of story_cost_report's output (Issue #3055)."""
     print(
         f"\n{'story':>7}  {'pr':>7}  {'dev $':>8}  {'fix $':>8}  {'review $':>9}  "
-        f"{'total $':>8}  {'rounds':>6}  {'partial':>7}",
+        f"{'total $':>8}  {'rounds':>6}  {'reads':>6}  {'read~$':>7}  {'partial':>7}",
         file=out,
     )
-    print("-" * 76, file=out)
+    print("-" * 94, file=out)
     for story in stories:
         print(
             f"{str(story['story'] or '-'):>7}  {str(story['pr'] or '-'):>7}  "
             f"{story['dev_cost_usd']:>8.2f}  {story['fix_cost_usd']:>8.2f}  "
             f"{story['review_cost_usd']:>9.2f}  {story['total_cost_usd']:>8.2f}  "
-            f"{story['fix_rounds']:>6}  {('yes' if story['partial'] else ''):>7}",
+            f"{story['fix_rounds']:>6}  {story['reads']:>6}  "
+            f"{story['read_carry_usd_est']:>7.2f}  "
+            f"{('yes' if story['partial'] else ''):>7}",
             file=out,
         )
-    print("-" * 76, file=out)
+    print("-" * 94, file=out)
     total = sum(s["total_cost_usd"] for s in stories)
+    carry = sum(s["read_carry_usd_est"] for s in stories)
     partial_count = sum(1 for s in stories if s["partial"])
     print(f"{len(stories)} stories, ${total:.2f} total, {partial_count} partial", file=out)
+    # Deliberately not added to the total: read~$ is a component OF the measured
+    # cost columns (context re-read is part of what dev/fix/review already
+    # charged), not spend alongside them. Summing the two would double-count.
+    print(
+        f"read~$ = estimated cost of carrying Read output for the rest of its session: "
+        f"${carry:.2f} across {sum(s['reads'] for s in stories)} reads",
+        file=out,
+    )
     print("excludes: cron orchestration's own share of cost", file=out)
 
 
