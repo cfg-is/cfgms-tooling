@@ -48,6 +48,29 @@ BARE_PATH_RE = re.compile(
     r"(?:^|[\s(\[])"
     r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py))"
 )
+#: A path may be written with the line it refers to (`handlers.go:114`, or a
+#: `:114-126` range). Both PATH regexes above end at the extension, so the colon
+#: suffix left the whole reference unmatched and the story parsed as declaring NO
+#: files -- which reads downstream as `no files parsed from Files In Scope` and
+#: holds the story rather than dispatching it. Stripped before matching.
+#: Covers extensionless names too (`Dockerfile:155`), which the PATH regexes match
+#: only when the name ends the reference.
+LINE_SUFFIX_RE = re.compile(
+    r"(\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py)"
+    r"|Makefile|Dockerfile(?:\.[\w-]+)?):\d+(?:-\d+)?"
+)
+
+#: A declaration inside `## Files In Scope` is conventionally a list item or a
+#: table row. Prose lines contribute only backticked paths, so a path named in
+#: passing does not become a requirement.
+LIST_OR_TABLE_RE = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\|)")
+
+#: "None — documentation only.", "None (no code changes)", "none." and friends:
+#: an explicit declaration that the story touches no files. Only matched when the
+#: section OPENS with it, so a section that merely mentions "none" in prose still
+#: goes through normal path extraction.
+NONE_PREFIX_RE = re.compile(r"^\s*none\b\s*[-—:(]", re.IGNORECASE)
+
 BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)")
 
 # Permission levels that indicate a trusted (first-party) collaborator.
@@ -1005,6 +1028,43 @@ def extract_section(body, section_name):
     return None
 
 
+def extract_scope_paths(section):
+    """Paths a story actually DECLARES in scope, from its `## Files In Scope` text.
+
+    Deliberately stricter than the loose body-wide scan (`all_paths_in_body`),
+    which stays permissive as an LLM-facing diagnostic. This set gates real
+    behaviour -- file-conflict holds today, coverage checking next -- so both of
+    its error directions cost something:
+
+      over-extraction  -> the dispatcher holds a story for conflicting on a file
+                          the story never claimed, or a coverage gate demands an
+                          edit the story forbade
+      under-extraction -> two agents collide on one file, or a coverage gate
+                          passes a PR that skipped declared work
+
+    Handled per line: a `:<line>` or `:<line>-<line>` suffix is stripped first;
+    list items and table rows contribute bare and backticked paths; any other
+    line contributes only backticked paths.
+
+    Structure alone decides this -- no attempt is made to read intent from the
+    wording. A phrasing filter was tried and removed: real story bodies say "do
+    NOT" and "never" in instructions ABOUT a file they are declaring
+    ("`assurance.go` -- do NOT lower `webauthn:register`"), so keying on those
+    words dropped legitimate declarations from three live stories. The known
+    residual limitation is therefore that a path a story backticks in order to
+    exclude still parses as in scope; write such a path unbackticked in prose.
+    """
+    if not section:
+        return []
+    found = set()
+    for raw_line in section.splitlines():
+        line = LINE_SUFFIX_RE.sub(r"\1", raw_line)
+        found.update(BACKTICK_PATH_RE.findall(line))
+        if LIST_OR_TABLE_RE.match(line):
+            found.update(BARE_PATH_RE.findall(line))
+    return sorted(found)
+
+
 def parse_story(issue):
     """Parse a story into structured dispatch-gating data.
 
@@ -1035,10 +1095,14 @@ def parse_story(issue):
     files_parsed = []
     if files_raw is None:
         warnings.append("no '## Files In Scope' section found")
+    elif files_raw.strip().lower().rstrip(".") in ("", "none", "n/a") or NONE_PREFIX_RE.match(files_raw):
+        # An explicit "None — documentation only." is a real declaration, not a
+        # parse failure. Dependencies already reads it that way; without the same
+        # handling here a docs-only story warns "no file paths detected", which
+        # downstream is indistinguishable from a section the parser could not read.
+        pass
     else:
-        backtick_hits = set(BACKTICK_PATH_RE.findall(files_raw))
-        bare_hits = set(BARE_PATH_RE.findall(files_raw))
-        files_parsed = sorted(backtick_hits | bare_hits)
+        files_parsed = extract_scope_paths(files_raw)
         if not files_parsed:
             warnings.append("'## Files In Scope' section had content but no file paths detected")
 
