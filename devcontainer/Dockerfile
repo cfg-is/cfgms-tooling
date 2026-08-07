@@ -82,9 +82,30 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
     && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
-    && go install github.com/google/go-licenses/v2@v2.0.1 \
-    && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-       | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+    && go install github.com/google/go-licenses/v2@v2.0.1
+
+# golangci-lint — same rule as Trivy below: download the pinned release archive
+# and verify its SHA-256 before extraction, rather than piping the project's
+# install.sh through `sh`. The previous form fetched that script from the
+# golangci-lint repo's HEAD, so its contents were whatever the branch tip held
+# at image-build time — an unpinned remote script executing as root, which is
+# the exact pattern the Trivy block was rewritten to avoid.
+# Per-architecture checksums from the golangci-lint-<ver>-checksums.txt release
+# asset at https://github.com/golangci/golangci-lint/releases/download/v<ver>/
+RUN set -eu; \
+    GOLANGCI_VERSION='2.12.2'; \
+    case "$TARGETARCH" in \
+      amd64) GOLANGCI_ARCH='linux-amd64'; GOLANGCI_SHA256='8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553' ;; \
+      arm64) GOLANGCI_ARCH='linux-arm64'; GOLANGCI_SHA256='44cd40a8c76c86755375adfeea52cfd3533cb43d7bd647771e0ae065e166df3a' ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    STEM="golangci-lint-${GOLANGCI_VERSION}-${GOLANGCI_ARCH}"; \
+    curl -sSfL -o "/tmp/${STEM}.tar.gz" \
+      "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_VERSION}/${STEM}.tar.gz"; \
+    printf '%s  /tmp/%s.tar.gz\n' "${GOLANGCI_SHA256}" "${STEM}" | sha256sum -c -; \
+    tar -xzf "/tmp/${STEM}.tar.gz" -C /tmp "${STEM}/golangci-lint"; \
+    install -m 0755 "/tmp/${STEM}/golangci-lint" "$(go env GOPATH)/bin/golangci-lint"; \
+    rm -rf "/tmp/${STEM}.tar.gz" "/tmp/${STEM}"
 
 # Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.72.0 is the
 # post-incident clean release. We download the project's release archive and
