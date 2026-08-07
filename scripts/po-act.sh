@@ -354,6 +354,68 @@ _capacity_ok() {
   return 1
 }
 
+# _mq_failed_runs_for_pr <pr>
+#   Reads `gh run list --event merge_group --json
+#   databaseId,headBranch,conclusion,workflowName` output on stdin and prints one
+#   "<run_id>\t<workflow>" line per FAILED run belonging to this PR.
+#
+#   GitHub does not link a merge_group run back to its PR in any field. The only
+#   connection is the branch it ran on, which the queue names
+#   gh-readonly-queue/<base>/pr-<N>-<sha> -- so the PR number is matched out of
+#   that, anchored, with the trailing dash required. Without the dash, pr-31 would
+#   also match pr-3139's branch.
+#   NOTE: the program is passed with `python3 -c`, not a heredoc. A heredoc IS
+#   python's stdin, so `json.load(sys.stdin)` would read the program text instead
+#   of the piped JSON and silently return nothing.
+_mq_failed_runs_for_pr() {
+  CFGMS_DIAG_PR="${1:?pr required}" python3 -c '
+import json, os, re, sys
+pr = os.environ["CFGMS_DIAG_PR"]
+try:
+    runs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(runs, list):
+    sys.exit(0)
+pat = re.compile(r"^gh-readonly-queue/[^/]+/pr-%s-" % re.escape(pr))
+for run in runs:
+    if not isinstance(run, dict):
+        continue
+    if not pat.match(run.get("headBranch") or ""):
+        continue
+    if (run.get("conclusion") or "").strip().lower() != "failure":
+        continue
+    rid = run.get("databaseId")
+    if rid is None:
+        continue
+    print("%s\t%s" % (rid, run.get("workflowName") or "?"))
+'
+}
+
+# _failed_job_ids
+#   Reads `gh api repos/<repo>/actions/runs/<id>/jobs` output on stdin and prints
+#   the id of every job that concluded in failure. A merge-group run can carry
+#   dozens of jobs where only one failed, so filtering here keeps the log fetch
+#   below to the job that actually has the failure in it.
+#   Same `-c` requirement as above: stdin carries the data, not the program.
+_failed_job_ids() {
+  python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+jobs = data.get("jobs") if isinstance(data, dict) else None
+for job in jobs or []:
+    if not isinstance(job, dict):
+        continue
+    if (job.get("conclusion") or "").strip().lower() == "failure":
+        jid = job.get("id")
+        if jid is not None:
+            print(jid)
+'
+}
+
 # _claim_item <item_id>
 #   Re-read status; proceed only if still Ready; set it to In Progress. Prints
 #   CLAIMED:<item> (rc 0) or CLAIM_LOST:<item> (rc 1). This is the dashboard-state
@@ -771,28 +833,70 @@ except Exception: print('')" 2>/dev/null || echo "")
     ;;
 
   diagnose)
+    # A PR's statusCheckRollup describes its own head. A merge-queue failure runs
+    # against the merge-group commit on a gh-readonly-queue branch and never
+    # appears there, so a PR evicted from the queue used to report
+    # "no_failing_jobs" while a real failure sat one ref away -- measured on PR
+    # #3139, evicted twice by a Windows-only test with diagnose returning nothing
+    # both times. Head first (unchanged); merge-group only as a fallback, so the
+    # common case costs no extra API calls.
     pr="${1:?PR number required}"
+    # `|| true` is load-bearing. This file runs under `set -euo pipefail`, and
+    # when a PR has no failing check `grep` matches nothing and exits 1, which
+    # pipefail turns into a failed assignment and `set -e` turns into an abort --
+    # so the "no_failing_jobs" branch below was UNREACHABLE and diagnose exited 1
+    # printing nothing at all. That, not merge-group blindness alone, is why
+    # diagnose "returns empty": it never got past this line on a green head.
     job_ids=$(gh pr view "$pr" --repo "$REPO" --json statusCheckRollup \
       -q '.statusCheckRollup[]? | select(.conclusion == "FAILURE") | .detailsUrl' \
-      | grep -oE '/job/[0-9]+' | grep -oE '[0-9]+' | sort -u)
-    if [ -z "$job_ids" ]; then
-      echo "no_failing_jobs"
+      | grep -oE '/job/[0-9]+' | grep -oE '[0-9]+' | sort -u || true)
+    if [ -n "$job_ids" ]; then
+      for jid in $job_ids; do
+        echo "=== job $jid ==="
+        gh api "repos/${REPO}/actions/jobs/${jid}/logs" 2>/dev/null \
+          | grep -iE "^\S+Z (--- FAIL|FAIL\s|panic:|Error:)" \
+          | head -15 || true
+      done
       exit 0
     fi
-    for jid in $job_ids; do
-      echo "=== job $jid ==="
-      gh api "repos/${REPO}/actions/jobs/${jid}/logs" 2>/dev/null \
-        | grep -iE "^\S+Z (--- FAIL|FAIL\s|panic:|Error:)" \
-        | head -15 || true
-    done
+
+    mq_runs=$(gh run list --repo "$REPO" --event merge_group --limit 100 \
+      --json databaseId,headBranch,conclusion,workflowName 2>/dev/null \
+      | _mq_failed_runs_for_pr "$pr")
+    if [ -z "$mq_runs" ]; then
+      # Distinguishing these two is the point: "clean everywhere" and "the
+      # failure is on a ref this command never looked at" used to print the same
+      # line, which is what made #3139 opaque.
+      echo "no_failing_jobs (head clean; no failing merge-group run for pr-${pr})"
+      exit 0
+    fi
+    while IFS="$(printf '\t')" read -r rid wf; do
+      [ -n "$rid" ] || continue
+      echo "=== merge-group run $rid (${wf}) ==="
+      mq_jobs=$(gh api "repos/${REPO}/actions/runs/${rid}/jobs" 2>/dev/null | _failed_job_ids)
+      if [ -z "$mq_jobs" ]; then
+        echo "  (run failed but reported no failing job — check the run's own annotations)"
+        continue
+      fi
+      for jid in $mq_jobs; do
+        echo "--- job $jid ---"
+        gh api "repos/${REPO}/actions/jobs/${jid}/logs" 2>/dev/null \
+          | grep -iE "^\S+Z (--- FAIL|FAIL\s|panic:|Error:)" \
+          | head -15 || true
+      done
+    done <<EOF
+$mq_runs
+EOF
     ;;
 
   rerun)
     pr="${1:?PR number required}"
     comment="${2:-}"
+    # Same pipefail trap as `diagnose` above: without `|| true` a PR with nothing
+    # failing aborts here instead of reaching the no_failing_runs branch.
     run_ids=$(gh pr view "$pr" --repo "$REPO" --json statusCheckRollup \
       -q '.statusCheckRollup[]? | select(.conclusion == "FAILURE") | .detailsUrl' \
-      | grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+' | sort -u)
+      | grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+' | sort -u || true)
     if [ -z "$run_ids" ]; then
       echo "no_failing_runs"
       exit 0
@@ -1106,6 +1210,19 @@ if by_role:
 avg_cycle = total_cost / cycle_count if cycle_count else 0.0
 print(f"\nAverage cost per cycle: ${avg_cycle:.2f}  (total across {cycle_count} cycles: ${total_cost:.2f})")
 PYEOF
+    ;;
+
+  _test-mq-failed-runs)
+    # Hidden test hook for .claude/scripts/tests/diagnose_merge_group.test.sh.
+    # Not user-facing; feeds stdin straight to _mq_failed_runs_for_pr so the
+    # branch-matching and conclusion-filtering can be driven from fixture JSON.
+    # Safe: no gh, no docker, no writes.
+    _mq_failed_runs_for_pr "${1:?pr required}"
+    ;;
+
+  _test-failed-job-ids)
+    # Hidden test hook, as above, for _failed_job_ids.
+    _failed_job_ids
     ;;
 
   ""|-h|--help|help)
