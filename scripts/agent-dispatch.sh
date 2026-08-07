@@ -667,6 +667,8 @@ _review_refusal_hint() {
       echo "lease acquisition failed unexpectedly — check './scripts/pipeline-helper.sh lease-acquire' directly." ;;
     no_new_commit_since_review)
       echo "head is unchanged since the last acceptance review — a re-review would re-reach the same verdict. Dispatch a fix (po-act.sh dispatch-fix <PR>) so a commit lands first, or pass --force if the acceptance criteria changed rather than the code." ;;
+    merge_conflicts)
+      echo "PR conflicts with develop (mergeStateStatus=DIRTY), so GitHub builds no merge ref and NO pull_request workflow runs for it — a reviewer would judge it with zero CI evidence. Clear the conflict first: './.claude/scripts/rebase-pr.sh <PR>', escalating to resolve-conflict on REBASE_CONFLICT, then review." ;;
     *)
       echo "" ;;
   esac
@@ -2112,10 +2114,11 @@ PYEOF
 
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
-      --json state,headRefName,body,labels,headRepositoryOwner,author 2>/dev/null) || {
+      --json state,headRefName,body,labels,headRepositoryOwner,author,mergeStateStatus 2>/dev/null) || {
       _emit_review_refused "$pr_num" "pr_not_found"
     }
     state=$(echo "$pr_meta" | jq -r '.state')
+    merge_state=$(echo "$pr_meta" | jq -r '.mergeStateStatus // empty' | tr '[:lower:]' '[:upper:]')
     pr_branch=$(echo "$pr_meta" | jq -r '.headRefName')
     fork_owner=$(echo "$pr_meta" | jq -r '.headRepositoryOwner.login // empty')
     pr_body=$(echo "$pr_meta" | jq -r '.body // ""')
@@ -2138,6 +2141,25 @@ PYEOF
     fi
 
     validate_branch "$pr_branch"
+
+    # Conflict guard: a DIRTY PR has no merge ref, so GitHub runs NO pull_request
+    # workflow for it and every required check is simply absent. A reviewer handed
+    # that PR has no CI evidence to judge against and reaches for the story's ACs
+    # alone — one such review FAILed a PR partly for checks that could never have
+    # run, then a fix agent was dispatched against a branch whose real problem was
+    # a conflict. Rebase is strictly cheaper than that round trip.
+    #
+    # Lives here for the same reason as _review_is_stale below: the preflight
+    # already recommends `rebase` ahead of review for DIRTY, but that is advisory
+    # and a direct `review-pr <N>` call bypasses it. The dispatcher is the
+    # enforcement point.
+    #
+    # Only exact DIRTY refuses. GitHub reports UNKNOWN while it is still computing
+    # mergeability, and BEHIND/BLOCKED are the merge queue's business, not the
+    # reviewer's — refusing on those would strand reviewable PRs.
+    if [[ "$merge_state" == "DIRTY" ]]; then
+      _emit_review_refused "$pr_num" "merge_conflicts"
+    fi
 
     # Stale-head guard: refuse a re-review when no commit has landed since the
     # last acceptance review. Runs before story resolution / capacity / lease so

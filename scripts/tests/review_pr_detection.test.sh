@@ -266,6 +266,7 @@ assert_has_hint "container_exists" "container_exists"
 assert_has_hint "lease_held" "lease_held"
 assert_has_hint "lease_error" "lease_error"
 assert_has_hint "no_new_commit_since_review" "no_new_commit_since_review"
+assert_has_hint "merge_conflicts" "merge_conflicts"
 
 echo
 echo "--- review-pr: stale-head guard (_review_is_stale) ---"
@@ -330,6 +331,71 @@ assert_staleness "newest commit compared, not last listed → reviewable" "$f" "
 # Malformed payload → fails open rather than stranding the PR.
 f=$(write_fixture broken '{"comments":[],"commits":[]}')
 assert_staleness "missing commit data → fails open (reviewable)" "$f" "reviewable"
+
+echo
+echo "--- review-pr: conflict guard (mergeStateStatus) ---"
+
+# A DIRTY PR has no merge ref, so GitHub runs no pull_request workflow and every
+# required check is absent. Reviewing it produced a FAIL citing CI that could
+# never have run, then a fix dispatch against a branch whose real problem was a
+# conflict. The preflight already deprioritises it, but a direct `review-pr <N>`
+# bypasses the preflight entirely — hence this guard, and hence this test.
+#
+# End-to-end through the real CLI: the stub answers both gh calls the guard sits
+# behind (the PR view, then the author-permission check) by branching on args.
+CONFLICT_STUB_DIR=$(mktemp -d)
+trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR"' EXIT
+cat > "$CONFLICT_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+# The permission probe runs `gh api ... --jq '.permission // ""'`, so it expects
+# the already-extracted value, not a JSON object.
+for a in "$@"; do
+  case "$a" in
+    *collaborators*permission*) echo admin; exit 0 ;;
+  esac
+done
+# `gh pr view` is the only other call reached before the guard.
+case "$1" in
+  pr) cat "$GH_FIXTURE" ;;
+  *)  exit 0 ;;
+esac
+STUB
+chmod +x "$CONFLICT_STUB_DIR/gh"
+
+assert_review_refusal() {
+  local description="$1" merge_state="$2" expected="$3"
+  ran=$((ran + 1))
+  local fixture actual
+  fixture="${CONFLICT_STUB_DIR}/meta-${merge_state}.json"
+  printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"%s"}' \
+    "$merge_state" > "$fixture"
+  actual=$(GH_FIXTURE="$fixture" PATH="$CONFLICT_STUB_DIR:$PATH" \
+    "$DISPATCH" review-pr 4242 2>&1 | head -1) || true
+  case "$expected" in
+    refused)
+      if [[ "$actual" == *"REVIEW_REFUSED:4242:merge_conflicts"* ]]; then
+        printf '  ok    %s\n' "$description"
+      else
+        printf '  FAIL  %s\n        expected merge_conflicts refusal, got=%q\n' "$description" "$actual"
+        fail=$((fail + 1))
+      fi ;;
+    not_refused)
+      if [[ "$actual" == *"merge_conflicts"* ]]; then
+        printf '  FAIL  %s\n        must not refuse on %s, got=%q\n' "$description" "$merge_state" "$actual"
+        fail=$((fail + 1))
+      else
+        printf '  ok    %s\n' "$description"
+      fi ;;
+  esac
+}
+
+assert_review_refusal "DIRTY → refused before any container is launched" "DIRTY" "refused"
+# UNKNOWN is GitHub still computing mergeability; BEHIND/BLOCKED are the merge
+# queue's business. Refusing on any of these would strand reviewable PRs.
+assert_review_refusal "UNKNOWN (still computing) → not refused" "UNKNOWN" "not_refused"
+assert_review_refusal "BEHIND → not refused" "BEHIND" "not_refused"
+assert_review_refusal "BLOCKED → not refused" "BLOCKED" "not_refused"
+assert_review_refusal "CLEAN → not refused" "CLEAN" "not_refused"
 
 echo
 echo "ran ${ran} assertions; failures: ${fail}"
