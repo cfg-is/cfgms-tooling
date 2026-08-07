@@ -307,6 +307,84 @@ check_eq "CYCLE_DIR is distinct from the dispatch ledger dir" \
 check_contains "CYCLE_DIR sits beside CACHE_DIR, not under it via retention pruning" "$poact_src" \
   'CYCLE_DIR="${CFGMS_CYCLE_DIR:-${CACHE_DIR}/cycles}"'
 
+printf '\n== a cycle counts only its own [start, end] window (regression) ==\n'
+# Two back-to-back cycles in ONE session -- what a `/loop` produces. Filtering
+# calls on session alone made every cycle report itself PLUS every earlier cycle,
+# so reported cost climbed monotonically no matter how little work was done, and
+# the prior cycles' calls all landed in "unattributed" (they precede this cycle's
+# first step boundary). Measured on 2026-08-07 before the fix: three cycles
+# reported $6.36 / $9.43 / $11.30 for true costs of $6.36 / $3.06 / $1.87, with
+# unattributed growing 2 -> 109 -> 169 calls.
+TC_SESSION="two-cycle-session"
+TC_PROJECTS="${SANDBOX}/tc-projects"
+mkdir -p "${TC_PROJECTS}/-workspace"
+python3 - "${TC_PROJECTS}/-workspace" "$TC_SESSION" "$SANDBOX" <<'PYEOF'
+import json, sys
+from datetime import datetime, timedelta, timezone
+tc_dir, session, sandbox = sys.argv[1:4]
+def ago(seconds):
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def row(request_id, ts, inp, out):
+    return json.dumps({
+        "type": "assistant", "requestId": request_id, "timestamp": ts,
+        "gitBranch": "develop", "cwd": "/workspace", "isSidechain": False,
+        "message": {"model": "claude-sonnet-4-6", "usage": {
+            "input_tokens": inp, "cache_read_input_tokens": 0, "output_tokens": out,
+        }},
+    })
+# Cycle A owns [600s, 500s] ago; cycle B owns [200s, 100s] ago. B's rows are
+# deliberately 4x A's tokens so a leaked total is visible as a cost, not just a
+# count. Each cycle's single step boundary sits mid-window, so one row lands in
+# the step and one before it (unattributed) on both sides.
+with open(f"{tc_dir}/{session}.jsonl", "w") as f:
+    f.write(row("tc_a1", ago(590), 1000, 500) + "\n")
+    f.write(row("tc_a2", ago(520), 1000, 500) + "\n")
+    f.write(row("tc_b1", ago(190), 4000, 2000) + "\n")
+    f.write(row("tc_b2", ago(120), 4000, 2000) + "\n")
+for name, (start, boundary, end) in {
+    "cycle-A": (600, 550, 500),
+    "cycle-B": (200, 150, 100),
+}.items():
+    with open(f"{sandbox}/{name}.json", "w") as f:
+        json.dump({
+            "cycle_id": name, "mode": "pipeline", "session": session, "host": "test",
+            "start": ago(start), "end": ago(end),
+            "steps": [{"ts": ago(boundary), "subcommand": "merge-queue", "args": "",
+                       "outcome": "work", "exit_code": 0, "result": None}],
+        }, f, indent=2)
+PYEOF
+
+for c in cycle-A cycle-B; do
+  python3 "$TOKEN_REPORT" --cycle-manifest "${SANDBOX}/${c}.json" \
+    --projects-dir "$TC_PROJECTS" --quiet >/dev/null 2>&1 || true
+done
+a_json="${SANDBOX}/cycle-A.json"; b_json="${SANDBOX}/cycle-B.json"
+
+check_eq "cycle A counts only its own 2 calls" \
+  "$(jf "$a_json" 'd["steps"][0]["calls"] + d["unattributed"]["calls"]')" "2"
+check_eq "cycle B counts only its own 2 calls, not the session's 4" \
+  "$(jf "$b_json" 'd["steps"][0]["calls"] + d["unattributed"]["calls"]')" "2"
+check_eq "cycle A excludes the later cycle's calls from its window" \
+  "$(jf "$a_json" 'd["excluded_calls"]["outside_window"]')" "2"
+check_eq "cycle B excludes the earlier cycle's calls from its window" \
+  "$(jf "$b_json" 'd["excluded_calls"]["outside_window"]')" "2"
+check_eq "an earlier cycle's calls no longer masquerade as this cycle's unattributed" \
+  "$(jf "$b_json" 'd["unattributed"]["calls"]')" "1"
+# The load-bearing assertion: B is not a running total. B's rows carry 4x A's
+# tokens, so a leak would make B strictly greater than A+B's true sum.
+check_eq "the two cycles' token totals are disjoint, summing to the session's" \
+  "$(python3 -c "
+import json
+a=json.load(open('$a_json')); b=json.load(open('$b_json'))
+print(a['cycle_total_tokens'] + b['cycle_total_tokens'] == 15000
+      and b['cycle_total_tokens'] == 12000)")" "True"
+if [[ "$(jf "$b_json" 'd["cycle_cost_usd"] > 0')" == "True" ]]; then
+  ok "windowed correlation still produces real measured dollars"
+else
+  bad "windowed correlation still produces real measured dollars" \
+    "got: $(jf "$b_json" 'd["cycle_cost_usd"]')"
+fi
+
 printf '\n%s\n' "-----------------------------------------"
 if [[ "$fail" -eq 0 ]]; then
   printf 'PASS: %d checks\n' "$ran"; exit 0

@@ -667,13 +667,18 @@ def correlate_cycle_manifest(
     output but not cache-read traffic, ~95% of the bill). Self-reporting is
     not a substitute for this.
 
+    Only calls inside the manifest's own [start, end] window count toward the
+    cycle -- see the comment on the window filter below for why session alone is
+    not enough.
+
     Writes cycle_cost_usd, cycle_total_tokens, per-step cost_usd/total_tokens/
     calls, the nested agents spawned during the cycle with their roles and
-    their own measured cost, and an "unattributed" bucket (calls before the
-    first step boundary, or with no timestamp) back into the same manifest
-    file. Returns (call_count, note) for the caller to log; never raises on a
-    malformed or half-written manifest -- a cycle that failed partway still has
-    one to read, and correlation failing must not destroy it.
+    their own measured cost, an "unattributed" bucket (in-window calls that fall
+    before the first step boundary) and an "excluded_calls" record (in-session
+    calls the window rejected, plus undated ones that cannot be placed) back into
+    the same manifest file. Returns (call_count, note) for the caller to log;
+    never raises on a malformed or half-written manifest -- a cycle that failed
+    partway still has one to read, and correlation failing must not destroy it.
     """
     manifest = json.loads(manifest_path.read_text())
 
@@ -689,8 +694,40 @@ def correlate_cycle_manifest(
             step_bounds.append((ts, i))
     step_bounds.sort()
 
+    # A cycle owns only the calls inside its own [start, end] window. Filtering
+    # on session alone also attributes every EARLIER cycle in the same session
+    # to this one, so a long-lived session (what a `/loop` creates) reports a
+    # running total that climbs regardless of the work done. Measured on
+    # 2026-08-07: three back-to-back cycles reported $6.36 / $9.43 / $11.30 for
+    # true costs of $6.36 / $3.06 / $1.87, and their "unattributed" buckets grew
+    # 2 -> 109 -> 169 calls purely because the prior cycles' calls fall before
+    # this cycle's first step boundary. Same window the `containers` and
+    # `agents` records below already apply.
+    cycle_start = _parse_time(manifest.get("start"))
+    cycle_end = _parse_time(manifest.get("end"))
+
+    def in_window(ts: datetime) -> bool:
+        if cycle_start is not None and ts < cycle_start:
+            return False
+        if cycle_end is not None and ts > cycle_end:
+            return False
+        return True
+
     calls, _stats = collect(roots, pricing, None, None)
-    session_calls = [c for c, _ in calls if c.session == session]
+    session_calls: list[Call] = []
+    excluded_undated = 0
+    excluded_outside = 0
+    for c, _ in calls:
+        if c.session != session:
+            continue
+        if c.timestamp is None:
+            # An undated call cannot be placed in any one cycle. Counted and
+            # dropped rather than leaked into every cycle of the session.
+            excluded_undated += 1
+        elif not in_window(c.timestamp):
+            excluded_outside += 1
+        else:
+            session_calls.append(c)
 
     def bucket_for(ts: datetime | None) -> int | None:
         if ts is None:
@@ -736,8 +773,6 @@ def correlate_cycle_manifest(
         bucket["cost_usd"] += call.cost_usd or 0.0
         bucket["total_tokens"] += call.total_tokens
 
-    cycle_start = _parse_time(manifest.get("start"))
-    cycle_end = _parse_time(manifest.get("end"))
     main_transcript = _find_session_transcript(session, roots)
     agents: list[dict[str, Any]] = []
     if main_transcript is not None:
@@ -768,6 +803,12 @@ def correlate_cycle_manifest(
         "calls": unattributed["calls"],
         "cost_usd": round(unattributed["cost_usd"], 4),
         "total_tokens": unattributed["total_tokens"],
+    }
+    # Visible rather than silent: what the cycle window excluded, so a surprising
+    # cycle_cost_usd can be told apart from a windowing problem.
+    manifest["excluded_calls"] = {
+        "outside_window": excluded_outside,
+        "undated": excluded_undated,
     }
 
     manifest_path.write_text(json.dumps(manifest, indent=2))
