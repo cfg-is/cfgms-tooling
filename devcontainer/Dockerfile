@@ -107,7 +107,7 @@ RUN set -eu; \
     install -m 0755 "/tmp/${STEM}/golangci-lint" "$(go env GOPATH)/bin/golangci-lint"; \
     rm -rf "/tmp/${STEM}.tar.gz" "/tmp/${STEM}"
 
-# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.72.0 is the
+# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.73.0 is the
 # post-incident clean release. We download the project's release archive and
 # verify its SHA-256 against a pinned value before extraction, rather than
 # piping the trivy main branch's install.sh through `sh` (whose contents are
@@ -116,10 +116,10 @@ RUN set -eu; \
 # Per-architecture checksums from trivy_<ver>_checksums.txt release asset at
 # https://github.com/aquasecurity/trivy/releases/download/<ver>/trivy_<ver>_checksums.txt
 RUN set -eu; \
-    TRIVY_VERSION='v0.72.0'; \
+    TRIVY_VERSION='v0.73.0'; \
     case "$TARGETARCH" in \
-      amd64) TRIVY_ARCH='Linux-64bit'; TRIVY_SHA256='bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea' ;; \
-      arm64) TRIVY_ARCH='Linux-ARM64'; TRIVY_SHA256='2ca2c023109c2db6b2b77366b6717291452d4531167377d95c79547f0c8e3467' ;; \
+      amd64) TRIVY_ARCH='Linux-64bit'; TRIVY_SHA256='2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b' ;; \
+      arm64) TRIVY_ARCH='Linux-ARM64'; TRIVY_SHA256='13833d97e8a1a5367471c372a173180157f593bece570e20d5d925fef552f5dd' ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     ARCHIVE="trivy_${TRIVY_VERSION#v}_${TRIVY_ARCH}.tar.gz"; \
