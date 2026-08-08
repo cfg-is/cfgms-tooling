@@ -222,6 +222,71 @@ class TestPreviouslyWorkingForms(unittest.TestCase):
         self.assertEqual(scope(None), [])
 
 
+class TestDecoratedSectionHeaders(unittest.TestCase):
+    """A decorated `## ` header must still resolve to the section it names.
+
+    Exact equality was the original rule, so `## Files In Scope (2 occurrences —
+    lockstep required)` made the section read as ABSENT — and absent is the
+    dangerous direction: the dispatch gate hits `if not my_files:` and dispatches
+    with file-overlap conflict detection disabled.
+
+    Measured on four live stories (#3208-#3211) whose bodies all decorate the
+    header. Two of them (#3209, #3211) edit the same workflow file, so the bug
+    would have let them run in parallel on `release.yml`.
+    """
+
+    def test_parenthetical_decoration(self):
+        body = "## Files In Scope (2 occurrences — lockstep required)\n\n- `a/b.go`\n"
+        self.assertEqual(PF.extract_section(body, "Files In Scope"), "- `a/b.go`")
+
+    def test_em_dash_and_colon_decorations(self):
+        for header in (
+            "## Files In Scope — lockstep required",
+            "## Files In Scope: two files",
+            "## Files In Scope [draft]",
+            "## Files In Scope, plus tests",
+        ):
+            body = header + "\n\n- `a/b.go`\n"
+            self.assertEqual(
+                PF.extract_section(body, "Files In Scope"), "- `a/b.go`", header
+            )
+
+    def test_a_longer_section_name_is_not_a_decoration(self):
+        # `## Files In Scope Notes` is a DIFFERENT section. Matching it here would
+        # silently attribute another section's content to this one.
+        body = "## Files In Scope Notes\n\n- `a/b.go`\n"
+        self.assertIsNone(PF.extract_section(body, "Files In Scope"))
+
+    def test_exact_header_wins_over_a_decorated_one(self):
+        body = (
+            "## Files In Scope (extra)\n\n- `x/decorated.go`\n\n"
+            "## Files In Scope\n\n- `y/plain.go`\n"
+        )
+        self.assertEqual(PF.extract_section(body, "Files In Scope"), "- `y/plain.go`")
+
+    def test_decoration_applies_to_dependencies_too(self):
+        body = "## Dependencies (none — self-contained)\n\n- #1140\n"
+        parsed = PF.parse_story(
+            {"number": 1, "title": "t", "state": "OPEN",
+             "body": body + "\n## Files In Scope\n\n- `a/b.go`\n"}
+        )
+        self.assertEqual(parsed["deps_parsed"], [1140])
+
+    def test_the_live_3209_header_yields_its_file(self):
+        # Verbatim from story #3209, the shape that was silently losing conflict
+        # detection in production.
+        body = (
+            "## Files In Scope (2 occurrences — lockstep required)\n\n"
+            "- `.github/workflows/release.yml:323` — `uses: actions/attest@59d89421`\n"
+        )
+        parsed = PF.parse_story(
+            {"number": 3209, "title": "t", "state": "OPEN",
+             "body": "## Dependencies\n\nNone\n\n" + body}
+        )
+        self.assertEqual(parsed["files_parsed"], [".github/workflows/release.yml"])
+        self.assertEqual(parsed["parse_warnings"], [])
+
+
 class TestParseStoryIntegration(unittest.TestCase):
     """The strict set feeds files_parsed; the loose body scan stays permissive."""
 

@@ -1015,17 +1015,54 @@ def code_health_check():
     return result
 
 
+#: Characters that may begin a decoration after a section name. A real body writes
+#: `## Files In Scope (2 occurrences — lockstep required)` and means the Files In
+#: Scope section; anything starting with a word character (`## Files In Scope Notes`)
+#: is a different section and must not match.
+_HEADER_DECORATION = r"(?:\s*[(\[{:,—–-].*)?$"
+
+
+def _header_matches(header_text, section_name):
+    """Whether a `## ` header names this section, decorated or not.
+
+    Exact equality alone was the original rule, which made a decorated header
+    invisible: `extract_section` returned None and callers read the section as
+    ABSENT. For `## Files In Scope` that is the dangerous direction — the dispatch
+    gate then hits `if not my_files:` and dispatches with file-overlap conflict
+    detection disabled. Measured on four open workflow-pin stories (#3208-#3211),
+    which conflict with each other and so were the worst possible set to lose
+    conflict checking on.
+    """
+    return bool(re.match(
+        re.escape(section_name.strip().lower()) + _HEADER_DECORATION,
+        header_text.strip().lower(),
+    ))
+
+
 def extract_section(body, section_name):
-    """Extract text under `## <section_name>` until the next `## ` or EOF."""
+    """Extract text under `## <section_name>` until the next `## ` or EOF.
+
+    A decorated header (`## Dependencies (none)`) resolves to the section it names.
+    An exact header wins over a decorated one when a body carries both, so adding
+    a decorated variant can never steal the section from the plain heading.
+    """
     if not body:
         return None
     headers = list(SECTION_RE.finditer(body))
+
+    def _slice(i):
+        start = headers[i].end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(body)
+        return body[start:end].strip()
+
+    decorated = None
     for i, m in enumerate(headers):
-        if m.group(1).strip().lower() == section_name.lower():
-            start = m.end()
-            end = headers[i + 1].start() if i + 1 < len(headers) else len(body)
-            return body[start:end].strip()
-    return None
+        text = m.group(1).strip().lower()
+        if text == section_name.strip().lower():
+            return _slice(i)
+        if decorated is None and _header_matches(m.group(1), section_name):
+            decorated = i
+    return _slice(decorated) if decorated is not None else None
 
 
 def extract_scope_paths(section):
