@@ -331,6 +331,7 @@ query {
         mergeStateStatus
         autoMergeRequest { enabledAt }
         author { login }
+        files(first: 100) { totalCount nodes { path } }
         closingIssuesReferences(first: 5) { nodes { number } }
         labels(first: 20) { nodes { name } }
         timelineItems(itemTypes: [LABELED_EVENT, ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT], first: 50) {
@@ -375,7 +376,10 @@ query {
   }
 }
 """
-    empty = {"epics": [], "merge_queue": [], "prs": [], "body_refs": {}}
+    # `ok` distinguishes "the query ran and found nothing" from "the query
+    # failed" — callers that gate on PR-derived data need that difference
+    # rather than reading an empty list as authoritative (Issue #3294).
+    empty = {"epics": [], "merge_queue": [], "prs": [], "body_refs": {}, "ok": False}
     data = gh("api", "graphql", "-f", f"query={query}", check=False)
     if not data:
         return empty
@@ -425,6 +429,18 @@ query {
                 if c and c.get("number") is not None
             ],
             "author_login": ((n.get("author") or {}).get("login")) or "",
+            # Actual changed files (Issue #3294). The dispatch overlap gate unions
+            # these with the story's declared `## Files In Scope`, because a branch
+            # that drifts outside its declaration is otherwise invisible to the
+            # gate — and the gate fails open. `files_truncated` marks a PR with
+            # more than the 100 paths this query can carry; its file list is
+            # incomplete and is treated as a degraded signal, same as a failed
+            # fetch.
+            "files": [
+                f.get("path") for f in (((n.get("files") or {}).get("nodes")) or [])
+                if f and f.get("path")
+            ],
+            "files_truncated": (((n.get("files") or {}).get("totalCount")) or 0) > 100,
             "labels": ((n.get("labels") or {}).get("nodes")) or [],
             "timeline_items": ((n.get("timelineItems") or {}).get("nodes")) or [],
             "comments": ((n.get("comments") or {}).get("nodes")) or [],
@@ -445,7 +461,7 @@ query {
             seen.add(epic_num)
             counts[epic_num] = counts.get(epic_num, 0) + 1
 
-    return {"epics": epics, "merge_queue": merge_queue, "prs": prs, "body_refs": counts}
+    return {"epics": epics, "merge_queue": merge_queue, "prs": prs, "body_refs": counts, "ok": True}
 
 
 def gh_graphql_issues_batch(numbers):
@@ -1264,9 +1280,46 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
     story already picked this cycle.
     """
     caps = caps or {DEFAULT_ENV}
+    # Per active story, the declared scope and the PR's actual changed files are
+    # kept apart (Issue #3294) so a hold can name which source produced the
+    # overlap. Comparing declared-against-declared alone fails open: a branch
+    # that drifts outside its declaration is invisible to the gate.
     active_file_sets = [
-        (s["number"], set(s["files_parsed"])) for s in active_stories
+        {
+            "number": s["number"],
+            "declared": set(s.get("files_parsed") or []),
+            "pr_files": set(s.get("pr_files") or []),
+            "pr_number": s.get("pr_number"),
+            "fetch_failed": bool(s.get("pr_files_fetch_failed")),
+        }
+        for s in active_stories
     ]
+
+    # An active story whose PR file list could not be read is compared on its
+    # declaration alone — exactly the unverified state this gate exists to close
+    # — so every Ready story that was checked against it says so rather than
+    # silently degrading (AC4). The granularity is per-cycle, not per-PR: the
+    # file lists ride in the single batched overview query, so they fail
+    # together.
+    unread_pr_refs = sorted(
+        f"PR #{a['pr_number']}" if a["pr_number"] else f"story #{a['number']}"
+        for a in active_file_sets if a["fetch_failed"]
+    )
+    pr_files_caveat = None
+    if unread_pr_refs:
+        pr_files_caveat = (
+            "pr_files_unread_conflict_check_incomplete — changed files unavailable for "
+            + ", ".join(unread_pr_refs)
+            + "; overlap with those stories was checked against declared scope only"
+        )
+
+    def with_caveat(rec):
+        """Attach the degraded-fetch caveat, preserving any existing one."""
+        if not pr_files_caveat:
+            return rec
+        existing = rec.get("caveat")
+        rec["caveat"] = f"{existing}; {pr_files_caveat}" if existing else pr_files_caveat
+        return rec
 
     recommendations = []
     picked_file_sets = []
@@ -1335,18 +1388,37 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
             picked_file_sets.append((num, set()))
             continue
 
-        active_hit = next(
-            ((n, my_files & f) for n, f in active_file_sets if my_files & f),
-            None,
-        )
+        active_hit = None
+        for a in active_file_sets:
+            declared_shared = my_files & a["declared"]
+            pr_shared = my_files & a["pr_files"]
+            if declared_shared or pr_shared:
+                active_hit = (a, declared_shared, pr_shared)
+                break
         if active_hit:
-            n, shared = active_hit
-            recommendations.append({
+            a, declared_shared, pr_shared = active_hit
+            # Name the source, so a hold caused purely by branch drift is
+            # distinguishable from one the declaration already predicted (AC2).
+            sources = []
+            if declared_shared:
+                sources.append(
+                    f"declared scope on: {', '.join(sorted(declared_shared))}"
+                )
+            if pr_shared:
+                pr_ref = f" PR #{a['pr_number']}" if a["pr_number"] else ""
+                sources.append(
+                    f"actual changed files of{pr_ref or ' its open PR'} on: "
+                    f"{', '.join(sorted(pr_shared))}"
+                )
+            recommendations.append(with_caveat({
                 "number": num,
                 "item_id": item_id,
                 "action": "hold",
-                "reason": f"file-conflict with active #{n} (in-progress or open PR) on: {', '.join(sorted(shared))}",
-            })
+                "reason": (
+                    f"file-conflict with active #{a['number']} "
+                    f"(in-progress or open PR) — " + "; ".join(sources)
+                ),
+            }))
             continue
 
         picked_hit = next(
@@ -1355,20 +1427,20 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
         )
         if picked_hit:
             n, shared = picked_hit
-            recommendations.append({
+            recommendations.append(with_caveat({
                 "number": num,
                 "item_id": item_id,
                 "action": "hold",
                 "reason": f"file-conflict with dispatch-candidate #{n} on: {', '.join(sorted(shared))}",
-            })
+            }))
             continue
 
-        recommendations.append({
+        recommendations.append(with_caveat({
             "number": num,
             "item_id": item_id,
             "action": "dispatch",
             "reason": "deps clear; no file overlap with in-progress or dispatch set",
-        })
+        }))
         picked_file_sets.append((num, my_files))
 
     return recommendations
@@ -2093,6 +2165,10 @@ def main():
             degraded_reasons.append(f"graphql pipeline overview failed: {e}")
             overview = {}
         prs = overview.get("prs") or []
+        # When the overview query failed, `prs` is empty because nothing was
+        # read — not because no PRs exist. The dispatch overlap gate must not
+        # read that as "no active story has drifted" (Issue #3294).
+        overview_ok = bool(overview.get("ok"))
         epics_summary = overview.get("epics") or []
         merge_queue = overview.get("merge_queue") or []
         body_refs = overview.get("body_refs") or {}
@@ -2201,11 +2277,22 @@ def main():
     ready_nums = list(ready_item_id_by_num.keys())
     in_progress_nums = list(in_progress_item_id_by_num.keys())
 
+    # story number -> that story's open PR (Issue #3294). The PR's own `number`
+    # is not the story's issue number; capture the whole entry here rather than
+    # re-deriving the linkage later, so the dispatch gate can read the PR's
+    # actual changed files.
     pr_story_nums = []
+    pr_by_story_num = {}
     for pr in prs:
         m = BRANCH_STORY_RE.match(pr.get("headRefName", ""))
         if m and m.group(1) and m.group(1).isdigit():
-            pr_story_nums.append(int(m.group(1)))
+            story_num = int(m.group(1))
+            pr_story_nums.append(story_num)
+            # Lowest PR number wins if a story somehow has several open PRs, so
+            # the choice is deterministic across cycles.
+            existing = pr_by_story_num.get(story_num)
+            if existing is None or (pr.get("number") or 0) < (existing.get("number") or 0):
+                pr_by_story_num[story_num] = pr
     active_story_nums = sorted(set(in_progress_nums + pr_story_nums))
     all_story_nums = sorted(set(ready_nums + active_story_nums))
 
@@ -2296,6 +2383,25 @@ def main():
             p = parse_story(story_bodies[n])
             p["item_id"] = ""
             active_parsed.append(p)
+
+    # Union the actual changed files of each active story's open PR into its
+    # entry (Issue #3294). A story whose implementation drifts outside its
+    # declared `## Files In Scope` is otherwise invisible to the overlap gate,
+    # and the gate fails open — measured on #3130/#3284, where a story
+    # declaring scripts/*.sh had a PR rewriting pkg/ha/raft_consensus.go and a
+    # colliding story was dispatched anyway.
+    #
+    # An active story with no open PR keeps declaration-only behaviour and
+    # costs no extra call: the file lists ride along in the single overview
+    # round trip that was already being made.
+    for p in active_parsed:
+        pr = pr_by_story_num.get(p.get("number"))
+        p["pr_number"] = (pr or {}).get("number")
+        p["pr_files"] = list((pr or {}).get("files") or [])
+        # Degraded whenever the PR's file list cannot be trusted to be complete:
+        # the whole overview query failed (coarse — one caveat per cycle rather
+        # than per PR), or this PR has more changed files than the query carries.
+        p["pr_files_fetch_failed"] = (not overview_ok) or bool((pr or {}).get("files_truncated"))
 
     # Phase 3: fetch states for every unique dep referenced across ready stories.
     # Reuse story_bodies first (deps often overlap with already-fetched stories);
