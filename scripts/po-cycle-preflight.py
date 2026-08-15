@@ -1162,10 +1162,22 @@ def parse_story(issue):
     all_nums = sorted({int(n) for n in ISSUE_NUM_RE.findall(body) if number is None or int(n) != number})
     all_paths = sorted(set(BACKTICK_PATH_RE.findall(body)) | set(BARE_PATH_RE.findall(body)))
 
+    # An epic is never a dispatchable unit of work — it is decomposed into
+    # stories (Step 7) and closed by a sweep once its sub-issues land. A board
+    # item backed by an epic-labelled issue must therefore be held by the
+    # dispatch gate and ignored by the stalled-dispatch detector, which would
+    # otherwise re-dispatch it every cycle (an epic has no container and no PR
+    # of its own by construction, so it looks permanently "stalled").
+    label_names = {
+        ((l.get("name") if isinstance(l, dict) else l) or "").lower()
+        for l in (issue.get("labels") or [])
+    }
+
     return {
         "number": number,
         "title": issue.get("title", ""),
         "state": issue.get("state"),
+        "is_epic": "epic" in label_names,
         "parse_ok": len(warnings) == 0,
         "parse_warnings": warnings,
         "deps_parsed": deps_parsed,
@@ -1220,7 +1232,7 @@ def ci_summary(checks):
     }
 
 
-def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries):
+def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries, epic_nums=None):
     """Detect In-Progress stories with no running agent container and no open PR.
 
     A story is stalled when:
@@ -1236,7 +1248,14 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries):
 
     Pure draft items (number=None) are skipped — they have no container or
     branch naming convention to cross-reference.
+
+    Epic-backed items (numbers in `epic_nums`) are skipped too. An epic tracks
+    its children and never owns a container or a branch of its own, so it
+    matches every stall condition permanently; without this guard an In-Progress
+    epic is recommended for re-dispatch on every cycle and an agent is burned
+    trying to implement a whole epic as one story.
     """
+    epic_nums = set(epic_nums or ())
     running_story_nums = set()
     for name in containers or []:
         tail = name.removeprefix("cfg-agent-")
@@ -1253,6 +1272,8 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries):
     for item in in_progress_issues:
         n = item.get("number")
         if n is None:
+            continue
+        if n in epic_nums:
             continue
         if n in running_story_nums:
             continue
@@ -1345,6 +1366,21 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
                 "item_id": item_id,
                 "action": "hold",
                 "reason": f"story issue is {state} — board item is stale, move it to Done",
+                "stale_board": True,
+            })
+            continue
+
+        # Epic gate. An epic is decomposed, never dispatched: it has no single
+        # branch, no Files In Scope, and dispatching one burns an agent session
+        # on a container of other people's stories. Runs alongside the
+        # self-closure gate so the board anomaly is reported regardless of
+        # routing, deps or file overlap.
+        if s.get("is_epic"):
+            recommendations.append({
+                "number": num,
+                "item_id": item_id,
+                "action": "hold",
+                "reason": "item is an epic, not a dispatchable story — epics are decomposed (Step 7), never dispatched",
                 "stale_board": True,
             })
             continue
@@ -2558,6 +2594,10 @@ def main():
     )
     out["stalled_dispatches"] = compute_stalled_dispatches(
         in_progress_issues, containers, pr_summaries,
+        epic_nums={
+            s["number"] for s in in_progress_parsed
+            if s.get("is_epic") and s.get("number") is not None
+        },
     )
 
     parse_warning_count = sum(

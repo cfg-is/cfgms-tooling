@@ -108,6 +108,36 @@ result = m.compute_stalled_dispatches(
 )
 check("pr-fix container does not prevent stall flag", len(result), 1)
 
+# ── Epic-backed item — must NOT be flagged ──
+# An epic never owns a container or a branch, so it matches every stall
+# condition forever. Without the epic guard the cron re-dispatches it every
+# cycle and an agent tries to implement a whole epic as one story.
+result = m.compute_stalled_dispatches(
+    [mk_issue(2911, title="DNA clean-break epic")],
+    containers=[],
+    pr_summaries=[],
+    epic_nums={2911},
+)
+check("epic-backed In Progress item — not flagged", len(result), 0)
+
+# Same input WITHOUT the epic set — proves the guard is what suppresses it,
+# not some other condition in the fixture.
+result = m.compute_stalled_dispatches(
+    [mk_issue(2911, title="DNA clean-break epic")],
+    containers=[],
+    pr_summaries=[],
+)
+check("same item with no epic_nums — still flagged", len(result), 1)
+
+# A stalled story alongside an epic: the story is flagged, the epic is not.
+result = m.compute_stalled_dispatches(
+    [mk_issue(2911), mk_issue(3370)],
+    containers=[],
+    pr_summaries=[],
+    epic_nums={2911},
+)
+check("epic filtered, real stalled story kept", [r["number"] for r in result], [3370])
+
 # ── Empty inputs — no crash ──
 result = m.compute_stalled_dispatches([], containers=[], pr_summaries=[])
 check("empty inputs — no crash, empty result", result, [])
