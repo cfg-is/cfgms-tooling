@@ -585,6 +585,146 @@ test_17_review_gate_uses_story_review_workflow() {
 }
 
 # ============================================================================
+# _salvage_no_pr — exit-0-with-no-PR salvage (Issue #3397, root cause of #3158)
+#
+# The helpers are loaded via the CFGMS_ENTRYPOINT_SOURCE_ONLY hook, which
+# returns before any agent flow runs. Each test drives the function inside a
+# throwaway git repo with `git`, `gh` and `project-queue.sh` stubbed to record
+# their invocations, so the assertions are on what the function actually did.
+# ============================================================================
+
+setup_salvage_env() {
+    SALVAGE_DIR="$(mktemp -d)"
+    SALVAGE_LOG="$SALVAGE_DIR/calls.log"
+    : > "$SALVAGE_LOG"
+
+    # gh stub — records every invocation.
+    cat > "$SALVAGE_DIR/gh" <<STUB
+#!/usr/bin/env bash
+echo "gh \$*" >> "$SALVAGE_LOG"
+STUB
+    chmod +x "$SALVAGE_DIR/gh"
+
+    # project-queue.sh stub — records field updates.
+    cat > "$SALVAGE_DIR/project-queue.sh" <<STUB
+#!/usr/bin/env bash
+echo "project-queue \$*" >> "$SALVAGE_LOG"
+case "\$1" in
+    get-item) printf '{"fields":{"ZeroWorkRetries":"0"}}\n' ;;
+esac
+STUB
+    chmod +x "$SALVAGE_DIR/project-queue.sh"
+
+    # A real git repo, so `git status --porcelain` reports honestly. Only the
+    # network-touching subcommands are stubbed out.
+    SALVAGE_REPO="$SALVAGE_DIR/repo"
+    mkdir -p "$SALVAGE_REPO"
+    git -C "$SALVAGE_REPO" init -q
+    git -C "$SALVAGE_REPO" config user.email "test@example.com"
+    git -C "$SALVAGE_REPO" config user.name "Test"
+    echo "seed" > "$SALVAGE_REPO/seed.txt"
+    git -C "$SALVAGE_REPO" add seed.txt
+    git -C "$SALVAGE_REPO" commit -q -m "seed"
+
+    cat > "$SALVAGE_DIR/git" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "push" ]]; then
+    echo "git \$*" >> "$SALVAGE_LOG"
+    exit 0
+fi
+exec /usr/bin/env -u PATH_OVERRIDE $(command -v git) "\$@"
+STUB
+    chmod +x "$SALVAGE_DIR/git"
+
+    ORIG_SALVAGE_PATH="$PATH"
+    export PATH="$SALVAGE_DIR:$PATH"
+
+    # Load the helpers without running any agent flow.
+    # shellcheck disable=SC1090
+    CFGMS_ENTRYPOINT_SOURCE_ONLY=1 source "$SCRIPT_DIR/entrypoint.sh"
+}
+
+teardown_salvage_env() {
+    export PATH="$ORIG_SALVAGE_PATH"
+    rm -rf "$SALVAGE_DIR"
+    unset SALVAGE_DIR SALVAGE_LOG SALVAGE_REPO ORIG_SALVAGE_PATH
+}
+
+# T18 — dirty tree: the work is committed and pushed as a draft PR.
+test_18_salvage_captures_uncommitted_work() {
+    setup_salvage_env
+
+    echo "agent work" > "$SALVAGE_REPO/seed.txt"
+
+    (
+        cd "$SALVAGE_REPO" || exit 1
+        CURRENT_BRANCH="feature/story-9999-agent"
+        ISSUE_NUM="9999"
+        EXIT_CODE=0
+        PROJECT_QUEUE="$SALVAGE_DIR/project-queue.sh"
+        CFGMS_PROJECT_ITEM_ID="pv2-test-item"
+        _salvage_no_pr "exited 0 without opening a pull request" > /dev/null 2>&1
+    )
+
+    local log
+    log=$(cat "$SALVAGE_LOG")
+
+    assert_contains "$log" "git push -u origin feature/story-9999-agent" \
+        "salvaged branch is pushed"
+    assert_contains "$log" "pr create --base develop --draft" \
+        "salvaged work becomes a draft PR"
+    assert_contains "$log" "exited 0 without opening a pull request" \
+        "draft PR body carries the reason"
+
+    local subject
+    subject=$(git -C "$SALVAGE_REPO" log --format=%s -1)
+    assert_equals "$subject" "WIP: agent attempt for issue #9999 (exited 0 without opening a pull request)" \
+        "WIP commit records the issue and the reason"
+
+    teardown_salvage_env
+}
+
+# T19 — clean tree: no PR is invented; the item is routed for re-dispatch.
+test_19_salvage_routes_zero_work_for_redispatch() {
+    setup_salvage_env
+
+    (
+        cd "$SALVAGE_REPO" || exit 1
+        CURRENT_BRANCH="feature/story-9999-agent"
+        ISSUE_NUM="9999"
+        EXIT_CODE=0
+        PROJECT_QUEUE="$SALVAGE_DIR/project-queue.sh"
+        CFGMS_PROJECT_ITEM_ID="pv2-test-item"
+        _salvage_no_pr "exited 0 without opening a pull request" > /dev/null 2>&1
+    )
+
+    local log
+    log=$(cat "$SALVAGE_LOG")
+
+    assert_not_contains "$log" "pr create" \
+        "no draft PR is created when there is nothing to capture"
+    assert_contains "$log" "project-queue update-field pv2-test-item ZeroWorkRetries 1" \
+        "retry counter is incremented"
+    assert_contains "$log" "project-queue update-field pv2-test-item status Ready" \
+        "item is reset to Ready for re-dispatch"
+
+    teardown_salvage_env
+}
+
+# T20 — regression guard: the EXIT_CODE==0 branch must salvage a missing PR.
+# This is the exact gap that stranded #3158 — exit 0 was treated as success
+# without ever checking PR_URL.
+test_20_exit_zero_branch_checks_pr_url() {
+    local success_branch
+    success_branch=$(sed -n '/^if \[ "\$EXIT_CODE" -eq 0 \]; then/,/^else$/p' "$SCRIPT_DIR/entrypoint.sh")
+
+    assert_contains "$success_branch" '[ -z "$PR_URL" ]' \
+        "exit-0 branch tests for an empty PR_URL"
+    assert_contains "$success_branch" "_salvage_no_pr" \
+        "exit-0 branch calls the salvage path"
+}
+
+# ============================================================================
 # runner
 # ============================================================================
 
@@ -605,6 +745,9 @@ run_test "T14 — dry-run issue mode: no injection, project body present" test_1
 run_test "T15 — dry-run branch mode: no injection, project body present" test_15_dry_run_branch_mode_no_injection
 run_test "T16 — hard refusal when CFGMS_PROJECT_ITEM_ID unset" test_16_hard_refusal_missing_project_item_id
 run_test "T17 — dry-run: review gate invokes story-review workflow" test_17_review_gate_uses_story_review_workflow
+run_test "T18 — salvage: exit-0 with work becomes a draft PR" test_18_salvage_captures_uncommitted_work
+run_test "T19 — salvage: exit-0 with no work routes for re-dispatch" test_19_salvage_routes_zero_work_for_redispatch
+run_test "T20 — regression guard: exit-0 branch checks PR_URL" test_20_exit_zero_branch_checks_pr_url
 
 echo ""
 echo "============================================================"

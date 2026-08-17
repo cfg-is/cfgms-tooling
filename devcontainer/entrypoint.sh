@@ -30,6 +30,123 @@ release_cfgms_lease() {
 }
 trap release_cfgms_lease EXIT
 
+# _zero_work_retry — handle a zero-work failure retry/escalation.
+# Reads the retry count from the ZeroWorkRetries project field rather than from
+# issue comments, so comment content (or count) cannot influence dispatch state.
+# A read failure is treated conservatively: Blocked, not re-dispatch.
+# Globals used: PROJECT_QUEUE, CFGMS_PROJECT_ITEM_ID, ISSUE_NUM, EXIT_CODE
+_zero_work_retry() {
+    local zw_marker="<!-- cfgms-zero-work-retry -->"
+
+    # Read retry count from the project field. On get-item failure zw_read_ok
+    # stays false — a read failure must never be treated as "count is zero".
+    local zw_item_json zw_read_ok=false
+    if zw_item_json=$(bash "$PROJECT_QUEUE" get-item "$CFGMS_PROJECT_ITEM_ID" 2>/dev/null); then
+        zw_read_ok=true
+    fi
+
+    if [[ "$zw_read_ok" != "true" ]]; then
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
+            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — retry counter unavailable (project field read failed). Status set to Blocked for operator review." \
+            2>/dev/null || true
+        echo "Zero-work failure: retry counter unavailable — set to Blocked (conservative)"
+        return
+    fi
+
+    # Parse ZeroWorkRetries; a missing or empty value means first failure (treat as 0).
+    local zw_count
+    zw_count=$(printf '%s' "$zw_item_json" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); v=d.get("fields",{}).get("ZeroWorkRetries",""); print(v if v and v.strip() else "0")' \
+        2>/dev/null || echo "PARSE_ERROR")
+
+    if [[ "$zw_count" == "PARSE_ERROR" ]] || ! [[ "$zw_count" =~ ^[0-9]+$ ]]; then
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        echo "Zero-work failure: retry counter parse error — set to Blocked (conservative)"
+        return
+    fi
+
+    if [ "$zw_count" -lt 3 ]; then
+        local new_count=$((zw_count + 1))
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" "ZeroWorkRetries" "$new_count" \
+            2>/dev/null || echo "WARN: failed to increment ZeroWorkRetries field"
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Ready" \
+            2>/dev/null || echo "WARN: failed to reset status Ready"
+        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
+            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — no changes produced (likely usage limit / token reauth / early crash). Status reset to Ready for re-dispatch (retry ${new_count}/3)." \
+            2>/dev/null || true
+        echo "Zero-work failure: reset to Ready for re-dispatch (retry ${new_count}/3)"
+    else
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
+            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — 3 re-dispatch retries exhausted with no progress. Status set to Blocked for operator review." \
+            2>/dev/null || true
+        echo "Zero-work failure: retry cap reached — set to Blocked for operator review"
+    fi
+}
+
+# _salvage_no_pr — the run produced no PR. Capture whatever work exists so the
+# item is resumable, or route it for re-dispatch when there is nothing to keep.
+#
+# Called from BOTH exit paths. A zero exit code is not evidence that a PR was
+# opened: an agent that ends its turn waiting on a background task exits 0 with
+# no PR and no pushed branch, and without this the run produced no artifact and
+# no re-dispatch signal, stranding the item at In Progress forever (Issue #3158).
+#
+# $1 — human-readable reason, used in the WIP commit and draft-PR body.
+# Globals used: CURRENT_BRANCH, ISSUE_NUM, EXIT_CODE, PROJECT_QUEUE,
+#               CFGMS_PROJECT_ITEM_ID
+_salvage_no_pr() {
+    local reason="$1"
+
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        # The agent produced work but opened no PR — capture it as a draft PR so
+        # the cron's resume_failed_session path can pick it up.
+        git add --update
+        local local_issue_ref=""
+        if [[ -n "${ISSUE_NUM:-}" ]]; then
+            local_issue_ref=" for issue #${ISSUE_NUM}"
+        fi
+        git commit -m "WIP: agent attempt${local_issue_ref} (${reason})" \
+            2>/dev/null || true
+        git push -u origin "$CURRENT_BRANCH" 2>/dev/null || true
+        gh pr create --base develop --draft \
+            --title "WIP: ${CURRENT_BRANCH} (agent produced no PR)" \
+            --body "Agent session ended with exit code ${EXIT_CODE} and no pull request: ${reason}. Review container logs for details." \
+            2>/dev/null || true
+        return
+    fi
+
+    # Zero-work run: the agent produced no changes — it never got going (usage
+    # limit, token reauth, early crash) or it stalled before doing anything.
+    # There is nothing to capture as a draft PR, and leaving the item at In
+    # Progress strands it forever (the cron won't re-dispatch In Progress work).
+    # Reset it to Ready so the next cron cycle re-dispatches it, capped so a
+    # persistent failure escalates instead of looping. The retry count is read
+    # from the ZeroWorkRetries project field — not from issue comments — so
+    # comment content cannot influence dispatch state.
+    if [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
+        echo "Zero-work run: no project item id — cannot route for re-dispatch"
+    elif [[ -z "${ISSUE_NUM:-}" ]]; then
+        # No issue linked — escalate rather than risk dispatch loops without
+        # operator-visible comment history.
+        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
+            2>/dev/null || echo "WARN: failed to set status Blocked"
+        echo "Zero-work run (no issue linked) — set to Blocked"
+    else
+        _zero_work_retry
+    fi
+}
+
+# Testability hook: sourcing this file with CFGMS_ENTRYPOINT_SOURCE_ONLY=1
+# yields the helper definitions above without running any agent flow.
+if [[ "${CFGMS_ENTRYPOINT_SOURCE_ONLY:-}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # --- Argument parsing ---
 MODE="issue"
 ISSUE_NUM=""
@@ -152,64 +269,6 @@ gh_api_with_retry() {
     fi
     echo "ERROR: ${desc} failed after retry: ${result}" >&2
     return 1
-}
-
-# _zero_work_retry — handle a zero-work failure retry/escalation.
-# Reads the retry count from the ZeroWorkRetries project field rather than from
-# issue comments, so comment content (or count) cannot influence dispatch state.
-# A read failure is treated conservatively: Blocked, not re-dispatch.
-# Globals used: PROJECT_QUEUE, CFGMS_PROJECT_ITEM_ID, ISSUE_NUM, EXIT_CODE
-_zero_work_retry() {
-    local zw_marker="<!-- cfgms-zero-work-retry -->"
-
-    # Read retry count from the project field. On get-item failure zw_read_ok
-    # stays false — a read failure must never be treated as "count is zero".
-    local zw_item_json zw_read_ok=false
-    if zw_item_json=$(bash "$PROJECT_QUEUE" get-item "$CFGMS_PROJECT_ITEM_ID" 2>/dev/null); then
-        zw_read_ok=true
-    fi
-
-    if [[ "$zw_read_ok" != "true" ]]; then
-        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
-            2>/dev/null || echo "WARN: failed to set status Blocked"
-        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
-            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — retry counter unavailable (project field read failed). Status set to Blocked for operator review." \
-            2>/dev/null || true
-        echo "Zero-work failure: retry counter unavailable — set to Blocked (conservative)"
-        return
-    fi
-
-    # Parse ZeroWorkRetries; a missing or empty value means first failure (treat as 0).
-    local zw_count
-    zw_count=$(printf '%s' "$zw_item_json" | python3 -c \
-        'import json,sys; d=json.load(sys.stdin); v=d.get("fields",{}).get("ZeroWorkRetries",""); print(v if v and v.strip() else "0")' \
-        2>/dev/null || echo "PARSE_ERROR")
-
-    if [[ "$zw_count" == "PARSE_ERROR" ]] || ! [[ "$zw_count" =~ ^[0-9]+$ ]]; then
-        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
-            2>/dev/null || echo "WARN: failed to set status Blocked"
-        echo "Zero-work failure: retry counter parse error — set to Blocked (conservative)"
-        return
-    fi
-
-    if [ "$zw_count" -lt 3 ]; then
-        local new_count=$((zw_count + 1))
-        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" "ZeroWorkRetries" "$new_count" \
-            2>/dev/null || echo "WARN: failed to increment ZeroWorkRetries field"
-        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Ready" \
-            2>/dev/null || echo "WARN: failed to reset status Ready"
-        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
-            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — no changes produced (likely usage limit / token reauth / early crash). Status reset to Ready for re-dispatch (retry ${new_count}/3)." \
-            2>/dev/null || true
-        echo "Zero-work failure: reset to Ready for re-dispatch (retry ${new_count}/3)"
-    else
-        bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
-            2>/dev/null || echo "WARN: failed to set status Blocked"
-        [[ -n "${ISSUE_NUM:-}" ]] && gh issue comment "$ISSUE_NUM" --body \
-            "${zw_marker} Zero-work agent failure (exit ${EXIT_CODE}) — 3 re-dispatch retries exhausted with no progress. Status set to Blocked for operator review." \
-            2>/dev/null || true
-        echo "Zero-work failure: retry cap reached — set to Blocked for operator review"
-    fi
 }
 
 # --- Shared prompt sections ---
@@ -1022,46 +1081,20 @@ if [ "$EXIT_CODE" -eq 0 ]; then
             gh pr ready "$PR_URL" 2>/dev/null || true
         fi
     fi
+
+    # A zero exit code is NOT evidence that a PR exists. An agent that ends its
+    # turn waiting on a background task exits 0 having pushed nothing (Issue
+    # #3158). Salvage it on the same path a failed run takes, so the work
+    # becomes a resumable draft PR instead of vanishing.
+    if [[ "$MODE" != "fix-pr" ]] && [[ "$MODE" != "resolve-conflict" ]] && [ -z "$PR_URL" ]; then
+        echo "WARN: agent exited 0 but opened no pull request — salvaging"
+        _salvage_no_pr "exited 0 without opening a pull request"
+    fi
 else
     echo "Agent failed with exit code ${EXIT_CODE}"
 
     if [[ "$MODE" != "fix-pr" ]] && [[ "$MODE" != "resolve-conflict" ]] && [ -z "$PR_URL" ]; then
-        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-            # Agent produced work but failed — capture it as a draft PR so the
-            # cron's resume_failed_session path can pick it up.
-            git add --update
-            local_issue_ref=""
-            if [[ -n "$ISSUE_NUM" ]]; then
-                local_issue_ref=" for issue #${ISSUE_NUM}"
-            fi
-            git commit -m "WIP: agent attempt${local_issue_ref} (failed validation)" \
-                2>/dev/null || true
-            git push -u origin "$CURRENT_BRANCH" 2>/dev/null || true
-            gh pr create --base develop --draft \
-                --title "WIP: ${CURRENT_BRANCH} (agent failed)" \
-                --body "Agent session failed with exit code ${EXIT_CODE}. Review container logs for details." \
-                2>/dev/null || true
-        else
-            # Zero-work failure: the agent produced no changes — it never got
-            # going (usage limit, token reauth, early crash). There is nothing
-            # to capture as a draft PR, and leaving the item at In Progress
-            # strands it forever (the cron won't re-dispatch In Progress work).
-            # Reset it to Ready so the next cron cycle re-dispatches it, capped
-            # so a persistent failure escalates instead of looping. The retry
-            # count is read from the ZeroWorkRetries project field — not from
-            # issue comments — so comment content cannot influence dispatch state.
-            if [[ -z "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
-                echo "Zero-work failure: no project item id — cannot route for re-dispatch"
-            elif [[ -z "$ISSUE_NUM" ]]; then
-                # No issue linked — escalate rather than risk dispatch loops without
-                # operator-visible comment history.
-                bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Blocked" \
-                    2>/dev/null || echo "WARN: failed to set status Blocked"
-                echo "Zero-work failure (no issue linked) — set to Blocked"
-            else
-                _zero_work_retry
-            fi
-        fi
+        _salvage_no_pr "failed validation"
     fi
 fi
 
