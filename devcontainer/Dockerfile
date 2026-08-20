@@ -107,7 +107,7 @@ RUN set -eu; \
     install -m 0755 "/tmp/${STEM}/golangci-lint" "$(go env GOPATH)/bin/golangci-lint"; \
     rm -rf "/tmp/${STEM}.tar.gz" "/tmp/${STEM}"
 
-# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.73.0 is the
+# Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.74.0 is the
 # post-incident clean release. We download the project's release archive and
 # verify its SHA-256 against a pinned value before extraction, rather than
 # piping the trivy main branch's install.sh through `sh` (whose contents are
@@ -116,10 +116,10 @@ RUN set -eu; \
 # Per-architecture checksums from trivy_<ver>_checksums.txt release asset at
 # https://github.com/aquasecurity/trivy/releases/download/<ver>/trivy_<ver>_checksums.txt
 RUN set -eu; \
-    TRIVY_VERSION='v0.73.0'; \
+    TRIVY_VERSION='v0.74.0'; \
     case "$TARGETARCH" in \
-      amd64) TRIVY_ARCH='Linux-64bit'; TRIVY_SHA256='2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b' ;; \
-      arm64) TRIVY_ARCH='Linux-ARM64'; TRIVY_SHA256='13833d97e8a1a5367471c372a173180157f593bece570e20d5d925fef552f5dd' ;; \
+      amd64) TRIVY_ARCH='Linux-64bit'; TRIVY_SHA256='2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a' ;; \
+      arm64) TRIVY_ARCH='Linux-ARM64'; TRIVY_SHA256='b94ce1976bbf3c15b514b605ee88be7c6d94a29be2302847ff01cb794d47aad5' ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     ARCHIVE="trivy_${TRIVY_VERSION#v}_${TRIVY_ARCH}.tar.gz"; \
@@ -143,7 +143,7 @@ RUN set -eu; \
     && chmod +x "$GOPATH/bin/nancy"
 
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.96.0/scripts/install.sh | sh -s -- -b /usr/local/bin v3.96.0 || true
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.0/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.0 || true
 
 # Claude Code — pinned, never @latest (same supply-chain rule as every other
 # tool here; see dependency-pin-check.yml). An unpinned install also froze
