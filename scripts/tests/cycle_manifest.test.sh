@@ -53,7 +53,24 @@ export CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger"
 CYCLE_DIR="${PO_CACHE_DIR}/cycles"
 
 printf '\n== no cycle open: a subcommand call is a silent no-op ==\n'
-out="$(bash "$POACT" merge-queue 2>&1)"
+# `merge-queue` shells out to `gh`. Unauthenticated -- every CI runner -- gh
+# prints its login prompt and po-act.sh exits 4, so this asserted rc==0 against
+# the environment rather than against the manifest logic it exists to test, and
+# `set -e` aborted the whole file at this line. The rest of the test is already
+# hermetic (sandboxed PO_CACHE_DIR, ledger dir, CFGMS_TEST_REPO_ROOT); the gh
+# dependency was the one hole. Stub it so the assertion measures what it claims:
+# a subcommand with no cycle open runs normally and creates no manifest.
+# (Issue #3459 -- found when .claude/scripts/tests/ was first wired into `make test`.)
+GH_STUB_DIR="${SANDBOX}/ghstub"
+mkdir -p "$GH_STUB_DIR"
+cat > "$GH_STUB_DIR/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# Empty, successful answer for whatever merge-queue asks. This test asserts on
+# manifest side-effects, never on gh's payload.
+exit 0
+GHSTUB
+chmod +x "$GH_STUB_DIR/gh"
+out="$(PATH="${GH_STUB_DIR}:$PATH" bash "$POACT" merge-queue 2>&1)"
 rc=$?
 check_eq "merge-queue still runs normally with no cycle open" "$rc" "0"
 if [[ -d "$CYCLE_DIR" ]]; then

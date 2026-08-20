@@ -138,6 +138,45 @@ result = m.compute_stalled_dispatches(
 )
 check("epic filtered, real stalled story kept", [r["number"] for r in result], [3370])
 
+# ── Closed issue is NOT a stall (Issue #3459) ──
+#
+# The dangerous false positive. A story that COMPLETED between two cycles looks
+# identical to one whose container was killed: no container because the agent
+# finished, no OPEN PR because the PR merged. Only the issue state separates
+# them, and the board status that would otherwise disambiguate is exactly the
+# field that drifts — an auto-closed issue leaves its item at `In Progress`.
+#
+# Observed on story #3385 on 2026-08-20: PR #3454 merged 04:18:02Z, issue
+# auto-closed 04:18:03Z, and preflight reported "no container cfg-agent-3385
+# running and no open PR". Both halves true, conclusion wrong. Acting on it
+# would have re-implemented merged work onto a new branch.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3385)],
+    containers=[],
+    pr_summaries=[],
+    closed_nums={3385},
+)
+check("closed issue is not a stall", result, [])
+
+# The guard must not swallow genuine stalls sitting beside a closed one.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3385), mk_issue(3370)],
+    containers=[],
+    pr_summaries=[],
+    closed_nums={3385},
+)
+check("closed filtered, real stalled story kept", [r["number"] for r in result], [3370])
+
+# Absent/empty closed_nums must behave exactly as before — the parameter is
+# optional, and an older caller that omits it still gets stall detection.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3370)],
+    containers=[],
+    pr_summaries=[],
+    closed_nums=None,
+)
+check("closed_nums=None — still detects stall", [r["number"] for r in result], [3370])
+
 # ── Empty inputs — no crash ──
 result = m.compute_stalled_dispatches([], containers=[], pr_summaries=[])
 check("empty inputs — no crash, empty result", result, [])

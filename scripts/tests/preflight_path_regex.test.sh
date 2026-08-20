@@ -6,6 +6,13 @@
 # (Python scripts), Makefile, and Dockerfile(.variant)?. Story #1854 surfaced
 # the gap: a PowerShell-shaped story's Files In Scope parsed to zero matches
 # and got flagged as malformed by the cron.
+#
+# Extended for the same gap in a second shape: .mod / .sum / .nancy-ignore.
+# Story #3451 (a routine go.mod bump) parsed to zero files and dispatched with
+# the file-overlap check comparing against an empty set. The lesson from both is
+# that a missing entry here fails SILENTLY in the under-extraction direction —
+# the story still dispatches, just without its collision guard — so every new
+# file shape we start declaring needs a case added below.
 
 set -euo pipefail
 
@@ -37,6 +44,32 @@ spec.loader.exec_module(m)
 snippet = os.environ["SNIPPET"]
 hits = sorted(set(m.BACKTICK_PATH_RE.findall(snippet)) | set(m.BARE_PATH_RE.findall(snippet)))
 print(",".join(hits))
+PY
+)
+  if [[ "$actual" == "$expected" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n         expected: %s\n         actual:   %s\n' "$description" "$expected" "$actual"
+    fail=$((fail + 1))
+  fi
+}
+
+# Exercises extract_scope_paths() -- the function the dispatcher actually calls.
+# Distinct from assert_paths above, which runs the two regexes raw. Line-suffix
+# stripping (LINE_SUFFIX_RE) happens inside extract_scope_paths, so a `file:12`
+# reference can only be asserted through this path.
+assert_scope() {
+  local description="$1"
+  local section="$2"
+  local expected="$3"
+  ran=$((ran + 1))
+  local actual
+  actual=$(SECTION="$section" PREFLIGHT_PATH="$PREFLIGHT" python3 - <<'PY'
+import importlib.util, os
+spec = importlib.util.spec_from_file_location("preflight", os.environ["PREFLIGHT_PATH"])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+print(",".join(m.extract_scope_paths(os.environ["SECTION"])))
 PY
 )
   if [[ "$actual" == "$expected" ]]; then
@@ -81,6 +114,36 @@ assert_paths "bare Makefile (no slash)"   'See the Makefile.'                   
 assert_paths "prose 'all controller files'" 'Touch all controller package files.' ""
 assert_paths "version number is not a path" 'Bump to v1.2.3 today.'               ""
 assert_paths "empty section"                ''                                      ""
+
+# ── Dependency-manifest files: go.mod / go.sum / .nancy-ignore (Issue #3451) ──
+#
+# Every dependency-bump story declares go.mod and go.sum and nothing else, and
+# neither extension was in the list, so those stories parsed to ZERO files. That
+# is the under-extraction direction the extract_scope_paths docstring warns
+# about: the dispatcher's file-overlap check silently had nothing to compare, so
+# two agents could have been put on go.mod at once. Measured on story #3451,
+# which dispatched with `files_parsed: []` and a `degraded` preflight warning.
+assert_paths "backtick go.mod"        '- `go.mod` — bump require lines'  "go.mod"
+assert_paths "backtick go.sum"        '- `go.sum` — regenerated'         "go.sum"
+assert_paths "backtick .nancy-ignore" '- `.nancy-ignore` — add entry'    ".nancy-ignore"
+assert_paths "bare go.sum with path"  'See vendor/go.sum for the tree.'  "vendor/go.sum"
+
+# Line-suffix stripping has to know these names too, or `go.mod:9-12` is left
+# unmatched exactly as an unlisted extension would be.
+assert_scope "go.mod with line range" '- `go.mod:9-12` — four requires' "go.mod"
+assert_scope "go.sum with line"       '- `go.sum:120` — checksum'        "go.sum"
+assert_scope ".nancy-ignore w/ line"  '- `.nancy-ignore:19` — entry'     ".nancy-ignore"
+
+# False-positive guards for the two new extensions. `mod` and `sum` are ordinary
+# English words, so they must only match as a real extension after a dot.
+assert_paths "prose 'modules'"        'Touch the `modules` package.'     ""
+assert_paths "prose 'summed'"         'The summed total is wrong.'       ""
+assert_paths "bare word go"           'Run `go` build first.'            ""
+
+# ── #3451's actual Files In Scope (the regression that started this one) ──
+FIS_3451='- `go.mod:9-12` — the four direct `require` lines
+- `go.sum` — regenerated'
+assert_scope "#3451 Files In Scope literal" "$FIS_3451" "go.mod,go.sum"
 
 # ── #1854's actual Files In Scope (the regression that started this) ──
 FIS_1854='- `scripts/install-hyperv-host.ps1` — new file

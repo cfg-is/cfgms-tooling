@@ -369,7 +369,16 @@ assert_review_refusal() {
   fixture="${CONFLICT_STUB_DIR}/meta-${merge_state}.json"
   printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"%s"}' \
     "$merge_state" > "$fixture"
+  # Stub the credential gate. It runs BEFORE the conflict guard, so on a host
+  # with no ~/.claude/.credentials.json -- every CI runner -- review-pr returns
+  # DISPATCH_DEFERRED:creds_missing and the guard under test is never reached.
+  # That made the `refused` case fail and, worse, made all four `not_refused`
+  # cases pass for the wrong reason: they only assert the output does not
+  # contain "merge_conflicts", which a creds-deferred message also satisfies.
+  # Injecting CREDS_OK is what actually exercises the guard. (Issue #3459 --
+  # found when .claude/scripts/tests/ was first wired into `make test`.)
   actual=$(GH_FIXTURE="$fixture" PATH="$CONFLICT_STUB_DIR:$PATH" \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
     "$DISPATCH" review-pr 4242 2>&1 | head -1) || true
   case "$expected" in
     refused)

@@ -41,12 +41,12 @@ REPO = "cfg-is/cfgms"
 SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
 ISSUE_NUM_RE = re.compile(r"#(\d+)")
 BACKTICK_PATH_RE = re.compile(
-    r"`((?:[^`\n]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py))"
-    r"|(?:[a-zA-Z0-9_./-]*/)?(?:Makefile|Dockerfile(?:\.[\w-]+)?))`"
+    r"`((?:[^`\n]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum))"
+    r"|(?:[a-zA-Z0-9_./-]*/)?(?:Makefile|Dockerfile(?:\.[\w-]+)?|\.nancy-ignore))`"
 )
 BARE_PATH_RE = re.compile(
     r"(?:^|[\s(\[])"
-    r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py))"
+    r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum))"
 )
 #: A path may be written with the line it refers to (`handlers.go:114`, or a
 #: `:114-126` range). Both PATH regexes above end at the extension, so the colon
@@ -56,8 +56,8 @@ BARE_PATH_RE = re.compile(
 #: Covers extensionless names too (`Dockerfile:155`), which the PATH regexes match
 #: only when the name ends the reference.
 LINE_SUFFIX_RE = re.compile(
-    r"(\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py)"
-    r"|Makefile|Dockerfile(?:\.[\w-]+)?):\d+(?:-\d+)?"
+    r"(\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum)"
+    r"|Makefile|Dockerfile(?:\.[\w-]+)?|\.nancy-ignore):\d+(?:-\d+)?"
 )
 
 #: A declaration inside `## Files In Scope` is conventionally a list item or a
@@ -1232,13 +1232,15 @@ def ci_summary(checks):
     }
 
 
-def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries, epic_nums=None):
+def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
+                               epic_nums=None, closed_nums=None):
     """Detect In-Progress stories with no running agent container and no open PR.
 
     A story is stalled when:
     - Its project status is `In Progress`
     - No container named `cfg-agent-<N>` is currently running
     - No open PR (including WIP drafts) references this story number
+    - Its own issue is NOT closed
 
     Draft PRs count as "open PR" — they should go through dispatch-fix, not
     re-dispatch. Only pure container deaths with no PR artifact trigger this.
@@ -1254,8 +1256,27 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries, epi
     matches every stall condition permanently; without this guard an In-Progress
     epic is recommended for re-dispatch on every cycle and an agent is burned
     trying to implement a whole epic as one story.
+
+    Stories whose own issue is CLOSED (numbers in `closed_nums`) are skipped for
+    the same reason, and it is the more dangerous case. A story that COMPLETED
+    between two cycles looks identical to one whose container was killed: the
+    container is gone because the agent finished, and there is no OPEN PR because
+    the PR merged. Only the issue state distinguishes them, and the board status
+    that would otherwise disambiguate is exactly the field that drifts -- an
+    auto-closed issue leaves its project item at `In Progress` until something
+    reconciles it.
+
+    Without this guard the recommendation is to re-dispatch, and a fresh agent
+    re-implements merged work onto a new branch. Observed on story #3385 on
+    2026-08-20: PR #3454 merged at 04:18:02Z, the issue auto-closed at 04:18:03Z,
+    and the next preflight reported `no container cfg-agent-3385 running and no
+    open PR`. Both halves of that reason were true and the conclusion was wrong.
+
+    `compute_dispatch_recommendations` below already applies this check as its
+    self-closure gate; this function simply never had it.
     """
     epic_nums = set(epic_nums or ())
+    closed_nums = set(closed_nums or ())
     running_story_nums = set()
     for name in containers or []:
         tail = name.removeprefix("cfg-agent-")
@@ -1274,6 +1295,8 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries, epi
         if n is None:
             continue
         if n in epic_nums:
+            continue
+        if n in closed_nums:
             continue
         if n in running_story_nums:
             continue
@@ -2597,6 +2620,10 @@ def main():
         epic_nums={
             s["number"] for s in in_progress_parsed
             if s.get("is_epic") and s.get("number") is not None
+        },
+        closed_nums={
+            s["number"] for s in in_progress_parsed
+            if s.get("state") in ("CLOSED", "MERGED") and s.get("number") is not None
         },
     )
 
