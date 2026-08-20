@@ -73,6 +73,17 @@ NONE_PREFIX_RE = re.compile(r"^\s*none\b\s*[-—:(]", re.IGNORECASE)
 
 BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)")
 
+#: A branch minted by `agent-dispatch.sh`, which always appends `-agent`:
+#: `feature/story-<N>-agent` or `feature/item-<id>-agent`. Anything else on a
+#: `feature/` branch is hand-authored.
+#:
+#: Deliberately NOT `BRANCH_STORY_RE` above. That pattern matches
+#: `feature/story-(\d+)` with no suffix requirement, so it also matches a
+#: hand-named branch such as
+#: `feature/story-3095-real-cluster-network-partition-split-brain` — using it to
+#: decide pipeline ownership would claim genuine manual work.
+AGENT_BRANCH_RE = re.compile(r"^feature/(?:story-\d+|item-[A-Za-z0-9]+)-agent$")
+
 # Permission levels that indicate a trusted (first-party) collaborator.
 _TRUSTED_PERMS = frozenset({"push", "maintain", "admin"})
 
@@ -733,6 +744,53 @@ def _pq_script_path():
     return str(Path(__file__).resolve().parent.parent.parent / "scripts" / "project-queue.sh")
 
 
+def _pipeline_helper_path():
+    """Return the pipeline-helper.sh path, honoring CFGMS_TEST_PIPELINE_HELPER."""
+    override = os.environ.get("CFGMS_TEST_PIPELINE_HELPER")
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent.parent.parent / "scripts" / "pipeline-helper.sh")
+
+
+def live_story_lease_item_ids():
+    """Item IDs holding a live (unexpired) story lease, from `lease-list`.
+
+    One call returns every lease as TSV: ``key<TAB>holder<TAB>exp<TAB>expired``.
+    Story leases are keyed ``story-<ITEM_ID>``; other kinds (``pr-<N>``, ``sweep``)
+    are ignored here.
+
+    A lease is the cross-host interlock, so this is the only signal that
+    distinguishes work happening on ANOTHER machine from work that died. It
+    fails **open** — returning an empty set on any error — because the caller
+    uses it to suppress a stall report, and a lease lookup that cannot run
+    should not silently hide genuinely dead dispatches.
+    """
+    script = _pipeline_helper_path()
+    try:
+        result = subprocess.run(
+            [resolve_bash(), script, "lease-list"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=30,
+        )
+    except Exception:
+        return set()
+    if result.returncode != 0 or not result.stdout.strip():
+        return set()
+
+    live = set()
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        key, _holder, _exp, expired = parts[0], parts[1], parts[2], parts[3]
+        if not key.startswith("story-"):
+            continue
+        if expired.strip().lower() in ("true", "1", "yes"):
+            continue
+        live.add(key[len("story-"):])
+    return live
+
+
 def project_queue_list_by_status(status):
     """Call project-queue.sh list-by-status; return [{number, title, item_id}].
 
@@ -1233,7 +1291,8 @@ def ci_summary(checks):
 
 
 def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
-                               epic_nums=None, closed_nums=None):
+                               epic_nums=None, closed_nums=None,
+                               leased_item_ids=None):
     """Detect In-Progress stories with no running agent container and no open PR.
 
     A story is stalled when:
@@ -1241,6 +1300,7 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
     - No container named `cfg-agent-<N>` is currently running
     - No open PR (including WIP drafts) references this story number
     - Its own issue is NOT closed
+    - No live story lease is held for it on any host
 
     Draft PRs count as "open PR" — they should go through dispatch-fix, not
     re-dispatch. Only pure container deaths with no PR artifact trigger this.
@@ -1274,9 +1334,27 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
 
     `compute_dispatch_recommendations` below already applies this check as its
     self-closure gate; this function simply never had it.
+
+    Stories holding a live lease (item IDs in `leased_item_ids`) are skipped for
+    a third, distinct reason: they are being worked **on another host**. Under
+    Self-Dispatch Mode a story is claimed by lease and worked in-session, so
+    there is no container on this machine and no PR until the work is pushed —
+    the exact signature of a dead dispatch. Only the lease tells them apart.
+
+    Observed on story #3439 on 2026-08-20: preflight reported "no container
+    cfg-agent-3439 running and no open PR" while
+    `lease-status story-PVTI_lADOCrV4cc4BX5ezzg2-cMk` returned
+    `HELD:...:CFG-70-02:expired=false` — held by the Windows host, actively
+    working it. Re-dispatching would have put two hosts on the same branch,
+    which is worse than the closed-issue case: that one wastes an agent, this
+    one corrupts live work.
+
+    Expired leases do not count — an expired lease is exactly how a genuinely
+    dead dispatch presents, and suppressing on it would hide the real thing.
     """
     epic_nums = set(epic_nums or ())
     closed_nums = set(closed_nums or ())
+    leased_item_ids = set(leased_item_ids or ())
     running_story_nums = set()
     for name in containers or []:
         tail = name.removeprefix("cfg-agent-")
@@ -1297,6 +1375,8 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
         if n in epic_nums:
             continue
         if n in closed_nums:
+            continue
+        if item.get("item_id") and item["item_id"] in leased_item_ids:
             continue
         if n in running_story_nums:
             continue
@@ -1600,18 +1680,33 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
             })
             continue
 
-        # PRIORITY 0.6: founder-managed / fenced-off PRs. A draft PR that is NOT
-        # a wip_session_failed resume is manual work in progress; a PR whose
-        # linked story has project status Blocked was deliberately removed from
-        # the autonomous pipeline (e.g. #1887's Hyper-V branch needing a real
+        # PRIORITY 0.6: founder-managed / fenced-off PRs. A draft PR on a
+        # hand-authored branch is manual work in progress; a PR whose linked
+        # story has project status Blocked was deliberately removed from the
+        # autonomous pipeline (e.g. #1887's Hyper-V branch needing a real
         # Windows host). The cron must leave both entirely alone — rebasing or
         # dispatch-fixing them would clobber manual work pushed to the branch.
-        if pr.get("is_draft"):
+        #
+        # Draft status ALONE is not the discriminator, and treating it as one
+        # was silently terminal. An agent that finishes without flipping its PR
+        # out of draft produced a PR that is skipped here (never reviewed),
+        # does not match `resume_failed_session` (never resumed), and — because
+        # it HAS an open PR — is never reported by `compute_stalled_dispatches`
+        # either. Nothing in the pipeline would touch it again and its story sat
+        # `In Progress` forever.
+        #
+        # Observed on PR #3464 / story #3329 on 2026-08-20: branch
+        # `feature/story-3329-agent`, container `cfg-agent-3329` exited 0, zero
+        # comments, and CI fully green — completed work, permanently stranded.
+        # Contrast PR #3362, branch
+        # `feature/story-3095-real-cluster-network-partition-split-brain`, which
+        # is genuinely hand-authored and must keep the carve-out.
+        if pr.get("is_draft") and not AGENT_BRANCH_RE.match(pr.get("head_ref", "") or ""):
             recs.append({
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "skip",
-                "reason": "draft PR — not pipeline-managed (manual work in progress); cron leaves it untouched",
+                "reason": "draft PR on a hand-authored branch — not pipeline-managed (manual work in progress); cron leaves it untouched",
             })
             continue
         if pr.get("story_number") in blocked_story_nums:
@@ -2625,6 +2720,7 @@ def main():
             s["number"] for s in in_progress_parsed
             if s.get("state") in ("CLOSED", "MERGED") and s.get("number") is not None
         },
+        leased_item_ids=live_story_lease_item_ids(),
     )
 
     parse_warning_count = sum(

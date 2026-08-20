@@ -44,8 +44,11 @@ def check(desc, got, want):
 def mk_pr(story_num, is_draft=False):
     return {"story_number": story_num, "is_draft": is_draft}
 
-def mk_issue(num, title="Story title"):
-    return {"number": num, "title": title, "item_id": f"item-{num}"}
+def mk_issue(num, title="Story title", item_id=None):
+    # item_id defaults to the previous derived value so existing cases are
+    # unchanged; the lease cases below pass an explicit one because the lease
+    # key is `story-<ITEM_ID>`, not the story number.
+    return {"number": num, "title": title, "item_id": item_id or f"item-{num}"}
 
 # ── Case 1: stalled — no container, no PR ──
 result = m.compute_stalled_dispatches(
@@ -176,6 +179,53 @@ result = m.compute_stalled_dispatches(
     closed_nums=None,
 )
 check("closed_nums=None — still detects stall", [r["number"] for r in result], [3370])
+
+# ── Live lease on another host is NOT a stall (Issue #3439) ──
+#
+# Third distinct false positive, and the most damaging. Under Self-Dispatch Mode
+# a story is claimed by lease and worked in-session on another machine: no
+# container here, no PR until the work is pushed — identical output to a dead
+# dispatch. Only the lease separates them.
+#
+# Observed 2026-08-20: preflight reported "no container cfg-agent-3439 running
+# and no open PR" while lease-status returned HELD:...:CFG-70-02:expired=false.
+# Re-dispatching would have put two hosts on one branch — worse than the closed
+# case, which merely wastes an agent.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3439, item_id="PVTI_leased")],
+    containers=[],
+    pr_summaries=[],
+    leased_item_ids={"PVTI_leased"},
+)
+check("live lease on another host is not a stall", result, [])
+
+# An unleased sibling beside a leased one must still be flagged.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3439, item_id="PVTI_leased"), mk_issue(3370, item_id="PVTI_free")],
+    containers=[],
+    pr_summaries=[],
+    leased_item_ids={"PVTI_leased"},
+)
+check("leased filtered, unleased stalled story kept", [r["number"] for r in result], [3370])
+
+# An EXPIRED lease must not suppress. live_story_lease_item_ids() drops expired
+# entries before they reach here, so an expired lease arrives as absence — which
+# is exactly how a genuinely dead dispatch presents.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3370, item_id="PVTI_free")],
+    containers=[],
+    pr_summaries=[],
+    leased_item_ids=set(),
+)
+check("expired/absent lease — still detects stall", [r["number"] for r in result], [3370])
+
+# Optional parameter: an older caller omitting it keeps prior behaviour.
+result = m.compute_stalled_dispatches(
+    [mk_issue(3370, item_id="PVTI_free")],
+    containers=[],
+    pr_summaries=[],
+)
+check("leased_item_ids omitted — still detects stall", [r["number"] for r in result], [3370])
 
 # ── Empty inputs — no crash ──
 result = m.compute_stalled_dispatches([], containers=[], pr_summaries=[])

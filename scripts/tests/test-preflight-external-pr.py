@@ -270,11 +270,16 @@ class TestComputeReviewRecommendationsExternalPR(unittest.TestCase):
     def _make_summary(self, pr_num=999, story_num=None, is_external=True,
                       is_released=False, is_draft=False, ci_overall="green",
                       has_review=False, wip_failed=False, merge_state="CLEAN",
-                      mergeable="MERGEABLE", author_login="external-user"):
+                      mergeable="MERGEABLE", author_login="external-user",
+                      head_ref=""):
+        # head_ref defaults to "" so every pre-existing case keeps its prior
+        # behaviour: an empty ref is not an agent branch, so a draft still takes
+        # the manual-work skip exactly as before.
         return {
             "pr": pr_num,
             "story_number": story_num,
             "author_login": author_login,
+            "head_ref": head_ref,
             "is_external": is_external,
             "is_released": is_released,
             "is_draft": is_draft,
@@ -337,6 +342,65 @@ class TestComputeReviewRecommendationsExternalPR(unittest.TestCase):
         self.assertEqual(recs[0]["action"], "skip")
         # Reason should call out external, not 'draft PR' (external gate fires first).
         self.assertIn("external", recs[0]["reason"].lower())
+
+    def test_agent_draft_pr_is_not_treated_as_manual_work(self):
+        """An agent-produced draft PR must NOT take the manual-work skip.
+
+        Regression for the silently-terminal case. An agent that finishes without
+        flipping its PR out of draft produced a PR that was skipped here (never
+        reviewed), did not match resume_failed_session (never resumed), and --
+        because it HAS an open PR -- was never reported by
+        compute_stalled_dispatches either. Nothing would touch it again.
+
+        Observed on PR #3464 / story #3329 on 2026-08-20: branch
+        feature/story-3329-agent, container exited 0, CI fully green.
+        """
+        summaries = [self._make_summary(
+            pr_num=3464, story_num=3329, is_external=False, is_draft=True,
+            head_ref="feature/story-3329-agent",
+        )]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertNotIn(
+            "manual work in progress", recs[0]["reason"],
+            "agent draft PR must not take the hand-authored carve-out",
+        )
+
+    def test_item_mode_agent_draft_pr_is_not_manual_work(self):
+        """The item-mode agent branch shape is recognised too."""
+        summaries = [self._make_summary(
+            pr_num=4001, story_num=None, is_external=False, is_draft=True,
+            head_ref="feature/item-abc123-agent",
+        )]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertNotIn("manual work in progress", recs[0]["reason"])
+
+    def test_hand_authored_draft_pr_keeps_the_carve_out(self):
+        """A genuinely hand-authored draft branch must still be left alone.
+
+        This is the direction that must not regress: clobbering manual work is
+        worse than stranding an agent PR. `feature/story-3095-real-cluster-...`
+        (PR #3362) starts with `feature/story-<N>` but does NOT end in `-agent`,
+        which is exactly why BRANCH_STORY_RE is the wrong discriminator here --
+        it matches this branch.
+        """
+        summaries = [self._make_summary(
+            pr_num=3362, story_num=3095, is_external=False, is_draft=True,
+            head_ref="feature/story-3095-real-cluster-network-partition-split-brain",
+        )]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "skip")
+        self.assertIn("manual work in progress", recs[0]["reason"])
+
+    def test_non_draft_agent_pr_unaffected(self):
+        """A ready agent PR never reached this gate and still does not."""
+        summaries = [self._make_summary(
+            pr_num=4002, story_num=4002, is_external=False, is_draft=False,
+            head_ref="feature/story-4002-agent",
+        )]
+        recs = self.pf.compute_review_recommendations(summaries, set())
+        self.assertNotIn("manual work in progress", recs[0]["reason"])
 
     def test_external_unreleased_red_ci_still_skipped(self):
         """External PR with red CI → skip (quarantined), not investigate/rebase."""
