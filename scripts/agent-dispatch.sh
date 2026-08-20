@@ -307,8 +307,18 @@ _capacity_compute() {
   # Prints CAPACITY_OK:slots=<n> / CAPACITY_FULL:<reason>:slots=0 (line mode) or a
   # JSON object (json mode). Returns 0 when at least one slot is free, else 1.
   local mode="${1:-line}" running docker_root
-  running=$(docker ps --filter "label=cfg-agent=true" -q 2>/dev/null | wc -l | tr -d ' ')
-  docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+  # Where docker is absent (CI lint/test containers, a non-Docker host) there are
+  # by definition zero agent containers running. Guard the probe: without the
+  # guard the missing binary exits 127 mid-pipeline and `set -e` aborts the whole
+  # function before it prints a CAPACITY_ line, turning "no docker" into "no
+  # answer" for every caller of `agent-dispatch.sh capacity`.
+  if command -v docker >/dev/null 2>&1; then
+    running=$(docker ps --filter "label=cfg-agent=true" -q 2>/dev/null | wc -l | tr -d ' ')
+    docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+  else
+    running=0
+    docker_root=/var/lib/docker
+  fi
   CAP_MODE="$mode" CAP_RUNNING="${running:-0}" CAP_DOCKER_ROOT="$docker_root" \
   CAP_WORKTREE="$WORKTREE_BASE" python3 - <<'PY'
 import os
@@ -346,8 +356,24 @@ if mt > 0:
     used_mem = max(mt - ma, running * per_mem)
     slots["mem"] = max(0, slots_for(mem_ceil * mt, used_mem, per_mem))
 # Disk: worst filesystem among the clone dir and the docker data root.
+# Neither path is guaranteed to exist yet — the worktree base is created on the
+# first clone, and the docker data root is absent wherever docker isn't
+# installed. statvfs on a missing path raises, and swallowing that left the disk
+# dimension at its 999 sentinel, i.e. silently ungated on exactly the first run.
+# Measure the nearest existing ancestor instead: that is the filesystem the
+# directory would be created on, so its free space is the figure the gate wants.
+def nearest_existing(path):
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path: return None
+        path = parent
+    return path
+
 disk_slot = 999
-for p in {os.environ.get("CAP_WORKTREE", ""), os.environ.get("CAP_DOCKER_ROOT", "")}:
+for raw in {os.environ.get("CAP_WORKTREE", ""), os.environ.get("CAP_DOCKER_ROOT", "")}:
+    if not raw: continue
+    p = nearest_existing(raw)
     if not p: continue
     try:
         s = os.statvfs(p)
