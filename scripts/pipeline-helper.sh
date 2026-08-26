@@ -15,7 +15,7 @@ usage() {
 Pipeline Helper — wraps gh CLI for subagent permission compatibility
 
 Story lifecycle:
-  create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]
+  create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>] [--dep-draft <PVTI_id>] [--skip-validation]
                                                  Create story and materialize it immediately as a locked
                                                  `internal` issue linked under its epic (ADR-015). With
                                                  --defer, stay a private project draft until dispatch —
@@ -73,18 +73,81 @@ case "$cmd" in
 
   # ── Story lifecycle ──────────────────────────────────────────────
 
+  validate-story-body)
+    # Run the REAL dispatch parser over a story body and fail on any condition
+    # that would make a gate silently stop working (Issue #3634). Creates
+    # nothing and touches no network — safe to run on a draft at any time, and
+    # the entry point create-story delegates to.
+    vbody="${1:?Usage: validate-story-body <body_file> [epic_num]}"
+    vepic="${2:-}"
+    VPREFLIGHT="$(cd "$(dirname "$0")/.." && pwd)/.claude/scripts/po-cycle-preflight.py"
+    if [ ! -f "$vbody" ]; then
+      echo "ERROR: Body file not found: $vbody" >&2
+      exit 1
+    fi
+    if [ ! -f "$VPREFLIGHT" ]; then
+      echo "  WARN: preflight parser not found at $VPREFLIGHT — validation skipped" >&2
+      exit 0
+    fi
+    PF_PATH="$VPREFLIGHT" EPIC_NUM="$vepic" python3 - "$vbody" <<'VALIDATE_EOF'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("preflight", os.environ["PF_PATH"])
+pf = importlib.util.module_from_spec(spec); spec.loader.exec_module(pf)
+body = open(sys.argv[1]).read()
+r = pf.parse_story({"body": body, "number": None, "title": "", "labels": []})
+fatal, warn = [], []
+for w in r["parse_warnings"]:
+    if "Dependencies" in w and "no #NNN" in w:
+        fatal.append(f"{w}\n    -> the dependency gate would be DROPPED: this story would "
+                     "dispatch as if it declared None. Use real #NNN refs, a PVTI_ draft id "
+                     "(--dep-draft), or a bare 'None'.")
+    elif "Files In Scope" in w and "no file paths" in w:
+        fatal.append(f"{w}\n    -> file-overlap conflict detection would be DISABLED: two "
+                     "agents could edit the same files concurrently. Note bare DIRECTORY "
+                     "entries match nothing; list representative files.")
+    else:
+        warn.append(w)
+epic = (os.environ.get("EPIC_NUM") or "").strip()
+if epic.isdigit() and int(epic) in r["deps_parsed"]:
+    fatal.append(f"'## Dependencies' names the parent epic #{epic} as a dependency\n"
+                 "    -> parent epics do not close until all children merge, so this story "
+                 "would be held forever.")
+for w in warn:
+    print(f"  WARN: {w}", file=sys.stderr)
+if fatal:
+    print("ERROR: story body failed dispatch-parser validation:", file=sys.stderr)
+    for f in fatal:
+        print(f"  - {f}", file=sys.stderr)
+    print("  (re-run with --skip-validation to override)", file=sys.stderr)
+    sys.exit(1)
+print(f"  validation ok: deps={r['deps_parsed']} draft_deps={r['draft_deps_parsed']} "
+      f"files={len(r['files_parsed'])}", file=sys.stderr)
+VALIDATE_EOF
+    exit $?
+    ;;
+
   create-story)
-    epic_num="${1:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]}"
-    title="${2:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]}"
-    body_file="${3:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>]}"
+    epic_num="${1:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>] [--dep-draft <PVTI_id>] [--skip-validation]}"
+    title="${2:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>] [--dep-draft <PVTI_id>] [--skip-validation]}"
+    body_file="${3:?Usage: create-story <epic_num> <title> <body_file> [--defer] [--cap <c1,c2>] [--dep-draft <PVTI_id>] [--skip-validation]}"
     shift 3
     # Flags may appear in any order after the three positionals.
     defer=""
     cap=""
+    dep_drafts=""
+    skip_validation=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --defer) defer="--defer"; shift ;;
         --cap)   cap="${2:?--cap requires a comma-separated value (e.g. cms,twin)}"; shift 2 ;;
+        --dep-draft)
+          # Depend on a --defer'd sibling that has no issue number yet (Issue
+          # #3634). Repeatable. The id is appended to the story's
+          # `## Dependencies` section, where the dispatch gate reads it and
+          # holds until the draft materializes and its issue closes.
+          dep_drafts="${dep_drafts}${dep_drafts:+ }${2:?--dep-draft requires a PVTI_ draft item id}"
+          shift 2 ;;
+        --skip-validation) skip_validation="1"; shift ;;
         *) echo "ERROR: unknown create-story arg: $1"; exit 1 ;;
       esac
     done
@@ -95,6 +158,7 @@ case "$cmd" in
     fi
 
     PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
+    PREFLIGHT="$(cd "$(dirname "$0")/.." && pwd)/.claude/scripts/po-cycle-preflight.py"
 
     # cap:* capability tags (descriptive, multi-valued) name the product capability
     # that CONSUMES this story — see docs/product/roadmap.md. For a --defer draft
@@ -105,6 +169,47 @@ case "$cmd" in
       effective_body="$(mktemp)"
       cat "$body_file" > "$effective_body"
       printf '\n\n<!-- cap: %s -->\n' "$cap" >> "$effective_body"
+    fi
+
+    # --dep-draft: splice draft-item dependencies into `## Dependencies` so the
+    # author does not hand-edit the section (Issue #3634). A section reading
+    # exactly `None` is replaced; otherwise the ids are appended as list items.
+    if [ -n "$dep_drafts" ]; then
+      spliced="$(mktemp)"
+      # `if !` rather than a trailing `$?` check: `set -e` would abort the script
+      # on a non-zero python exit before any post-hoc test could run.
+      if ! DEP_DRAFTS="$dep_drafts" python3 - "$effective_body" > "$spliced" <<'SPLICE_EOF'
+import os, re, sys
+body = open(sys.argv[1]).read()
+ids = os.environ["DEP_DRAFTS"].split()
+bad = [i for i in ids if not re.fullmatch(r"PVTI_[A-Za-z0-9_-]{8,}", i)]
+if bad:
+    sys.exit(f"ERROR: --dep-draft value(s) are not project draft item ids: {', '.join(bad)}")
+lines = "\n".join(f"- {i}" for i in ids)
+m = re.search(r'(?ms)^## Dependencies\n(.*?)(?=^## |\Z)', body)
+if not m:
+    sys.exit("ERROR: --dep-draft given but the body has no '## Dependencies' section")
+cur = m.group(1).strip()
+new = lines if cur.lower().rstrip(".") in ("", "none", "n/a") else cur + "\n" + lines
+sys.stdout.write(body[:m.start(1)] + new + "\n\n" + body[m.end(1):])
+SPLICE_EOF
+      then
+        rm -f "$spliced"
+        echo "ERROR: create-story aborted — could not apply --dep-draft."
+        exit 1
+      fi
+      effective_body="$spliced"
+    fi
+
+    # Author-time validation (Issue #3634) — delegated to the `validate-story-body`
+    # subcommand so it is reachable, and testable, WITHOUT creating anything. The
+    # test suite for this gate targets that subcommand directly; an earlier
+    # revision tested it through create-story and created five real issues.
+    if [ -z "$skip_validation" ]; then
+      if ! bash "$0" validate-story-body "$effective_body" "$epic_num"; then
+        echo "ERROR: create-story aborted — body would dispatch with a broken gate."
+        exit 1
+      fi
     fi
 
     # Create a project draft item first. epic_num doubles as the traceability

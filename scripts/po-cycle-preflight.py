@@ -40,6 +40,12 @@ REPO = "cfg-is/cfgms"
 
 SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
 ISSUE_NUM_RE = re.compile(r"#(\d+)")
+# A Projects-V2 draft item id, as carried in `## Dependencies` by a story that
+# depends on a `--defer`red sibling (Issue #3634). A deferred story has no issue
+# number until it is materialized at dispatch, so `#NNNN` cannot express the
+# edge; without this the parser extracted nothing and the dependency vanished
+# rather than holding. Matched only inside the Dependencies section.
+DRAFT_ITEM_RE = re.compile(r"\b(PVTI_[A-Za-z0-9_-]{8,})\b")
 BACKTICK_PATH_RE = re.compile(
     r"`((?:[^`\n]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum))"
     r"|(?:[a-zA-Z0-9_./-]*/)?(?:Makefile|Dockerfile(?:\.[\w-]+)?|\.nancy-ignore))`"
@@ -1192,6 +1198,7 @@ def parse_story(issue):
     requires_env = detect_required_env(env_raw, issue.get("labels"))
 
     deps_parsed = []
+    draft_deps_parsed = []
     if deps_raw is None:
         warnings.append("no '## Dependencies' section found")
     elif deps_raw.strip().lower() in ("", "none", "none.", "n/a"):
@@ -1200,8 +1207,16 @@ def parse_story(issue):
         deps_parsed = sorted(
             {int(n) for n in ISSUE_NUM_RE.findall(deps_raw) if number is None or int(n) != number}
         )
-        if not deps_parsed:
-            warnings.append("'## Dependencies' section had content but no #NNN references found")
+        # Draft-item dependencies (Issue #3634): a `--defer`red sibling has no
+        # issue number to reference, so its project draft id stands in until it
+        # materializes. Extracted only from this section, never body-wide — a
+        # PVTI id quoted in Implementation Notes is context, not a dependency.
+        draft_deps_parsed = sorted(set(DRAFT_ITEM_RE.findall(deps_raw)))
+        if not deps_parsed and not draft_deps_parsed:
+            warnings.append(
+                "'## Dependencies' section had content but no #NNN or PVTI_ "
+                "dependency references found"
+            )
 
     files_parsed = []
     if files_raw is None:
@@ -1239,6 +1254,7 @@ def parse_story(issue):
         "parse_ok": len(warnings) == 0,
         "parse_warnings": warnings,
         "deps_parsed": deps_parsed,
+        "draft_deps_parsed": draft_deps_parsed,
         "deps_raw": deps_raw,
         "files_parsed": files_parsed,
         "files_raw": files_raw,
@@ -1391,7 +1407,8 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
     return stalled
 
 
-def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, caps=None):
+def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, caps=None,
+                                     draft_dep_states=None):
     """Greedy conflict-free selection.
 
     Order: ascending story number (stable, predictable); pure drafts (number=None) last.
@@ -1400,10 +1417,19 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
     Hold if the story's required execution env is not in this host's caps (routing
     to another host — e.g. windows stories on the linux orchestrator).
     Skip if any dep is not CLOSED.
+
+    `draft_dep_states` maps a Projects-V2 draft item id to
+    `{"issue_num": int|None, "status": str}` for every `PVTI_...` dependency
+    referenced by a ready story (Issue #3634). An unmaterialized draft
+    (`issue_num` is None) is an OPEN dependency, and an id missing from the map
+    is treated the same way: this gate **fails closed**, because the whole
+    defect it exists to fix was a dependency that silently evaporated and let
+    a story dispatch ahead of the deferred security fix it depended on.
     Skip if files overlap with an active story (status In Progress or open PR) or a
     story already picked this cycle.
     """
     caps = caps or {DEFAULT_ENV}
+    draft_dep_states = draft_dep_states or {}
     # Per active story, the declared scope and the PR's actual changed files are
     # kept apart (Issue #3294) so a hold can name which source produced the
     # overlap. Comparing declared-against-declared alone fails open: a branch
@@ -1512,6 +1538,39 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
                 "item_id": item_id,
                 "action": "hold",
                 "reason": f"deps not closed: {dep_desc}",
+            })
+            continue
+
+        # Draft-item dependencies (Issue #3634). A `--defer`red story is a
+        # private project draft with no issue number until it materializes at
+        # dispatch, so a dependent can only name its `PVTI_...` id. Resolve each
+        # to its materialized issue and apply the same CLOSED/MERGED test.
+        #
+        # Fails CLOSED on purpose. Unmaterialized means the deferred work has
+        # not even started, and an id absent from the map means we could not
+        # resolve it at all — both hold. The defect this replaces did the
+        # opposite: it extracted no reference, produced an empty `open_deps`,
+        # and dispatched as though the story had declared `None`.
+        open_draft_deps = []
+        for d in s.get("draft_deps_parsed") or []:
+            state = draft_dep_states.get(d)
+            if not state:
+                open_draft_deps.append((d, "UNRESOLVED"))
+                continue
+            dep_issue = state.get("issue_num")
+            if dep_issue is None:
+                open_draft_deps.append((d, f"unmaterialized draft/{state.get('status', '?')}"))
+                continue
+            issue_state = dep_states.get(int(dep_issue))
+            if issue_state not in ("CLOSED", "MERGED"):
+                open_draft_deps.append((d, f"#{dep_issue}({issue_state or 'UNKNOWN'})"))
+        if open_draft_deps:
+            draft_desc = ", ".join(f"{d}[{why}]" for d, why in open_draft_deps)
+            recommendations.append({
+                "number": num,
+                "item_id": item_id,
+                "action": "hold",
+                "reason": f"draft deps not satisfied: {draft_desc}",
             })
             continue
 
@@ -2585,6 +2644,56 @@ def main():
     for s in ready_parsed:
         s["deps_states"] = {str(d): dep_states.get(d, "UNKNOWN") for d in s["deps_parsed"]}
 
+    # Phase 3b: resolve draft-item dependencies (Issue #3634). Each `PVTI_...`
+    # referenced in a `## Dependencies` section is looked up on the project
+    # board to find whether it has materialized into an issue yet, and if so
+    # which one. A lookup that fails is deliberately left OUT of the map so the
+    # dispatch gate holds on it — resolution failure must not read as "satisfied".
+    draft_dep_ids = set()
+    for s in ready_parsed:
+        draft_dep_ids.update(s.get("draft_deps_parsed") or [])
+
+    draft_dep_states = {}
+    if draft_dep_ids:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "..", "scripts", "project-queue.sh")
+        for item_id in sorted(draft_dep_ids):
+            try:
+                res = subprocess.run(
+                    [resolve_bash(), script, "get-item", item_id],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if res.returncode != 0:
+                    degraded_reasons.append(
+                        f"draft dep {item_id}: get-item failed ({res.stderr.strip()[:80]}) "
+                        "— holding dependents"
+                    )
+                    continue
+                info = json.loads(res.stdout)
+                draft_dep_states[item_id] = {
+                    "issue_num": info.get("issue_num"),
+                    "status": info.get("status"),
+                }
+                # A materialized draft's issue state is needed by the gate; fetch
+                # it if the earlier dep-state pass has not already seen it.
+                n = info.get("issue_num")
+                if n is not None and int(n) not in dep_states:
+                    try:
+                        extra = gh_graphql_issues_batch([int(n)])
+                        dep_states[int(n)] = (extra.get(int(n)) or {}).get("state") or "UNKNOWN"
+                    except Exception as e:
+                        degraded_reasons.append(f"draft dep {item_id}: issue #{n} state fetch failed: {e}")
+            except Exception as e:
+                degraded_reasons.append(
+                    f"draft dep {item_id}: resolution error ({e}) — holding dependents"
+                )
+
+    for s in ready_parsed:
+        s["draft_deps_states"] = {
+            d: draft_dep_states.get(d, {"issue_num": None, "status": "UNRESOLVED"})
+            for d in (s.get("draft_deps_parsed") or [])
+        }
+
     out["ready_stories"] = ready_parsed
     out["in_progress_stories"] = [
         {
@@ -2679,6 +2788,7 @@ def main():
     ]
     out["dispatch_recommendations"] = compute_dispatch_recommendations(
         ready_parsed, active_parsed, dep_states, caps,
+        draft_dep_states=draft_dep_states,
     )
     # Pull the active fix-agent set out of running_containers so the review
     # recommender can skip rebase/dispatch-fix work for any PR with an
