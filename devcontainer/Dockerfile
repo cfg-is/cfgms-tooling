@@ -8,7 +8,7 @@
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
 # and .git history are never baked into the final image's layers.
 # CLI_BINARY=cfg  Entry point: ./cmd/cfg
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS cfg-builder
+FROM golang:1.27.0-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452 AS cfg-builder
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
@@ -26,7 +26,7 @@ RUN set -eu; \
        ./cmd/cfg
 
 # Stage 1 (runtime): main agent container with full tooling
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36
+FROM golang:1.27.0-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452
 
 # Declare TARGETARCH so BuildKit auto-populates it from the build platform.
 # Must be declared inside the consuming stage; an undeclared ${TARGETARCH}
@@ -80,32 +80,37 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Go-based security and quality tools
 # Versions MUST match .github/workflows/dependency-pin-check.yml
 RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
-    && go install honnef.co/go/tools/cmd/staticcheck@2026.1 \
+    && go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
     && go install github.com/google/go-licenses/v2@v2.0.1
 
-# golangci-lint — same rule as Trivy below: download the pinned release archive
-# and verify its SHA-256 before extraction, rather than piping the project's
-# install.sh through `sh`. The previous form fetched that script from the
-# golangci-lint repo's HEAD, so its contents were whatever the branch tip held
-# at image-build time — an unpinned remote script executing as root, which is
-# the exact pattern the Trivy block was rewritten to avoid.
-# Per-architecture checksums from the golangci-lint-<ver>-checksums.txt release
-# asset at https://github.com/golangci/golangci-lint/releases/download/v<ver>/
-RUN set -eu; \
-    GOLANGCI_VERSION='2.12.2'; \
-    case "$TARGETARCH" in \
-      amd64) GOLANGCI_ARCH='linux-amd64'; GOLANGCI_SHA256='8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553' ;; \
-      arm64) GOLANGCI_ARCH='linux-arm64'; GOLANGCI_SHA256='44cd40a8c76c86755375adfeea52cfd3533cb43d7bd647771e0ae065e166df3a' ;; \
-      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    STEM="golangci-lint-${GOLANGCI_VERSION}-${GOLANGCI_ARCH}"; \
-    curl -sSfL -o "/tmp/${STEM}.tar.gz" \
-      "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_VERSION}/${STEM}.tar.gz"; \
-    printf '%s  /tmp/%s.tar.gz\n' "${GOLANGCI_SHA256}" "${STEM}" | sha256sum -c -; \
-    tar -xzf "/tmp/${STEM}.tar.gz" -C /tmp "${STEM}/golangci-lint"; \
-    install -m 0755 "/tmp/${STEM}/golangci-lint" "$(go env GOPATH)/bin/golangci-lint"; \
-    rm -rf "/tmp/${STEM}.tar.gz" "/tmp/${STEM}"
+# golangci-lint — built from source at the pinned tag with THIS image's Go, not
+# downloaded as an upstream release archive.
+#
+# golangci-lint refuses to start when the Go version it was itself built with is
+# older than the version go.mod targets: "the Go language version (goX.Y) used to
+# build golangci-lint is lower than the targeted Go version". It reads that target
+# from the `toolchain` directive, so every toolchain bump in go.mod breaks a
+# prebuilt binary until upstream ships a release rebuilt on the new Go. Issue #3627
+# hit exactly that: its bump moved the directive to a Go minor newer than the one
+# the pinned v2.12.2 release archive was built with (go1.26.2), and `make lint`
+# failed to load its config with exit 3.
+# Building here makes the linter's build Go track the base image's Go, which is the
+# same pin the `toolchain` directive carries — the two can no longer drift.
+# .github/workflows/golangci-lint.yml installs it the same way (go install under
+# GOTOOLCHAIN=${GO_VERSION}), so local and CI runs use one build of one version.
+#
+# Supply chain: `go install <module>@<tag>` resolves through the Go module proxy and
+# is verified against the Go checksum database — the same path the four tools above
+# already use. Like the checksum-verified archive it replaces, and unlike the piped
+# install.sh that preceded that, nothing unpinned is executed at image-build time;
+# it additionally drops the per-architecture SHA-256 values this block had to
+# hand-maintain. The version pin below stays the single source of truth and must match
+# .github/workflows/dependency-pin-check.yml, .github/workflows/golangci-lint.yml,
+# windows-setup.ps1 and the Makefile's GOLANGCI_LINT_VERSION (the `lint` target
+# rebuilds the linter itself when the one on PATH predates a toolchain bump).
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1 \
+    && golangci-lint --version
 
 # Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.74.0 is the
 # post-incident clean release. We download the project's release archive and
