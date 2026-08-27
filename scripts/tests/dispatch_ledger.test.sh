@@ -54,6 +54,20 @@ export CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees"
 mkdir -p "$CFGMS_TEST_WORKTREE_BASE"
 export CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger"
 
+# Fixture finish times are computed relative to now, never hardcoded.
+#
+# `ledger-report` filters records to a ROLLING window (`ledger-report 30` keeps
+# the last 30 days), so a fixed fixture date silently rots out of range. That
+# happened: `2026-07-28T05:05:00Z` sat inside the 30-day window until
+# 2026-08-27T05:05Z, then fell out, and "ledger-report reports the fix-pr-mode
+# run" started failing on develop itself. `make test` runs this suite via
+# scripts/test-scripts.sh, so it reddened every PR, with nothing in any diff to
+# explain it and no bisect able to find a breaking commit.
+#
+# Keep these comfortably inside the smallest window any check here uses.
+FIXTURE_FINISHED_A="$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+FIXTURE_FINISHED_B="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+
 # shellcheck source=/dev/null
 source "$DISPATCH"
 
@@ -92,7 +106,7 @@ printf '\n== ledger_reconcile_exit: clean run (agent-result available) ==\n'
 _ledger_docker_inspect() {
   case "$1" in
     '{{.State.ExitCode}}')   echo "0" ;;
-    '{{.State.FinishedAt}}') echo "2026-07-28T05:00:00Z" ;;
+    '{{.State.FinishedAt}}') echo "$FIXTURE_FINISHED_A" ;;
   esac
 }
 result_file="${SANDBOX}/agent-result-clean.json"
@@ -120,7 +134,7 @@ printf '\n== ledger_reconcile_exit: hard-killed (AC4: no agent-result at all) ==
 _ledger_docker_inspect() {
   case "$1" in
     '{{.State.ExitCode}}')   echo "137" ;;
-    '{{.State.FinishedAt}}') echo "2026-07-28T05:05:00Z" ;;
+    '{{.State.FinishedAt}}') echo "$FIXTURE_FINISHED_B" ;;
   esac
 }
 ledger_append_launch "cfg-agent-9004" "fix-pr" "" "9004" "" "fix-agent" "pr-9004"
