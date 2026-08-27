@@ -1051,6 +1051,49 @@ EOF
   exit 1
 }
 
+# cleanup_reap_reason <state> <num> <failed_nums> <blocked_nums> <running>
+# Decides whether a story container should be reaped, and why. Prints the reason
+# and returns 0 when it should be reaped; prints nothing and returns 1 otherwise.
+#
+# The first three conditions reap even a running container: the story is
+# finished or parked for a human, so whatever is still executing is unwanted.
+#
+# The fourth (Issue #3656) covers a container that has already EXITED while its
+# story is still open -- Ready or In Progress. Nothing else reaps that case. The
+# stale name then collides with the next `docker run --name cfg-agent-<N>`, so
+# the story cannot be re-dispatched without a manual `docker rm`. Observed on
+# story #3417, whose agent died on an expired OAuth session: the entrypoint
+# correctly reset the story to Ready, but two re-dispatch attempts failed on
+# `Conflict. The container name "/cfg-agent-3417" is already in use`.
+#
+# Deliberately gated on running == "false", the exact string `docker inspect`
+# emits for `{{.State.Running}}`. An exited container has no work left to lose;
+# a live agent on an open story is precisely what must survive. Anything else,
+# including the empty string `_ledger_docker_inspect` returns when inspect
+# fails, is treated as "still running" and left alone -- unknown must not reap.
+cleanup_reap_reason() {
+  local state="$1" num="$2" failed_nums="$3" blocked_nums="$4" running="$5"
+  local reason=""
+
+  if [[ "$state" == "CLOSED" ]]; then
+    reason="story closed"
+  fi
+  if printf '%s' "$failed_nums" | grep -qxF "$num" 2>/dev/null; then
+    reason="project status: Failed"
+  fi
+  if printf '%s' "$blocked_nums" | grep -qxF "$num" 2>/dev/null; then
+    reason="project status: Blocked"
+  fi
+  if [[ -z "$reason" && "$running" == "false" ]]; then
+    reason="container exited, story still open"
+  fi
+
+  if [[ -z "$reason" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$reason"
+}
+
 # Guard so po-act.sh can `source` this file to reuse prepare_session_dir and
 # the AGENT_SESSIONS_* config (Issue #3051) without also executing this
 # script's own command dispatch against po-act.sh's positional args.
@@ -2577,22 +2620,15 @@ PROMPT_EOF
       issue_json=$(gh issue view "$num" --repo cfg-is/cfgms --json state 2>/dev/null || echo '{"state":"UNKNOWN"}')
       state=$(echo "$issue_json" | grep -oP '"state"\s*:\s*"\K[^"]+' || echo "UNKNOWN")
 
+      # `docker inspect` reports "true"/"false"; the wrapper yields "" if the
+      # container vanished between the ps listing and here. Only the literal
+      # "false" is treated as exited -- see cleanup_reap_reason.
+      running=$(_ledger_docker_inspect '{{.State.Running}}' "$container_name")
+
       should_clean=false
-
-      # Clean if story is closed (merged or manually closed)
-      if [[ "$state" == "CLOSED" ]]; then
+      reason=""
+      if reason=$(cleanup_reap_reason "$state" "$num" "$failed_nums" "$blocked_nums" "$running"); then
         should_clean=true
-        reason="story closed"
-      fi
-
-      # Clean if story is failed or blocked (agent is done, needs human intervention)
-      if echo "$failed_nums" | grep -qxF "$num" 2>/dev/null; then
-        should_clean=true
-        reason="project status: Failed"
-      fi
-      if echo "$blocked_nums" | grep -qxF "$num" 2>/dev/null; then
-        should_clean=true
-        reason="project status: Blocked"
       fi
 
       if $should_clean; then
