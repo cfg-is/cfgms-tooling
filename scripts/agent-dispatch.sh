@@ -1094,6 +1094,60 @@ cleanup_reap_reason() {
   printf '%s\n' "$reason"
 }
 
+# cleanup_container_class <container_name>
+# Maps an agent container name to its reap class, clone-directory prefix and
+# number, printed tab-separated. Returns 1 for a name no reaper owns.
+#
+# Issue #3657: the cleanup-stale loop matched only `^cfg-agent-([0-9]+)$` and
+# `continue`d past everything else, while cleanup-stale-reviews covered only
+# `cfg-agent-review-pr-<N>`. That left `cfg-agent-pr-fix-*` and
+# `cfg-agent-resolve-conflict-*` reaped by nothing at all. 18 had accumulated
+# when this was written, the oldest 2 days, spanning both exit 0 and exit 1 and
+# every PR terminal state -- so it was never a TTL set too long, it was the
+# absence of any TTL path. `docker system df` had 59GB reclaimable and disk was
+# the binding capacity resource holding the host at 3 free dispatch slots.
+#
+# Adding a class here is how a new container kind gets coverage. A bare regex
+# with an else-continue is how it silently loses it -- which is the whole bug.
+cleanup_container_class() {
+  local name="$1"
+  if [[ "$name" =~ ^cfg-agent-([0-9]+)$ ]]; then
+    printf 'story\tstory\t%s\n' "${BASH_REMATCH[1]}"; return 0
+  fi
+  if [[ "$name" =~ ^cfg-agent-pr-fix-([0-9]+)$ ]]; then
+    printf 'fix-pr\tpr-fix\t%s\n' "${BASH_REMATCH[1]}"; return 0
+  fi
+  if [[ "$name" =~ ^cfg-agent-resolve-conflict-([0-9]+)$ ]]; then
+    printf 'resolve-conflict\tresolve-conflict\t%s\n' "${BASH_REMATCH[1]}"; return 0
+  fi
+  if [[ "$name" =~ ^cfg-agent-review-pr-([0-9]+)$ ]]; then
+    printf 'review\treview-pr\t%s\n' "${BASH_REMATCH[1]}"; return 0
+  fi
+  return 1
+}
+
+# cleanup_pr_container_should_reap <running> <finished_ts> <now_ts> <max_age_s>
+# True only for a container that has genuinely exited and has been exited for at
+# least max_age_s.
+#
+# Fail-safe in both directions, deliberately. Only the literal "false" from
+# `{{.State.Running}}` counts as exited -- the empty string the inspect wrapper
+# yields on failure means "unknown", and unknown must never reap. An
+# unparseable or zero FinishedAt is likewise treated as unknown rather than as
+# "epoch, therefore ancient", which would reap a live container instantly.
+#
+# The 30-minute grace mirrors cleanup-stale-reviews and exists for the same
+# reason: an agent that has just exited may still be finishing final API calls,
+# and its clone is the only place its work survives until then.
+cleanup_pr_container_should_reap() {
+  local running="$1" finished_ts="$2" now_ts="$3" max_age="$4"
+  [[ "$running" == "false" ]] || return 1
+  [[ "$finished_ts" =~ ^[0-9]+$ ]] || return 1
+  [[ "$finished_ts" -gt 0 ]] || return 1
+  (( now_ts - finished_ts >= max_age )) || return 1
+  return 0
+}
+
 # Guard so po-act.sh can `source` this file to reuse prepare_session_dir and
 # the AGENT_SESSIONS_* config (Issue #3051) without also executing this
 # script's own command dispatch against po-act.sh's positional args.
@@ -2612,7 +2666,11 @@ PROMPT_EOF
       if [[ "$container_name" =~ ^cfg-agent-([0-9]+)$ ]]; then
         num="${BASH_REMATCH[1]}"
       else
-        # Skip non-issue containers (pr-fix, branch, interactive)
+        # Not a story container. pr-fix and resolve-conflict are handled by
+        # their own reap pass further down (Issue #3657); review containers by
+        # cleanup-stale-reviews; live/interactive sessions are founder-owned and
+        # deliberately never reaped. Do not turn this back into a blanket skip —
+        # that is what left two whole classes uncovered.
         continue
       fi
 
@@ -2649,6 +2707,50 @@ PROMPT_EOF
         cleaned=$((cleaned + 1))
       fi
     done
+
+    # --- Exited fix / resolve-conflict container reap (Issue #3657) ---
+    # The story loop above owns cfg-agent-<N>; cleanup-stale-reviews owns
+    # cfg-agent-review-pr-<N>. Nothing owned these two classes, so they grew
+    # without bound. Reaped on age alone, not on the PR's state: survival was
+    # measured to be independent of whether the PR merged, closed or was
+    # blocked, so keying off PR state would leave the same hole.
+    #
+    # No credential revoke here, unlike the story loop: mint_agent_creds is only
+    # ever called from the story launch path, so a fix or resolve-conflict
+    # container has no per-agent credential to revoke.
+    pr_reap_now=$(date -u +%s)
+    pr_reap_max_age=1800  # 30 minutes, matching cleanup-stale-reviews
+    while IFS= read -r container_name; do
+      [[ -z "$container_name" ]] && continue
+      class_line=$(cleanup_container_class "$container_name") || continue
+      IFS=$'\t' read -r reap_class clone_prefix reap_num <<< "$class_line"
+      case "$reap_class" in
+        fix-pr|resolve-conflict) ;;
+        *) continue ;;
+      esac
+
+      running=$(_ledger_docker_inspect '{{.State.Running}}' "$container_name")
+      finished_iso=$(_ledger_docker_inspect '{{.State.FinishedAt}}' "$container_name")
+      finished_ts=$(date -u -d "$finished_iso" +%s 2>/dev/null || echo 0)
+
+      cleanup_pr_container_should_reap \
+        "$running" "$finished_ts" "$pr_reap_now" "$pr_reap_max_age" || continue
+
+      echo "STALE:${container_name}:${reap_class} exited over $((pr_reap_max_age / 60))m ago"
+      docker cp "${container_name}:/tmp/agent-result.json" \
+        "/tmp/agent-result-${container_name}.json" 2>/dev/null || true
+      ledger_reconcile_exit "$container_name" "/tmp/agent-result-${container_name}.json"
+      if docker rm -f "$container_name" >/dev/null 2>&1; then
+        echo "CLEANED:container:${container_name}"
+      fi
+      clone_dir="${WORKTREE_BASE}/${clone_prefix}-${reap_num}"
+      if [[ -d "$clone_dir" ]]; then
+        rm -rf "$clone_dir"
+        echo "CLEANED:clone:${clone_dir}"
+      fi
+      cleaned=$((cleaned + 1))
+    done < <(docker ps -a --filter "label=cfg-agent=true" \
+               --filter "status=exited" --format '{{.Names}}' 2>/dev/null || true)
 
     # --- PR agent-status label reconcile ---
     # fix-agent / review-agent are display-only PR labels the dispatcher adds
