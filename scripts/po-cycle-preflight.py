@@ -71,6 +71,51 @@ LINE_SUFFIX_RE = re.compile(
 #: passing does not become a requirement.
 LIST_OR_TABLE_RE = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\|)")
 
+#: A list item's declaration is its SUBJECT -- the text up to (but not
+#: including) its first description separator. Everything from the separator
+#: onward is commentary (Issue #3683). All four dash/em-dash forms the house
+#: convention uses; each requires surrounding spaces so it never matches inside
+#: a hyphenated path or identifier.
+ITEM_SEPARATOR_RE = re.compile(r" — | – | -- | - ")
+
+#: A wrapped continuation line of the list item above it: indented and not
+#: itself a new list/table item. The house convention wraps a long item's
+#: prose onto indented lines rather than one long physical line (see #3611);
+#: a continuation line is always commentary, same as text after the separator
+#: on the item's own opening line.
+ITEM_CONTINUATION_RE = re.compile(r"^[ \t]+\S")
+
+
+def _find_separator_at_depth0(line, depth, start=0):
+    """Scan `line` from `start` for the item's description separator, only
+    accepting a match where parenthesis depth is 0.
+
+    `depth` is carried in from prior lines of the same item and returned
+    updated, so a `(` opened on one line and not yet closed keeps suppressing
+    matches on the lines that follow (Issue #3683 round 2 / #3577): a
+    multi-file item's real separator can arrive several lines after a
+    parenthetical aside that itself contains a " — "-shaped clause, and an
+    unanchored per-line search reads that aside as the item's boundary,
+    truncating the subject and silently dropping every file declared after it.
+
+    Returns (match_or_None, ending_depth). `ending_depth` is only meaningful
+    when no match was found -- once a separator is accepted the item's
+    subject is closed and no further depth tracking is needed.
+    """
+    i, n = start, len(line)
+    while i < n:
+        if depth == 0:
+            m = ITEM_SEPARATOR_RE.match(line, i)
+            if m:
+                return m, depth
+        ch = line[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        i += 1
+    return None, depth
+
 #: "None — documentation only.", "None (no code changes)", "none." and friends:
 #: an explicit declaration that the story touches no files. Only matched when the
 #: section OPENS with it, so a section that merely mentions "none" in prose still
@@ -1159,26 +1204,110 @@ def extract_scope_paths(section):
       under-extraction -> two agents collide on one file, or a coverage gate
                           passes a PR that skipped declared work
 
-    Handled per line: a `:<line>` or `:<line>-<line>` suffix is stripped first;
-    list items and table rows contribute bare and backticked paths; any other
-    line contributes only backticked paths.
+    Handled per line: a `:<line>` or `:<line>-<line>` suffix is stripped first.
+    A list item or table row is a DECLARATION, but only its SUBJECT counts --
+    the text up to (not including) its first description separator (`ITEM_SEPARATOR_RE`:
+    " — ", " – ", " -- ", " - "). Text after that separator is commentary and
+    contributes nothing -- bare or backticked. A wrapped continuation line
+    (`ITEM_CONTINUATION_RE`: an indented line that is not itself a new
+    list/table item) is commentary ONLY once the item's separator has already
+    appeared on an earlier line of that item; while the subject is still open
+    (no separator seen yet), a continuation line is still subject and keeps
+    contributing paths -- the house convention wraps a multi-file subject
+    across lines too, with the separator arriving on the LAST wrapped line
+    rather than the item's opening line (`` - `a.go`,\\n  `b.go` — tests. ``
+    declares both `a.go` and `b.go`). A standalone prose line (not a list
+    item, table row, or continuation of one) still contributes its backticked
+    paths, same as always.
 
+    This is what fixes #3683: a bullet that names a file only to say a *second*
+    file does NOT need editing --
+    "`ChangeTimelineCard.tsx` -- new file, default export picked up by
+    `EvidenceCanvas.tsx`'s glob -- no edit to that file needed." -- wrapped
+    `EvidenceCanvas.tsx` onto an indented continuation line. Scanning every
+    line for backticked paths (the old behavior) recorded it as declared; the
+    dispatcher then held two unrelated stories on a false shared-file conflict.
     Structure alone decides this -- no attempt is made to read intent from the
     wording. A phrasing filter was tried and removed: real story bodies say "do
     NOT" and "never" in instructions ABOUT a file they are declaring
     ("`assurance.go` -- do NOT lower `webauthn:register`"), so keying on those
-    words dropped legitimate declarations from three live stories. The known
-    residual limitation is therefore that a path a story backticks in order to
-    exclude still parses as in scope; write such a path unbackticked in prose.
+    words dropped legitimate declarations from three live stories -- see
+    TestPhrasingIsNotIntent. Because "do NOT lower `webauthn:register`" sits
+    entirely inside the item's own commentary tail, this rule already leaves it
+    alone without needing to read it.
+
+    A separator candidate inside an unclosed parenthetical is not a boundary:
+    `_find_separator_at_depth0` tracks `(`/`)` depth across an item's lines
+    (reset at each new list item) and only accepts a separator match at depth
+    0. A multi-file item's real separator can arrive several lines after a
+    parenthetical aside that itself contains a " — "-shaped clause -- #3577's
+    nine-file item opens a paren on one line, uses " — " inside it two lines
+    later, and does not close the paren until three lines after that, with
+    the item's real separator on its own last line. Treating the nested
+    " — " as the boundary truncated the subject and silently dropped every
+    file declared after it.
+
+    Residual limitation, narrower than before: a backticked path on a
+    STANDALONE PROSE LINE (not part of any list item) still parses as in scope
+    even when the sentence excludes it -- "Do NOT touch `features/.../server.go`."
+    as its own line still declares that file, because prose lines have no
+    subject/commentary split to apply. Escape hatch: write such a path
+    unbackticked in prose, or -- if it must be declared as excluded from
+    inside a list item -- put it after that item's separator has already
+    appeared (same line or a later wrapped line), where it is now correctly
+    excluded. A path that must declare more than one file keeps every file
+    before the item's separator, whether on the opening line or a wrapped
+    continuation line that precedes the separator:
+    `` - `a/b/x.go` and `a/b/x_test.go` -- add the guard. ``.
     """
     if not section:
         return []
     found = set()
+    in_item = False
+    sep_seen = False  # has this item's separator appeared on an earlier line?
+    paren_depth = 0  # unclosed "(" count carried across this item's lines
     for raw_line in section.splitlines():
         line = LINE_SUFFIX_RE.sub(r"\1", raw_line)
-        found.update(BACKTICK_PATH_RE.findall(line))
-        if LIST_OR_TABLE_RE.match(line):
-            found.update(BARE_PATH_RE.findall(line))
+        marker = LIST_OR_TABLE_RE.match(line)
+        is_item_start = marker is not None
+
+        if not is_item_start and in_item and ITEM_CONTINUATION_RE.match(line):
+            if sep_seen:
+                continue  # wrapped commentary, after the item's separator
+            # The subject is still open -- this continuation line is the
+            # wrapped tail of a multi-file subject (#3608, #3388), not
+            # commentary. Extract up to the separator if this line carries
+            # one at parenthesis depth 0; otherwise the whole line is still
+            # subject.
+            sep, paren_depth = _find_separator_at_depth0(line, paren_depth)
+            subject = line[:sep.start()] if sep else line
+            found.update(BACKTICK_PATH_RE.findall(subject))
+            found.update(BARE_PATH_RE.findall(subject))
+            if sep:
+                sep_seen = True
+            continue
+
+        in_item = is_item_start
+
+        if is_item_start:
+            # Search for the separator only AFTER the item's own list marker,
+            # and only at parenthesis depth 0. " - " is one of the separator
+            # forms, so on an INDENTED dash bullet ("  - `pkg/a.go` — x") an
+            # unanchored search matches the bullet marker itself at index 1,
+            # collapsing the subject to the leading whitespace and extracting
+            # nothing -- hence the marker.end() anchor. A separator can also
+            # appear inside an unclosed parenthetical aside (#3577) and get
+            # mistaken for the item's real boundary several lines early --
+            # hence tracking paren depth across the item's lines and only
+            # accepting a depth-0 match.
+            paren_depth = 0
+            sep, paren_depth = _find_separator_at_depth0(line, paren_depth, marker.end())
+            subject = line[:sep.start()] if sep else line
+            found.update(BACKTICK_PATH_RE.findall(subject))
+            found.update(BARE_PATH_RE.findall(subject))
+            sep_seen = sep is not None
+        else:
+            found.update(BACKTICK_PATH_RE.findall(line))
     return sorted(found)
 
 

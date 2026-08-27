@@ -22,6 +22,18 @@ cannot regress them. The loose body-wide scan (`all_paths_in_body`) is
 deliberately NOT tightened — it exists as a permissive diagnostic — and a test
 here pins that difference so the two are not "unified" later.
 
+  3. OVER-extraction, structural variant (Issue #3683). A list item's
+     commentary tail, or a wrapped continuation line belonging to that item,
+     named a second file in passing — "`ChangeTimelineCard.tsx` — new file...
+     picked up by `EvidenceCanvas.tsx`'s glob... no edit to that file needed" —
+     and the second file parsed as declared anyway, because extraction ran
+     per physical line with no notion of "this line continues the item above
+     it." Measured on stories #3611 and #3612, which shared no real file but
+     were held against each other on a fabricated `EvidenceCanvas.tsx`
+     conflict. `TestExactRepro3611And3612`, `TestMultiPathSubject` and
+     `TestScopeCorpusDifferential` below cover the fix; see the
+     `extract_scope_paths` docstring for the structural rule.
+
 Run: python3 .claude/scripts/tests/test-preflight-files-in-scope.py
 """
 import importlib.util
@@ -332,6 +344,296 @@ class TestParseStoryIntegration(unittest.TestCase):
             story("Do NOT touch features/controller/api/server.go — owned by #2839.")
         )
         self.assertIn("features/controller/api/server.go", parsed["all_paths_in_body"])
+
+
+class TestExactRepro3611And3612(unittest.TestCase):
+    """AC1: byte-for-byte regression fixture for Issue #3683.
+
+    Both inputs are the real `## Files In Scope` section bodies from stories
+    #3611 and #3612 (verified via `gh issue view <N> --json body`), reproduced
+    here exactly — same three-physical-line wrap on the first bullet, same
+    backticks, same `'s` possessive, same em dashes. Before the fix, both
+    inputs additionally yielded `'EvidenceCanvas.tsx'`, fabricating a shared
+    file between two stories that touch no common file — the dispatcher held
+    each against the other on that phantom conflict. The assertion is on the
+    whole list (not a `not in` check) so a change that fixes the wrapped-line
+    case by over-extracting elsewhere cannot pass.
+    """
+
+    def test_3611_change_timeline_card_yields_exactly_its_two_files(self):
+        section = (
+            "- `web/src/cockpit/cards/ChangeTimelineCard.tsx` — new file, default export\n"
+            "  picked up by `EvidenceCanvas.tsx`'s glob (Story 7) — no edit to that file\n"
+            "  needed.\n"
+            "- `web/src/cockpit/cards/ChangeTimelineCard.test.tsx` — new file.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "web/src/cockpit/cards/ChangeTimelineCard.test.tsx",
+                "web/src/cockpit/cards/ChangeTimelineCard.tsx",
+            ],
+        )
+
+    def test_3612_remediation_card_yields_exactly_its_two_files(self):
+        # Same shape, different filename — pins that the fix is structural,
+        # not keyed to the ChangeTimelineCard name.
+        section = (
+            "- `web/src/cockpit/cards/RemediationCard.tsx` — new file, default export\n"
+            "  picked up by `EvidenceCanvas.tsx`'s glob (Story 7) — no edit to that file\n"
+            "  needed.\n"
+            "- `web/src/cockpit/cards/RemediationCard.test.tsx` — new file.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "web/src/cockpit/cards/RemediationCard.test.tsx",
+                "web/src/cockpit/cards/RemediationCard.tsx",
+            ],
+        )
+
+
+class TestMultiPathSubject(unittest.TestCase):
+    """AC4: a bullet whose subject names two files must declare both.
+
+    The structural rule cuts a list item at its first description separator,
+    not at its first path — so two paths that both precede the separator are
+    both in the subject and both extracted.
+    """
+
+    def test_two_paths_before_the_separator_both_declared(self):
+        self.assertEqual(
+            scope("- `a/b/x.go` and `a/b/x_test.go` — add the guard."),
+            ["a/b/x.go", "a/b/x_test.go"],
+        )
+
+    def test_two_bare_paths_before_the_separator_both_declared(self):
+        self.assertEqual(
+            scope("- a/b/x.go and a/b/x_test.go — add the guard."),
+            ["a/b/x.go", "a/b/x_test.go"],
+        )
+
+
+class TestScopeCorpusDifferential(unittest.TestCase):
+    """AC5: under-extraction guard.
+
+    Every section here is the real `## Files In Scope` text from a merged
+    CFGMS story (fetched via `gh issue view <N> --json body`), except the
+    table-form entry: no merged story's `Files In Scope` section actually uses
+    a markdown table, so that fixture is constructed from the real per-alert
+    file/line table in #3620 (`features/controller/api/handlers_deployments.go`,
+    `features/rbac/manager.go`, both genuinely edited by that PR) reshaped into
+    the table form `test_table_row_is_a_declaration` already pins. A future
+    change that narrows extraction too far — e.g. by treating more of an item
+    as commentary than it should — fails here by dropping a file one of these
+    real stories genuinely declared.
+    """
+
+    def test_3097_none_documentation_only(self):
+        self.assertEqual(scope("None — documentation only."), [])
+
+    def test_3192_single_file_with_prose_subject(self):
+        section = '- `.claude/agents/po.md` — the "Reference: Story Body Conventions" section.'
+        self.assertEqual(scope(section), [".claude/agents/po.md"])
+
+    def test_3209_decorated_header_with_line_suffix_repeated(self):
+        # Both bullets reference the same file at different lines — dedup to one.
+        section = (
+            '- `.github/workflows/release.yml:323` — `uses: actions/attest@59d89421... # v4.1.0` '
+            '("Attest release provenance" step, `subject-checksums: release-assets/SHA256SUMS`)\n'
+            '- `.github/workflows/release.yml:329` — `uses: actions/attest@59d89421... # v4.1.0` '
+            '("Attest release SBOM" step, `subject-checksums` + `sbom-path`)\n'
+        )
+        self.assertEqual(scope(section), [".github/workflows/release.yml"])
+
+    def test_3213_two_bare_backticked_files_no_separator(self):
+        section = (
+            "- `web/src/workflow/WorkflowDrawer.tsx`\n"
+            "- `web/src/workflow/WorkflowDrawer.test.tsx`\n"
+        )
+        self.assertEqual(
+            scope(section),
+            ["web/src/workflow/WorkflowDrawer.test.tsx", "web/src/workflow/WorkflowDrawer.tsx"],
+        )
+
+    def test_3506_parenthetical_annotation_is_not_a_separator(self):
+        section = (
+            "- `pkg/storage/providers/flatfile/steward_store.go`\n"
+            "- `pkg/storage/providers/flatfile/steward_store_test.go` (already exists)\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "pkg/storage/providers/flatfile/steward_store.go",
+                "pkg/storage/providers/flatfile/steward_store_test.go",
+            ],
+        )
+
+    def test_3542_wrapped_item_with_separator_on_its_opening_line(self):
+        section = (
+            "- `features/controller/api/handlers_installer.go` — add the leadership gate\n"
+            "  as the first statement in `handleUploadInstallerArtifact` (line 59) and\n"
+            "  `handleDeleteInstallerArtifact` (line 230).\n"
+            "- `features/controller/api/handlers_installer_test.go` — add the required\n"
+            "  tests.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "features/controller/api/handlers_installer.go",
+                "features/controller/api/handlers_installer_test.go",
+            ],
+        )
+
+    def test_3568_long_unwrapped_subject_with_nested_backticks(self):
+        section = (
+            '- `pkg/entitygraph/writers/dnasync/writer.go` — add shape/bounds validation '
+            '(length caps, charset, expected type) keyed by `fragment_id` for the four '
+            'curated `host:*` kinds when `Authority == "osquery"`, applied before storage '
+            'in `Writer.WriteFragmentDelta`\n'
+            '- `pkg/entitygraph/writers/dnasync/writer_test.go` — ingest-validation tests\n'
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "pkg/entitygraph/writers/dnasync/writer.go",
+                "pkg/entitygraph/writers/dnasync/writer_test.go",
+            ],
+        )
+
+    def test_nested_dash_bullet_under_a_group_heading(self):
+        # The separator search must start AFTER the item's own list marker.
+        # " - " is a separator form, so on an indented dash bullet an unanchored
+        # search matched the bullet marker itself and cut the subject down to the
+        # indent — extracting nothing at all. Grouped sub-lists are the house
+        # convention, and the failure was silent: empty files_parsed reads
+        # downstream as no_files_parsed_cannot_check_conflicts, which dispatches
+        # with file-overlap detection off.
+        section = (
+            "- Handler and its test:\n"
+            "  - `features/controller/api/handlers_push.go` — add the gate\n"
+            "  - `features/controller/api/handlers_push_test.go` — cover it\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "features/controller/api/handlers_push.go",
+                "features/controller/api/handlers_push_test.go",
+            ],
+        )
+
+    def test_indented_bullet_forms_agree_across_markers(self):
+        # `*` and `1.` never regressed; pin all three so a marker-specific fix
+        # cannot drift them apart again.
+        for line in (
+            "  - `pkg/nested.go` — nested bullet",
+            "  * `pkg/nested.go` — nested bullet",
+            "  1. `pkg/nested.go` — nested bullet",
+            " - `pkg/nested.go` — single leading space",
+            "\t- `pkg/nested.go` — tab indent",
+        ):
+            self.assertEqual(scope(line), ["pkg/nested.go"], line)
+
+    def test_indented_bullet_still_cuts_its_commentary_tail(self):
+        # Anchoring the search must not disable it: the tail of an indented item
+        # is commentary exactly like the tail of a top-level one.
+        self.assertEqual(
+            scope("  - `pkg/a.go` — mirrors `pkg/b.go`, no edit there\n"),
+            ["pkg/a.go"],
+        )
+
+    def test_3608_wrapped_multi_file_subject_declares_the_wrapped_file(self):
+        # #3608, verbatim. A multi-file subject can wrap its SECOND file onto
+        # an indented continuation line, with the separator arriving only on
+        # that later line -- not on the item's opening line. A continuation
+        # line is commentary only once the item's separator has already
+        # appeared; while the subject is still open, a continuation line is
+        # still subject and must keep contributing paths.
+        section = (
+            "- `web/src/cockpit/CockpitView.test.tsx`,\n"
+            "  `web/src/cockpit/TicketQuickReference.test.tsx` — new test files.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "web/src/cockpit/CockpitView.test.tsx",
+                "web/src/cockpit/TicketQuickReference.test.tsx",
+            ],
+        )
+
+    def test_3388_wrapped_three_file_subject_declares_every_file(self):
+        # #3388, verbatim. Same shape as #3608 but with three files split
+        # across the wrap instead of two, pinning that the rule isn't
+        # accidentally limited to a two-file subject.
+        section = (
+            "- `pkg/ha/raft_consensus_test.go`, `pkg/ha/manager_test.go`,\n"
+            "  `pkg/ha/config_test.go` — tests.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "pkg/ha/config_test.go",
+                "pkg/ha/manager_test.go",
+                "pkg/ha/raft_consensus_test.go",
+            ],
+        )
+
+    def test_3577_separator_inside_unclosed_parenthetical_is_not_the_items_boundary(self):
+        # #3577, verbatim (issue body). This item's real separator is on its
+        # LAST line ("— update every renamed symbol..."). An earlier line
+        # carries a " — " that reads like a separator but sits inside a
+        # parenthetical opened on a prior line and not closed until three
+        # lines later ("(rename the four `ungatedHandlerBaseline` map ...
+        # unless the four keys are updated in the same commit as the function
+        # renames),") -- it must not be read as the item's boundary, or every
+        # file declared after it (7 of them) is silently dropped.
+        section = (
+            "- `features/controller/api/handlers_web_accounts_test.go` (rename to\n"
+            "  features/controller/api/handlers_accounts_test.go),\n"
+            "  `features/controller/api/architecture_test.go` (rename the four `ungatedHandlerBaseline` map\n"
+            "  string-literal keys — `\"handleCreateWebAccount\"`, `\"handleUpdateWebAccount\"`,\n"
+            "  `\"handleDeleteWebAccount\"`, `\"handleRevokeEnrollmentLink\"` — to their renamed equivalents, e.g.\n"
+            "  `\"handleCreateAccount\"`. This is a silent failure mode, not a compiler-caught one: the map is\n"
+            "  keyed by string literals, so renaming the Go functions does not touch these strings, and\n"
+            "  `make check-architecture` fails post-rename (the renamed function is now unbaselined, ungated,\n"
+            "  unannotated) unless the four keys are updated in the same commit as the function renames),\n"
+            "  `features/controller/api/assurance_test.go`,\n"
+            "  `features/controller/api/handlers_web_session_test.go`,\n"
+            "  `features/controller/api/handlers_webauthn_elevate_test.go`,\n"
+            "  `features/controller/api/handlers_webauthn_test.go`, `features/controller/api/middleware_test.go`,\n"
+            "  `features/controller/api/handlers_entities_test.go`, `features/controller/api/tier_enforcement_test.go`\n"
+            "  — update every renamed symbol these tests reference.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            sorted([
+                "features/controller/api/handlers_web_accounts_test.go",
+                "features/controller/api/handlers_accounts_test.go",
+                "features/controller/api/architecture_test.go",
+                "features/controller/api/assurance_test.go",
+                "features/controller/api/handlers_web_session_test.go",
+                "features/controller/api/handlers_webauthn_elevate_test.go",
+                "features/controller/api/handlers_webauthn_test.go",
+                "features/controller/api/middleware_test.go",
+                "features/controller/api/handlers_entities_test.go",
+                "features/controller/api/tier_enforcement_test.go",
+            ]),
+        )
+
+    def test_table_form_modeled_on_3620_real_alert_locations(self):
+        section = (
+            "| File | Line | Fix |\n"
+            "|------|------|-----|\n"
+            "| `features/controller/api/handlers_deployments.go` | 45 | log-injection |\n"
+            "| `features/rbac/manager.go` | 906 | log-injection |\n"
+        )
+        self.assertEqual(
+            scope(section),
+            [
+                "features/controller/api/handlers_deployments.go",
+                "features/rbac/manager.go",
+            ],
+        )
 
 
 if __name__ == "__main__":
