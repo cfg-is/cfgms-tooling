@@ -93,7 +93,7 @@ RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
 # from the `toolchain` directive, so every toolchain bump in go.mod breaks a
 # prebuilt binary until upstream ships a release rebuilt on the new Go. Issue #3627
 # hit exactly that: its bump moved the directive to a Go minor newer than the one
-# the pinned v2.12.2 release archive was built with (go1.26.2), and `make lint`
+# the prior pinned release archive was built with (go1.26.2), and `make lint`
 # failed to load its config with exit 3.
 # Building here makes the linter's build Go track the base image's Go, which is the
 # same pin the `toolchain` directive carries — the two can no longer drift.
