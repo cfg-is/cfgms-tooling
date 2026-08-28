@@ -84,17 +84,58 @@ check_no_file() {
   fi
 }
 
+# check_perms <desc> <path> <mode>
+# Asserts that <path> is accessible to its owner only.
+#
+# The mode digits are the assertion on Linux/macOS, where they are the access
+# control. They are NOT the assertion on Windows: Git-Bash synthesizes st_mode
+# from the read-only attribute, so it reports 644/755 for every file no matter
+# what chmod was asked for, and the real access control is the NTFS DACL.
+# Asserting the digits there would test the emulation layer rather than the
+# security property, so on Windows this reads the DACL and requires that no
+# principal other than the current user is granted anything.
 check_perms() {
   local desc="$1" path="$2" want_perms="$3"
   ran=$((ran + 1))
-  local got_perms
-  got_perms=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%p' "$path" 2>/dev/null | tail -c 4 || echo "ERR")
-  if [[ "$got_perms" == "$want_perms" ]]; then
-    printf '  ok    %s\n' "$desc"
-  else
-    fail=$((fail + 1))
-    printf '  FAIL  %s — expected %s, got %s (%s)\n' "$desc" "$want_perms" "$got_perms" "$path"
-  fi
+
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*)
+      local acl extra_principals user
+      user="$(whoami)"
+      acl=$(MSYS2_ARG_CONV_EXCL='*' icacls "$(cygpath -w "$path")" 2>/dev/null) || {
+        fail=$((fail + 1))
+        printf '  FAIL  %s — could not read the ACL of %s\n' "$desc" "$path"
+        return
+      }
+      # icacls prints "<path> PRINCIPAL:(perms)" then one "PRINCIPAL:(perms)"
+      # per additional ACE, then a summary line. Collect every principal and
+      # subtract the owner; anything left can read the credential. The domain
+      # qualifier is stripped because icacls reports the ACE as "LAB\cfg" while
+      # whoami(1) under Git-Bash reports the bare account name "cfg" — matching
+      # the raw strings would flag the owner's own ACE as an extra principal.
+      extra_principals=$(printf '%s\n' "$acl" \
+        | sed -n 's/.*[[:space:]]\([^[:space:]]*\):([^[:space:]]*)[[:space:]]*$/\1/p' \
+        | sed 's/.*\\//' \
+        | grep -vixF "${user##*\\}" || true)
+      if [[ -z "$extra_principals" ]]; then
+        printf '  ok    %s\n' "$desc"
+      else
+        fail=$((fail + 1))
+        printf '  FAIL  %s — ACL grants access beyond %s: %s (%s)\n' \
+          "$desc" "$user" "$(printf '%s' "$extra_principals" | tr '\n' ' ')" "$path"
+      fi
+      ;;
+    *)
+      local got_perms
+      got_perms=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%p' "$path" 2>/dev/null | tail -c 4 || echo "ERR")
+      if [[ "$got_perms" == "$want_perms" ]]; then
+        printf '  ok    %s\n' "$desc"
+      else
+        fail=$((fail + 1))
+        printf '  FAIL  %s — expected %s, got %s (%s)\n' "$desc" "$want_perms" "$got_perms" "$path"
+      fi
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------

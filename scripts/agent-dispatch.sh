@@ -132,6 +132,35 @@ META
 AGENT_LEDGER_DIR="${CFGMS_AGENT_LEDGER_DIR:-${HOME}/.cache/cfgms-agent-ledger}"
 AGENT_LEDGER_FILE="${AGENT_LEDGER_DIR}/ledger.jsonl"
 
+# _cfgms_locked_do <lockfile> <timeout_secs> <body_fn>
+# Best-effort mutual exclusion around <body_fn> (a shell function name, called
+# with bash's normal dynamic scoping so it sees the caller's locals). Prefers
+# flock (atomic FD lock). When the flock binary is absent — not installed in
+# this host's Git-Bash/MSYS usr/bin; its "command not found" (exit 127) was
+# being swallowed identically to lock contention by a bare `|| exit 0`, so
+# every guarded write silently never happened (Issue #3686) — falls back to an
+# mkdir-based spinlock, atomic on every filesystem bash runs on. Either way:
+# best-effort, matching every caller's existing contract that a lock-guarded
+# write must never block or fail the caller beyond the timeout.
+_cfgms_locked_do() {
+  local lockfile="$1" timeout="$2" body_fn="$3"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -w "$timeout" 200 || exit 0
+      "$body_fn"
+    ) 200>>"$lockfile" 2>/dev/null || true
+  else
+    local lockdir="${lockfile}.d" waited=0 max_waits=$((timeout * 5))
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      waited=$((waited + 1))
+      [[ $waited -gt $max_waits ]] && return 0
+      sleep 0.2
+    done
+    "$body_fn" 2>/dev/null || true
+    rmdir "$lockdir" 2>/dev/null || true
+  fi
+}
+
 # _ledger_write_line <json_line>
 # Appends one already-serialized JSON line, lock-guarded against concurrent
 # writers on this host (JSONL lines are small enough for an atomic O_APPEND
@@ -142,10 +171,10 @@ _ledger_write_line() {
   local line="$1"
   [[ -n "$line" ]] || return 0
   mkdir -p "$AGENT_LEDGER_DIR" 2>/dev/null || return 0
-  (
-    flock -w 2 200 || exit 0
-    printf '%s\n' "$line" >> "$AGENT_LEDGER_FILE"
-  ) 200>>"${AGENT_LEDGER_FILE}.lock" 2>/dev/null || true
+  _cfgms_locked_do "${AGENT_LEDGER_FILE}.lock" 2 _ledger_write_line__append
+}
+_ledger_write_line__append() {
+  printf '%s\n' "$line" >> "$AGENT_LEDGER_FILE"
 }
 
 # ledger_resolve_model <segment>
@@ -322,6 +351,7 @@ _capacity_compute() {
   CAP_MODE="$mode" CAP_RUNNING="${running:-0}" CAP_DOCKER_ROOT="$docker_root" \
   CAP_WORKTREE="$WORKTREE_BASE" python3 - <<'PY'
 import os
+import shutil
 def f(k, d):
     try: return float(os.environ[k])
     except Exception: return d
@@ -358,10 +388,13 @@ if mt > 0:
 # Disk: worst filesystem among the clone dir and the docker data root.
 # Neither path is guaranteed to exist yet — the worktree base is created on the
 # first clone, and the docker data root is absent wherever docker isn't
-# installed. statvfs on a missing path raises, and swallowing that left the disk
-# dimension at its 999 sentinel, i.e. silently ungated on exactly the first run.
-# Measure the nearest existing ancestor instead: that is the filesystem the
-# directory would be created on, so its free space is the figure the gate wants.
+# installed. shutil.disk_usage on a missing path raises, and swallowing that
+# left the disk dimension at its 999 sentinel, i.e. silently ungated on
+# exactly the first run. Measure the nearest existing ancestor instead: that
+# is the filesystem the directory would be created on, so its free space is
+# the figure the gate wants. shutil.disk_usage (not os.statvfs, which does not
+# exist on Windows and left this gate permanently unbounded there — Issue
+# #3686) is the cross-platform stdlib call for total/used/free bytes.
 def nearest_existing(path):
     path = os.path.abspath(path)
     while not os.path.exists(path):
@@ -376,10 +409,8 @@ for raw in {os.environ.get("CAP_WORKTREE", ""), os.environ.get("CAP_DOCKER_ROOT"
     p = nearest_existing(raw)
     if not p: continue
     try:
-        s = os.statvfs(p)
-        tot = s.f_blocks * s.f_frsize
-        used = tot - s.f_bavail * s.f_frsize
-        disk_slot = min(disk_slot, max(0, slots_for(disk_ceil * tot, used, per_disk)))
+        du = shutil.disk_usage(p)
+        disk_slot = min(disk_slot, max(0, slots_for(disk_ceil * du.total, du.used, per_disk)))
     except Exception:
         pass
 slots["disk"] = disk_slot
@@ -510,6 +541,34 @@ PY
     "$@"
 }
 
+# restrict_to_owner <mode> <path>
+# Makes <path> readable by its owner only.
+#
+# chmod alone does not deliver that on every host this dispatcher runs on.
+# Under Git-Bash/MSYS the POSIX mode bits are synthesized, not stored: `chmod
+# 600` on a credential file leaves stat reporting 644 and, more importantly,
+# leaves the file's real access control — the NTFS DACL — untouched, so the
+# inherited "Users"/"Authenticated Users" read ACEs survive. A minted API key
+# written that way is readable by every local account on the box. Applying the
+# mode AND, on Windows, replacing the DACL with a single owner ACE makes the
+# guarantee the comments claim true on both platforms.
+restrict_to_owner() {
+  local mode="$1" path="$2"
+  chmod "$mode" "$path"
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*)
+      # (OI)(CI) so a directory's restriction is inherited by the credential
+      # files created inside it. MSYS2_ARG_CONV_EXCL stops the msys argument
+      # mangler rewriting icacls' /inheritance and /grant switches into
+      # filesystem paths.
+      local ace="(F)"
+      [[ -d "$path" ]] && ace="(OI)(CI)(F)"
+      MSYS2_ARG_CONV_EXCL='*' icacls "$(cygpath -w "$path")" \
+        /inheritance:r /grant:r "$(whoami):${ace}" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
 # mint_agent_creds <num>
 # Creates agent-test/<num> sub-tenant (idempotent) and issues an agent.dev-scoped
 # API key. Writes key value to ${AGENT_CRED_BASE}/<num>/api.key (0600) and the
@@ -522,7 +581,7 @@ mint_agent_creds() {
 
   # Create and secure the per-agent cred dir.
   mkdir -p "$cred_dir"
-  chmod 700 "$cred_dir"
+  restrict_to_owner 700 "$cred_dir"
 
   # 1. Create agent-test sub-tenant (idempotent — 409 is success).
   local create_resp http_code
@@ -570,9 +629,9 @@ print(d.get('data', {}).get('id', '') or d.get('id', ''))
 
   # 3. Write credential files (600 — no world or group read).
   printf '%s' "$key_value" > "${cred_dir}/api.key"
-  chmod 600 "${cred_dir}/api.key"
+  restrict_to_owner 600 "${cred_dir}/api.key"
   printf '%s' "$key_id" > "${cred_dir}/api.key.id"
-  chmod 600 "${cred_dir}/api.key.id"
+  restrict_to_owner 600 "${cred_dir}/api.key.id"
 
   echo "CRED_MINTED:${num}:${key_id}"
 }
@@ -626,7 +685,7 @@ revoke_agent_creds() {
   # Record any revocation failures for manual follow-up (never block cleanup).
   if [[ ${#errors[@]} -gt 0 ]]; then
     printf '%s\n' "${errors[@]}" >> "$revoke_failed_file"
-    chmod 600 "$revoke_failed_file"
+    restrict_to_owner 600 "$revoke_failed_file"
     for err in "${errors[@]}"; do
       echo "WARN:revoke_failed:${num}:${err}"
     done
@@ -1267,8 +1326,15 @@ case "$cmd" in
   create-clone-item)
     [[ $# -eq 1 ]] || { echo "create-clone-item requires exactly one item_id"; exit 1; }
     item_id="$1"
-    # Derive LAST12: last 12 alphanumeric chars of item_id (strip non-[a-zA-Z0-9])
-    LAST12=$(echo "$item_id" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
+    # Derive LAST12: last 12 alphanumeric chars of item_id (strip non-[a-zA-Z0-9]),
+    # or the whole string when it has fewer than 12. Pure-bash suffix slice, not
+    # `rev` (not installed in this host's Git-Bash/MSYS usr/bin — Issue #3686).
+    # A plain negative-offset slice (`${_alnum: -12}`) returns EMPTY rather than
+    # the whole string once length < 12 -- verified: bash clamps a negative
+    # resulting offset to nothing, not to 0 -- so the offset is computed
+    # explicitly instead.
+    _alnum=$(echo "$item_id" | tr -cd 'a-zA-Z0-9')
+    LAST12="${_alnum:$(( ${#_alnum} > 12 ? ${#_alnum} - 12 : 0 )):12}"
     [[ -n "$LAST12" ]] || { echo "ERROR: item_id '${item_id}' has no alphanumeric chars — cannot derive LAST12"; exit 1; }
     branch_name="feature/item-${LAST12}-agent"
     dest="${WORKTREE_BASE}/item-${LAST12}"
@@ -1927,8 +1993,10 @@ else:
         echo "SKIP:clone:${clone_dir} not found"
       fi
     else
-      # Item mode (non-numeric item_id): derive LAST12 and clean item resources
-      item_last12=$(echo "$num" | tr -cd 'a-zA-Z0-9' | rev | cut -c1-12 | rev)
+      # Item mode (non-numeric item_id): derive LAST12 and clean item resources.
+      # See create-clone-item above for why this isn't `${_alnum: -12}`.
+      _alnum=$(echo "$num" | tr -cd 'a-zA-Z0-9')
+      item_last12="${_alnum:$(( ${#_alnum} > 12 ? ${#_alnum} - 12 : 0 )):12}"
       item_container="cfg-agent-item-${item_last12}"
       docker cp "${item_container}:/tmp/agent-result.json" "/tmp/agent-result-${item_container}.json" 2>/dev/null || true
       ledger_reconcile_exit "$item_container" "/tmp/agent-result-${item_container}.json"

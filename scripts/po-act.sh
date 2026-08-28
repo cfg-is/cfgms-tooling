@@ -144,13 +144,16 @@ _cycle_append_step() {
   local manifest idx
   manifest=$(_cycle_manifest_path) || return 0
   [[ -n "$manifest" ]] && [[ -f "$manifest" ]] || return 0
-  idx=$(
-    # stderr first: a command substitution runs before any redirection on the
-    # assignment itself could suppress it, so this subshell must silence its
-    # own noise (best-effort recording never speaks over a subcommand).
-    exec 2>/dev/null 201>>"${manifest}.lock"
-    flock -w 2 201 || exit 0
-    python3 - "$manifest" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$subcommand" "$*" <<'PYEOF'
+  local _step_args="$*"
+  # stderr silenced by _cfgms_locked_do itself (best-effort recording never
+  # speaks over a subcommand); only stdout (the printed index) is captured.
+  idx=$(_cfgms_locked_do "${manifest}.lock" 2 _cycle_append_step__record) || idx=""
+  [[ "$idx" =~ ^[0-9]+$ ]] || return 0
+  CYCLE_STEP_MANIFEST="$manifest"
+  CYCLE_STEP_INDEX="$idx"
+}
+_cycle_append_step__record() {
+  python3 - "$manifest" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$subcommand" "$_step_args" <<'PYEOF'
 import json, sys
 path, ts, subcommand, args = sys.argv[1:5]
 try:
@@ -167,10 +170,6 @@ with open(path, "w") as f:
     json.dump(manifest, f, indent=2)
 print(len(steps) - 1)
 PYEOF
-  ) || idx=""
-  [[ "$idx" =~ ^[0-9]+$ ]] || return 0
-  CYCLE_STEP_MANIFEST="$manifest"
-  CYCLE_STEP_INDEX="$idx"
 }
 
 # _cycle_arm_step_outcome
@@ -215,9 +214,11 @@ _cycle_finalize_step() {
       i=$((i + 1))
     done
   fi
-  (
-    exec 203>>"${CYCLE_STEP_MANIFEST}.lock" 2>/dev/null
-    flock -w 2 203 || exit 0
+  _cfgms_locked_do "${CYCLE_STEP_MANIFEST}.lock" 2 _cycle_finalize_step__record >/dev/null 2>&1 || true
+  [[ -n "$CYCLE_STEP_OUTFILE" ]] && rm -f "$CYCLE_STEP_OUTFILE"
+  return 0
+}
+_cycle_finalize_step__record() {
     python3 - "$CYCLE_STEP_MANIFEST" "$CYCLE_STEP_INDEX" "$rc" "${CYCLE_STEP_OUTFILE:-}" <<'PYEOF'
 import json, re, sys
 path, idx_raw, rc_raw, out_path = sys.argv[1:5]
@@ -274,9 +275,6 @@ step["result"] = marker[:200] or None
 with open(path, "w") as f:
     json.dump(manifest, f, indent=2)
 PYEOF
-  ) >/dev/null 2>&1 || true
-  [[ -n "$CYCLE_STEP_OUTFILE" ]] && rm -f "$CYCLE_STEP_OUTFILE"
-  return 0
 }
 
 # _cycle_append_lease <action> <key> <result>
@@ -289,9 +287,10 @@ _cycle_append_lease() {
   local manifest
   manifest=$(_cycle_manifest_path) || return 0
   [[ -n "$manifest" ]] && [[ -f "$manifest" ]] || return 0
-  (
-    flock -w 2 202 || exit 0
-    python3 - "$manifest" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$key" "$result" <<'PYEOF'
+  _cfgms_locked_do "${manifest}.lock" 2 _cycle_append_lease__record
+}
+_cycle_append_lease__record() {
+  python3 - "$manifest" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$key" "$result" <<'PYEOF'
 import json, sys
 path, ts, action, key, result = sys.argv[1:6]
 try:
@@ -303,7 +302,6 @@ manifest.setdefault("leases", []).append({"ts": ts, "action": action, "key": key
 with open(path, "w") as f:
     json.dump(manifest, f, indent=2)
 PYEOF
-  ) 202>>"${manifest}.lock" 2>/dev/null || true
 }
 
 # ── Shared claim / routing helpers ──────────────────────────────────────────
@@ -370,6 +368,10 @@ _capacity_ok() {
 _mq_failed_runs_for_pr() {
   CFGMS_DIAG_PR="${1:?pr required}" python3 -c '
 import json, os, re, sys
+# Windows python defaults stdout to translate "\n" -> os.linesep ("\r\n"),
+# corrupting the last field of every downstream `IFS=$"\t" read`/`tr` split
+# (Issue #3686). Force real newlines regardless of platform.
+sys.stdout.reconfigure(newline="\n")
 pr = os.environ["CFGMS_DIAG_PR"]
 try:
     runs = json.load(sys.stdin)
@@ -401,6 +403,7 @@ for run in runs:
 _failed_job_ids() {
   python3 -c '
 import json, sys
+sys.stdout.reconfigure(newline="\n")
 try:
     data = json.load(sys.stdin)
 except Exception:

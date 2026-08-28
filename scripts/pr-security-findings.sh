@@ -93,22 +93,36 @@ HEAD_SHA=$(gh pr view "${PR}" --repo "${REPO}" --json headRefOid --jq '.headRefO
     # check concludes `success`. state=open respects human dismissal; the
     # added-line intersection keeps it new-in-PR (no inherited-alert FP).
     # Queries the PR-merge ref (Issue #2913) so new-file alerts are visible.
-    python3 - "${REPO}" "${PR}" <<'PYEOF' 2>/dev/null || true
-import json, re, subprocess, sys
-repo, pr = sys.argv[1], sys.argv[2]
+    #
+    # Both `gh api` calls run here in bash, not inside python's subprocess
+    # module (Issue #3686): native Windows Python's subprocess.run(['gh', ...])
+    # cannot exec the test harness's fake `gh` (an extensionless shebang
+    # script) — it silently falls through PATH to a real installed gh.exe
+    # instead of erroring, defeating PATH-interception test mocks. Python
+    # below only parses the pre-fetched JSON.
+    pr_files_json=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate 2>/dev/null || echo '[]')
+    alerts_json=$(gh api "repos/${REPO}/code-scanning/alerts?ref=refs/pull/${PR}/merge&state=open&per_page=100" --paginate 2>/dev/null || echo '[]')
+    pr_files_file=$(mktemp)
+    alerts_file=$(mktemp)
+    trap 'rm -f "$pr_files_file" "$alerts_file"' EXIT
+    printf '%s' "$pr_files_json" > "$pr_files_file"
+    printf '%s' "$alerts_json" > "$alerts_file"
+    python3 - "$pr_files_file" "$alerts_file" <<'PYEOF' 2>/dev/null || true
+import json, re, sys
 
-def gh_json(*args):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True)
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
+def load_json(path):
     try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
         return None
+
+pr_files = load_json(sys.argv[1]) or []
+alerts = load_json(sys.argv[2]) or []
 
 # Lines this PR ADDS, per file, from the unified-diff patch (new-file numbering).
 added = {}
-for f in gh_json("api", f"repos/{repo}/pulls/{pr}/files", "--paginate") or []:
+for f in pr_files:
     path, patch = f.get("filename"), f.get("patch")
     if not path or not patch:
         continue
@@ -134,13 +148,15 @@ for f in gh_json("api", f"repos/{repo}/pulls/{pr}/files", "--paginate") or []:
 # live only on refs/pull/<N>/merge. The added-line intersection below still
 # filters develop's inherited alerts on untouched lines, so widening the query
 # to the merge ref adds no false-positives (see header).
-for a in gh_json("api", f"repos/{repo}/code-scanning/alerts?ref=refs/pull/{pr}/merge&state=open&per_page=100", "--paginate") or []:
+for a in alerts:
     loc = ((a.get("most_recent_instance") or {}).get("location")) or {}
     path, start = loc.get("path"), loc.get("start_line")
     if path in added and start in added[path]:
         rule = (a.get("rule") or {}).get("id") or "code-scanning"
         print(f"{path}:{start}:{rule}")
 PYEOF
+    rm -f "$pr_files_file" "$alerts_file"
+    trap - EXIT
 } | tr -d '\r' | tr '\000-\010\013-\037' ' ' | grep -v '^$' | sort -u | head -200 || true
 
 # Always succeed: an empty result (grep filtering all lines -> exit 1 under

@@ -655,25 +655,27 @@ PYEOF
     # lease-list  →  one TSV line per live lease ref: <key>\t<holder>\t<exp>\t<expired>
     owner="${REPO%%/*}"; name="${REPO##*/}"
     now=$(date +%s)
+    # Pure bash + local jq (Issue #3686), mirroring lease-status above: native
+    # Windows Python's subprocess module can't exec the test harness's fake
+    # `gh` (an extensionless shebang script) — it silently falls through PATH
+    # to a real installed gh.exe instead of erroring, defeating
+    # PATH-interception test mocks. Piping through the system `jq` binary
+    # directly (not `gh api --jq`) avoids spawning a second process per ref,
+    # so there is nothing here for that failure mode to attach to.
     refs_json=$(gh api "repos/${owner}/${name}/git/matching-refs/cfgms-lease/" 2>/dev/null || echo '[]')
-    printf '%s' "$refs_json" | python3 -c "
-import json,sys,subprocess
-try: refs=json.load(sys.stdin)
-except Exception: refs=[]
-now=${now}
-for r in refs:
-    key=r['ref'].replace('refs/cfgms-lease/','')
-    sha=r.get('object',{}).get('sha','')
-    msg=''
-    if sha:
-        p=subprocess.run(['gh','api','repos/${owner}/${name}/git/commits/'+sha,'--jq','.message'],capture_output=True,text=True)
-        msg=p.stdout.strip()
-    import re
-    exp=(re.search(r'exp=(\d+)',msg) or [None,''])[1]
-    holder=(re.search(r'holder=(\S+)',msg) or [None,''])[1]
-    expired = bool(exp) and now>int(exp)
-    print(f'{key}\t{holder}\t{exp}\t{expired}')
-" 2>/dev/null || true
+    while IFS=$'\t' read -r ref sha; do
+      [ -n "$ref" ] || continue
+      key="${ref#refs/cfgms-lease/}"
+      msg=""
+      if [ -n "$sha" ]; then
+        msg=$(gh api "repos/${owner}/${name}/git/commits/${sha}" --jq '.message' 2>/dev/null || true)
+      fi
+      exp=$(printf '%s' "$msg" | grep -oE 'exp=[0-9]+' | head -1 | cut -d= -f2)
+      holder=$(printf '%s' "$msg" | grep -oE 'holder=[^ ]+' | head -1 | cut -d= -f2)
+      expired=false
+      [ -n "$exp" ] && [ "$now" -gt "$exp" ] && expired=true
+      printf '%s\t%s\t%s\t%s\n' "$key" "$holder" "$exp" "$expired"
+    done < <(printf '%s' "$refs_json" | jq -r '.[] | "\(.ref)\t\(.object.sha // "")"' 2>/dev/null | tr -d '\r' || true)
     exit 0
     ;;
 

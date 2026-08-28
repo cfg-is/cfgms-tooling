@@ -45,6 +45,12 @@ printf '\n== bash -n parses ==\n'
 if bash -n "$POACT" 2>/dev/null; then ok "po-act.sh parses"; else bad "po-act.sh parses" "bash -n failed"; fi
 
 SANDBOX="$(mktemp -d)"
+# Several fixtures below embed $SANDBOX-derived paths as literal string
+# content inside python heredocs (not argv, which MSYS auto-converts on exec).
+# Normalize to the native form up front so native Windows Python's own path
+# handling doesn't misread a leading "/tmp/..." as drive-root and raise
+# FileNotFoundError (Issue #3686).
+SANDBOX="$(cd "$SANDBOX" && { pwd -W 2>/dev/null || pwd; })"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 export CFGMS_TEST_REPO_ROOT="$REPO_ROOT"
