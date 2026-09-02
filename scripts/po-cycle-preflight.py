@@ -135,6 +135,29 @@ BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)
 #: decide pipeline ownership would claim genuine manual work.
 AGENT_BRANCH_RE = re.compile(r"^feature/(?:story-\d+|item-[A-Za-z0-9]+)-agent$")
 
+# Markers identifying a draft PR opened by the container entrypoint's
+# _salvage_no_pr() after a session-truncated run (token reauth/limit, agent
+# never got going). Both a body prefix and a title-suffix form are accepted
+# because either alone is sufficient evidence of a truncated session.
+#
+# CURRENT emitter (.devcontainer/entrypoint.sh:117-118, `gh pr create --draft`):
+#   title: "WIP: <branch> (agent produced no PR)"
+#   body:  "Agent session ended with exit code <N> and no pull request: ..."
+#
+# LEGACY forms (older containers; already-open drafts may still carry these —
+# the emitter strings are never changed to avoid stranding them):
+#   body:  "Agent session failed with exit code ..."
+#   title: "...(agent failed)" (see entrypoint.sh:1065, which rewrites this
+#          leftover legacy title on successful fix-pr resume)
+_WIP_SESSION_FAILED_BODY_PREFIXES = (
+    "Agent session ended with exit code",
+    "Agent session failed with exit code",
+)
+_WIP_SESSION_FAILED_TITLE_SUFFIXES = (
+    "(agent produced no PR)",
+    "(agent failed)",
+)
+
 # Permission levels that indicate a trusted (first-party) collaborator.
 _TRUSTED_PERMS = frozenset({"push", "maintain", "admin"})
 
@@ -2402,8 +2425,8 @@ def _build_pr_summaries(prs):
         review_verdict_val, review_comment_date = latest_review(comments)
         is_draft = bool(pr.get("isDraft"))
         wip_session_failed = is_draft and (
-            body.startswith("Agent session failed with exit code")
-            or (title.startswith("WIP:") and title.endswith("(agent failed)"))
+            body.startswith(_WIP_SESSION_FAILED_BODY_PREFIXES)
+            or (title.startswith("WIP:") and title.endswith(_WIP_SESSION_FAILED_TITLE_SUFFIXES))
         )
 
         summaries.append({
