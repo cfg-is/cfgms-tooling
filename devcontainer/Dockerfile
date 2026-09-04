@@ -79,7 +79,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Go-based security and quality tools
 # Versions MUST match .github/workflows/dependency-pin-check.yml
-RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
+RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0 \
     && go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
     && go install github.com/google/go-licenses/v2@v2.0.1
@@ -109,7 +109,7 @@ RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
 # .github/workflows/dependency-pin-check.yml, .github/workflows/golangci-lint.yml,
 # windows-setup.ps1 and the Makefile's GOLANGCI_LINT_VERSION (the `lint` target
 # rebuilds the linter itself when the one on PATH predates a toolchain bump).
-RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1 \
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 \
     && golangci-lint --version
 
 # Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.74.0 is the
@@ -148,7 +148,7 @@ RUN set -eu; \
     && chmod +x "$GOPATH/bin/nancy"
 
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.0/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.0 || true
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.1/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.1 || true
 
 # Claude Code — pinned, never @latest (same supply-chain rule as every other
 # tool here; see dependency-pin-check.yml). An unpinned install also froze
