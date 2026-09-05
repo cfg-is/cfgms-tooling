@@ -66,8 +66,8 @@ echo ""
 echo "== every dispatch launch path bind-mounts the host's live credentials file =="
 cred_mount='.claude/.credentials.json:/home/agent/.claude/.credentials.json'
 dispatch_mount_count=$(grep -c "$cred_mount" "$DISPATCH")
-check_contains "agent-dispatch.sh bind-mounts host creds at least 4x (launch/launch-generic/launch-interactive/po-live)" \
-  "$dispatch_mount_count" "4"
+check_contains "agent-dispatch.sh bind-mounts host creds at least 5x (launch/launch-generic/launch-interactive/po-live/launch-investigator plan mode)" \
+  "$dispatch_mount_count" "5"
 check_contains "po-act.sh bind-mounts host creds for its inlined launch" "$po_act_src" "$cred_mount"
 
 echo ""
