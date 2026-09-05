@@ -157,7 +157,7 @@ RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.9
 # built while `npm latest` moved on. The pin makes the layer key change with
 # the version, and dependency-pin-check.yml files a weekly issue when npm's
 # dist-tags.latest moves ahead of it.
-ARG CLAUDE_CODE_VERSION=2.1.232
+ARG CLAUDE_CODE_VERSION=2.1.258
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 # Non-root agent user with sudo for iptables only
