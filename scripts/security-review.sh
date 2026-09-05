@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# security-review.sh — sweep orchestration CLI for the security review harness
+# (Issue #3910). The single host-side command a human runs to operate the
+# whole harness end to end: launch a sweep against a named ref, check its
+# status, and resume an interrupted or partially-parked sweep.
+#
+# This is a thin CLI. It adds no classification, schema, or credential logic
+# of its own -- it only calls each dependency's existing entry point, in
+# sequence, exactly as documented in docs/architecture/security-review-harness.md:
+#   - manifest.py (#3902)   -- create_sweep()
+#   - planner.py (#3906)    -- prepare()/launch()/finalize()
+#   - agent-dispatch.sh launch-investigator (#3903) -- dispatches each of the
+#     three finder lanes (#3907/#3908/#3909), one container per invocation
+#   - consolidate.py (#3904) -- consolidate()/load_sweep()/build_coverage_table()
+#
+# Container lifecycle is short-lived and per-invocation, not one long-running
+# process per lane: each launch/resume call dispatches a lane's container for
+# one pass over its currently-missing steps, waits for it to exit (`docker
+# wait`), then moves on. That is what makes #3903's per-invocation credential
+# file safe to remove on every container exit (its own design) -- a park
+# interval spanning days is never a still-running container holding a stale
+# credential mount, because parking IS the container exiting under this
+# lifecycle. This script owns that guarantee; #3903 depends on it rather than
+# re-deriving it.
+#
+# No GitHub Actions workflow and no repository secret are added or required by
+# this script -- it is a host-only tool, invoked interactively or by a future
+# scheduling wrapper, never by CI.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECURITY_REVIEW_DIR="${SCRIPT_DIR}/security-review"
+AGENT_DISPATCH_SCRIPT="${SCRIPT_DIR}/agent-dispatch.sh"
+
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$REPO_ROOT" ]]; then
+  echo "ERROR: cannot determine the repository root (\`git rev-parse --show-toplevel\` failed)" >&2
+  exit 1
+fi
+
+# One entry per finder lane this harness dispatches. Lane ids match
+# manifest.py::LANES exactly -- that tuple is the single source of truth for
+# lane directory names (Issue #3902). Cred names are the OS-keychain entry
+# names agent-dispatch.sh's launch-investigator --cred-name looks up
+# (Issue #3903); provisioning the actual keychain entries is an operational
+# precondition documented alongside each lane, not something this script or
+# any dev agent can do.
+LANE_IDS=(anthropic-opus5 openai-gpt56-sol ollama-qwen)
+LANE_CRED_NAMES=(ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY)
+LANE_SCRIPTS=(
+  "${SECURITY_REVIEW_DIR}/lanes/anthropic.py"
+  "${SECURITY_REVIEW_DIR}/lanes/openai.py"
+  "${SECURITY_REVIEW_DIR}/lanes/ollama.py"
+)
+
+usage() {
+  cat <<'EOF'
+Usage: security-review.sh <command> [args...]
+
+Commands:
+  launch <ref>        Resolve <ref>, create a new sweep tree, run the metadata-only
+                       planner, dispatch all three finder lanes independently, run the
+                       consolidator, and print the path to report/consolidated.md.
+  resume <sweep-id>   Re-invoke the planner against an existing sweep (a no-op if
+                       plan/ is already populated) and re-dispatch all three lanes --
+                       each lane's own resume-scanner integration ensures only its
+                       missing steps run again -- then re-run the consolidator.
+  status <sweep-id>   Print the per-lane x per-step coverage breakdown for an existing
+                       sweep. Read-only: never re-runs the planner, a lane, or the
+                       consolidator.
+
+A lane that parks, refuses, or fails on some steps never blocks the other two lanes'
+dispatch or progress, and never prevents the consolidator from running against
+whatever the other lanes produced.
+
+Exit status: non-zero if the sweep base directory cannot be resolved, or if
+consolidation could not run -- this script never exits 0 having silently written a
+partial or empty sweep tree.
+EOF
+}
+
+resolve_base_dir() {
+  python3 "${SECURITY_REVIEW_DIR}/basedir.py" --repo-root "$REPO_ROOT"
+}
+
+# create_sweep_tree <ref>
+# Prints "<sweep_dir><TAB><commit_sha>" on success. Calls manifest.py's
+# create_sweep(), which resolves the base directory (fail-closed) before
+# creating anything -- a BaseDirError here means zero directories were
+# created, satisfying the "write no partial sweep tree" exit-code contract.
+create_sweep_tree() {
+  local ref="$1"
+  python3 - "$SECURITY_REVIEW_DIR" "$REPO_ROOT" "$ref" <<'PYEOF'
+import json
+import os
+import sys
+
+sec_dir, repo_root, ref = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, sec_dir)
+import manifest  # noqa: E402
+
+try:
+    sweep_dir = manifest.create_sweep(ref, repo_root=repo_root)
+except Exception as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+with open(os.path.join(sweep_dir, "manifest.json")) as f:
+    m = json.load(f)
+print(f"{sweep_dir}\t{m['commit_sha']}")
+PYEOF
+}
+
+# plan_already_populated <sweep_dir>
+# True if at least one plan/step-*.json file already exists -- resume's
+# signal to skip re-dispatching the planner as a no-op (#3906's planner does
+# not overwrite an existing valid plan; this is the check that keeps this
+# script from asking it to regenerate one anyway).
+plan_already_populated() {
+  local sweep_dir="$1"
+  compgen -G "${sweep_dir}/plan/step-*.json" >/dev/null 2>&1
+}
+
+# dispatch_planner <sweep_dir> <commit_sha>
+# prepare() -> launch() -> wait for the container to exit -> finalize().
+# Every failure here is logged and treated as non-fatal to the overall
+# launch/resume: a broken plan leaves the lanes nothing to do (they will
+# simply find zero outstanding steps), and the consolidator still runs and
+# renders that state visibly rather than the whole command aborting.
+dispatch_planner() {
+  local sweep_dir="$1" commit_sha="$2"
+
+  local prepare_output
+  if ! prepare_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" prepare "$sweep_dir" "$commit_sha" --repo-root "$REPO_ROOT" 2>&1); then
+    echo "WARNING: planner prepare failed: ${prepare_output}" >&2
+    return 0
+  fi
+
+  local launch_output
+  if ! launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --repo-root "$REPO_ROOT" 2>&1); then
+    echo "WARNING: planner launch failed: ${launch_output}" >&2
+    return 0
+  fi
+
+  local container_id
+  container_id="$(printf '%s\n' "$launch_output" | sed -n 's/^LAUNCHED_INVESTIGATOR:plan://p' | tail -n1)"
+  if [[ -n "$container_id" ]]; then
+    docker wait "$container_id" >/dev/null 2>&1 || true
+  fi
+
+  local finalize_output
+  if ! finalize_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" finalize "$sweep_dir" 2>&1); then
+    echo "WARNING: planning failed for ${sweep_dir}: ${finalize_output}" >&2
+  fi
+  return 0
+}
+
+# dispatch_all_lanes <sweep_dir>
+# Dispatches all three lanes independently (AC6): a lane that fails to
+# dispatch at all (credential unavailable, container name collision, ...) is
+# logged and skipped -- it never stops the loop from dispatching the
+# remaining lanes. Every container that did launch is `docker run -d`
+# (already returned by the time launch-investigator's own call returns), so
+# waiting on them here, even sequentially, does not serialize their work --
+# it only serializes this script's observation of when each one is done.
+dispatch_all_lanes() {
+  local sweep_dir="$1"
+  local container_ids=()
+  local i lane_id cred_name script output rc cid
+
+  for i in "${!LANE_IDS[@]}"; do
+    lane_id="${LANE_IDS[$i]}"
+    cred_name="${LANE_CRED_NAMES[$i]}"
+    script="${LANE_SCRIPTS[$i]}"
+
+    rc=0
+    output=$("$AGENT_DISPATCH_SCRIPT" launch-investigator \
+      --sweep-dir "$sweep_dir" \
+      --mode "$lane_id" \
+      --cred-name "$cred_name" \
+      --lane-entrypoint "$script" 2>&1) || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+      echo "WARNING: lane ${lane_id} dispatch failed (exit ${rc}): ${output}" >&2
+      continue
+    fi
+
+    cid="$(printf '%s\n' "$output" | sed -n "s/^LAUNCHED_INVESTIGATOR:${lane_id}://p" | tail -n1)"
+    if [[ -z "$cid" ]]; then
+      echo "WARNING: lane ${lane_id} dispatched but no container id was parsed from: ${output}" >&2
+      continue
+    fi
+    container_ids+=("$cid")
+  done
+
+  for cid in "${container_ids[@]:-}"; do
+    [[ -n "$cid" ]] || continue
+    docker wait "$cid" >/dev/null 2>&1 || true
+  done
+}
+
+# run_consolidation <sweep_dir>
+# Reuses consolidate.py's CLI unmodified. Its own exit code is the contract:
+# non-zero only when the repository root could not be determined, which
+# cannot happen here since $REPO_ROOT is already resolved.
+run_consolidation() {
+  local sweep_dir="$1"
+  python3 "${SECURITY_REVIEW_DIR}/consolidate.py" "$sweep_dir" --repo-root "$REPO_ROOT"
+}
+
+cmd_launch() {
+  if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    echo "ERROR: launch requires a <ref> argument" >&2
+    exit 1
+  fi
+  local ref="$1"
+  local result sweep_dir commit_sha
+
+  if ! result=$(create_sweep_tree "$ref"); then
+    exit 1
+  fi
+  sweep_dir="$(printf '%s' "$result" | cut -f1)"
+  commit_sha="$(printf '%s' "$result" | cut -f2)"
+
+  dispatch_planner "$sweep_dir" "$commit_sha"
+  dispatch_all_lanes "$sweep_dir"
+
+  if ! run_consolidation "$sweep_dir"; then
+    echo "ERROR: consolidation failed for sweep ${sweep_dir}" >&2
+    exit 1
+  fi
+
+  echo "${sweep_dir}/report/consolidated.md"
+}
+
+cmd_resume() {
+  if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    echo "ERROR: resume requires a <sweep-id> argument" >&2
+    exit 1
+  fi
+  local sweep_id="$1"
+  local base_dir
+
+  if ! base_dir=$(resolve_base_dir 2>&1); then
+    echo "ERROR: cannot resolve sweep base directory: ${base_dir}" >&2
+    exit 1
+  fi
+
+  local sweep_dir="${base_dir}/${sweep_id}"
+  if [[ ! -f "${sweep_dir}/manifest.json" ]]; then
+    echo "ERROR: no sweep found at ${sweep_dir} (manifest.json missing)" >&2
+    exit 1
+  fi
+
+  local commit_sha
+  commit_sha="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['commit_sha'])" "${sweep_dir}/manifest.json")"
+
+  if plan_already_populated "$sweep_dir"; then
+    echo "plan/ already populated for ${sweep_id}; skipping planner re-dispatch" >&2
+  else
+    dispatch_planner "$sweep_dir" "$commit_sha"
+  fi
+
+  dispatch_all_lanes "$sweep_dir"
+
+  if ! run_consolidation "$sweep_dir"; then
+    echo "ERROR: consolidation failed for sweep ${sweep_dir}" >&2
+    exit 1
+  fi
+
+  echo "${sweep_dir}/report/consolidated.md"
+}
+
+cmd_status() {
+  if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    echo "ERROR: status requires a <sweep-id> argument" >&2
+    exit 1
+  fi
+  local sweep_id="$1"
+  local base_dir
+
+  if ! base_dir=$(resolve_base_dir 2>&1); then
+    echo "ERROR: cannot resolve sweep base directory: ${base_dir}" >&2
+    exit 1
+  fi
+
+  local sweep_dir="${base_dir}/${sweep_id}"
+  if [[ ! -f "${sweep_dir}/manifest.json" ]]; then
+    echo "ERROR: no sweep found at ${sweep_dir} (manifest.json missing)" >&2
+    exit 1
+  fi
+
+  # Reuses consolidate.py's own load_sweep()/build_coverage_table() rather
+  # than re-deriving the coverage computation -- this command never writes
+  # anything and never touches a lane or the planner.
+  python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" <<'PYEOF'
+import sys
+
+sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, sec_dir)
+import consolidate  # noqa: E402
+
+lanes, step_ids, lane_step_state, _findings = consolidate.load_sweep(sweep_dir)
+coverage = consolidate.build_coverage_table(lanes, step_ids, lane_step_state)
+
+print(f"Sweep: {sweep_dir}")
+print(f"Steps discovered: {len(step_ids)}")
+print("")
+if not coverage:
+    print("(no lane output found for this sweep)")
+else:
+    print(f"{'Lane':<24}{'Complete':>10}{'Parked':>9}{'Refused':>10}{'Failed':>9}")
+    for row in coverage:
+        total = row["total_steps"]
+        print(
+            f"{row['lane']:<24}"
+            f"{str(row['complete']) + '/' + str(total):>10}"
+            f"{str(row['parked']) + '/' + str(total):>9}"
+            f"{str(row['refused']) + '/' + str(total):>10}"
+            f"{str(row['failed']) + '/' + str(total):>9}"
+        )
+PYEOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    launch)
+      shift
+      cmd_launch "$@"
+      ;;
+    resume)
+      shift
+      cmd_resume "$@"
+      ;;
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
