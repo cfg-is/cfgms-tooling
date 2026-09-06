@@ -41,7 +41,7 @@ class BaseDirError(Exception):
     it must be checked against cannot be determined."""
 
 
-def _detect_repo_root(repo_root: str | None) -> str:
+def detect_repo_root(repo_root: str | None) -> str:
     """Return the realpath of the repository root to guard against.
 
     Detection failure is itself a fail-closed condition: without a repo root
@@ -51,6 +51,12 @@ def _detect_repo_root(repo_root: str | None) -> str:
     `rev-parse` (cwd is not a work tree), and an empty toplevel -- raises
     `BaseDirError`. Callers that legitimately run outside a checkout pass
     `repo_root` explicitly (CLI: `--repo-root`).
+
+    Public so `planner.py`/`consolidate.py` can share this detection logic
+    instead of each carrying its own `git rev-parse --show-toplevel` copy
+    (Issue #3929) -- those callers do not want the raising contract, so they
+    wrap this call in `try/except BaseDirError` and translate to `None`
+    rather than importing the exception-free behavior.
     """
     if repo_root is not None:
         return os.path.realpath(repo_root)
@@ -106,7 +112,7 @@ def resolve_base_dir(repo_root: str | None = None) -> str:
 
     resolved = os.path.realpath(raw)
 
-    detected_repo_root = _detect_repo_root(repo_root)
+    detected_repo_root = detect_repo_root(repo_root)
     if _is_repo_subpath(resolved, detected_repo_root):
         raise BaseDirError(
             "security-review base directory resolves inside the repository root "

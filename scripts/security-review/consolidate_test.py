@@ -11,6 +11,7 @@ Run: python3 .claude/scripts/security-review/consolidate_test.py
 """
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -21,6 +22,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import basedir  # noqa: E402
 import consolidate  # noqa: E402
 import schema  # noqa: E402
 
@@ -402,6 +404,53 @@ def test_cli_exits_nonzero_when_repo_root_undetectable():
         check(
             not os.path.isdir(os.path.join(sweep, "report")),
             "consolidate.py CLI: writes no report directory when the repo root cannot be determined",
+        )
+
+
+def test_detect_repo_root_delegates_to_shared_basedir_implementation():
+    # REQUIRED TEST (Issue #3929): consolidate.py must not carry its own copy
+    # of the `git rev-parse --show-toplevel` subprocess logic -- it delegates
+    # to the shared `basedir.detect_repo_root()`. Reverting consolidate.py's
+    # local `_detect_repo_root` definition back to its own duplicated
+    # subprocess call reintroduces "rev-parse" in its source and drops the
+    # delegation call, failing both checks below.
+    check(
+        consolidate.basedir.detect_repo_root is basedir.detect_repo_root,
+        "consolidate.py imports the shared basedir.detect_repo_root implementation",
+    )
+    source = inspect.getsource(consolidate._detect_repo_root)
+    check(
+        "rev-parse" not in source,
+        "consolidate._detect_repo_root: no duplicated git subprocess call in its own body",
+        source,
+    )
+    check(
+        "basedir.detect_repo_root" in source,
+        "consolidate._detect_repo_root: delegates to basedir.detect_repo_root",
+        source,
+    )
+
+
+def test_detect_repo_root_returns_none_when_git_absent():
+    # REQUIRED TEST (Issue #3929): basedir.detect_repo_root() raises
+    # BaseDirError on every failure mode (git absent from PATH here); this
+    # module's own `_detect_repo_root()` must still translate that to
+    # `None` -- its external behavior on detection failure is unchanged
+    # from before the dedup onto the shared basedir implementation.
+    with tempfile.TemporaryDirectory() as empty_path_dir:
+        path_backup = os.environ.get("PATH")
+        os.environ["PATH"] = empty_path_dir
+        try:
+            result = consolidate._detect_repo_root()
+        finally:
+            if path_backup is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = path_backup
+        check(
+            result is None,
+            "consolidate._detect_repo_root: returns None when git is absent from PATH",
+            repr(result),
         )
 
 

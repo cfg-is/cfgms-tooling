@@ -19,6 +19,7 @@ Run: python3 .claude/scripts/security-review/planner_test.py
 """
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -30,6 +31,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import basedir  # noqa: E402
 import metadata  # noqa: E402
 import planner  # noqa: E402
 
@@ -864,6 +866,53 @@ def test_finalize_invalid_step_logs_single_safe_record():
                 "finalize: the forged text survives, escaped, inside the record's field",
                 repr(output),
             )
+
+
+def test_detect_repo_root_delegates_to_shared_basedir_implementation():
+    # REQUIRED TEST (Issue #3929): planner.py must not carry its own copy of
+    # the `git rev-parse --show-toplevel` subprocess logic -- it delegates to
+    # the shared `basedir.detect_repo_root()`. Reverting planner.py's local
+    # `_detect_repo_root` definition back to its own duplicated subprocess
+    # call reintroduces "rev-parse" in its source and drops the delegation
+    # call, failing both checks below.
+    check(
+        planner.basedir.detect_repo_root is basedir.detect_repo_root,
+        "planner.py imports the shared basedir.detect_repo_root implementation",
+    )
+    source = inspect.getsource(planner._detect_repo_root)
+    check(
+        "rev-parse" not in source,
+        "planner._detect_repo_root: no duplicated git subprocess call in its own body",
+        source,
+    )
+    check(
+        "basedir.detect_repo_root" in source,
+        "planner._detect_repo_root: delegates to basedir.detect_repo_root",
+        source,
+    )
+
+
+def test_detect_repo_root_returns_none_when_git_absent():
+    # REQUIRED TEST (Issue #3929): basedir.detect_repo_root() raises
+    # BaseDirError on every failure mode (git absent from PATH here); this
+    # module's own `_detect_repo_root()` must still translate that to
+    # `None` -- its external behavior on detection failure is unchanged
+    # from before the dedup onto the shared basedir implementation.
+    with tempfile.TemporaryDirectory() as empty_path_dir:
+        path_backup = os.environ.get("PATH")
+        os.environ["PATH"] = empty_path_dir
+        try:
+            result = planner._detect_repo_root()
+        finally:
+            if path_backup is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = path_backup
+        check(
+            result is None,
+            "planner._detect_repo_root: returns None when git is absent from PATH",
+            repr(result),
+        )
 
 
 def main() -> int:

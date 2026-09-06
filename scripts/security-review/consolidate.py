@@ -53,6 +53,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
+import basedir  # noqa: E402
 import schema  # noqa: E402
 
 STEP_STATES = ("complete", "parked", "refused", "failed")
@@ -386,18 +387,16 @@ def render_markdown(report: dict) -> str:
 
 
 def _detect_repo_root() -> str | None:
+    """Same detection `planner.py` and `basedir.py` use, via the shared
+    `basedir.detect_repo_root()` (Issue #3929) -- `None` on any failure,
+    never a `cwd` guess. `basedir.detect_repo_root()` raises `BaseDirError`
+    on every failure mode (its own fail-closed contract); this wrapper
+    translates that to `None` so this module's external behavior on
+    detection failure is unchanged from before the dedup."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        return basedir.detect_repo_root(None)
+    except basedir.BaseDirError:
         return None
-    toplevel = result.stdout.strip()
-    return toplevel or None
 
 
 def main(argv: list[str] | None = None) -> int:
