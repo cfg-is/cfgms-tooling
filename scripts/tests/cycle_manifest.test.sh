@@ -58,6 +58,13 @@ export PO_CACHE_DIR="${SANDBOX}/po"
 export CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger"
 CYCLE_DIR="${PO_CACHE_DIR}/cycles"
 
+# The open-cycle pointer is per session, so the test has to resolve the same
+# path po-act.sh writes. Mirrors CYCLE_SESSION_SLUG in the script.
+cycle_ptr() {
+  printf '%s/current.%s\n' "$CYCLE_DIR" \
+    "$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-unknown}" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-64)"
+}
+
 printf '\n== no cycle open: a subcommand call is a silent no-op ==\n'
 # `merge-queue` shells out to `gh`. Unauthenticated -- every CI runner -- gh
 # prints its login prompt and po-act.sh exits 4, so this asserted rc==0 against
@@ -144,7 +151,7 @@ PYEOF
 
 out="$(bash "$POACT" cycle-start cron 2>&1)"
 check_contains "cycle-start reports CYCLE_STARTED" "$out" "CYCLE_STARTED:"
-cycle_id="$(cat "${CYCLE_DIR}/current")"
+cycle_id="$(cat "$(cycle_ptr)")"
 manifest="${CYCLE_DIR}/${cycle_id}.json"
 [[ -f "$manifest" ]] && ok "manifest file created" || bad "manifest file created" "missing: $manifest"
 check_eq "manifest records the harness session id" "$(jf "$manifest" 'd["session"]')" "$SESSION"
@@ -191,7 +198,7 @@ fi
 # real ~/.claude/projects, so this stays hermetic without faking the code path.
 out="$(CFGMS_TEST_TRANSCRIPTS_DIR="$PROJECTS_ROOT" bash "$POACT" cycle-end 2>&1)"
 check_contains "cycle-end reports CYCLE_ENDED" "$out" "CYCLE_ENDED:"
-check_eq "current-cycle pointer cleared after cycle-end" "$([[ -f "${CYCLE_DIR}/current" ]] && echo present || echo cleared)" "cleared"
+check_eq "current-cycle pointer cleared after cycle-end" "$([[ -f "$(cycle_ptr)" ]] && echo present || echo cleared)" "cleared"
 check_eq "manifest end timestamp is set" "$([[ "$(jf "$manifest" 'd["end"]')" != "None" ]] && echo set || echo unset)" "set"
 # The step's own call (req_b) plus the nested Tech Lead agent's call, which is
 # spend the cycle incurred inside that step -- nested transcripts roll up to
@@ -225,7 +232,7 @@ fi
 printf '\n== per-step work-or-no-op outcome (AC1) ==\n'
 export CLAUDE_CODE_SESSION_ID="outcome-test-session"
 bash "$POACT" cycle-start cron >/dev/null 2>&1
-oc_id="$(cat "${CYCLE_DIR}/current")"
+oc_id="$(cat "$(cycle_ptr)")"
 oc="${CYCLE_DIR}/${oc_id}.json"
 
 # A real no-op path through the real code: the capacity gate refuses, so
@@ -282,7 +289,7 @@ check_eq "the killed step is on disk" "$(jf "$oc" 'd["steps"][-1]["subcommand"]'
 check_eq "a step killed before it finished is not claimed as work" \
   "$(jf "$oc" 'd["steps"][-1]["outcome"]')" "incomplete"
 
-rm -f "${CYCLE_DIR}/current"
+rm -f "$(cycle_ptr)"
 export CLAUDE_CODE_SESSION_ID="$SESSION"
 
 printf '\n== cycle-report ==\n'
@@ -292,9 +299,9 @@ check_contains "cycle-report shows a totals row" "$report" "Average cost per cyc
 
 printf '\n== incomplete cycles are excluded from the average but stay on disk (AC4) ==\n'
 bash "$POACT" cycle-start cron >/dev/null 2>&1
-incomplete_id="$(cat "${CYCLE_DIR}/current")"
+incomplete_id="$(cat "$(cycle_ptr)")"
 bash "$POACT" merge-queue >/dev/null 2>&1 || true
-rm -f "${CYCLE_DIR}/current"  # simulate a crash: never reached cycle-end
+rm -f "$(cycle_ptr)"  # simulate a crash: never reached cycle-end
 [[ -f "${CYCLE_DIR}/${incomplete_id}.json" ]] && ok "crashed cycle's manifest survives on disk" \
   || bad "crashed cycle's manifest survives on disk" "missing"
 report2="$(bash "$POACT" cycle-report 5 2>&1)"
@@ -407,6 +414,45 @@ else
   bad "windowed correlation still produces real measured dollars" \
     "got: $(jf "$b_json" 'd["cycle_cost_usd"]')"
 fi
+
+printf '\n== concurrent sessions: two open cycles do not share one pointer (2026-09-05) ==\n'
+# Regression. The pointer used to be a single "${CYCLE_DIR}/current" shared by
+# every PO session on the host. A pipeline cycle running beside a long-lived
+# cfg-agent-live-po container hit this for real: cycle B started 83s after A,
+# overwrote the pointer, absorbed A's remaining steps, then B's cycle-end
+# removed the pointer so A's cycle-end reported CYCLE_END_SKIPPED:no_open_cycle
+# and A's cost was split across two manifests.
+export CLAUDE_CODE_SESSION_ID="race-session-a"
+race_a_out="$("$POACT" cycle-start pipeline 2>&1 | tail -1)"
+race_a_id="${race_a_out#CYCLE_STARTED:}"
+race_a_ptr="$(cycle_ptr)"
+
+export CLAUDE_CODE_SESSION_ID="race-session-b"
+race_b_out="$("$POACT" cycle-start pipeline 2>&1 | tail -1)"
+race_b_id="${race_b_out#CYCLE_STARTED:}"
+race_b_ptr="$(cycle_ptr)"
+
+check_eq "each session gets its own pointer file" \
+  "$([[ "$race_a_ptr" != "$race_b_ptr" ]] && echo distinct || echo shared)" "distinct"
+check_eq "session A's pointer still names A's cycle after B starts" \
+  "$(cat "$race_a_ptr" 2>/dev/null)" "$race_a_id"
+check_eq "session B's pointer names B's cycle" \
+  "$(cat "$race_b_ptr" 2>/dev/null)" "$race_b_id"
+check_eq "the two cycles are distinct" \
+  "$([[ "$race_a_id" != "$race_b_id" ]] && echo distinct || echo same)" "distinct"
+
+# B closing must not strand A. This is the exact failure that was observed.
+export CLAUDE_CODE_SESSION_ID="race-session-b"
+race_b_end="$("$POACT" cycle-end 2>&1 | tail -1)"
+check_eq "session B closes its own cycle" \
+  "$(printf '%s' "$race_b_end" | cut -d: -f1)" "CYCLE_ENDED"
+
+export CLAUDE_CODE_SESSION_ID="race-session-a"
+race_a_end="$("$POACT" cycle-end 2>&1 | tail -1)"
+check_eq "session A still closes cleanly after B closed — never CYCLE_END_SKIPPED" \
+  "$(printf '%s' "$race_a_end" | cut -d: -f1)" "CYCLE_ENDED"
+check_eq "session A closed A's cycle, not B's" \
+  "$(printf '%s' "$race_a_end" | cut -d: -f2)" "$race_a_id"
 
 printf '\n%s\n' "-----------------------------------------"
 if [[ "$fail" -eq 0 ]]; then

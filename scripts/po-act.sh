@@ -107,7 +107,33 @@ CACHE_FILE="$CACHE_DIR/preflight.json"
 # Lives beside CACHE_DIR (durable, survives session-transcript retention —
 # distinct from AGENT_LEDGER_DIR/AGENT_SESSIONS_BASE, never pruned by either).
 CYCLE_DIR="${CFGMS_CYCLE_DIR:-${CACHE_DIR}/cycles}"
-CYCLE_CURRENT_PTR="${CYCLE_DIR}/current"
+
+# The open-cycle pointer is PER SESSION, not per host.
+#
+# It used to be a single "${CYCLE_DIR}/current". More than one PO session runs
+# on a host routinely -- a cron/pipeline cycle alongside a long-lived
+# `cfg-agent-live-po` container, or two cycles the founder starts back to back
+# -- and one pointer cannot name two open cycles. Observed 2026-09-05: cycle B
+# started 83s after cycle A, overwrote the pointer, absorbed A's remaining
+# steps into B's manifest, and then B's cycle-end `rm -f`'d the pointer, so A's
+# cycle-end reported CYCLE_END_SKIPPED:no_open_cycle. Both manifests survived
+# but the cost of one cycle was split across two records, which is exactly the
+# self-reporting-free attribution the manifest exists to provide.
+#
+# Locking the write would not have helped: the writes were not torn, they were
+# both correct and the second legitimately replaced the first. The fix is to
+# stop sharing the slot. CLAUDE_CODE_SESSION_ID is set by the harness for every
+# command an agent invokes, so each PO session gets its own pointer file and
+# concurrent cycles no longer see each other.
+#
+# Sessions without that variable (a human running po-act.sh from a plain shell)
+# all share the "unknown" slot -- no worse than the previous behaviour, and the
+# case that motivated this is agent sessions, which always have one.
+CYCLE_SESSION_SLUG="$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-unknown}" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-64)"
+CYCLE_CURRENT_PTR="${CYCLE_DIR}/current.${CYCLE_SESSION_SLUG}"
+# Pre-split pointer. Read as a fallback so a cycle opened by an older revision
+# of this script still closes cleanly; never written.
+CYCLE_LEGACY_PTR="${CYCLE_DIR}/current"
 
 # _cycle_manifest_path [cycle_id]
 # Prints the manifest path for the given (or currently open) cycle. Empty
@@ -117,11 +143,40 @@ CYCLE_CURRENT_PTR="${CYCLE_DIR}/current"
 _cycle_manifest_path() {
   local cycle_id="${1:-}"
   if [[ -z "$cycle_id" ]]; then
-    [[ -f "$CYCLE_CURRENT_PTR" ]] || return 0
-    cycle_id=$(cat "$CYCLE_CURRENT_PTR" 2>/dev/null) || return 0
+    local ptr
+    for ptr in "$CYCLE_CURRENT_PTR" "$CYCLE_LEGACY_PTR"; do
+      [[ -f "$ptr" ]] || continue
+      cycle_id=$(cat "$ptr" 2>/dev/null) || cycle_id=""
+      [[ -n "$cycle_id" ]] && break
+    done
   fi
   [[ -n "$cycle_id" ]] || return 0
   echo "${CYCLE_DIR}/${cycle_id}.json"
+}
+
+# _cycle_write_ptr <cycle_id>
+# Publishes the open-cycle pointer atomically. rename(2) within one directory
+# is atomic, so a concurrent reader sees either the old id or the new one,
+# never a partial write.
+_cycle_write_ptr() {
+  local cycle_id="$1" tmp
+  tmp="$(mktemp "${CYCLE_CURRENT_PTR}.XXXXXX" 2>/dev/null)" || {
+    _cycle_write_ptr "$cycle_id"
+    return 0
+  }
+  printf '%s\n' "$cycle_id" > "$tmp"
+  mv -f "$tmp" "$CYCLE_CURRENT_PTR" 2>/dev/null || rm -f "$tmp"
+}
+
+# _cycle_clear_ptr <cycle_id>
+# Removes this session's pointer, and the legacy pointer only when it still
+# names the cycle being closed -- never another session's open cycle.
+_cycle_clear_ptr() {
+  local cycle_id="$1"
+  rm -f "$CYCLE_CURRENT_PTR"
+  if [[ -f "$CYCLE_LEGACY_PTR" ]] && [[ "$(cat "$CYCLE_LEGACY_PTR" 2>/dev/null)" == "$cycle_id" ]]; then
+    rm -f "$CYCLE_LEGACY_PTR"
+  fi
 }
 
 # _cycle_append_step <subcommand> [args...]
@@ -1140,7 +1195,7 @@ PYEOF
     # Scratch capture files from steps that were killed before their outcome
     # could be classified (the step record itself stays, honestly "incomplete").
     rm -f "${manifest}".step-*.out
-    rm -f "$CYCLE_CURRENT_PTR"
+    _cycle_clear_ptr "$(basename "$manifest" .json)"
     echo "CYCLE_ENDED:$(basename "$manifest" .json):cost=${cost}"
     ;;
 
