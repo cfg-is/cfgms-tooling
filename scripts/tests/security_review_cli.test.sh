@@ -351,6 +351,97 @@ check_contains "report shows the parked lane's coverage" "$report_md" "openai-gp
 check_contains "report shows 0/2 complete for the parked lane" "$report_md" "| openai-gpt56-sol | 0/2 | 2/2 | 0/2 | 0/2 |"
 check_contains "report shows 2/2 complete for the non-parked lanes" "$report_md" "| anthropic-opus5 | 2/2 | 0/2 | 0/2 | 0/2 |"
 
+echo ""
+echo "== REQUIRED TEST evidence — REST lanes keep running unchanged when"
+echo "   CFGMS_SECURITY_REVIEW_LANES is unset (Issue #3932's AC4) =="
+# Anchor: the pre-existing case1 test above ("launch creates the sweep tree,
+# runs the planner, dispatches all three lanes, runs the consolidator, and
+# prints the report path (AC1)") already ran with CFGMS_SECURITY_REVIEW_LANES
+# unset throughout this file and asserted all three hardcoded lane ids
+# produced findings. This block re-confirms case1's own docker call log
+# carries no roster/--harness wiring in that unset case -- reverting
+# dispatch_all_lanes to always take the roster branch (or leaking
+# --harness/--model into the hardcoded loop) would fail these checks even
+# though case1 above still happens to pass.
+unset_call_log="$(cat "${SUB1}/docker_calls.log")"
+check_not_contains "unset-roster dispatch never sets CFGMS_SECURITY_REVIEW_HARNESS" "$unset_call_log" "CFGMS_SECURITY_REVIEW_HARNESS"
+check_not_contains "unset-roster dispatch never sets CFGMS_SECURITY_REVIEW_LANE_ID" "$unset_call_log" "CFGMS_SECURITY_REVIEW_LANE_ID"
+check_contains "unset-roster dispatch still uses the hardcoded lane id anthropic-opus5" "$unset_call_log" "anthropic-opus5"
+check_contains "unset-roster dispatch still uses the hardcoded lane id openai-gpt56-sol" "$unset_call_log" "openai-gpt56-sol"
+check_contains "unset-roster dispatch still uses the hardcoded lane id ollama-qwen" "$unset_call_log" "ollama-qwen"
+
+echo ""
+echo "== structural — hardcoded LANE_IDS/LANE_CRED_NAMES/LANE_SCRIPTS arrays and the"
+echo "   roster-aware dispatch_all_lanes branch are both present (Issue #3932) =="
+check_contains "LANE_IDS array unchanged" "$cli_src" 'LANE_IDS=(anthropic-opus5 openai-gpt56-sol ollama-qwen)'
+check_contains "LANE_CRED_NAMES array unchanged" "$cli_src" 'LANE_CRED_NAMES=(ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY)'
+check_contains "dispatch_all_lanes still defined" "$cli_src" $'dispatch_all_lanes() {'
+check_contains "dispatch_roster_lanes exists for the roster path" "$cli_src" $'dispatch_roster_lanes() {'
+check_contains "dispatch_all_lanes branches to the roster path only when CFGMS_SECURITY_REVIEW_LANES is set" "$cli_src" 'if [[ -n "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then'
+
+echo ""
+echo "== REQUIRED TEST — CFGMS_SECURITY_REVIEW_LANES roster path: a stub harness:model"
+echo "   entry dispatches via launch-investigator --harness/--model and the stub lane's"
+echo "   envelope is picked up by the consolidator (Issue #3932, epic #3927's C5) =="
+SUB_ROSTER="${SANDBOX}/case-roster"
+setup_sub_sandbox "$SUB_ROSTER"
+ROSTER_ENTRYPOINT_DIR="${SUB_ROSTER}/lane-entrypoints"
+mkdir -p "$ROSTER_ENTRYPOINT_DIR"
+# This story's own stub --lane-entrypoint fixture (per the story's Out of
+# Scope: proven against a stub, never against claude_lane.py, which does not
+# exist until STORY-5b). Its content is never executed -- the docker stub
+# below performs "the container's job" itself -- it exists only so
+# launch-investigator's --lane-entrypoint file-existence check passes.
+cat > "${ROSTER_ENTRYPOINT_DIR}/stub_lane.py" <<'PYEOF'
+#!/usr/bin/env python3
+# Stub lane entrypoint for security_review_cli.test.sh's roster-dispatch
+# case (Issue #3932). Never actually executed in this test.
+PYEOF
+
+roster_out=$(CFGMS_SECURITY_REVIEW_LANES="stub:stubmodel" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
+  STUB_PLAN_STEP_COUNT=2 \
+  run_cli "$SUB_ROSTER" launch HEAD 2>"${SUB_ROSTER}/stderr.log")
+roster_rc=$?
+check_eq "roster-path launch exits 0" "$roster_rc" "0"
+SWEEP_DIR_ROSTER="$(dirname "$(dirname "$roster_out")")"
+
+roster_call_log="$(cat "${SUB_ROSTER}/docker_calls.log")"
+roster_lane_call="$(grep ' stub-stubmodel$' "${SUB_ROSTER}/docker_calls.log" || true)"
+check_contains "roster dispatch invoked launch-investigator for the stub-stubmodel lane" "$roster_call_log" "stub-stubmodel"
+check_contains "roster-dispatched container carries CFGMS_SECURITY_REVIEW_HARNESS=stub" "$roster_lane_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
+check_contains "roster-dispatched container carries CFGMS_SECURITY_REVIEW_MODEL=stubmodel" "$roster_lane_call" "CFGMS_SECURITY_REVIEW_MODEL=stubmodel"
+check_contains "roster-dispatched container carries CFGMS_SECURITY_REVIEW_LANE_ID=stub-stubmodel" "$roster_lane_call" "CFGMS_SECURITY_REVIEW_LANE_ID=stub-stubmodel"
+
+[[ -f "${SWEEP_DIR_ROSTER}/lanes/stub-stubmodel/step-001.findings.json" ]] \
+  && ok "stub lane produced step-001 findings under its harness-model-named directory" \
+  || bad "stub lane produced step-001 findings under its harness-model-named directory" "not found"
+[[ -f "${SWEEP_DIR_ROSTER}/lanes/stub-stubmodel/step-002.findings.json" ]] \
+  && ok "stub lane produced step-002 findings" \
+  || bad "stub lane produced step-002 findings" "not found"
+
+report_roster="$(cat "${SWEEP_DIR_ROSTER}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "consolidated report picked up the roster-dispatched stub lane (existing consolidator, unmodified)" "$report_roster" "stub-stubmodel"
+
+echo ""
+echo "== REQUIRED TEST — roster.py rejects a malformed CFGMS_SECURITY_REVIEW_LANES"
+echo "   entry and security-review.sh fails closed rather than dispatching anything =="
+SUB_ROSTER_BAD="${SANDBOX}/case-roster-bad"
+setup_sub_sandbox "$SUB_ROSTER_BAD"
+set +e
+roster_bad_out=$(CFGMS_SECURITY_REVIEW_LANES="not-a-valid-entry" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
+  run_cli "$SUB_ROSTER_BAD" launch HEAD 2>&1)
+roster_bad_rc=$?
+set -e
+if [[ "$roster_bad_rc" -ne 0 ]]; then
+  ok "a malformed roster entry exits non-zero"
+else
+  bad "a malformed roster entry exits non-zero" "exited 0"
+fi
+check_not_contains "a malformed roster entry never dispatches a container" "$(cat "${SUB_ROSTER_BAD}/docker_calls.log" 2>/dev/null || true)" "run -d"
+check_not_contains "a malformed roster entry does not print the report path as if the sweep completed cleanly" "$roster_bad_out" "report/consolidated.md"
+
 # ----------------------------------------------------------------------------
 # Issue #3930: a dedicated, self-contained docker stub that tracks container
 # name persistence, separate from the shared FAKEBIN stub above. The shared
@@ -566,6 +657,51 @@ fi
 check_contains "the failure is reported for the affected lane" "$fail_out" "openai-gpt56-sol"
 check_not_contains "the forced failure is never misclassified as a credential skip" "$fail_out" "credential_unavailable"
 check_not_contains "launch does not print the report path as if the sweep completed cleanly" "$fail_out" "report/consolidated.md"
+
+echo ""
+echo "== REQUIRED TEST — the same non-skip-dispatch-failure property survives the"
+echo "   roster-aware path (Issue #3932's modification of dispatch_all_lanes must not"
+echo "   swallow Issue #3930's exit-code fix) =="
+# Same forced-failure technique as the hardcoded-lane case just above, but
+# routed through dispatch_roster_lanes: a stub roster lane's
+# launch-investigator call is forced to look like a genuine still-running
+# container collision (INVESTIGATOR_REFUSED:...:container_exists, exit 3),
+# never a documented credential-unavailable skip. Reverting this story's
+# dispatch_all_lanes/dispatch_roster_lanes change to swallow that failure
+# (e.g. `dispatch_roster_lanes ... || true`) makes this test fail.
+SANDBOX7="$(mktemp -d)"
+mkdir -p "${SANDBOX7}/HOME/.claude" "${SANDBOX7}/docker-state" "${SANDBOX7}/lane-entrypoints"
+echo '{}' > "${SANDBOX7}/HOME/.claude/.credentials.json"
+cat > "${SANDBOX7}/lane-entrypoints/stub_lane.py" <<'PYEOF'
+#!/usr/bin/env python3
+PYEOF
+: > "${SANDBOX7}/docker_calls.log"
+set +e
+roster_fail_out=$(STUB_PLAN_STEP_COUNT=2 \
+  STUB_FORCE_RUNNING_MODE="stub-stubmodel" \
+  CFGMS_SECURITY_REVIEW_LANES="stub:stubmodel" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="${SANDBOX7}/lane-entrypoints" \
+  PATH="${FAKEBIN2}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX7}/credbase" \
+  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX7}/ledger" \
+  HOME="${SANDBOX7}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${SANDBOX7}/base" \
+  DOCKER_CALL_LOG="${SANDBOX7}/docker_calls.log" \
+  DOCKER_STATE_DIR="${SANDBOX7}/docker-state" \
+  "$CLI" launch HEAD 2>&1)
+roster_fail_rc=$?
+set -e
+if [[ "$roster_fail_rc" -ne 0 ]]; then
+  ok "roster-path launch exits non-zero on a real (non-skip) lane dispatch failure"
+else
+  bad "roster-path launch exits non-zero on a real (non-skip) lane dispatch failure" "exited 0"
+fi
+check_contains "the failure is reported for the affected roster lane" "$roster_fail_out" "stub-stubmodel"
+check_not_contains "roster failure is never misclassified as a credential skip" "$roster_fail_out" "credential_unavailable"
+check_not_contains "roster launch does not print the report path as if the sweep completed cleanly" "$roster_fail_out" "report/consolidated.md"
 
 echo ""
 echo "-----------------------------------------"

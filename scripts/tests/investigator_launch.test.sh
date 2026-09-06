@@ -254,6 +254,50 @@ else
 fi
 
 echo ""
+echo "== REQUIRED TEST evidence — --harness/--model generalize the credential mount"
+echo "   without changing plan mode's own invocation (Issue #3932, epic #3927's C2) =="
+check_contains "launch-investigator accepts --harness" "$launch_block_code" '--harness)'
+check_contains "launch-investigator accepts --model" "$launch_block_code" '--model)'
+check_contains "usage() documents --harness/--model" "$dispatch_src" '--harness <ID>'
+# Plan mode's own credential mount variable must remain byte-for-byte the
+# same (still no ":ro" suffix) -- the --harness generalization is a
+# separate mount/env block, never a rewrite of this line.
+check_contains "plan mode's own credential mount is untouched (still writable, unchanged)" "$launch_block_code" 'claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json")'
+check_contains "the --harness claude mount is read-only, distinct from plan mode's mount" "$launch_block_code" 'inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
+
+: > "$DOCKER_CALL_LOG"
+harness_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-harness" \
+  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-sonnet5 \
+    --harness claude --model sonnet-5 --lane-entrypoint "$LOADER_STAND_IN" 2>&1)
+check_contains "harness-mode launch reports LAUNCHED_INVESTIGATOR" "$harness_out" "LAUNCHED_INVESTIGATOR:claude-sonnet5:fake-container-id"
+
+harness_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "--harness claude mounts ~/.claude/.credentials.json read-only" "$harness_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "--harness claude sets CFGMS_SECURITY_REVIEW_HARNESS=claude" "$harness_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
+check_contains "--model sonnet-5 sets CFGMS_SECURITY_REVIEW_MODEL=sonnet-5" "$harness_run_call" "CFGMS_SECURITY_REVIEW_MODEL=sonnet-5"
+check_contains "--mode claude-sonnet5 sets CFGMS_SECURITY_REVIEW_LANE_ID=claude-sonnet5" "$harness_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=claude-sonnet5"
+check_not_contains "harness-mode launch has no GH_TOKEN" "$harness_run_call" "GH_TOKEN"
+
+: > "$DOCKER_CALL_LOG"
+unwired_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-unwired" \
+  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode stub-lane \
+    --harness stub --model stubmodel --lane-entrypoint "$LOADER_STAND_IN" 2>&1)
+check_contains "an unwired --harness still dispatches (env vars set, no error)" "$unwired_out" "LAUNCHED_INVESTIGATOR:stub-lane:fake-container-id"
+unwired_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "an unwired --harness still sets CFGMS_SECURITY_REVIEW_HARNESS" "$unwired_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
+check_not_contains "an unwired --harness gets no claude credential mount" "$unwired_run_call" ".claude/.credentials.json"
+
+echo ""
 echo "== REQUIRED TEST evidence — --mode path traversal cannot widen the writable mount =="
 # The writable mount path is built from the RAW --mode value, so --mode is
 # validated as a lane id. The `tr`-sanitized $inv_mode_safe is for the

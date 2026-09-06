@@ -213,12 +213,20 @@ RUN chown -R agent:agent /tmp/webcache \
 # The builder stage is discarded; only the binary is copied to this layer.
 COPY --from=cfg-builder /usr/local/bin/cfg /usr/local/bin/cfg
 
-# Copy container scripts and DNS allowlist
+# Copy container scripts and DNS allowlist. The allowlist is split into a
+# base file (everything that is not a model provider) plus per-harness
+# fragments under dnsmasq-allowlist.d/ -- init-firewall.sh loads the base
+# plus exactly one fragment, selected by the launcher-supplied harness
+# (Issue #3932, epic #3927's per-harness egress isolation). This closes the
+# one real cross-harness bleed in the single-investigator-image model: every
+# container previously resolved every provider's domain regardless of which
+# one it authenticated to.
 COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY .devcontainer/scripts/setup-env.sh /usr/local/bin/setup-env.sh
 COPY .devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY .devcontainer/agent-context.sh /usr/local/bin/agent-context.sh
-COPY .devcontainer/dnsmasq-allowlist.conf /etc/dnsmasq-allowlist.conf
+COPY .devcontainer/dnsmasq-allowlist-base.conf /etc/dnsmasq-allowlist-base.conf
+COPY .devcontainer/dnsmasq-allowlist.d/ /etc/dnsmasq-allowlist.d/
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/local/bin/entrypoint.sh
 
 # Token reporter (Issue #3028/#3041) — baked into the harness so accounting is a

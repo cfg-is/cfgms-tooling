@@ -66,8 +66,13 @@ echo ""
 echo "== every dispatch launch path bind-mounts the host's live credentials file =="
 cred_mount='.claude/.credentials.json:/home/agent/.claude/.credentials.json'
 dispatch_mount_count=$(grep -c "$cred_mount" "$DISPATCH")
-check_contains "agent-dispatch.sh bind-mounts host creds at least 5x (launch/launch-generic/launch-interactive/po-live/launch-investigator plan mode)" \
-  "$dispatch_mount_count" "5"
+# 6 since Issue #3932 added a distinct, read-only --harness claude mount
+# (inv_harness_creds_mount) alongside the 5 pre-existing writable mounts
+# (launch/launch-generic/launch-interactive/po-live/launch-investigator plan
+# mode) -- it generalizes the plan-mode mount without changing it, so the
+# count grows rather than one of the 5 being replaced.
+check_contains "agent-dispatch.sh bind-mounts host creds at least 6x (launch/launch-generic/launch-interactive/po-live/launch-investigator plan mode/launch-investigator --harness claude)" \
+  "$dispatch_mount_count" "6"
 check_contains "po-act.sh bind-mounts host creds for its inlined launch" "$po_act_src" "$cred_mount"
 
 echo ""

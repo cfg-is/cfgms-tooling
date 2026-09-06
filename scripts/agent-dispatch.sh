@@ -1271,6 +1271,7 @@ Commands:
                                             their clone directory on exit.
   launch-investigator --sweep-dir <DIR> --mode <plan|LANE_ID>
                       [--cred-name <NAME>] [--lane-entrypoint <SCRIPT>]
+                      [--harness <ID>] [--model <ID>]
                                             Launch a read-only investigator container (Issue #3903)
                                             against an existing security-review sweep directory.
                                             /workspace is mounted :ro, no GH_TOKEN, no git identity.
@@ -1280,6 +1281,12 @@ Commands:
                                             rw as /workspace-out, and execs --lane-entrypoint's script.
                                             --cred-name delivers one OS-keychain key as a 0600 file
                                             in a memory-backed, :ro-mounted directory removed on exit.
+                                            --harness/--model (Issue #3932) select a subscription
+                                            agent harness instead: --harness claude mounts
+                                            ~/.claude/.credentials.json read-only (plan mode's own
+                                            mount is separate and untouched) and both flags set
+                                            CFGMS_SECURITY_REVIEW_HARNESS/_MODEL/_LANE_ID in the
+                                            container. Only `claude` is wired today.
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
@@ -2838,12 +2845,16 @@ PROMPT_EOF
     inv_mode=""
     inv_cred_name=""
     inv_lane_entrypoint=""
+    inv_harness=""
+    inv_model=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --sweep-dir)       inv_sweep_dir="${2:?--sweep-dir requires a value}"; shift 2 ;;
         --mode)            inv_mode="${2:?--mode requires a value}"; shift 2 ;;
         --cred-name)       inv_cred_name="${2:?--cred-name requires a value}"; shift 2 ;;
         --lane-entrypoint) inv_lane_entrypoint="${2:?--lane-entrypoint requires a value}"; shift 2 ;;
+        --harness)         inv_harness="${2:?--harness requires a value}"; shift 2 ;;
+        --model)           inv_model="${2:?--model requires a value}"; shift 2 ;;
         *) echo "Unknown flag for launch-investigator: $1"; exit 1 ;;
       esac
     done
@@ -2986,6 +2997,31 @@ PROMPT_EOF
       cred_env=(-e "CFGMS_SECURITY_REVIEW_CRED_FILE=/run/cfgms/security-review-cred/${inv_cred_name}.key")
     fi
 
+    # Harness session credential (Issue #3932, epic #3927's contract C2).
+    # Generalizes the plan-mode-only mount two blocks up
+    # (`claude_creds_mount`, left untouched — plan mode's own invocation is
+    # unaffected by this flag) so a lane can authenticate as a subscription
+    # agent harness's own session instead of an OS-keychain API key. Only
+    # `claude` is wired for this story (STORY-7/8 add codex/opencode); an
+    # unrecognized harness id gets the env vars below but no credential
+    # mount, which is a deliberate no-op rather than a hard failure — the
+    # roster mechanism (C5) is proven in this story against a stub harness
+    # that legitimately has no credential file of its own.
+    inv_harness_creds_mount=()
+    inv_harness_env=()
+    if [[ -n "$inv_harness" ]]; then
+      case "$inv_harness" in
+        claude)
+          inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+          ;;
+      esac
+      inv_harness_env=(
+        -e "CFGMS_SECURITY_REVIEW_HARNESS=${inv_harness}"
+        -e "CFGMS_SECURITY_REVIEW_MODEL=${inv_model}"
+        -e "CFGMS_SECURITY_REVIEW_LANE_ID=${inv_mode}"
+      )
+    fi
+
     inv_lane_entrypoint_mount=()
     if [[ -n "$inv_lane_entrypoint" ]]; then
       if [[ ! -f "$inv_lane_entrypoint" ]]; then
@@ -3034,6 +3070,7 @@ PROMPT_EOF
       "${inv_plan_mount[@]}" \
       "${inv_out_mount[@]}" \
       "${cred_mount[@]}" \
+      "${inv_harness_creds_mount[@]}" \
       "${inv_lane_entrypoint_mount[@]}" \
       -v "${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh:/usr/local/bin/investigator-entrypoint.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
@@ -3043,6 +3080,7 @@ PROMPT_EOF
       -e "CFGMS_INVESTIGATOR_MODE=${inv_mode}" \
       -e "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=${inv_disallowed}" \
       "${cred_env[@]}" \
+      "${inv_harness_env[@]}" \
       -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
       --entrypoint /usr/local/bin/investigator-entrypoint.sh \
       cfg-agent:latest \
