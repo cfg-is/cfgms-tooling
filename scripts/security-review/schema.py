@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Finding and step-envelope schema validation for the security review harness.
 
-Two shapes are validated here:
+Three shapes are validated here:
 
 - A **finding** (`validate_finding`): the structured output a lane emits per
   vulnerability, matching the epic's "Finding schema" exactly. The
@@ -20,6 +20,15 @@ Two shapes are validated here:
   `stop_reason_raw` recording the provider's raw, unmodified terminating
   reason so a new refusal encoding after a provider update is diagnosable
   from the recorded envelope rather than lost to a normalized enum.
+
+- A **plan step** (`validate_plan_step`): the one shape the planner writes and
+  every lane reads (epic #3927's contract C1). Before this story, the planner
+  (`planner.py`) emitted `{step_id, scope, description}` while the lane
+  adapters each independently demanded `sweep_id`/`commit_sha`/`files` and
+  silently `continue`d past every step that lacked them — zero API calls,
+  zero files written, and nothing about it visible from inside either side of
+  that contract. `validate_plan_step` is now the single shared definition of
+  the shape, so a step can only be malformed once, in one place.
 
 Also provides `safe_log_event`/`log_event`: this module and its siblings
 (resume.py, basedir.py) log diagnostic text that can carry model-generated or
@@ -62,6 +71,16 @@ REQUIRED_STEP_ENVELOPE_FIELDS = (
 )
 
 STEP_STATES = frozenset({"complete", "parked", "refused", "failed"})
+
+REQUIRED_PLAN_STEP_FIELDS = (
+    "step_id",
+    "sweep_id",
+    "commit_sha",
+    "scope",
+    "description",
+    "files",
+    "planners",
+)
 
 
 def validate_finding(finding: object) -> list[str]:
@@ -134,6 +153,64 @@ def validate_step_envelope(envelope: object) -> list[str]:
             errors.append(
                 "stop_reason_raw must be present and non-empty when state is not complete"
             )
+
+    return errors
+
+
+def _non_empty_string_list(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) and v for v in value)
+
+
+def validate_plan_step(step: object) -> list[str]:
+    """Return a list of validation errors; empty list means valid.
+
+    Never raises on malformed input -- a caller checks `errors == []`, same
+    shape as `validate_finding`/`validate_step_envelope`.
+
+    `step_id`/`sweep_id`/`commit_sha`/`description` must each be a non-empty
+    string. `scope` must be a non-empty string or a non-empty list of
+    non-empty strings. `files` must be a list of non-empty strings (may be
+    empty -- a step can legitimately name zero concrete files while still
+    describing a scope). `planners` must be a non-empty list of non-empty
+    strings: a step always has at least one planner that proposed it.
+
+    This function validates shape only. It does not, and cannot, verify that
+    `sweep_id`/`commit_sha` are the *correct* values for the sweep a step was
+    produced for -- a plan step is written by a model that must never be
+    trusted to source those two fields itself. `planner.finalize()` enforces
+    that guarantee by overwriting both from the sweep's own context before
+    validating, never by trusting whatever a step file already contains.
+    """
+    if not isinstance(step, dict):
+        return ["plan step must be a JSON object"]
+
+    errors: list[str] = []
+    for field in REQUIRED_PLAN_STEP_FIELDS:
+        if field not in step:
+            errors.append(f"missing required field: {field}")
+            continue
+        value = step[field]
+
+        if field in ("step_id", "sweep_id", "commit_sha", "description"):
+            if not isinstance(value, str) or value == "":
+                errors.append(f"field {field} must be a non-empty string, got {value!r}")
+        elif field == "scope":
+            scope_valid = (isinstance(value, str) and value != "") or (
+                isinstance(value, list) and bool(value) and _non_empty_string_list(value)
+            )
+            if not scope_valid:
+                errors.append(
+                    "field scope must be a non-empty string or a non-empty list of "
+                    f"non-empty strings, got {value!r}"
+                )
+        elif field == "files":
+            if not _non_empty_string_list(value):
+                errors.append(f"field files must be a list of non-empty strings, got {value!r}")
+        elif field == "planners":
+            if not (isinstance(value, list) and value and _non_empty_string_list(value)):
+                errors.append(
+                    f"field planners must be a non-empty list of non-empty strings, got {value!r}"
+                )
 
     return errors
 

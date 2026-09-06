@@ -385,25 +385,6 @@ def render_markdown(report: dict) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def _write_text_atomic(path: str, text: str) -> None:
-    """Same temp-file + `os.replace` guarantee as `atomic_write.write_json_atomic`,
-    for the one non-JSON artifact this module writes."""
-    tmp_path = f"{path}.tmp"
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-    except BaseException:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp_path, path)
-
-
 def _detect_repo_root() -> str | None:
     try:
         result = subprocess.run(
@@ -444,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
     report_dir = os.path.join(args.sweep_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
     atomic_write.write_json_atomic(os.path.join(report_dir, "consolidated.json"), report)
-    _write_text_atomic(os.path.join(report_dir, "consolidated.md"), render_markdown(report))
+    atomic_write.write_text_atomic(os.path.join(report_dir, "consolidated.md"), render_markdown(report))
     return 0
 
 

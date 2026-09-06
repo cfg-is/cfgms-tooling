@@ -219,6 +219,69 @@ def test_validate_step_envelope_missing_fields_distinct_errors():
     )
 
 
+def valid_plan_step(**overrides) -> dict:
+    step = {
+        "step_id": "step-007",
+        "sweep_id": "2026-09-05T2312Z-9735bb32",
+        "commit_sha": "9735bb32",
+        "scope": "pkg/storage/providers/database",
+        "description": "PostgreSQL storage provider: stores, schema migration, CAS writes",
+        "files": ["pkg/storage/providers/database/case_store.go"],
+        "planners": ["metadata-only-planner"],
+    }
+    step.update(overrides)
+    return step
+
+
+def test_validate_plan_step_accepts_the_c1_example():
+    errors = schema.validate_plan_step(valid_plan_step())
+    check(errors == [], "validate_plan_step: accepts the epic's C1 JSON example", str(errors))
+
+
+def test_validate_plan_step_rejects_each_required_field_missing():
+    for field in schema.REQUIRED_PLAN_STEP_FIELDS:
+        step = valid_plan_step()
+        del step[field]
+        errors = schema.validate_plan_step(step)
+        check(
+            any(field in e for e in errors),
+            f"validate_plan_step: rejects a step missing '{field}'",
+            str(errors),
+        )
+
+
+def test_validate_plan_step_rejects_non_object():
+    errors = schema.validate_plan_step(["not", "an", "object"])
+    check(len(errors) == 1, "validate_plan_step: a non-object payload is rejected with one error", str(errors))
+
+
+def test_validate_plan_step_accepts_scope_as_list_too():
+    errors = schema.validate_plan_step(valid_plan_step(scope=["pkg/a/a.go", "pkg/a/b.go"]))
+    check(errors == [], "validate_plan_step: scope may be a list of paths, not only a single string", str(errors))
+
+
+def test_validate_plan_step_rejects_empty_scope_string():
+    errors = schema.validate_plan_step(valid_plan_step(scope=""))
+    check(any("scope" in e for e in errors), "validate_plan_step: rejects an empty scope string", str(errors))
+
+
+def test_validate_plan_step_accepts_empty_files_list():
+    # A step may legitimately name zero concrete files while still describing
+    # a scope -- only `planners` requires at least one entry.
+    errors = schema.validate_plan_step(valid_plan_step(files=[]))
+    check(errors == [], "validate_plan_step: an empty files list is valid", str(errors))
+
+
+def test_validate_plan_step_rejects_empty_planners_list():
+    errors = schema.validate_plan_step(valid_plan_step(planners=[]))
+    check(any("planners" in e for e in errors), "validate_plan_step: rejects an empty planners list", str(errors))
+
+
+def test_validate_plan_step_rejects_non_string_list_entries():
+    errors = schema.validate_plan_step(valid_plan_step(files=["ok.go", 42]))
+    check(any("files" in e for e in errors), "validate_plan_step: rejects a files entry that is not a string", str(errors))
+
+
 def test_safe_log_event_single_line_and_escaped():
     # REQUIRED TEST: an embedded newline plus a forged log line must not become
     # a second, forged-looking log record.

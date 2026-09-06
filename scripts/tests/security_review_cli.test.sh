@@ -176,7 +176,14 @@ if [[ "$mode" == "plan" ]]; then
     step_id=$(printf "step-%03d" "$i")
     step_file="${out_dir}/${step_id}.json"
     [[ -f "$step_file" ]] && continue
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"description":"stub step"}' \
+    # The four fields the plan prompt actually asks the model for
+    # (step_id/scope/description/files). sweep_id, commit_sha and planners are
+    # deliberately absent: planner.py's prompt never asks for them and
+    # planner.finalize() injects all three from the sweep's own context
+    # sidecar, so a real plan-mode container never writes them either. A step
+    # missing `files` is rejected by schema.validate_plan_step() -- the shared
+    # C1 shape every lane reads -- and finalize() would drop it.
+    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"description":"stub step","files":["pkg/example/file.go"]}' \
       "$step_id" > "$step_file"
   done
 else

@@ -63,6 +63,29 @@ def init_repo_with_commit(repo: str, files: dict[str, str]) -> str:
     return result.stdout.strip()
 
 
+def write_context(
+    sweep_dir: str,
+    sweep_id: str = "2026-09-05T0000Z-abc1234",
+    commit_sha: str = "abc1234",
+    raw: str | None = None,
+) -> str:
+    """Write the sweep-context sidecar `prepare()` writes, at the sweep root.
+
+    Tests that build a `plan/` directory by hand (rather than through
+    `prepare()`) must write this too: `finalize()` fails closed without it,
+    since a step's own `sweep_id`/`commit_sha` are model-supplied values it
+    must never fall back to. `raw` writes arbitrary bytes instead of a
+    well-formed object, for the malformed-sidecar cases.
+    """
+    path = os.path.join(sweep_dir, planner.CONTEXT_FILENAME)
+    with open(path, "w") as f:
+        if raw is not None:
+            f.write(raw)
+        else:
+            json.dump({"sweep_id": sweep_id, "commit_sha": commit_sha}, f)
+    return path
+
+
 def write_step(plan_dir: str, filename: str, data: object) -> None:
     with open(os.path.join(plan_dir, filename), "w") as f:
         if isinstance(data, str):
@@ -71,8 +94,24 @@ def write_step(plan_dir: str, filename: str, data: object) -> None:
             json.dump(data, f)
 
 
-def valid_step(step_id: str, scope: list[str] | str, description: str = "reviews the scope") -> dict:
-    return {"step_id": step_id, "scope": scope, "description": description}
+def valid_step(
+    step_id: str,
+    scope: list[str] | str,
+    description: str = "reviews the scope",
+    sweep_id: str = "2026-09-05T0000Z-abc1234",
+    commit_sha: str = "abc1234",
+    files: list[str] | None = None,
+    planners: list[str] | None = None,
+) -> dict:
+    return {
+        "step_id": step_id,
+        "sweep_id": sweep_id,
+        "commit_sha": commit_sha,
+        "scope": scope,
+        "description": description,
+        "files": files if files is not None else ["pkg/example/thing.go"],
+        "planners": planners if planners is not None else [planner.PLANNER_ID],
+    }
 
 
 # --- build_prompt() / metadata-only boundary ---------------------------------
@@ -293,10 +332,63 @@ def test_validate_step_accepts_web_src_single_subtree():
     check(errors == [], "validate_step: a scope confined to one web/src/ subtree is valid", str(errors))
 
 
-def test_validate_step_rejects_scope_outside_recognized_trees():
+def test_validate_step_accepts_scope_previously_outside_the_allowlist():
+    # The bounded-scope rule is a DENYLIST now, not a four-name allowlist: a
+    # path that isn't pkg/features/cmd/web-src is still a valid scope as long
+    # as it isn't explicitly excluded.
     step = valid_step("step-001", ["docs/architecture/thing.md"])
     errors = planner.validate_step(step, "step-001.json")
-    check(len(errors) == 1 and "outside any recognized" in errors[0], "validate_step: rejects a scope outside pkg/features/cmd/web-src entirely", str(errors))
+    check(errors == [], "validate_step: a path outside the old four-subtree allowlist is accepted", str(errors))
+
+
+def test_validate_step_accepts_scope_under_internal():
+    # REQUIRED TEST: internal/ holds real, reviewable Go packages
+    # (internal/controller among them) that the old four-subtree allowlist
+    # rejected outright. Reverting to that allowlist makes this test fail.
+    step = valid_step("step-001", ["internal/controller/state.go"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(errors == [], "validate_step: a path under internal/ is accepted under the new denylist", str(errors))
+
+
+def test_validate_step_accepts_scope_under_api_proto_examples_scripts():
+    for scope_path in (
+        "api/proto/controlplane/service.proto",
+        "examples/quickstart/main.go",
+        "scripts/install-git-hooks.sh",
+    ):
+        step = valid_step("step-001", [scope_path])
+        errors = planner.validate_step(step, "step-001.json")
+        check(errors == [], f"validate_step: {scope_path} is accepted under the new denylist", str(errors))
+
+
+def test_validate_step_rejects_git_internals_scope():
+    step = valid_step("step-001", [".git/config"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(
+        len(errors) == 1 and "excluded or invalid" in errors[0],
+        "validate_step: .git/ remains explicitly excluded even under the denylist",
+        str(errors),
+    )
+
+
+def test_validate_step_rejects_path_traversal_scope():
+    step = valid_step("step-001", ["../outside/evil.go"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(
+        len(errors) == 1 and "excluded or invalid" in errors[0],
+        "validate_step: a path-traversal scope is excluded even under the denylist",
+        str(errors),
+    )
+
+
+def test_validate_step_rejects_absolute_path_scope():
+    step = valid_step("step-001", ["/etc/passwd"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(
+        len(errors) == 1 and "excluded or invalid" in errors[0],
+        "validate_step: an absolute path scope is excluded even under the denylist",
+        str(errors),
+    )
 
 
 def test_validate_step_accepts_scope_as_single_package_path_string():
@@ -312,11 +404,22 @@ def test_validate_step_requires_step_id_to_match_filename():
 
 
 def test_validate_step_requires_all_fields():
+    # REQUIRED TEST: matches C1's full seven-field shape -- step_id, sweep_id,
+    # commit_sha, scope, description, files, planners. `anthropic.py:537` and
+    # `openai.py:485` both demand sweep_id/commit_sha; a validator that never
+    # requires them accepts steps that silently produce zero API calls.
     errors = planner.validate_step({}, "step-001.json")
     check(
-        {"step-001.json: missing required field: step_id",
-         "step-001.json: missing required field: scope",
-         "step-001.json: missing required field: description"} <= set(errors),
+        {
+            "step-001.json: missing required field: step_id",
+            "step-001.json: missing required field: sweep_id",
+            "step-001.json: missing required field: commit_sha",
+            "step-001.json: missing required field: scope",
+            "step-001.json: missing required field: description",
+            "step-001.json: missing required field: files",
+            "step-001.json: missing required field: planners",
+        }
+        <= set(errors),
         "validate_step: reports every missing required field",
         str(errors),
     )
@@ -333,6 +436,7 @@ def test_finalize_accepts_a_fully_valid_plan():
     with tempfile.TemporaryDirectory() as sweep_dir:
         plan_dir = os.path.join(sweep_dir, "plan")
         os.makedirs(plan_dir)
+        write_context(sweep_dir)
         write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go"]))
         write_step(plan_dir, "step-002.json", valid_step("step-002", ["cmd/steward/main.go"]))
 
@@ -354,29 +458,262 @@ def test_finalize_fails_closed_on_zero_steps():
         check(os.path.isfile(os.path.join(sweep_dir, "plan", planner.FAILURE_MARKER_FILENAME)), "finalize: writes the PLANNING_FAILED marker")
 
 
-def test_finalize_fails_closed_and_removes_partial_plan_on_one_invalid_step():
-    # AC5: a failure marker instead of an empty OR PARTIAL step plan -- one
-    # bad step file invalidates the whole plan, and every step file that was
-    # produced (including the valid ones) is removed so the marker is never
-    # sitting alongside leftover step files.
+def test_finalize_excludes_only_the_invalid_step_keeps_valid_ones_on_disk():
+    # REQUIRED TEST: per-step exclusion, never an all-or-nothing wipe.
+    # Reverting to the old all-or-nothing deletion (deleting every step file
+    # because one of three failed validation) makes this test fail.
     with tempfile.TemporaryDirectory() as sweep_dir:
         plan_dir = os.path.join(sweep_dir, "plan")
         os.makedirs(plan_dir)
+        write_context(sweep_dir)
         write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go"]))
-        write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/foo/bar.go", "features/x/y.go"]))  # spans two subtrees
+        write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/foo/bar.go", "features/x/y.go"]))  # spans two subtrees -- invalid
+        write_step(plan_dir, "step-003.json", valid_step("step-003", ["cmd/steward/main.go"]))
 
         ok, errors = planner.finalize(sweep_dir)
-        check(ok is False, "finalize: one invalid step fails the whole plan")
-        check(len(errors) >= 1, "finalize: reports the validation error", str(errors))
-        check(not os.path.exists(os.path.join(plan_dir, "step-001.json")), "finalize: removes the otherwise-valid step file too -- no partial plan")
-        check(not os.path.exists(os.path.join(plan_dir, "step-002.json")), "finalize: removes the invalid step file")
+
+        check(ok is True, "finalize: a plan with two valid steps and one invalid step still succeeds")
+        check(len(errors) >= 1, "finalize: the excluded step's validation error is still reported", str(errors))
+        check(os.path.isfile(os.path.join(plan_dir, "step-001.json")), "finalize: the first valid step file is left on disk")
+        check(os.path.isfile(os.path.join(plan_dir, "step-003.json")), "finalize: the second valid step file is left on disk")
+        check(not os.path.exists(os.path.join(plan_dir, "step-002.json")), "finalize: only the invalid step file is removed")
+        check(
+            not os.path.exists(os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)),
+            "finalize: no failure marker is written when at least one valid step remains",
+        )
+
+
+def test_finalize_still_fails_closed_when_every_step_is_invalid():
+    # The zero-valid-steps case still fails closed -- per-step exclusion does
+    # not weaken the "never a silent empty plan" guarantee, it just no longer
+    # punishes steps that were independently valid.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go", "features/x/y.go"]))
+        write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/foo/bar.go", "cmd/steward/main.go"]))
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is False, "finalize: a plan with zero valid steps still fails closed")
+        check(len(errors) >= 2, "finalize: reports both steps' validation errors", str(errors))
+        check(not os.path.exists(os.path.join(plan_dir, "step-001.json")), "finalize: removes the first invalid step file")
+        check(not os.path.exists(os.path.join(plan_dir, "step-002.json")), "finalize: removes the second invalid step file")
         check(os.path.isfile(os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)), "finalize: writes the PLANNING_FAILED marker")
+
+
+def test_finalize_accepts_plan_scoped_to_internal_package_end_to_end():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        write_step(plan_dir, "step-001.json", valid_step("step-001", ["internal/controller/state.go"]))
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: a step scoped to internal/ is accepted end-to-end", str(errors))
+        check(os.path.isfile(os.path.join(plan_dir, "step-001.json")), "finalize: the internal/-scoped step file is kept")
+
+
+def test_finalize_injects_sweep_context_never_trusting_model_supplied_values():
+    # REQUIRED TEST: sweep_id/commit_sha must come from prepare()'s own sweep
+    # context (planner.py:174-189), never from whatever (if anything) the
+    # model wrote for those two fields in its own step-NNN.json output.
+    # `planners` is likewise populated deterministically, never left to the
+    # model.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        plan_dir = os.path.join(sweep_dir, "plan")
+
+        # Simulate the model writing a step with a fabricated sweep_id and
+        # commit_sha, and no `planners` field at all.
+        write_step(
+            plan_dir,
+            "step-001.json",
+            {
+                "step_id": "step-001",
+                "scope": ["pkg/a/a.go"],
+                "description": "reviews pkg/a",
+                "files": ["pkg/a/a.go"],
+                "sweep_id": "some-other-sweep-the-model-made-up",
+                "commit_sha": "0" * 40,
+            },
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: accepts the step once sweep_id/commit_sha/planners are injected", str(errors))
+
+        with open(os.path.join(plan_dir, "step-001.json")) as f:
+            written = json.load(f)
+        expected_sweep_id = os.path.basename(os.path.normpath(sweep_dir))
+        check(
+            written["sweep_id"] == expected_sweep_id,
+            "finalize: sweep_id is overwritten from prepare()'s own context, not the model's value",
+            written["sweep_id"],
+        )
+        check(
+            written["commit_sha"] == sha,
+            "finalize: commit_sha is overwritten from prepare()'s own context, not the model's value",
+            written["commit_sha"],
+        )
+        check(
+            written["planners"] == [planner.PLANNER_ID],
+            "finalize: planners is populated deterministically, never left to the model",
+            written.get("planners"),
+        )
+
+
+def test_prepare_writes_the_sweep_context_outside_the_container_writable_mount():
+    # REQUIRED TEST: `<sweep_dir>/plan` is bind-mounted /workspace-out:rw into
+    # the plan-mode container (agent-dispatch.sh), which runs
+    # `claude --dangerously-skip-permissions` with Bash. The sidecar that
+    # overrides that model's identity claims must therefore live OUTSIDE that
+    # mount -- in the sweep root, which agent-dispatch.sh mounts into no
+    # container at all. Moving it back under plan/ makes this test fail.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+
+        root_context = os.path.join(sweep_dir, planner.CONTEXT_FILENAME)
+        plan_context = os.path.join(sweep_dir, "plan", planner.CONTEXT_FILENAME)
+        check(os.path.isfile(root_context), "prepare: the sweep context sidecar is written in the sweep root")
+        check(
+            not os.path.exists(plan_context),
+            "prepare: the sweep context sidecar is NOT written inside plan/, the container's writable mount",
+        )
+        with open(root_context) as f:
+            recorded = json.load(f)
+        check(
+            recorded == {"sweep_id": os.path.basename(os.path.normpath(sweep_dir)), "commit_sha": sha},
+            "prepare: the sidecar records this sweep's own id and commit sha",
+            str(recorded),
+        )
+
+
+def test_finalize_ignores_a_context_sidecar_planted_inside_plan_dir():
+    # REQUIRED TEST: the plan-mode container can write anything it likes into
+    # plan/, including a file named `.plan-context.json`. finalize() must read
+    # only the sweep-root sidecar, so a planted one has no effect on the
+    # identity injected onto the surviving steps.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        plan_dir = os.path.join(sweep_dir, "plan")
+
+        with open(os.path.join(plan_dir, planner.CONTEXT_FILENAME), "w") as f:
+            json.dump({"sweep_id": "attacker-chosen-sweep", "commit_sha": "deadbeef" * 5}, f)
+        write_step(
+            plan_dir,
+            "step-001.json",
+            {
+                "step_id": "step-001",
+                "scope": ["pkg/a/a.go"],
+                "description": "reviews pkg/a",
+                "files": ["pkg/a/a.go"],
+                "sweep_id": "attacker-chosen-sweep",
+                "commit_sha": "deadbeef" * 5,
+                "planners": ["forged"],
+            },
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: succeeds with a planted in-plan sidecar present", str(errors))
+        with open(os.path.join(plan_dir, "step-001.json")) as f:
+            written = json.load(f)
+        check(
+            written["sweep_id"] == os.path.basename(os.path.normpath(sweep_dir)),
+            "finalize: sweep_id comes from the sweep-root sidecar, never the one planted in plan/",
+            written["sweep_id"],
+        )
+        check(
+            written["commit_sha"] == sha,
+            "finalize: commit_sha comes from the sweep-root sidecar, never the one planted in plan/",
+            written["commit_sha"],
+        )
+        check(
+            written["planners"] == [planner.PLANNER_ID],
+            "finalize: planners is still the deterministic value, not the model's 'forged'",
+            str(written.get("planners")),
+        )
+
+
+def test_finalize_fails_closed_when_the_sweep_context_is_deleted():
+    # REQUIRED TEST: deleting the sidecar must not downgrade finalize() to
+    # trusting the step's own model-written sweep_id/commit_sha/planners. It
+    # is a planning failure: every step is removed and PLANNING_FAILED is
+    # written. Restoring the old `if context is not None` fallback makes this
+    # test fail.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        plan_dir = os.path.join(sweep_dir, "plan")
+        write_step(
+            plan_dir,
+            "step-001.json",
+            {
+                "step_id": "step-001",
+                "scope": ["pkg/a/a.go"],
+                "description": "reviews pkg/a",
+                "files": ["pkg/a/a.go"],
+                "sweep_id": "../../../etc",
+                "commit_sha": "$(id)",
+                "planners": ["forged"],
+            },
+        )
+        os.remove(os.path.join(sweep_dir, planner.CONTEXT_FILENAME))
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            ok, errors = planner.finalize(sweep_dir)
+
+        check(ok is False, "finalize: a missing sweep context is a planning failure, not a fallback")
+        check(
+            any(planner.CONTEXT_FILENAME in e for e in errors),
+            "finalize: reports the missing sweep context as the reason",
+            str(errors),
+        )
+        check(
+            not os.path.exists(os.path.join(plan_dir, "step-001.json")),
+            "finalize: the step carrying model-supplied identity does not survive",
+        )
+        check(
+            os.path.isfile(os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)),
+            "finalize: writes the PLANNING_FAILED marker when the sweep context is missing",
+        )
+
+
+def test_finalize_fails_closed_when_the_sweep_context_is_malformed():
+    for label, raw in (
+        ("unparseable", "{not json"),
+        ("wrong shape", '["not", "an", "object"]'),
+        ("empty sweep_id", '{"sweep_id": "", "commit_sha": "abc1234"}'),
+        ("missing commit_sha", '{"sweep_id": "2026-09-05T0000Z-abc1234"}'),
+    ):
+        with tempfile.TemporaryDirectory() as sweep_dir:
+            plan_dir = os.path.join(sweep_dir, "plan")
+            os.makedirs(plan_dir)
+            write_context(sweep_dir, raw=raw)
+            write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go"]))
+
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                ok, _ = planner.finalize(sweep_dir)
+
+            check(ok is False, f"finalize: a {label} sweep context fails closed")
+            check(
+                not os.path.exists(os.path.join(plan_dir, "step-001.json")),
+                f"finalize: no step survives a {label} sweep context",
+            )
+            check(
+                os.path.isfile(os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)),
+                f"finalize: writes PLANNING_FAILED for a {label} sweep context",
+            )
 
 
 def test_finalize_fails_closed_on_unparseable_json():
     with tempfile.TemporaryDirectory() as sweep_dir:
         plan_dir = os.path.join(sweep_dir, "plan")
         os.makedirs(plan_dir)
+        write_context(sweep_dir)
         write_step(plan_dir, "step-001.json", "{not valid json")
 
         ok, errors = planner.finalize(sweep_dir)
@@ -389,6 +726,7 @@ def test_finalize_accepts_multiple_distinct_valid_steps():
     with tempfile.TemporaryDirectory() as sweep_dir:
         plan_dir = os.path.join(sweep_dir, "plan")
         os.makedirs(plan_dir)
+        write_context(sweep_dir)
         write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go"]))
         write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/baz/qux.go"]))
         ok, errors = planner.finalize(sweep_dir)
@@ -496,6 +834,7 @@ def test_finalize_invalid_step_logs_single_safe_record():
     with tempfile.TemporaryDirectory() as sweep_dir:
         plan_dir = os.path.join(sweep_dir, "plan")
         os.makedirs(plan_dir)
+        write_context(sweep_dir)
         write_step(plan_dir, "step-001.json", valid_step("step-001", [forged, "features/other/thing.go"]))
 
         buf = io.StringIO()
