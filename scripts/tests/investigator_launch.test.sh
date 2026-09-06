@@ -402,6 +402,71 @@ check_contains "refuses when a container by that name already exists" "$dup_out"
 if [[ "$dup_rc" -eq 3 ]]; then ok "container-exists refusal exits 3"; else bad "container-exists refusal exits 3" "actual rc: ${dup_rc}"; fi
 
 echo ""
+echo "== REQUIRED TEST evidence — an exited container is reaped and the relaunch succeeds (Issue #3930) =="
+# No --rm is passed to `docker run` for investigators, so a finished
+# container's name stays taken until something removes it. Before the fix,
+# `docker ps -a --filter name=...` matched ANY state and refused
+# unconditionally -- resuming a sweep whose investigator container had
+# already exited was a silent, permanent no-op. Reverting the reap logic
+# (restoring the unconditional refusal) makes this test fail with
+# INVESTIGATOR_REFUSED:...:container_exists instead of relaunching.
+: > "$DOCKER_CALL_LOG"
+CONTAINER_NAME="cfg-agent-investigator-$(basename "$SWEEP_DIR")-plan"
+cat > "${FAKEBIN}/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "${DOCKER_CALL_LOG:?}"
+case "$1" in
+  ps)  echo "exited" ;;
+  run) echo "fake-container-id-reaped" ;;
+  rm)  exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "${FAKEBIN}/docker"
+set +e
+reap_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-reap" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
+reap_rc=$?
+set -e
+check_contains "an exited container is reaped, then a new one is launched" "$reap_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id-reaped"
+if [[ "$reap_rc" -eq 0 ]]; then ok "relaunch after reap exits 0"; else bad "relaunch after reap exits 0" "actual rc: ${reap_rc}"; fi
+check_contains "the exited container is removed before relaunch" "$(cat "$DOCKER_CALL_LOG")" "rm -f ${CONTAINER_NAME}"
+check_contains "docker run is actually invoked after the reap" "$(cat "$DOCKER_CALL_LOG")" "run -d"
+
+echo ""
+echo "== REQUIRED TEST evidence — a genuinely still-running container is refused, never reaped (Issue #3930) =="
+# The other half of the same guard: a container this script can observe is
+# still alive (running/restarting/created) must never be removed or raced --
+# only "exited" is safe to reap. This must remain true after the fix above.
+: > "$DOCKER_CALL_LOG"
+cat > "${FAKEBIN}/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "${DOCKER_CALL_LOG:?}"
+case "$1" in
+  ps)  echo "running" ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "${FAKEBIN}/docker"
+set +e
+running_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-running" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
+running_rc=$?
+set -e
+check_contains "a still-running container is refused" "$running_out" "INVESTIGATOR_REFUSED:plan:container_exists"
+if [[ "$running_rc" -eq 3 ]]; then ok "still-running refusal exits 3"; else bad "still-running refusal exits 3" "actual rc: ${running_rc}"; fi
+check_not_contains "a still-running container is never removed" "$(cat "$DOCKER_CALL_LOG")" "rm -f"
+check_not_contains "a still-running container is never raced with a new launch" "$(cat "$DOCKER_CALL_LOG")" "run -d"
+
+echo ""
 echo "== functional: missing sweep directory is a hard failure =="
 set +e
 missing_out=$(PATH="${FAKEBIN}:${PATH}" CFGMS_TEST_REPO_ROOT="$REPO_ROOT" HOME="${SANDBOX}/HOME" \

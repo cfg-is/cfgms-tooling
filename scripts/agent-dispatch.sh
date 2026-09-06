@@ -872,6 +872,25 @@ _classify_review_container_state() {
   esac
 }
 
+# _container_safe_to_reap <docker_state>
+#   True (exit 0) only when a container's `docker ps` `.State` is exactly
+#   "exited" — the coarser two-way split (reap vs. do-not-touch) used by
+#   launch paths that have no crash-diagnosis need of their own. Every other
+#   value — running, restarting, created, or anything unrecognized — fails
+#   CONSERVATIVE: false, i.e. "leave it alone."
+#
+# Why this doesn't reuse _classify_review_container_state's three-way split
+# (Issue #3930): that function preserves a non-zero-exit container for human
+# inspection (review-pr posts no completion signal anywhere else, so the
+# container is the only crash evidence). An investigator's crash is already
+# captured by ledger_append_launch_failed and its own session directory, so
+# nothing is lost by reaping it unconditionally on the next launch attempt —
+# and requiring a clean exit before reaping would leave a sweep's `resume`
+# permanently stuck on any lane whose prior attempt happened to crash.
+_container_safe_to_reap() {
+  [[ "$1" == "exited" ]]
+}
+
 # Resolve which story or project item a PR belongs to from its branch name
 # and body. Branch name is authoritative; body extraction is a legacy fallback
 # only used when the branch follows neither the story- nor item- convention.
@@ -2864,9 +2883,22 @@ PROMPT_EOF
     inv_sweep_id_safe=$(printf '%s' "$inv_sweep_id" | tr -c 'a-zA-Z0-9._-' '-')
     container_name="cfg-agent-investigator-${inv_sweep_id_safe}-${inv_mode_safe}"
 
-    if docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null | grep -q .; then
-      echo "INVESTIGATOR_REFUSED:${inv_mode}:container_exists:${container_name}"
-      exit 3
+    # Container conflict gate (Issue #3930). launch-investigator's `docker
+    # run -d` carries no `--rm`, so a finished container's name stays taken
+    # until something removes it — without this state check, ANY container
+    # by this name, exited or not, refused every future launch for the same
+    # sweep/mode forever, which made `security-review.sh resume` a permanent
+    # no-op for a lane whose container had already exited. An exited
+    # container is reaped here and the launch proceeds; a genuinely still-
+    # running one is refused exactly as before.
+    existing_state=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.State}}" 2>/dev/null | head -1)
+    if [[ -n "$existing_state" ]]; then
+      if _container_safe_to_reap "$existing_state"; then
+        docker rm -f "$container_name" >/dev/null 2>&1 || true
+      else
+        echo "INVESTIGATOR_REFUSED:${inv_mode}:container_exists:${container_name}"
+        exit 3
+      fi
     fi
 
     # Mount plan/lane subpaths only — never the sweep root — per the lane

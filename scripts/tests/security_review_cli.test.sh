@@ -351,6 +351,222 @@ check_contains "report shows the parked lane's coverage" "$report_md" "openai-gp
 check_contains "report shows 0/2 complete for the parked lane" "$report_md" "| openai-gpt56-sol | 0/2 | 2/2 | 0/2 | 0/2 |"
 check_contains "report shows 2/2 complete for the non-parked lanes" "$report_md" "| anthropic-opus5 | 2/2 | 0/2 | 0/2 | 0/2 |"
 
+# ----------------------------------------------------------------------------
+# Issue #3930: a dedicated, self-contained docker stub that tracks container
+# name persistence, separate from the shared FAKEBIN stub above. The shared
+# stub's `docker ps` always reports empty regardless of filter, so it cannot
+# exercise the container-exists guard at all -- this is exactly why it was
+# safe to leave untouched for every other test in this file (its "shape" is
+# unmodified) while this story needs a stub that actually models the real
+# bug: launch-investigator's `docker run -d` carries no `--rm`, so a
+# container's name stays taken (and, before this story's fix, permanently
+# refused) until something removes it. This stub's `docker ps` reports
+# "exited" for any container name a prior `docker run` in this stub created,
+# and `docker rm -f` (agent-dispatch.sh's new reap call) clears that record --
+# mirroring the real daemon closely enough to prove the fix end to end.
+# ----------------------------------------------------------------------------
+
+FAKEBIN2="$(mktemp -d)"
+SANDBOX2="$(mktemp -d)"
+STATE_DIR2="${SANDBOX2}/docker-state"
+mkdir -p "$STATE_DIR2" "${SANDBOX2}/HOME/.claude"
+echo '{}' > "${SANDBOX2}/HOME/.claude/.credentials.json"
+
+cat > "${FAKEBIN2}/docker" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_DIR="${DOCKER_STATE_DIR:?}"
+printf '%s\n' "$*" >> "${DOCKER_CALL_LOG:-/dev/null}"
+
+case "${1:-}" in
+  wait) exit 0 ;;
+  ps)
+    name=""
+    for a in "$@"; do
+      case "$a" in
+        name=^/*)
+          name="${a#name=^/}"
+          name="${name%\$}"
+          ;;
+      esac
+    done
+    if [[ -n "$name" && -f "${STATE_DIR}/${name}.state" ]]; then
+      cat "${STATE_DIR}/${name}.state"
+    fi
+    exit 0
+    ;;
+  rm)
+    for a in "$@"; do
+      case "$a" in
+        -*) ;;
+        *) rm -f "${STATE_DIR}/${a}.state" ;;
+      esac
+    done
+    exit 0
+    ;;
+esac
+
+[[ "${1:-}" == "run" ]] || exit 0
+shift
+args=("$@")
+n=${#args[@]}
+mode="${args[$((n-1))]}"
+out_dir=""
+plan_dir=""
+cname=""
+for i in "${!args[@]}"; do
+  a="${args[$i]}"
+  case "$a" in
+    *:/workspace-out:rw) out_dir="${a%:/workspace-out:rw}" ;;
+    *:/workspace-plan:ro) plan_dir="${a%:/workspace-plan:ro}" ;;
+  esac
+  [[ "$a" == "--name" ]] && cname="${args[$((i+1))]}"
+done
+
+# One lane can be forced to look like a genuine still-running collision
+# (agent-dispatch.sh's own INVESTIGATOR_REFUSED:...:container_exists path,
+# never reaped) so the non-skip dispatch-failure propagation can be
+# exercised without needing a real still-running container -- see the
+# "non-skip lane dispatch failure" test below.
+if [[ -n "${STUB_FORCE_RUNNING_MODE:-}" && "$mode" == "$STUB_FORCE_RUNNING_MODE" ]]; then
+  echo "INVESTIGATOR_REFUSED:${mode}:container_exists:${cname}" >&2
+  exit 3
+fi
+
+if [[ "$mode" == "plan" ]]; then
+  n_steps="${STUB_PLAN_STEP_COUNT:-2}"
+  for i in $(seq 1 "$n_steps"); do
+    step_id=$(printf "step-%03d" "$i")
+    step_file="${out_dir}/${step_id}.json"
+    [[ -f "$step_file" ]] && continue
+    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"description":"stub step","files":["pkg/example/file.go"]}' \
+      "$step_id" > "$step_file"
+  done
+else
+  lane_dir="$out_dir"
+  shopt -s nullglob
+  for f in "${plan_dir}"/step-*.json; do
+    step_id="$(basename "$f" .json)"
+    if [[ -f "${lane_dir}/${step_id}.findings.json" || -f "${lane_dir}/${step_id}.status.json" ]]; then
+      continue
+    fi
+    printf '{"sweep_id":"stub","commit_sha":"0000000000000000000000000000000000000000","lane":"%s","step_id":"%s","state":"complete","model_id":"stub-model","findings":[]}' \
+      "$mode" "$step_id" > "${lane_dir}/${step_id}.findings.json"
+  done
+fi
+
+# No --rm in the real invocation -- record this container name as exited so
+# a later `docker ps` against it (the reap-before-relaunch guard under test)
+# sees it, exactly like the real daemon leaves it after this story's fix.
+[[ -n "$cname" ]] && echo "exited" > "${STATE_DIR}/${cname}.state"
+
+echo "fake-container-id-${mode}-$RANDOM-$$"
+STUB
+chmod +x "${FAKEBIN2}/docker"
+
+cat > "${FAKEBIN2}/secret-tool" <<'STUB'
+#!/usr/bin/env bash
+printf 'FAKE_SECRET_FOR_TEST'
+STUB
+chmod +x "${FAKEBIN2}/secret-tool"
+
+run_cli2() {
+  local sub="$1"; shift
+  PATH="${FAKEBIN2}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${sub}/credbase" \
+  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
+  CFGMS_AGENT_LEDGER_DIR="${sub}/ledger" \
+  HOME="${sub}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${sub}/base" \
+  DOCKER_CALL_LOG="${sub}/docker_calls.log" \
+  DOCKER_STATE_DIR="$STATE_DIR2" \
+  "$CLI" "$@"
+}
+
+echo ""
+echo "== REQUIRED TEST — launch immediately followed by resume actually re-dispatches a"
+echo "   lane whose investigator container already exited: resume is not a no-op (Issue #3930) =="
+: > "${SANDBOX2}/docker_calls.log"
+launch4_out=$(STUB_PLAN_STEP_COUNT=2 run_cli2 "$SANDBOX2" launch HEAD 2>"${SANDBOX2}/stderr1.log")
+launch4_rc=$?
+check_eq "launch against the persistent-container stub exits 0" "$launch4_rc" "0"
+SWEEP_DIR_4="$(dirname "$(dirname "$launch4_out")")"
+for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+  [[ -f "${SWEEP_DIR_4}/lanes/${lane}/step-001.findings.json" && -f "${SWEEP_DIR_4}/lanes/${lane}/step-002.findings.json" ]] \
+    && ok "lane ${lane} completed both steps on the first launch" \
+    || bad "lane ${lane} completed both steps on the first launch" "missing findings"
+done
+if find "$STATE_DIR2" -name '*.state' -print -quit 2>/dev/null | grep -q .; then
+  ok "at least one investigator container is on record as exited after launch (no --rm)"
+else
+  bad "at least one investigator container is on record as exited after launch (no --rm)" "no state files found"
+fi
+
+# Simulate an interrupted sweep: drop step-002's result for every lane. Every
+# investigator container from the launch above is still on record as
+# "exited" and was never removed -- exactly the state that made resume a
+# permanent no-op before this story's fix (reverting agent-dispatch.sh's
+# reap logic makes the loop below never see step-002 filled in).
+for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+  rm -f "${SWEEP_DIR_4}/lanes/${lane}/step-002.findings.json"
+done
+
+: > "${SANDBOX2}/docker_calls.log"
+resume4_out=$(run_cli2 "$SANDBOX2" resume "$(basename "$SWEEP_DIR_4")" 2>"${SANDBOX2}/stderr2.log")
+resume4_rc=$?
+check_eq "resume against the persistent-container stub exits 0" "$resume4_rc" "0"
+check_contains "resume prints the consolidated report path" "$resume4_out" "report/consolidated.md"
+reap_calls="$(grep -c '^rm -f cfg-agent-investigator-' "${SANDBOX2}/docker_calls.log" 2>/dev/null || true)"
+if [[ "${reap_calls:-0}" -ge 1 ]]; then
+  ok "resume reaped at least one already-exited investigator container before relaunching"
+else
+  bad "resume reaped at least one already-exited investigator container before relaunching" "no docker rm -f call logged"
+fi
+for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+  [[ -f "${SWEEP_DIR_4}/lanes/${lane}/step-002.findings.json" ]] \
+    && ok "resume completed the missing step-002 for lane ${lane} despite its container already having exited" \
+    || bad "resume completed the missing step-002 for lane ${lane} despite its container already having exited" "not found"
+done
+
+echo ""
+echo "== REQUIRED TEST — a non-skip lane dispatch failure exits non-zero and does not"
+echo "   report the sweep as having completed cleanly (Issue #3930) =="
+# Force the openai-gpt56-sol lane's investigator launch to fail the way a
+# stale, unreapable container or a still-running-container name collision
+# would -- LAUNCH_FAILED with no credential_unavailable/DISPATCH_DEFERRED
+# marker in it, i.e. a real failure, not a documented skip. The other two
+# lanes and the planner still dispatch normally.
+SANDBOX5="$(mktemp -d)"
+mkdir -p "${SANDBOX5}/HOME/.claude" "${SANDBOX5}/docker-state"
+echo '{}' > "${SANDBOX5}/HOME/.claude/.credentials.json"
+: > "${SANDBOX5}/docker_calls.log"
+set +e
+fail_out=$(STUB_PLAN_STEP_COUNT=2 \
+  STUB_FORCE_RUNNING_MODE="openai-gpt56-sol" \
+  PATH="${FAKEBIN2}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX5}/credbase" \
+  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX5}/ledger" \
+  HOME="${SANDBOX5}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${SANDBOX5}/base" \
+  DOCKER_CALL_LOG="${SANDBOX5}/docker_calls.log" \
+  DOCKER_STATE_DIR="${SANDBOX5}/docker-state" \
+  "$CLI" launch HEAD 2>&1)
+fail_rc=$?
+set -e
+if [[ "$fail_rc" -ne 0 ]]; then
+  ok "launch exits non-zero when a lane hits a real (non-skip) dispatch failure"
+else
+  bad "launch exits non-zero when a lane hits a real (non-skip) dispatch failure" "exited 0"
+fi
+check_contains "the failure is reported for the affected lane" "$fail_out" "openai-gpt56-sol"
+check_not_contains "the forced failure is never misclassified as a credential skip" "$fail_out" "credential_unavailable"
+check_not_contains "launch does not print the report path as if the sweep completed cleanly" "$fail_out" "report/consolidated.md"
+
 echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"

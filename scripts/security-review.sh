@@ -111,6 +111,32 @@ print(f"{sweep_dir}\t{m['commit_sha']}")
 PYEOF
 }
 
+# _is_intentional_dispatch_skip <launch_investigator_output>
+# True (exit 0) when a non-zero `launch-investigator` (or `planner.py
+# launch`, which just wraps it and folds its stdout/stderr into its own
+# error message) exit is one of the two documented, non-fatal credential-
+# unavailable skips: the lane-mode credential loader's own
+# "LAUNCH_FAILED:...:credential_unavailable", or the plan-mode credential
+# gate's "DISPATCH_DEFERRED:creds_missing:..." (gate_credentials_for_launch
+# in agent-dispatch.sh). Both mean "nothing is wrong, the operator just
+# hasn't provisioned this credential yet" -- an expected, recoverable state
+# this script has always treated as a per-lane skip.
+#
+# Everything else -- a stale container that could not be reaped, a
+# container-name collision with a still-running container
+# (INVESTIGATOR_REFUSED:...:container_exists), invalid input, or any other
+# non-zero exit -- is a real failure (Issue #3930) and must NOT match here,
+# so the caller can tell "the operator hasn't set up credentials yet" apart
+# from "something is actually broken" and set a non-zero final exit code
+# only for the latter.
+_is_intentional_dispatch_skip() {
+  local output="$1"
+  case "$output" in
+    *credential_unavailable*|*DISPATCH_DEFERRED:creds_missing*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # plan_already_populated <sweep_dir>
 # True if at least one plan/step-*.json file already exists -- resume's
 # signal to skip re-dispatching the planner as a no-op (#3906's planner does
@@ -123,10 +149,19 @@ plan_already_populated() {
 
 # dispatch_planner <sweep_dir> <commit_sha>
 # prepare() -> launch() -> wait for the container to exit -> finalize().
-# Every failure here is logged and treated as non-fatal to the overall
-# launch/resume: a broken plan leaves the lanes nothing to do (they will
-# simply find zero outstanding steps), and the consolidator still runs and
-# renders that state visibly rather than the whole command aborting.
+# A `prepare` or `finalize` failure is logged and treated as non-fatal to the
+# overall launch/resume: a broken plan leaves the lanes nothing to do (they
+# will simply find zero outstanding steps), and the consolidator still runs
+# and renders that state visibly rather than the whole command aborting.
+#
+# A `launch` failure is different (Issue #3930): `launch` is the one step
+# that actually calls `agent-dispatch.sh launch-investigator`, so its
+# failure is either a documented credential-unavailable skip (non-fatal,
+# same as before) or a real dispatch problem -- a stale container that could
+# not be reaped, a container-name collision with a still-running container,
+# or anything else launch-investigator can fail on. Returns 1 for the latter
+# so the caller can propagate a non-zero final exit code instead of silently
+# reporting the sweep as having completed cleanly.
 dispatch_planner() {
   local sweep_dir="$1" commit_sha="$2"
 
@@ -138,8 +173,12 @@ dispatch_planner() {
 
   local launch_output
   if ! launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --repo-root "$REPO_ROOT" 2>&1); then
-    echo "WARNING: planner launch failed: ${launch_output}" >&2
-    return 0
+    if _is_intentional_dispatch_skip "$launch_output"; then
+      echo "WARNING: planner launch skipped (credentials unavailable): ${launch_output}" >&2
+      return 0
+    fi
+    echo "ERROR: planner launch failed: ${launch_output}" >&2
+    return 1
   fi
 
   local container_id
@@ -157,16 +196,24 @@ dispatch_planner() {
 
 # dispatch_all_lanes <sweep_dir>
 # Dispatches all three lanes independently (AC6): a lane that fails to
-# dispatch at all (credential unavailable, container name collision, ...) is
-# logged and skipped -- it never stops the loop from dispatching the
-# remaining lanes. Every container that did launch is `docker run -d`
-# (already returned by the time launch-investigator's own call returns), so
-# waiting on them here, even sequentially, does not serialize their work --
-# it only serializes this script's observation of when each one is done.
+# dispatch for a documented credential-unavailable reason is logged and
+# skipped -- it never stops the loop from dispatching the remaining lanes.
+# Every container that did launch is `docker run -d` (already returned by
+# the time launch-investigator's own call returns), so waiting on them here,
+# even sequentially, does not serialize their work -- it only serializes
+# this script's observation of when each one is done.
+#
+# A lane dispatch failure that is NOT a documented credential-unavailable
+# skip -- a stale container that could not be reaped, a container-name
+# collision with a still-running container, or any other launch-investigator
+# non-zero exit -- is a real failure (Issue #3930): it still does not stop
+# the other lanes from dispatching, but this function returns 1 so the
+# caller does not report the sweep as having completed cleanly.
 dispatch_all_lanes() {
   local sweep_dir="$1"
   local container_ids=()
   local i lane_id cred_name script output rc cid
+  local had_failure=0
 
   for i in "${!LANE_IDS[@]}"; do
     lane_id="${LANE_IDS[$i]}"
@@ -181,13 +228,19 @@ dispatch_all_lanes() {
       --lane-entrypoint "$script" 2>&1) || rc=$?
 
     if [[ $rc -ne 0 ]]; then
-      echo "WARNING: lane ${lane_id} dispatch failed (exit ${rc}): ${output}" >&2
+      if _is_intentional_dispatch_skip "$output"; then
+        echo "WARNING: lane ${lane_id} dispatch skipped (exit ${rc}): ${output}" >&2
+      else
+        echo "ERROR: lane ${lane_id} dispatch failed (exit ${rc}): ${output}" >&2
+        had_failure=1
+      fi
       continue
     fi
 
     cid="$(printf '%s\n' "$output" | sed -n "s/^LAUNCHED_INVESTIGATOR:${lane_id}://p" | tail -n1)"
     if [[ -z "$cid" ]]; then
-      echo "WARNING: lane ${lane_id} dispatched but no container id was parsed from: ${output}" >&2
+      echo "ERROR: lane ${lane_id} dispatched but no container id was parsed from: ${output}" >&2
+      had_failure=1
       continue
     fi
     container_ids+=("$cid")
@@ -197,6 +250,8 @@ dispatch_all_lanes() {
     [[ -n "$cid" ]] || continue
     docker wait "$cid" >/dev/null 2>&1 || true
   done
+
+  return "$had_failure"
 }
 
 # run_consolidation <sweep_dir>
@@ -222,11 +277,21 @@ cmd_launch() {
   sweep_dir="$(printf '%s' "$result" | cut -f1)"
   commit_sha="$(printf '%s' "$result" | cut -f2)"
 
-  dispatch_planner "$sweep_dir" "$commit_sha"
-  dispatch_all_lanes "$sweep_dir"
+  local dispatch_failed=0
+  dispatch_planner "$sweep_dir" "$commit_sha" || dispatch_failed=1
+  dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then
     echo "ERROR: consolidation failed for sweep ${sweep_dir}" >&2
+    exit 1
+  fi
+
+  # A real (non-skip) dispatch failure (Issue #3930) exits non-zero rather
+  # than printing the report path as if the sweep completed cleanly -- the
+  # WARNING/ERROR lines already logged above explain which lane or the
+  # planner failed and why.
+  if [[ "$dispatch_failed" -ne 0 ]]; then
+    echo "ERROR: sweep ${sweep_dir} had a dispatch failure that was not an intentional credential-unavailable skip; see ERROR lines above" >&2
     exit 1
   fi
 
@@ -255,16 +320,24 @@ cmd_resume() {
   local commit_sha
   commit_sha="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['commit_sha'])" "${sweep_dir}/manifest.json")"
 
+  local dispatch_failed=0
   if plan_already_populated "$sweep_dir"; then
     echo "plan/ already populated for ${sweep_id}; skipping planner re-dispatch" >&2
   else
-    dispatch_planner "$sweep_dir" "$commit_sha"
+    dispatch_planner "$sweep_dir" "$commit_sha" || dispatch_failed=1
   fi
 
-  dispatch_all_lanes "$sweep_dir"
+  dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then
     echo "ERROR: consolidation failed for sweep ${sweep_dir}" >&2
+    exit 1
+  fi
+
+  # See cmd_launch: a real (non-skip) dispatch failure exits non-zero rather
+  # than printing the report path as if resume completed cleanly.
+  if [[ "$dispatch_failed" -ne 0 ]]; then
+    echo "ERROR: sweep ${sweep_dir} had a dispatch failure that was not an intentional credential-unavailable skip; see ERROR lines above" >&2
     exit 1
   fi
 
