@@ -238,6 +238,116 @@ def test_build_envelope_carries_refusal_attempts_even_when_complete():
     )
 
 
+# --- files_intended/files_read passthrough (Issue #3957) -------------------
+
+
+def test_build_envelope_includes_files_fields_on_complete():
+    envelope = harness_runner.build_envelope(
+        make_context(),
+        "claude-sonnet-5",
+        terminal_state.COMPLETE,
+        0,
+        findings=[],
+        files_intended=["a.go", "b.go"],
+        files_read=["a.go"],
+    )
+    check(
+        envelope.get("files_intended") == ["a.go", "b.go"] and envelope.get("files_read") == ["a.go"],
+        "build_envelope: files_intended/files_read pass through on a complete envelope",
+        str(envelope),
+    )
+
+
+def test_build_envelope_defaults_files_fields_to_empty_lists_when_omitted():
+    envelope = harness_runner.build_envelope(
+        make_context(), "claude-sonnet-5", terminal_state.COMPLETE, 0, findings=[]
+    )
+    check(
+        envelope.get("files_intended") == [] and envelope.get("files_read") == [],
+        "build_envelope: files_intended/files_read default to empty lists on a complete envelope "
+        "when the caller passes neither",
+        str(envelope),
+    )
+
+
+def test_build_envelope_omits_files_fields_when_not_complete():
+    # A refused/failed/parked step never got far enough to have read anything
+    # meaningful -- the fields must not appear at all, never an empty pair
+    # that could be misread as "declared and read nothing".
+    envelope = harness_runner.build_envelope(
+        make_context(),
+        "claude-sonnet-5",
+        terminal_state.REFUSED,
+        1,
+        stop_reason_raw="policy_decline",
+        files_intended=["a.go"],
+        files_read=[],
+    )
+    check(
+        "files_intended" not in envelope and "files_read" not in envelope,
+        "build_envelope: files_intended/files_read are omitted on a non-complete envelope",
+        str(envelope),
+    )
+
+
+def test_apply_refusal_policy_passes_files_fields_through_on_complete():
+    with tempfile.TemporaryDirectory() as lane_dir:
+        step_id = "step-400"
+        context = make_context(step_id=step_id)
+        status_path = harness_runner.status_envelope_path(lane_dir, step_id)
+        envelope = harness_runner.apply_refusal_policy(
+            terminal_state.COMPLETE,
+            status_path,
+            context,
+            "claude-sonnet-5",
+            findings=[],
+            files_intended=["a.go", "b.go"],
+            files_read=["a.go"],
+        )
+        check(
+            envelope.get("files_intended") == ["a.go", "b.go"] and envelope.get("files_read") == ["a.go"],
+            "apply_refusal_policy: threads files_intended/files_read through to build_envelope",
+            str(envelope),
+        )
+
+
+def test_apply_refusal_policy_omits_files_fields_when_surfaced_as_failed():
+    # A second consecutive refusal is promoted to FAILED inside
+    # apply_refusal_policy -- the files fields passed in must not leak onto
+    # the final non-complete envelope just because the caller supplied them.
+    with tempfile.TemporaryDirectory() as lane_dir:
+        step_id = "step-401"
+        context = make_context(step_id=step_id)
+        status_path = harness_runner.status_envelope_path(lane_dir, step_id)
+        first = harness_runner.apply_refusal_policy(
+            terminal_state.REFUSED,
+            status_path,
+            context,
+            "claude-sonnet-5",
+            stop_reason_raw="policy_decline",
+            files_intended=["a.go"],
+            files_read=[],
+        )
+        harness_runner.write_envelope(lane_dir, step_id, first)
+
+        second = harness_runner.apply_refusal_policy(
+            terminal_state.REFUSED,
+            status_path,
+            context,
+            "claude-sonnet-5",
+            stop_reason_raw="policy_decline",
+            files_intended=["a.go"],
+            files_read=[],
+        )
+        check(
+            second["state"] == terminal_state.FAILED
+            and "files_intended" not in second
+            and "files_read" not in second,
+            "apply_refusal_policy: files fields stay absent when a refusal surfaces as failed",
+            str(second),
+        )
+
+
 # --- Envelope round-trip through real files -- REQUIRED TEST ---------------
 
 

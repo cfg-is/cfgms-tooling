@@ -20,6 +20,13 @@ Three shapes are validated here:
   `stop_reason_raw` recording the provider's raw, unmodified terminating
   reason so a new refusal encoding after a provider update is diagnosable
   from the recorded envelope rather than lost to a normalized enum.
+  `files_intended`/`files_read` are optional-but-typed lists of strings, valid
+  only on a `complete` envelope (Issue #3957) — a `refused`/`failed`/`parked`
+  step never got far enough to have read anything meaningful. Recording both,
+  rather than only `files_read`, is what lets a report distinguish "reviewed
+  everything declared and found nothing" from "skipped every declared file
+  and still returned an empty findings array" — the two are otherwise
+  indistinguishable from `findings: []` alone.
 
 - A **plan step** (`validate_plan_step`): the one shape the planner writes and
   every lane reads (epic #3927's contract C1). Before this story, the planner
@@ -147,6 +154,15 @@ def validate_step_envelope(envelope: object) -> list[str]:
             for index, finding in enumerate(findings):
                 for finding_error in validate_finding(finding):
                     errors.append(f"findings[{index}]: {finding_error}")
+
+        for field in ("files_intended", "files_read"):
+            if field not in envelope:
+                continue
+            value = envelope[field]
+            if not _non_empty_string_list(value):
+                errors.append(
+                    f"field {field} must be a list of non-empty strings when present, got {value!r}"
+                )
     elif state in STEP_STATES:
         raw_reason = envelope.get("stop_reason_raw")
         if not isinstance(raw_reason, str) or raw_reason == "":

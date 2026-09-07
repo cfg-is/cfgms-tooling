@@ -207,6 +207,57 @@ def test_validate_step_envelope_rejects_bad_state():
     )
 
 
+def test_validate_step_envelope_accepts_files_intended_and_files_read():
+    envelope = valid_step_envelope(files_intended=["a.go", "b.go"], files_read=["a.go"])
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        errors == [],
+        "validate_step_envelope: complete with files_intended/files_read lists is valid",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_files_fields_are_optional():
+    envelope = valid_step_envelope()  # no files_intended/files_read at all
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        errors == [],
+        "validate_step_envelope: files_intended/files_read are optional, absence is valid",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_accepts_empty_files_lists():
+    envelope = valid_step_envelope(files_intended=[], files_read=[])
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        errors == [],
+        "validate_step_envelope: empty files_intended/files_read lists are valid "
+        "(a step whose scope names a directory rather than concrete files)",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_rejects_non_list_files_intended():
+    envelope = valid_step_envelope(files_intended="not-a-list")
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("files_intended" in e for e in errors),
+        "validate_step_envelope: rejects a non-list files_intended",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_rejects_non_string_entry_in_files_read():
+    envelope = valid_step_envelope(files_read=["a.go", 42])
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("files_read" in e for e in errors),
+        "validate_step_envelope: rejects a files_read entry that is not a string",
+        str(errors),
+    )
+
+
 def test_validate_step_envelope_missing_fields_distinct_errors():
     envelope = valid_step_envelope()
     del envelope["sweep_id"]

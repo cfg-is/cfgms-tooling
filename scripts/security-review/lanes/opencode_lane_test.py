@@ -277,6 +277,51 @@ def test_unsafe_file_path_is_skipped() -> None:
         )
 
 
+def test_files_intended_vs_files_read_on_partial_read() -> None:
+    """[REQUIRED TEST] A step declares two files; one resolves through a
+    symlink that escapes the repo root, triggering `_resolve_within_repo`'s
+    existing containment rejection. The written `complete` envelope must
+    record both declared files in `files_intended` (length 2) while
+    `files_read` reflects only the one actually read (length 1) -- an empty
+    findings array from this step must never be read as evidence the step
+    reviewed everything it was asked to."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir, \
+            tempfile.TemporaryDirectory() as repo_root, tempfile.TemporaryDirectory() as outside_dir:
+        readable_dir = os.path.join(repo_root, "pkg", "example")
+        os.makedirs(readable_dir)
+        with open(os.path.join(readable_dir, "thing.go"), "w") as f:
+            f.write("package example\n")
+
+        outside_target = os.path.join(outside_dir, "secret.go")
+        with open(outside_target, "w") as f:
+            f.write("package secret\n")
+        escaping_symlink = os.path.join(repo_root, "escape.go")
+        os.symlink(outside_target, escaping_symlink)
+
+        write_plan_step(plan_dir, "step-001", files=["pkg/example/thing.go", "escape.go"])
+        written = opencode_lane.run_lane(
+            plan_dir, out_dir, repo_root, LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(exit_code=0, raw_body={"findings": []}),
+        )
+        check(written[0]["state"] == "complete", "partial read: state is complete", repr(written))
+        check(
+            written[0].get("files_intended") == ["pkg/example/thing.go", "escape.go"],
+            "partial read: files_intended records both declared files",
+            repr(written),
+        )
+        check(
+            written[0].get("files_read") == ["pkg/example/thing.go"],
+            "partial read: files_read records only the file actually read",
+            repr(written),
+        )
+        check(
+            len(written[0].get("files_read", [])) == 1 and len(written[0].get("files_intended", [])) == 2,
+            "partial read: files_read length (1) is distinct from files_intended length (2) -- "
+            "the empty findings array here is not evidence of full review",
+            repr(written),
+        )
+
+
 def _write_argv_recording_stub(stub_path: str, argv_path: str) -> None:
     with open(stub_path, "w") as f:
         f.write(

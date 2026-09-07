@@ -420,7 +420,13 @@ def run_lane(
         except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
             schema.log_event("step_launch_failed", step_id=step_id, error=str(exc))
             envelope = harness_runner.apply_refusal_policy(
-                terminal_state.FAILED, envelope_path, context, model, stop_reason_raw=f"launch_exception:{exc}"
+                terminal_state.FAILED,
+                envelope_path,
+                context,
+                model,
+                stop_reason_raw=f"launch_exception:{exc}",
+                files_intended=files,
+                files_read=list(file_contents.keys()),
             )
             harness_runner.write_envelope(out_dir, step_id, envelope)
             written.append(envelope)
@@ -448,6 +454,8 @@ def run_lane(
             model,
             stop_reason_raw=stop_reason_raw,
             findings=enriched if state == terminal_state.COMPLETE else None,
+            files_intended=files,
+            files_read=list(file_contents.keys()),
         )
         harness_runner.write_envelope(out_dir, step_id, envelope)
         schema.log_event(

@@ -99,8 +99,15 @@ def finding(commit_sha: str, lane: str, step_id: str, **overrides) -> dict:
     return f
 
 
-def complete_envelope(commit_sha: str, lane: str, step_id: str, findings: list[dict]) -> dict:
-    return {
+def complete_envelope(
+    commit_sha: str,
+    lane: str,
+    step_id: str,
+    findings: list[dict],
+    files_intended: list[str] | None = None,
+    files_read: list[str] | None = None,
+) -> dict:
+    envelope = {
         "sweep_id": "2026-09-05T0214Z-0541b9c8",
         "commit_sha": commit_sha,
         "lane": lane,
@@ -109,6 +116,11 @@ def complete_envelope(commit_sha: str, lane: str, step_id: str, findings: list[d
         "model_id": "claude-opus-5",
         "findings": findings,
     }
+    if files_intended is not None:
+        envelope["files_intended"] = files_intended
+    if files_read is not None:
+        envelope["files_read"] = files_read
+    return envelope
 
 
 def status_envelope(commit_sha: str, lane: str, step_id: str, state: str) -> dict:
@@ -650,6 +662,101 @@ def test_skill_md_ranking_sentence_matches_shipped_sort_order():
             "under the old sorted(groups.items()) behavior",
             str([f["file"] for f in report["findings"]]),
         )
+
+
+def test_files_short_counts_steps_with_declared_but_unread_files():
+    # REQUIRED TEST: files_intended=["a.go","b.go"], files_read=["a.go"] --
+    # build_coverage_table()'s files_short count for that lane must be
+    # exactly 1, checked as a count, never a substring match against the
+    # rendered markdown (which could false-match an unrelated log line).
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha, "laneA", "step-001", [],
+                files_intended=["a.go", "b.go"], files_read=["a.go"],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        row = next(r for r in report["coverage"] if r["lane"] == "laneA")
+        check(row["files_short"] == 1, "consolidate: files_short counts a step with declared but unread files", str(row))
+
+
+def test_files_short_excludes_steps_with_no_gap():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha, "laneA", "step-001", [],
+                files_intended=["a.go", "b.go"], files_read=["a.go", "b.go"],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        row = next(r for r in report["coverage"] if r["lane"] == "laneA")
+        check(
+            row["files_short"] == 0,
+            "consolidate: files_short is 0 when files_read equals files_intended (no gap)",
+            str(row),
+        )
+
+
+def test_files_short_excludes_steps_with_empty_files_intended():
+    # An empty files_intended (scope names a directory, not concrete files)
+    # is not itself a gap and must never be counted.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [], files_intended=[], files_read=[]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        row = next(r for r in report["coverage"] if r["lane"] == "laneA")
+        check(
+            row["files_short"] == 0,
+            "consolidate: an empty files_intended is not a gap and is never counted",
+            str(row),
+        )
+
+
+def test_files_short_zero_when_envelope_predates_the_fields():
+    # An envelope written before this story (or by a lane not yet upgraded)
+    # carries no files_intended/files_read at all -- must not crash, and
+    # must not be assumed to be a gap.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        row = next(r for r in report["coverage"] if r["lane"] == "laneA")
+        check(
+            row["files_short"] == 0,
+            "consolidate: an envelope with no files_intended/files_read data contributes no gap",
+            str(row),
+        )
+
+
+def test_files_short_column_rendered_in_markdown():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha, "laneA", "step-001", [],
+                files_intended=["a.go", "b.go"], files_read=["a.go"],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check("Files short" in md, "consolidate.md: renders a Files short coverage column header", md)
 
 
 def test_schema_invalid_findings_file_excluded_and_marked_failed():

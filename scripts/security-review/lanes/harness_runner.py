@@ -164,6 +164,8 @@ def build_envelope(
     refusal_attempts: int,
     stop_reason_raw: str | None = None,
     findings: list[dict] | None = None,
+    files_intended: list[str] | None = None,
+    files_read: list[str] | None = None,
 ) -> dict:
     """Build a step envelope carrying `refusal_attempts` alongside the fields
     `schema.py::validate_step_envelope` requires. `context` supplies
@@ -174,6 +176,14 @@ def build_envelope(
     a refusal-only field, so a step's full history (including "this step
     once refused, then went on to complete") stays visible in its final
     envelope rather than being dropped once a retry succeeds.
+
+    `files_intended`/`files_read` (Issue #3957) are attached only when
+    `state == COMPLETE`, matching `findings`'s own conditional -- a
+    `refused`/`failed`/`parked` step never got far enough to have read
+    anything meaningful, so the fields are omitted rather than written as an
+    empty pair that could be misread as "declared and read nothing". Each
+    defaults to an empty list when the caller completed a step that declared
+    (or read) no files at all -- distinct from the fields being absent.
     """
     envelope = {
         "sweep_id": context["sweep_id"],
@@ -186,6 +196,8 @@ def build_envelope(
     }
     if state == terminal_state.COMPLETE:
         envelope["findings"] = findings if findings is not None else []
+        envelope["files_intended"] = files_intended if files_intended is not None else []
+        envelope["files_read"] = files_read if files_read is not None else []
     else:
         envelope["stop_reason_raw"] = stop_reason_raw or state
     return envelope
@@ -204,6 +216,8 @@ def apply_refusal_policy(
     model_id: str,
     stop_reason_raw: str | None = None,
     findings: list[dict] | None = None,
+    files_intended: list[str] | None = None,
+    files_read: list[str] | None = None,
 ) -> dict:
     """Apply the refusal-retry-once policy on top of one `terminal_state.classify()`
     result and return the envelope to write.
@@ -240,7 +254,14 @@ def apply_refusal_policy(
         refusal_attempts = prior_attempts
 
     return build_envelope(
-        context, model_id, state, refusal_attempts, stop_reason_raw=stop_reason_raw, findings=findings
+        context,
+        model_id,
+        state,
+        refusal_attempts,
+        stop_reason_raw=stop_reason_raw,
+        findings=findings,
+        files_intended=files_intended,
+        files_read=files_read,
     )
 
 

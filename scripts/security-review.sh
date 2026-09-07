@@ -413,8 +413,8 @@ sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
 sys.path.insert(0, sec_dir)
 import consolidate  # noqa: E402
 
-lanes, step_ids, lane_step_state, _findings, plan_failed = consolidate.load_sweep(sweep_dir)
-coverage = consolidate.build_coverage_table(lanes, step_ids, lane_step_state)
+lanes, step_ids, lane_step_state, lane_step_files, _findings, plan_failed = consolidate.load_sweep(sweep_dir)
+coverage = consolidate.build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
 
 print(f"Sweep: {sweep_dir}")
 if plan_failed:
@@ -426,7 +426,10 @@ else:
     if not coverage:
         print("(no lane output found for this sweep)")
     else:
-        print(f"{'Lane':<24}{'Complete':>10}{'Parked':>9}{'Refused':>10}{'Failed':>9}{'Not started':>13}")
+        print(
+            f"{'Lane':<24}{'Complete':>10}{'Parked':>9}{'Refused':>10}{'Failed':>9}"
+            f"{'Not started':>13}{'Files short':>13}"
+        )
         for row in coverage:
             total = row["total_steps"]
             print(
@@ -436,6 +439,7 @@ else:
                 f"{str(row['refused']) + '/' + str(total):>10}"
                 f"{str(row['failed']) + '/' + str(total):>9}"
                 f"{str(row['not_started']) + '/' + str(total):>13}"
+                f"{row['files_short']:>13}"
             )
 PYEOF
 }
