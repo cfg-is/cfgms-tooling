@@ -7,14 +7,16 @@
 # This is a thin CLI. It adds no classification, schema, or credential logic
 # of its own -- it only calls each dependency's existing entry point, in
 # sequence, exactly as documented in docs/architecture/security-review-harness.md:
-#   - manifest.py (#3902)   -- create_sweep()
+#   - manifest.py (#3902)   -- create_sweep(), given the roster-derived lane list
 #   - planner.py (#3906)    -- prepare()/launch()/finalize()
-#   - agent-dispatch.sh launch-investigator (#3903) -- dispatches each of the
-#     three finder lanes (#3907/#3908/#3909), one container per invocation
+#   - agent-dispatch.sh launch-investigator (#3903) -- dispatches each roster
+#     lane's own subscription-harness container, one per invocation
 #   - consolidate.py (#3904) -- consolidate()/load_sweep()/build_coverage_table()
-#   - roster.py (#3932) -- parse_roster(), used only when
-#     CFGMS_SECURITY_REVIEW_LANES is set (epic #3927's contract C5); the
-#     hardcoded three-lane path above remains the default
+#   - roster.py (#3932) -- parse_roster(), the ONLY lane-dispatch path (epic
+#     #3927's contract C5). `CFGMS_SECURITY_REVIEW_LANES` must be set; there
+#     is no hardcoded fallback lane set (Issue #3933 removed the three REST
+#     lanes this script used to dispatch directly, and STORY-5a's opt-in
+#     roster path with them).
 #
 # Container lifecycle is short-lived and per-invocation, not one long-running
 # process per lane: each launch/resume call dispatches a lane's container for
@@ -41,44 +43,33 @@ if [[ -z "$REPO_ROOT" ]]; then
   exit 1
 fi
 
-# One entry per finder lane this harness dispatches. Lane ids match
-# manifest.py::LANES exactly -- that tuple is the single source of truth for
-# lane directory names (Issue #3902). Cred names are the OS-keychain entry
-# names agent-dispatch.sh's launch-investigator --cred-name looks up
-# (Issue #3903); provisioning the actual keychain entries is an operational
-# precondition documented alongside each lane, not something this script or
-# any dev agent can do.
-LANE_IDS=(anthropic-opus5 openai-gpt56-sol ollama-qwen)
-LANE_CRED_NAMES=(ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY)
-LANE_SCRIPTS=(
-  "${SECURITY_REVIEW_DIR}/lanes/anthropic.py"
-  "${SECURITY_REVIEW_DIR}/lanes/openai.py"
-  "${SECURITY_REVIEW_DIR}/lanes/ollama.py"
-)
-
 usage() {
   cat <<'EOF'
 Usage: security-review.sh <command> [args...]
 
 Commands:
   launch <ref>        Resolve <ref>, create a new sweep tree, run the metadata-only
-                       planner, dispatch all three finder lanes independently, run the
-                       consolidator, and print the path to report/consolidated.md.
+                       planner, dispatch every roster lane (CFGMS_SECURITY_REVIEW_LANES)
+                       independently, run the consolidator, and print the path to
+                       report/consolidated.md.
   resume <sweep-id>   Re-invoke the planner against an existing sweep (a no-op if
-                       plan/ is already populated) and re-dispatch all three lanes --
+                       plan/ is already populated) and re-dispatch every roster lane --
                        each lane's own resume-scanner integration ensures only its
                        missing steps run again -- then re-run the consolidator.
   status <sweep-id>   Print the per-lane x per-step coverage breakdown for an existing
                        sweep. Read-only: never re-runs the planner, a lane, or the
                        consolidator.
 
-A lane that parks, refuses, or fails on some steps never blocks the other two lanes'
-dispatch or progress, and never prevents the consolidator from running against
-whatever the other lanes produced.
+CFGMS_SECURITY_REVIEW_LANES (required) is a comma-separated list of harness:model
+pairs, e.g. "claude:sonnet-5" -- see roster.py and
+docs/architecture/security-review-harness.md. A lane that parks, refuses, or fails
+on some steps never blocks any other lane's dispatch or progress, and never
+prevents the consolidator from running against whatever the other lanes produced.
 
-Exit status: non-zero if the sweep base directory cannot be resolved, or if
-consolidation could not run -- this script never exits 0 having silently written a
-partial or empty sweep tree.
+Exit status: non-zero if the sweep base directory cannot be resolved, if
+CFGMS_SECURITY_REVIEW_LANES is unset or malformed, or if consolidation could not
+run -- this script never exits 0 having silently written a partial or empty sweep
+tree.
 EOF
 }
 
@@ -87,23 +78,43 @@ resolve_base_dir() {
 }
 
 # create_sweep_tree <ref>
-# Prints "<sweep_dir><TAB><commit_sha>" on success. Calls manifest.py's
+# Prints "<sweep_dir><TAB><commit_sha>" on success. Resolves
+# CFGMS_SECURITY_REVIEW_LANES via roster.py (the only lane-dispatch path,
+# Issue #3933) into a lane_dir_name list and hands it to manifest.py's
 # create_sweep(), which resolves the base directory (fail-closed) before
 # creating anything -- a BaseDirError here means zero directories were
 # created, satisfying the "write no partial sweep tree" exit-code contract.
+# A missing or malformed CFGMS_SECURITY_REVIEW_LANES fails closed here too,
+# before any sweep directory exists -- there is no hardcoded lane set to
+# fall back to.
 create_sweep_tree() {
   local ref="$1"
-  python3 - "$SECURITY_REVIEW_DIR" "$REPO_ROOT" "$ref" <<'PYEOF'
+
+  if [[ -z "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then
+    echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:sonnet-5\") -- the roster is the only lane-dispatch path" >&2
+    return 1
+  fi
+
+  local roster_output
+  if ! roster_output=$(python3 "${SECURITY_REVIEW_DIR}/roster.py" "$CFGMS_SECURITY_REVIEW_LANES" 2>&1); then
+    echo "ERROR: could not parse CFGMS_SECURITY_REVIEW_LANES: ${roster_output}" >&2
+    return 1
+  fi
+  local lane_dir_names
+  lane_dir_names=$(printf '%s\n' "$roster_output" | cut -f3 | paste -sd, -)
+
+  python3 - "$SECURITY_REVIEW_DIR" "$REPO_ROOT" "$ref" "$lane_dir_names" <<'PYEOF'
 import json
 import os
 import sys
 
-sec_dir, repo_root, ref = sys.argv[1], sys.argv[2], sys.argv[3]
+sec_dir, repo_root, ref, lane_dir_names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sys.path.insert(0, sec_dir)
 import manifest  # noqa: E402
 
+lanes = tuple(lane_dir_names.split(","))
 try:
-    sweep_dir = manifest.create_sweep(ref, repo_root=repo_root)
+    sweep_dir = manifest.create_sweep(ref, lanes=lanes, repo_root=repo_root)
 except Exception as exc:
     print(f"ERROR: {exc}", file=sys.stderr)
     sys.exit(1)
@@ -198,24 +209,19 @@ dispatch_planner() {
 }
 
 # dispatch_roster_lanes <sweep_dir> <roster_value>
-# The roster-aware counterpart to the hardcoded loop below (Issue #3932,
-# epic #3927's contract C5): parses CFGMS_SECURITY_REVIEW_LANES via
-# roster.py into (harness, model, lane_dir_name) tuples and dispatches one
-# launch-investigator call per entry with --harness/--model in place of the
-# hardcoded loop's --cred-name/--lane-entrypoint pairing -- a roster lane
-# authenticates as its harness's own subscription session (C2), not an
-# OS-keychain API key. The lane entrypoint script is resolved by harness id
-# under CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR (default: lanes/ alongside
-# this script), named "<harness>_lane.py" -- for this story only a stub
-# harness's own test fixture exists there; claude_lane.py does not exist
-# until STORY-5b, so a real `claude:<model>` roster entry fails closed at
-# launch-investigator's own --lane-entrypoint file-existence check, which is
-# exactly the non-skip dispatch failure the property below must propagate.
+# The sole lane-dispatch mechanism (Issue #3932/#3933, epic #3927's contract
+# C5): parses CFGMS_SECURITY_REVIEW_LANES via roster.py into (harness, model,
+# lane_dir_name) tuples and dispatches one launch-investigator call per entry
+# with --harness/--model -- a roster lane authenticates as its harness's own
+# subscription session (C2), never an OS-keychain API key. The lane
+# entrypoint script is resolved by harness id under
+# CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR (default: lanes/ alongside this
+# script), named "<harness>_lane.py" -- e.g. `claude_lane.py` for harness
+# `claude` (Issue #3933).
 #
-# Mirrors dispatch_all_lanes's own failure-propagation contract exactly
-# (Issue #3930): a per-lane credential-unavailable skip is logged and does
-# not fail the sweep; any other non-zero launch-investigator exit is a real
-# failure and this function returns 1 so the caller does not report the
+# A per-lane credential-unavailable skip is logged and does not fail the
+# sweep; any other non-zero launch-investigator exit is a real failure
+# (Issue #3930) and this function returns 1 so the caller does not report the
 # sweep as having completed cleanly.
 dispatch_roster_lanes() {
   local sweep_dir="$1" roster_value="$2"
@@ -271,76 +277,21 @@ dispatch_roster_lanes() {
 }
 
 # dispatch_all_lanes <sweep_dir>
-# Dispatches all three lanes independently (AC6): a lane that fails to
-# dispatch for a documented credential-unavailable reason is logged and
-# skipped -- it never stops the loop from dispatching the remaining lanes.
-# Every container that did launch is `docker run -d` (already returned by
-# the time launch-investigator's own call returns), so waiting on them here,
-# even sequentially, does not serialize their work -- it only serializes
-# this script's observation of when each one is done.
-#
-# A lane dispatch failure that is NOT a documented credential-unavailable
-# skip -- a stale container that could not be reaped, a container-name
-# collision with a still-running container, or any other launch-investigator
-# non-zero exit -- is a real failure (Issue #3930): it still does not stop
-# the other lanes from dispatching, but this function returns 1 so the
-# caller does not report the sweep as having completed cleanly.
-#
-# When CFGMS_SECURITY_REVIEW_LANES is set, this delegates to the
-# roster-aware path above instead (Issue #3932, C5) -- the hardcoded
-# LANE_IDS/LANE_CRED_NAMES/LANE_SCRIPTS loop below is otherwise completely
-# unmodified and is exactly what still runs when the roster env var is
-# unset, which is the "REST lanes keep running unchanged" guarantee this
-# story must not break.
+# Dispatches every roster lane independently (AC6) via dispatch_roster_lanes
+# -- the only lane-dispatch path (Issue #3933 removed the hardcoded
+# LANE_IDS/LANE_CRED_NAMES/LANE_SCRIPTS loop and the three REST lanes it
+# called). Fails closed, before dispatching anything, if
+# CFGMS_SECURITY_REVIEW_LANES is unset -- there is no hardcoded lane set left
+# to fall back to.
 dispatch_all_lanes() {
   local sweep_dir="$1"
 
-  if [[ -n "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then
-    dispatch_roster_lanes "$sweep_dir" "$CFGMS_SECURITY_REVIEW_LANES"
-    return $?
+  if [[ -z "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then
+    echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:sonnet-5\") -- the roster is the only lane-dispatch path" >&2
+    return 1
   fi
 
-  local container_ids=()
-  local i lane_id cred_name script output rc cid
-  local had_failure=0
-
-  for i in "${!LANE_IDS[@]}"; do
-    lane_id="${LANE_IDS[$i]}"
-    cred_name="${LANE_CRED_NAMES[$i]}"
-    script="${LANE_SCRIPTS[$i]}"
-
-    rc=0
-    output=$("$AGENT_DISPATCH_SCRIPT" launch-investigator \
-      --sweep-dir "$sweep_dir" \
-      --mode "$lane_id" \
-      --cred-name "$cred_name" \
-      --lane-entrypoint "$script" 2>&1) || rc=$?
-
-    if [[ $rc -ne 0 ]]; then
-      if _is_intentional_dispatch_skip "$output"; then
-        echo "WARNING: lane ${lane_id} dispatch skipped (exit ${rc}): ${output}" >&2
-      else
-        echo "ERROR: lane ${lane_id} dispatch failed (exit ${rc}): ${output}" >&2
-        had_failure=1
-      fi
-      continue
-    fi
-
-    cid="$(printf '%s\n' "$output" | sed -n "s/^LAUNCHED_INVESTIGATOR:${lane_id}://p" | tail -n1)"
-    if [[ -z "$cid" ]]; then
-      echo "ERROR: lane ${lane_id} dispatched but no container id was parsed from: ${output}" >&2
-      had_failure=1
-      continue
-    fi
-    container_ids+=("$cid")
-  done
-
-  for cid in "${container_ids[@]:-}"; do
-    [[ -n "$cid" ]] || continue
-    docker wait "$cid" >/dev/null 2>&1 || true
-  done
-
-  return "$had_failure"
+  dispatch_roster_lanes "$sweep_dir" "$CFGMS_SECURITY_REVIEW_LANES"
 }
 
 # run_consolidation <sweep_dir>

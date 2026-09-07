@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Tests for the per-harness egress fragment selection in init-firewall.sh
-# (Issue #3932, epic #3927's per-harness egress isolation addendum).
+# (Issue #3932, epic #3927's per-harness egress isolation addendum; updated
+# by Issue #3933's switchover cutover).
 #
 # One investigator image with the harness chosen at launch (founder
 # decision) means the egress allowlist must also be chosen at launch, or
 # every container resolves every provider's domain regardless of which one
-# it authenticated to -- a Claude lane could reach OpenAI/Ollama endpoints
-# and vice versa. This story splits the baked allowlist into a base file
+# it authenticated to. The baked allowlist is a base file
 # (dnsmasq-allowlist-base.conf, unchanged domains) plus per-harness
 # fragments (dnsmasq-allowlist.d/<harness>.conf), and init-firewall.sh loads
 # the base plus exactly one fragment, named by CFGMS_SECURITY_REVIEW_HARNESS.
+#
+# Issue #3933 retired the "legacy" fragment (it existed only for the three
+# REST lanes that story deletes) and made "claude" the default when no
+# harness value is supplied -- every existing dev/review/fix agent container
+# and plan mode's own investigator invocation run Claude Code, so resolving
+# the Claude harness's own domains by default keeps them working unchanged.
+# api.openai.com/ollama.com are gone from every fragment and the base file.
 #
 # Two complementary strategies, matching investigator_launch.test.sh's own
 # precedent for testing a script that needs `sudo`/root it doesn't have here:
@@ -21,11 +28,10 @@
 #      without requiring root or colliding with this sandbox's own network.
 #   2. A real (unprivileged, alternate-port) dnsmasq instance is started
 #      directly against dnsmasq-allowlist-base.conf plus
-#      dnsmasq-allowlist.d/legacy.conf together -- the same combination
-#      init-firewall.sh loads for a no-harness launch -- and driven with
-#      `dig`, mirroring dnsmasq-allowlist_test.sh's own technique, to prove
-#      the split resolves exactly the same domain set as the single
-#      combined file that test still exercises unmodified.
+#      dnsmasq-allowlist.d/claude.conf together -- the same combination
+#      init-firewall.sh now loads by default -- and driven with `dig` to
+#      prove existing agent containers resolve the Claude domains and
+#      nothing else.
 #
 # Run: bash .devcontainer/init-firewall_test.sh
 set -euo pipefail
@@ -79,8 +85,8 @@ assert_eq() {
 }
 
 [[ -f "$BASE_CONF" ]] || { echo "FAIL: expected file not found: $BASE_CONF" >&2; exit 1; }
-[[ -f "${FRAGMENT_DIR}/legacy.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/legacy.conf" >&2; exit 1; }
 [[ -f "${FRAGMENT_DIR}/claude.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/claude.conf" >&2; exit 1; }
+[[ ! -f "${FRAGMENT_DIR}/legacy.conf" ]] || { echo "FAIL: legacy.conf should have been retired (Issue #3933): ${FRAGMENT_DIR}/legacy.conf still exists" >&2; exit 1; }
 
 echo "=== init-firewall.sh: per-harness egress fragment selection (Issue #3932) ==="
 
@@ -129,7 +135,7 @@ STUB
 chmod +x "${FAKEBIN}"/*
 
 echo ""
-echo "--- no harness value (default): loads base + legacy.conf ---"
+echo "--- no harness value (default): loads base + claude.conf (Issue #3933) ---"
 : > "$CALL_LOG"
 set +e
 out=$(CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
@@ -138,8 +144,7 @@ set -e
 assert_eq "$rc" "0" "no-harness launch exits 0"
 call_line="$(cat "$CALL_LOG")"
 assert_contains "$call_line" "--conf-file=${BASE_CONF}" "no-harness launch loads the base conf"
-assert_contains "$call_line" "--conf-file=${FRAGMENT_DIR}/legacy.conf" "no-harness launch loads the legacy fragment"
-assert_not_contains "$call_line" "claude.conf" "no-harness launch does not also load the claude fragment"
+assert_contains "$call_line" "--conf-file=${FRAGMENT_DIR}/claude.conf" "no-harness launch loads the claude fragment (the default, per Issue #3933)"
 frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_line" | wc -l)
 assert_eq "$frag_count" "1" "no-harness launch loads at most one fragment"
 
@@ -189,13 +194,16 @@ for bad_harness in bogus-harness-xyz "../etc" "codex"; do
 done
 
 # ----------------------------------------------------------------------------
-# Strategy 2: real (unprivileged) dnsmasq — behavior-neutrality for the
-# no-harness / legacy case, mirroring dnsmasq-allowlist_test.sh's own
-# technique and domain set exactly.
+# Strategy 2: real (unprivileged) dnsmasq against base+claude.conf together --
+# the exact combination init-firewall.sh now loads both for a no-harness
+# launch (the default, per Issue #3933) and for an explicit --harness claude
+# launch, since both select the identical fragment today. Mirrors
+# dnsmasq-allowlist_test.sh's own technique.
 # ----------------------------------------------------------------------------
 
 echo ""
-echo "--- REQUIRED TEST: no-harness launch resolves the same domain set as before this story ---"
+echo "--- REQUIRED TEST: a no-harness (default) or --harness claude launch resolves"
+echo "    the Claude domains and does NOT resolve api.openai.com/ollama.com ---"
 PORT=15354
 LOG_FILE="$(mktemp -t init-firewall-test.XXXXXX.log)"
 DNSMASQ_PID=""
@@ -208,7 +216,7 @@ cleanup_dnsmasq() {
 }
 trap 'cleanup_stubs; cleanup_dnsmasq' EXIT
 
-dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/legacy.conf" \
+dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/claude.conf" \
     --listen-address=127.0.0.1 --port="$PORT" --no-daemon --log-facility=- >"$LOG_FILE" 2>&1 &
 DNSMASQ_PID=$!
 
@@ -256,83 +264,17 @@ assert_blocked_dns() {
     fi
 }
 
-# Same assertions dnsmasq-allowlist_test.sh makes against the single
-# pre-existing combined file — repeated here against base+legacy together to
-# prove the split is behavior-neutral for the no-harness case.
-assert_resolves "github.com" "base+legacy: pre-existing GitHub entry still resolves"
-assert_resolves "anthropic.com" "base+legacy: pre-existing Anthropic entry still resolves"
-assert_resolves "api.openai.com" "base+legacy: OpenAI finder-lane API hostname resolves"
-assert_resolves "ollama.com" "base+legacy: Ollama Cloud finder-lane API hostname resolves"
-assert_blocked_dns "chat.openai.com" "base+legacy: unrelated openai.com subdomain still blocked"
-assert_blocked_dns "openai.com" "base+legacy: bare openai.com apex still blocked"
-assert_blocked_dns "example.com" "base+legacy: domain absent from allowlist still blocked"
+assert_resolves "github.com" "base+claude: pre-existing GitHub entry still resolves"
+assert_resolves "anthropic.com" "base+claude: anthropic.com resolves"
+assert_resolves "claude.ai" "base+claude: claude.ai resolves"
+assert_resolves "claude.com" "base+claude: claude.com resolves"
+assert_blocked_dns "api.openai.com" "base+claude: api.openai.com is NOT reachable (Issue #3933)"
+assert_blocked_dns "ollama.com" "base+claude: ollama.com is NOT reachable (Issue #3933)"
+assert_blocked_dns "example.com" "base+claude: domain absent from allowlist still blocked"
 
 kill "$DNSMASQ_PID" 2>/dev/null || true
 wait "$DNSMASQ_PID" 2>/dev/null || true
 DNSMASQ_PID=""
-
-echo ""
-echo "--- claude.conf is scoped tighter than legacy.conf (no OpenAI/Ollama) ---"
-PORT2=15355
-LOG_FILE2="$(mktemp -t init-firewall-test-claude.XXXXXX.log)"
-dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/claude.conf" \
-    --listen-address=127.0.0.1 --port="$PORT2" --no-daemon --log-facility=- >"$LOG_FILE2" 2>&1 &
-DNSMASQ_PID=$!
-ready=0
-for _ in $(seq 1 20); do
-    if dig +short +time=1 +tries=1 @127.0.0.1 -p "$PORT2" github.com >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    sleep 0.25
-done
-if [[ "$ready" -ne 1 ]]; then
-    echo "ERROR: dnsmasq did not become ready on port $PORT2" >&2
-    cat "$LOG_FILE2" >&2 || true
-    exit 1
-fi
-dns_status2() {
-    local domain="$1"
-    dig +time=3 +tries=1 @127.0.0.1 -p "$PORT2" "$domain" A +noall +comment 2>/dev/null \
-        | grep -oP '(?<=status: )[A-Z]+' || echo "QUERY_FAILED"
-}
-TESTS_RUN=$((TESTS_RUN + 1))
-status="$(dns_status2 github.com)"
-if [[ "$status" == "NOERROR" ]]; then
-    echo "    ✓ claude fragment: base entry (github.com) still resolves ($status)"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    _fail "claude fragment: base entry (github.com) still resolves — got $status"
-fi
-TESTS_RUN=$((TESTS_RUN + 1))
-status="$(dns_status2 anthropic.com)"
-if [[ "$status" == "NOERROR" ]]; then
-    echo "    ✓ claude fragment: anthropic.com resolves ($status)"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    _fail "claude fragment: anthropic.com resolves — got $status"
-fi
-TESTS_RUN=$((TESTS_RUN + 1))
-status="$(dns_status2 api.openai.com)"
-if [[ "$status" == "REFUSED" ]]; then
-    echo "    ✓ claude fragment: api.openai.com is NOT reachable ($status)"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    _fail "claude fragment: api.openai.com is NOT reachable — got $status"
-fi
-TESTS_RUN=$((TESTS_RUN + 1))
-status="$(dns_status2 ollama.com)"
-if [[ "$status" == "REFUSED" ]]; then
-    echo "    ✓ claude fragment: ollama.com is NOT reachable ($status)"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    _fail "claude fragment: ollama.com is NOT reachable — got $status"
-fi
-
-kill "$DNSMASQ_PID" 2>/dev/null || true
-wait "$DNSMASQ_PID" 2>/dev/null || true
-DNSMASQ_PID=""
-rm -f "$LOG_FILE2"
 
 echo ""
 echo "=== Summary: $TESTS_PASSED/$TESTS_RUN passed ==="

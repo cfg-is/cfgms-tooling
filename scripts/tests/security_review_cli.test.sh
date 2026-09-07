@@ -3,21 +3,24 @@
 #
 # No docker daemon is available in this environment (matching
 # investigator_launch.test.sh's own rationale), and a real run would also
-# require live Anthropic/OpenAI/Ollama Cloud credentials and make real
-# network calls out of a lane container. Both are stubbed the same way
-# investigator_launch.test.sh stubs them for agent-dispatch.sh itself:
+# require a live Claude OAuth session and make real subprocess calls out of a
+# lane container. Both are stubbed the same way investigator_launch.test.sh
+# stubs them for agent-dispatch.sh itself: a stub `docker` binary on PATH
+# renders the real, unmodified `agent-dispatch.sh launch-investigator` call
+# (real argument parsing, real mount construction) and then, in place of a
+# real container, synchronously performs "the container's job" against the
+# *actual* host paths `agent-dispatch.sh` bind-mounted (parsed straight out
+# of its own `docker run` argv) -- writing plan/step-NNN.json for plan mode,
+# or a findings/status envelope per outstanding step for lane mode. `docker
+# wait` returns immediately since the work already happened synchronously
+# inside `docker run`.
 #
-#   1. A stub `docker` binary on PATH renders the real, unmodified
-#      `agent-dispatch.sh launch-investigator` call (real argument parsing,
-#      real mount construction, real credential-dir plumbing) and then, in
-#      place of a real container, synchronously performs "the container's
-#      job" against the *actual* host paths `agent-dispatch.sh` bind-mounted
-#      (parsed straight out of its own `docker run` argv) -- writing
-#      plan/step-NNN.json for plan mode, or a findings/status envelope per
-#      outstanding step for lane mode. `docker wait` returns immediately
-#      since the work already happened synchronously inside `docker run`.
-#   2. A stub `secret-tool` satisfies the OS-keychain lookup
-#      `_investigator_prepare_cred_dir` performs for every `--cred-name`.
+# Every case in this file dispatches through CFGMS_SECURITY_REVIEW_LANES
+# (Issue #3933 made the roster the only lane-dispatch path -- there is no
+# more hardcoded lane set to fall back to) with a stub harness/lane-entrypoint
+# fixture standing in for a real `claude_lane.py` run, exactly mirroring the
+# real-lane proof `claude_lane_integration_test.py` carries instead (this
+# story's own separate, self-contained integration test).
 #
 # This exercises security-review.sh's real orchestration logic (sequencing,
 # per-lane independence, the resume no-op check, exit codes) against the
@@ -97,7 +100,11 @@ echo ""
 echo "== REQUIRED evidence — fail-closed base directory: exits non-zero, writes nothing =="
 INREPO_BASE="${REPO_ROOT}/.cache-security-review-test-$$"
 set +e
-inrepo_out=$(CFGMS_SECURITY_REVIEW_BASE="$INREPO_BASE" "$CLI" launch HEAD 2>&1)
+# CFGMS_SECURITY_REVIEW_LANES only needs to parse here -- create_sweep_tree's
+# roster check runs before basedir resolution, but no container is ever
+# dispatched (or needs a --lane-entrypoint file) when base-dir resolution
+# itself fails first, which is what this test actually exercises.
+inrepo_out=$(CFGMS_SECURITY_REVIEW_BASE="$INREPO_BASE" CFGMS_SECURITY_REVIEW_LANES="claude:sonnet-5" "$CLI" launch HEAD 2>&1)
 inrepo_rc=$?
 set -e
 [[ "$inrepo_rc" -ne 0 ]] && ok "launch exits non-zero when base dir resolves in-repo" || bad "launch exits non-zero when base dir resolves in-repo" "rc=$inrepo_rc"
@@ -129,9 +136,9 @@ rm -rf "$BOGUS_BASE"
 trap - EXIT
 
 # ----------------------------------------------------------------------------
-# Functional harness: stub docker + stub secret-tool, matching
-# investigator_launch.test.sh's own precedent for testing code that calls
-# agent-dispatch.sh launch-investigator.
+# Functional harness: a stub docker, matching investigator_launch.test.sh's
+# own precedent for testing code that calls agent-dispatch.sh
+# launch-investigator.
 # ----------------------------------------------------------------------------
 
 FAKEBIN="$(mktemp -d)"
@@ -211,26 +218,41 @@ echo "fake-container-id-${mode}-$RANDOM-$$"
 STUB
 chmod +x "${FAKEBIN}/docker"
 
-cat > "${FAKEBIN}/secret-tool" <<'STUB'
-#!/usr/bin/env bash
-printf 'FAKE_SECRET_FOR_TEST'
-STUB
-chmod +x "${FAKEBIN}/secret-tool"
+# Global roster fixture (Issue #3933): every case below dispatches through
+# CFGMS_SECURITY_REVIEW_LANES by default -- three stub lanes standing in for
+# where anthropic-opus5/openai-gpt56-sol/ollama-qwen used to be hardcoded,
+# proving the exact same "N independent lanes" properties (one parking or
+# failing never blocks the others) over the roster mechanism that is now the
+# only dispatch path. One shared `stub_lane.py` entrypoint covers all three
+# (they share harness id "stub", differing only by model) -- its content is
+# never executed, since the docker stub below performs "the container's job"
+# itself; it exists only so launch-investigator's --lane-entrypoint
+# file-existence check passes.
+DEFAULT_ROSTER="stub:model-a,stub:model-b,stub:model-c"
+ROSTER_ENTRYPOINT_DIR="${SANDBOX}/lane-entrypoints"
+mkdir -p "$ROSTER_ENTRYPOINT_DIR"
+cat > "${ROSTER_ENTRYPOINT_DIR}/stub_lane.py" <<'PYEOF'
+#!/usr/bin/env python3
+# Stub lane entrypoint for security_review_cli.test.sh (Issue #3933). Never
+# actually executed -- the docker stub simulates the container's job itself.
+PYEOF
 
 run_cli() {
   # run_cli <sub-sandbox> <cli-args...> — invokes the real CLI with the stub
-  # harness wired in, isolated per call via a fresh credential/ledger/session
-  # base under $1.
+  # harness wired in, isolated per call via a fresh ledger/session base under
+  # $1. CFGMS_SECURITY_REVIEW_LANES/_LANE_ENTRYPOINT_DIR default to the
+  # global roster fixture above but honor a caller's own exported value
+  # (some cases below deliberately set a different, or no, roster).
   local sub="$1"; shift
   PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${sub}/credbase" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${sub}/ledger" \
   HOME="${sub}/HOME" \
   CFGMS_SECURITY_REVIEW_BASE="${sub}/base" \
   DOCKER_CALL_LOG="${sub}/docker_calls.log" \
+  CFGMS_SECURITY_REVIEW_LANES="${CFGMS_SECURITY_REVIEW_LANES:-$DEFAULT_ROSTER}" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="${CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR:-$ROSTER_ENTRYPOINT_DIR}" \
   "$CLI" "$@"
 }
 
@@ -253,7 +275,7 @@ check_contains "launch prints the consolidated report path" "$launch_out" "repor
 SWEEP_DIR_1="$(dirname "$(dirname "$launch_out")")"
 [[ -f "${SWEEP_DIR_1}/manifest.json" ]] && ok "manifest.json exists" || bad "manifest.json exists" "not found"
 [[ -f "${SWEEP_DIR_1}/plan/step-001.json" ]] && ok "planner wrote plan/step-001.json" || bad "planner wrote plan/step-001.json" "not found"
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   [[ -f "${SWEEP_DIR_1}/lanes/${lane}/step-001.findings.json" ]] \
     && ok "lane ${lane} produced step-001 findings" \
     || bad "lane ${lane} produced step-001 findings" "not found"
@@ -270,8 +292,8 @@ status_out=$(run_cli "$SUB1" status "$(basename "$SWEEP_DIR_1")" 2>&1)
 status_rc=$?
 check_eq "status exits 0" "$status_rc" "0"
 check_contains "status reports steps discovered" "$status_out" "Steps discovered: 2"
-check_contains "status lists the anthropic lane" "$status_out" "anthropic-opus5"
-check_contains "status shows 2/2 complete for anthropic lane" "$status_out" "2/2"
+check_contains "status lists the stub-model-a lane" "$status_out" "stub-model-a"
+check_contains "status shows 2/2 complete for stub-model-a lane" "$status_out" "2/2"
 after_hash="$(find "$SWEEP_DIR_1" -type f -exec sha256sum {} \; | sort | sha256sum)"
 after_calls="$(wc -l < "${SUB1}/docker_calls.log")"
 check_eq "status does not modify any file under the sweep tree" "$after_hash" "$before_hash"
@@ -288,12 +310,12 @@ SWEEP_DIR_2="$(dirname "$(dirname "$launch2_out")")"
 # Simulate "killed mid-run": step-002 never finished for any lane. step-001
 # stays complete for all three, exactly as a real interrupted sweep would
 # leave it (resume is a rescan of the tree, never a separate progress log).
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   rm -f "${SWEEP_DIR_2}/lanes/${lane}/step-002.findings.json" "${SWEEP_DIR_2}/lanes/${lane}/step-002.status.json"
 done
 
-before_step1_hash="$(sha256sum "${SWEEP_DIR_2}/lanes/anthropic-opus5/step-001.findings.json" | cut -d' ' -f1)"
-before_step1_mtime="$(stat -c %Y "${SWEEP_DIR_2}/lanes/anthropic-opus5/step-001.findings.json")"
+before_step1_hash="$(sha256sum "${SWEEP_DIR_2}/lanes/stub-model-a/step-001.findings.json" | cut -d' ' -f1)"
+before_step1_mtime="$(stat -c %Y "${SWEEP_DIR_2}/lanes/stub-model-a/step-001.findings.json")"
 sleep 1  # ensure a real mtime change would be observable if step-001 were rewritten
 : > "${SUB2}/docker_calls.log"
 
@@ -306,17 +328,17 @@ resume_stderr="$(cat "${SUB2}/stderr.log")"
 check_contains "resume skips planner re-dispatch (plan/ already populated)" "$resume_stderr" "skipping planner re-dispatch"
 plan_calls_resume="$(grep -c ' plan$' "${SUB2}/docker_calls.log" || true)"
 check_eq "resume dispatches zero plan-mode containers" "$plan_calls_resume" "0"
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   lane_calls="$(grep -c " ${lane}\$" "${SUB2}/docker_calls.log" || true)"
   check_eq "resume dispatches lane ${lane} exactly once" "$lane_calls" "1"
 done
 
-after_step1_hash="$(sha256sum "${SWEEP_DIR_2}/lanes/anthropic-opus5/step-001.findings.json" | cut -d' ' -f1)"
-after_step1_mtime="$(stat -c %Y "${SWEEP_DIR_2}/lanes/anthropic-opus5/step-001.findings.json")"
+after_step1_hash="$(sha256sum "${SWEEP_DIR_2}/lanes/stub-model-a/step-001.findings.json" | cut -d' ' -f1)"
+after_step1_mtime="$(stat -c %Y "${SWEEP_DIR_2}/lanes/stub-model-a/step-001.findings.json")"
 check_eq "already-complete step-001 content is byte-unchanged after resume" "$after_step1_hash" "$before_step1_hash"
 check_eq "already-complete step-001 is never rewritten (mtime unchanged)" "$after_step1_mtime" "$before_step1_mtime"
 
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   [[ -f "${SWEEP_DIR_2}/lanes/${lane}/step-002.findings.json" ]] \
     && ok "resume resolved the missing step-002 for lane ${lane}" \
     || bad "resume resolved the missing step-002 for lane ${lane}" "not found"
@@ -327,57 +349,75 @@ echo "== REQUIRED TEST — a lane whose steps are all parked does not block the 
 echo "   two lanes, and consolidation still runs against what they produced (AC6) =="
 SUB3="${SANDBOX}/case3"
 setup_sub_sandbox "$SUB3"
-launch3_out=$(STUB_PLAN_STEP_COUNT=2 STUB_OUTCOME_OPENAI_GPT56_SOL=parked run_cli "$SUB3" launch HEAD 2>"${SUB3}/stderr.log")
+launch3_out=$(STUB_PLAN_STEP_COUNT=2 STUB_OUTCOME_STUB_MODEL_B=parked run_cli "$SUB3" launch HEAD 2>"${SUB3}/stderr.log")
 launch3_rc=$?
 check_eq "launch exits 0 even though one lane parked" "$launch3_rc" "0"
 SWEEP_DIR_3="$(dirname "$(dirname "$launch3_out")")"
 
-for lane in anthropic-opus5 ollama-qwen; do
+for lane in stub-model-a stub-model-c; do
   [[ -f "${SWEEP_DIR_3}/lanes/${lane}/step-001.findings.json" && -f "${SWEEP_DIR_3}/lanes/${lane}/step-002.findings.json" ]] \
     && ok "lane ${lane} completed both steps despite the other lane parking" \
     || bad "lane ${lane} completed both steps despite the other lane parking" "missing findings"
 done
-[[ -f "${SWEEP_DIR_3}/lanes/openai-gpt56-sol/step-001.status.json" && -f "${SWEEP_DIR_3}/lanes/openai-gpt56-sol/step-002.status.json" ]] \
+[[ -f "${SWEEP_DIR_3}/lanes/stub-model-b/step-001.status.json" && -f "${SWEEP_DIR_3}/lanes/stub-model-b/step-002.status.json" ]] \
   && ok "parked lane wrote status.json (not findings.json) for both steps" \
   || bad "parked lane wrote status.json for both steps" "missing status files"
-parked_state="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_3}/lanes/openai-gpt56-sol/step-001.status.json'))['state'])")"
+parked_state="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_3}/lanes/stub-model-b/step-001.status.json'))['state'])")"
 check_eq "parked lane's step state is literally 'parked'" "$parked_state" "parked"
 
 [[ -f "${SWEEP_DIR_3}/report/consolidated.md" ]] \
   && ok "consolidator still produced a report" \
   || bad "consolidator still produced a report" "not found"
 report_md="$(cat "${SWEEP_DIR_3}/report/consolidated.md")"
-check_contains "report shows the parked lane's coverage" "$report_md" "openai-gpt56-sol"
-check_contains "report shows 0/2 complete for the parked lane" "$report_md" "| openai-gpt56-sol | 0/2 | 2/2 | 0/2 | 0/2 |"
-check_contains "report shows 2/2 complete for the non-parked lanes" "$report_md" "| anthropic-opus5 | 2/2 | 0/2 | 0/2 | 0/2 |"
+check_contains "report shows the parked lane's coverage" "$report_md" "stub-model-b"
+check_contains "report shows 0/2 complete for the parked lane" "$report_md" "| stub-model-b | 0/2 | 2/2 | 0/2 | 0/2 |"
+check_contains "report shows 2/2 complete for the non-parked lanes" "$report_md" "| stub-model-a | 2/2 | 0/2 | 0/2 | 0/2 |"
 
 echo ""
-echo "== REQUIRED TEST evidence — REST lanes keep running unchanged when"
-echo "   CFGMS_SECURITY_REVIEW_LANES is unset (Issue #3932's AC4) =="
-# Anchor: the pre-existing case1 test above ("launch creates the sweep tree,
-# runs the planner, dispatches all three lanes, runs the consolidator, and
-# prints the report path (AC1)") already ran with CFGMS_SECURITY_REVIEW_LANES
-# unset throughout this file and asserted all three hardcoded lane ids
-# produced findings. This block re-confirms case1's own docker call log
-# carries no roster/--harness wiring in that unset case -- reverting
-# dispatch_all_lanes to always take the roster branch (or leaking
-# --harness/--model into the hardcoded loop) would fail these checks even
-# though case1 above still happens to pass.
-unset_call_log="$(cat "${SUB1}/docker_calls.log")"
-check_not_contains "unset-roster dispatch never sets CFGMS_SECURITY_REVIEW_HARNESS" "$unset_call_log" "CFGMS_SECURITY_REVIEW_HARNESS"
-check_not_contains "unset-roster dispatch never sets CFGMS_SECURITY_REVIEW_LANE_ID" "$unset_call_log" "CFGMS_SECURITY_REVIEW_LANE_ID"
-check_contains "unset-roster dispatch still uses the hardcoded lane id anthropic-opus5" "$unset_call_log" "anthropic-opus5"
-check_contains "unset-roster dispatch still uses the hardcoded lane id openai-gpt56-sol" "$unset_call_log" "openai-gpt56-sol"
-check_contains "unset-roster dispatch still uses the hardcoded lane id ollama-qwen" "$unset_call_log" "ollama-qwen"
+echo "== REQUIRED TEST evidence — CFGMS_SECURITY_REVIEW_LANES is now the ONLY"
+echo "   lane-dispatch path: unset fails closed, no hardcoded fallback (Issue #3933) =="
+# case1 above already proved the roster path dispatches every configured
+# lane. This proves the other half: reverting to a hardcoded fallback (or
+# silently treating an unset roster as "zero lanes, exit 0") would make this
+# block fail -- launch must refuse outright, before creating any lane
+# directory or dispatching any container.
+SUB_NOROSTER="${SANDBOX}/case-no-roster"
+setup_sub_sandbox "$SUB_NOROSTER"
+set +e
+noroster_out=$(CFGMS_SECURITY_REVIEW_LANES="" PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SUB_NOROSTER}/ledger" \
+  HOME="${SUB_NOROSTER}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${SUB_NOROSTER}/base" \
+  DOCKER_CALL_LOG="${SUB_NOROSTER}/docker_calls.log" \
+  "$CLI" launch HEAD 2>&1)
+noroster_rc=$?
+set -e
+if [[ "$noroster_rc" -ne 0 ]]; then
+  ok "launch exits non-zero when CFGMS_SECURITY_REVIEW_LANES is unset"
+else
+  bad "launch exits non-zero when CFGMS_SECURITY_REVIEW_LANES is unset" "exited 0"
+fi
+check_contains "the failure names CFGMS_SECURITY_REVIEW_LANES" "$noroster_out" "CFGMS_SECURITY_REVIEW_LANES"
+check_not_contains "no report path is printed as if the sweep completed cleanly" "$noroster_out" "report/consolidated.md"
+check_not_contains "no container is ever dispatched" "$(cat "${SUB_NOROSTER}/docker_calls.log" 2>/dev/null || true)" "run -d"
+if [[ -d "${SUB_NOROSTER}/base" ]] && find "${SUB_NOROSTER}/base" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+  bad "no sweep directory is created when the roster is unset" "found a file under ${SUB_NOROSTER}/base"
+else
+  ok "no sweep directory is created when the roster is unset"
+fi
 
 echo ""
-echo "== structural — hardcoded LANE_IDS/LANE_CRED_NAMES/LANE_SCRIPTS arrays and the"
-echo "   roster-aware dispatch_all_lanes branch are both present (Issue #3932) =="
-check_contains "LANE_IDS array unchanged" "$cli_src" 'LANE_IDS=(anthropic-opus5 openai-gpt56-sol ollama-qwen)'
-check_contains "LANE_CRED_NAMES array unchanged" "$cli_src" 'LANE_CRED_NAMES=(ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY)'
+echo "== structural — the old hardcoded lane arrays are gone; the roster path is the"
+echo "   only path (Issue #3933) =="
+check_not_contains "LANE_IDS array no longer exists" "$cli_src" 'LANE_IDS=('
+check_not_contains "LANE_CRED_NAMES array no longer exists" "$cli_src" 'LANE_CRED_NAMES=('
+check_not_contains "LANE_SCRIPTS array no longer exists" "$cli_src" 'LANE_SCRIPTS=('
+check_not_contains "no --cred-name flag is passed anywhere in this script" "$cli_src" '--cred-name'
 check_contains "dispatch_all_lanes still defined" "$cli_src" $'dispatch_all_lanes() {'
-check_contains "dispatch_roster_lanes exists for the roster path" "$cli_src" $'dispatch_roster_lanes() {'
-check_contains "dispatch_all_lanes branches to the roster path only when CFGMS_SECURITY_REVIEW_LANES is set" "$cli_src" 'if [[ -n "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then'
+check_contains "dispatch_roster_lanes exists for the (only) roster path" "$cli_src" $'dispatch_roster_lanes() {'
+check_contains "dispatch_all_lanes fails closed when CFGMS_SECURITY_REVIEW_LANES is unset" "$cli_src" 'if [[ -z "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then'
+check_contains "dispatch_all_lanes unconditionally delegates to dispatch_roster_lanes" "$cli_src" 'dispatch_roster_lanes "$sweep_dir" "$CFGMS_SECURITY_REVIEW_LANES"'
 
 echo ""
 echo "== REQUIRED TEST — CFGMS_SECURITY_REVIEW_LANES roster path: a stub harness:model"
@@ -385,18 +425,8 @@ echo "   entry dispatches via launch-investigator --harness/--model and the stub
 echo "   envelope is picked up by the consolidator (Issue #3932, epic #3927's C5) =="
 SUB_ROSTER="${SANDBOX}/case-roster"
 setup_sub_sandbox "$SUB_ROSTER"
-ROSTER_ENTRYPOINT_DIR="${SUB_ROSTER}/lane-entrypoints"
-mkdir -p "$ROSTER_ENTRYPOINT_DIR"
-# This story's own stub --lane-entrypoint fixture (per the story's Out of
-# Scope: proven against a stub, never against claude_lane.py, which does not
-# exist until STORY-5b). Its content is never executed -- the docker stub
-# below performs "the container's job" itself -- it exists only so
-# launch-investigator's --lane-entrypoint file-existence check passes.
-cat > "${ROSTER_ENTRYPOINT_DIR}/stub_lane.py" <<'PYEOF'
-#!/usr/bin/env python3
-# Stub lane entrypoint for security_review_cli.test.sh's roster-dispatch
-# case (Issue #3932). Never actually executed in this test.
-PYEOF
+# Reuses the global stub_lane.py fixture (harness id "stub") set up above --
+# only the model differs from the default three-lane roster.
 
 roster_out=$(CFGMS_SECURITY_REVIEW_LANES="stub:stubmodel" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
@@ -555,24 +585,18 @@ echo "fake-container-id-${mode}-$RANDOM-$$"
 STUB
 chmod +x "${FAKEBIN2}/docker"
 
-cat > "${FAKEBIN2}/secret-tool" <<'STUB'
-#!/usr/bin/env bash
-printf 'FAKE_SECRET_FOR_TEST'
-STUB
-chmod +x "${FAKEBIN2}/secret-tool"
-
 run_cli2() {
   local sub="$1"; shift
   PATH="${FAKEBIN2}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${sub}/credbase" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${sub}/ledger" \
   HOME="${sub}/HOME" \
   CFGMS_SECURITY_REVIEW_BASE="${sub}/base" \
   DOCKER_CALL_LOG="${sub}/docker_calls.log" \
   DOCKER_STATE_DIR="$STATE_DIR2" \
+  CFGMS_SECURITY_REVIEW_LANES="${CFGMS_SECURITY_REVIEW_LANES:-$DEFAULT_ROSTER}" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="${CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR:-$ROSTER_ENTRYPOINT_DIR}" \
   "$CLI" "$@"
 }
 
@@ -584,7 +608,7 @@ launch4_out=$(STUB_PLAN_STEP_COUNT=2 run_cli2 "$SANDBOX2" launch HEAD 2>"${SANDB
 launch4_rc=$?
 check_eq "launch against the persistent-container stub exits 0" "$launch4_rc" "0"
 SWEEP_DIR_4="$(dirname "$(dirname "$launch4_out")")"
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   [[ -f "${SWEEP_DIR_4}/lanes/${lane}/step-001.findings.json" && -f "${SWEEP_DIR_4}/lanes/${lane}/step-002.findings.json" ]] \
     && ok "lane ${lane} completed both steps on the first launch" \
     || bad "lane ${lane} completed both steps on the first launch" "missing findings"
@@ -600,7 +624,7 @@ fi
 # "exited" and was never removed -- exactly the state that made resume a
 # permanent no-op before this story's fix (reverting agent-dispatch.sh's
 # reap logic makes the loop below never see step-002 filled in).
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   rm -f "${SWEEP_DIR_4}/lanes/${lane}/step-002.findings.json"
 done
 
@@ -615,7 +639,7 @@ if [[ "${reap_calls:-0}" -ge 1 ]]; then
 else
   bad "resume reaped at least one already-exited investigator container before relaunching" "no docker rm -f call logged"
 fi
-for lane in anthropic-opus5 openai-gpt56-sol ollama-qwen; do
+for lane in stub-model-a stub-model-b stub-model-c; do
   [[ -f "${SWEEP_DIR_4}/lanes/${lane}/step-002.findings.json" ]] \
     && ok "resume completed the missing step-002 for lane ${lane} despite its container already having exited" \
     || bad "resume completed the missing step-002 for lane ${lane} despite its container already having exited" "not found"
@@ -624,7 +648,7 @@ done
 echo ""
 echo "== REQUIRED TEST — a non-skip lane dispatch failure exits non-zero and does not"
 echo "   report the sweep as having completed cleanly (Issue #3930) =="
-# Force the openai-gpt56-sol lane's investigator launch to fail the way a
+# Force the stub-model-b lane's investigator launch to fail the way a
 # stale, unreapable container or a still-running-container name collision
 # would -- LAUNCH_FAILED with no credential_unavailable/DISPATCH_DEFERRED
 # marker in it, i.e. a real failure, not a documented skip. The other two
@@ -635,17 +659,17 @@ echo '{}' > "${SANDBOX5}/HOME/.claude/.credentials.json"
 : > "${SANDBOX5}/docker_calls.log"
 set +e
 fail_out=$(STUB_PLAN_STEP_COUNT=2 \
-  STUB_FORCE_RUNNING_MODE="openai-gpt56-sol" \
+  STUB_FORCE_RUNNING_MODE="stub-model-b" \
   PATH="${FAKEBIN2}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX5}/credbase" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX5}/ledger" \
   HOME="${SANDBOX5}/HOME" \
   CFGMS_SECURITY_REVIEW_BASE="${SANDBOX5}/base" \
   DOCKER_CALL_LOG="${SANDBOX5}/docker_calls.log" \
   DOCKER_STATE_DIR="${SANDBOX5}/docker-state" \
+  CFGMS_SECURITY_REVIEW_LANES="$DEFAULT_ROSTER" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
   "$CLI" launch HEAD 2>&1)
 fail_rc=$?
 set -e
@@ -654,7 +678,7 @@ if [[ "$fail_rc" -ne 0 ]]; then
 else
   bad "launch exits non-zero when a lane hits a real (non-skip) dispatch failure" "exited 0"
 fi
-check_contains "the failure is reported for the affected lane" "$fail_out" "openai-gpt56-sol"
+check_contains "the failure is reported for the affected lane" "$fail_out" "stub-model-b"
 check_not_contains "the forced failure is never misclassified as a credential skip" "$fail_out" "credential_unavailable"
 check_not_contains "launch does not print the report path as if the sweep completed cleanly" "$fail_out" "report/consolidated.md"
 
@@ -684,8 +708,6 @@ roster_fail_out=$(STUB_PLAN_STEP_COUNT=2 \
   PATH="${FAKEBIN2}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX7}/credbase" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX7}/ledger" \
   HOME="${SANDBOX7}/HOME" \
   CFGMS_SECURITY_REVIEW_BASE="${SANDBOX7}/base" \

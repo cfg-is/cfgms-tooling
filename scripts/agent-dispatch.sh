@@ -26,13 +26,6 @@ fi
 # Override CFGMS_TEST_CRED_BASE in hermetic tests.
 AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
 
-# Base directory for launch-investigator's per-lane provider credential files
-# (Issue #3903). Must resolve onto a memory-backed filesystem — see
-# _investigator_assert_memory_backed — the same reasoning as AGENT_CRED_BASE
-# above, under /run rather than a repo- or disk-backed path.
-# Override CFGMS_TEST_SECURITY_REVIEW_CRED_BASE in hermetic tests.
-SECURITY_REVIEW_CRED_BASE="${CFGMS_TEST_SECURITY_REVIEW_CRED_BASE:-/run/cfgms/security-review-cred}"
-
 # Host directory where agent container session transcripts are persisted
 # (Issue #3028). Containers run with --rm and create ~/.claude inside
 # themselves, so without this bind mount every dev-agent and reviewer
@@ -1084,165 +1077,6 @@ gate_credentials_for_launch() {
   esac
 }
 
-# ---------------------------------------------------------------------------
-# launch-investigator credential path (Issue #3903).
-#
-# This block is the single owner of every credential concern for the
-# security-review harness — host-side keychain read AND container-side
-# delivery — because it owns the `docker run` block and its whole
-# mount/env boundary. The finder lanes (S6/S7/S8) contribute only their key
-# *name*; splitting mount/env/keychain logic across those per-lane stories is
-# exactly the orphaned-edge defect a prior decomposition attempt produced.
-
-# _investigator_assert_memory_backed <dir>
-# True only when <dir> resolves onto a memory-backed filesystem (tmpfs/ramfs
-# on Linux; a RAM-backed volume on macOS). Fails closed: any lookup failure,
-# unknown platform, or non-memory filesystem returns false. SEC3900 requires
-# this be *asserted*, not assumed, before any credential is ever written to
-# disk. CFGMS_TEST_FSTYPE_OVERRIDE lets hermetic tests exercise both branches
-# deterministically without depending on the host's actual mount table (which
-# varies — some hosts run tmpfs on /tmp, some don't).
-_investigator_assert_memory_backed() {
-  local dir="$1"
-  local fstype
-  if [[ -n "${CFGMS_TEST_FSTYPE_OVERRIDE:-}" ]]; then
-    fstype="$CFGMS_TEST_FSTYPE_OVERRIDE"
-  else
-    case "$(uname -s)" in
-      Linux)
-        fstype=$(df --output=fstype "$dir" 2>/dev/null | tail -1 | tr -d '[:space:]')
-        ;;
-      Darwin)
-        local dev
-        dev=$(df "$dir" 2>/dev/null | tail -1 | awk '{print $1}')
-        if [[ -n "$dev" ]] && diskutil info "$dev" 2>/dev/null | grep -qiE 'RAM Disk|Virtual:[[:space:]]*Yes'; then
-          fstype="tmpfs"
-        else
-          fstype=""
-        fi
-        ;;
-      *)
-        fstype=""
-        ;;
-    esac
-  fi
-  [[ "$fstype" == "tmpfs" || "$fstype" == "ramfs" ]]
-}
-
-# _investigator_prepare_cred_dir <unique_suffix> [<cred_name>]
-# Creates a fresh 0700 directory under SECURITY_REVIEW_CRED_BASE, asserts it
-# is memory-backed (removing it and failing closed otherwise), and when
-# <cred_name> is non-empty, looks up that key from the OS keychain via
-# scripts/load-security-review-credentials.sh and writes it to a 0600 file
-# inside. Prints the directory path on success and nothing else — the
-# credential value is never echoed, only ever written straight to the file.
-_investigator_prepare_cred_dir() {
-  local suffix="$1" cred_name="${2:-}"
-  local dir="${SECURITY_REVIEW_CRED_BASE}/${suffix}"
-
-  # SECURITY: cred_name is concatenated into the key file path further down.
-  # The memory-backed assertion below vouches for $dir only, so a traversing
-  # name ("../../outside/STOLEN") would write the plaintext secret to an
-  # ordinary disk-backed path that was never asserted and that
-  # _investigator_cred_cleanup_watcher — which removes $dir and nothing else —
-  # would never reap. Keychain key names need nothing beyond [A-Za-z0-9_], so
-  # anything else is refused here, before the directory is even created.
-  if [[ -n "$cred_name" && ! "$cred_name" =~ ^[A-Za-z0-9_]+$ ]]; then
-    echo "ERROR: invalid credential name -- must match ^[A-Za-z0-9_]+\$" >&2
-    return 1
-  fi
-
-  # SECURITY: $dir must be a real directory this function creates inside
-  # SECURITY_REVIEW_CRED_BASE -- never a symlink someone pre-planted at the
-  # (fully predictable) ${sweep_id}-${mode} path before launch. Neither check
-  # below is redundant with the memory-backed assertion: `df` FOLLOWS a symlink
-  # and reports the TARGET's filesystem, so a link to any tmpfs -- and
-  # /dev/shm is world-writable on a default Linux host -- passes that assertion
-  # while the plaintext key lands off-tree. The cleanup watcher then makes it
-  # permanent: `rm -rf` on a symlink-to-directory unlinks the LINK and leaves
-  # the target's key file readable forever. Both are closed here, before the
-  # assertion and before any write.
-  if [[ -L "$dir" ]]; then
-    echo "ERROR: credential directory ${dir} is a symlink -- refusing to write a credential through it" >&2
-    rm -f "$dir" 2>/dev/null || true
-    return 1
-  fi
-
-  mkdir -p "$dir" 2>/dev/null || { echo "ERROR: could not create credential directory ${dir}" >&2; return 1; }
-  chmod 0700 "$dir" 2>/dev/null || true
-
-  # Re-checked after the mkdir (a symlink planted in between would defeat the
-  # test above), and the resolved path must be exactly the intended child of
-  # the resolved base -- which also refuses a traversing <suffix>. The base is
-  # resolved too because a legitimate base can sit under symlinked ancestors
-  # (/tmp -> /private/tmp on macOS); only the leaf is required to be literal.
-  local base_real dir_real
-  base_real="$(realpath "$SECURITY_REVIEW_CRED_BASE" 2>/dev/null || true)"
-  dir_real="$(realpath "$dir" 2>/dev/null || true)"
-  if [[ -L "$dir" || -z "$base_real" || -z "$dir_real" || "$dir_real" != "${base_real}/${suffix}" ]]; then
-    echo "ERROR: credential directory ${dir} does not resolve inside ${SECURITY_REVIEW_CRED_BASE} -- refusing to write a credential" >&2
-    [[ -L "$dir" ]] && rm -f "$dir" 2>/dev/null
-    return 1
-  fi
-
-  if ! _investigator_assert_memory_backed "$dir"; then
-    echo "ERROR: credential directory ${dir} is not memory-backed (tmpfs) -- refusing to write a credential to disk" >&2
-    rm -rf "$dir" 2>/dev/null || true
-    return 1
-  fi
-
-  if [[ -n "$cred_name" ]]; then
-    local loader="${REPO_ROOT}/scripts/load-security-review-credentials.sh"
-    if [[ ! -f "$loader" ]]; then
-      echo "ERROR: credential loader not found at ${loader}" >&2
-      rm -rf "$dir" 2>/dev/null || true
-      return 1
-    fi
-    local secret=""
-    # shellcheck source=/dev/null
-    secret=$(source "$loader" && security_review_get_credential "$cred_name") || secret=""
-    if [[ -z "$secret" ]]; then
-      echo "ERROR: no credential found in OS keychain for '${cred_name}'" >&2
-      rm -rf "$dir" 2>/dev/null || true
-      return 1
-    fi
-    # The two properties this write depends on are established above, not here:
-    # cred_name carries no '/' (the ^[A-Za-z0-9_]+$ pattern), and $dir is a
-    # non-symlink that resolves to exactly ${base}/${suffix} (the realpath
-    # guard). A comparison at this point between dirname "$key_file" and $dir
-    # would be tautological -- both are literally $dir and both resolve through
-    # the same path -- so it is deliberately not repeated: it would read as a
-    # second layer of defence while being dead code.
-    local key_file="${dir}/${cred_name}.key"
-    ( umask 0077; printf '%s' "$secret" > "$key_file" )
-    chmod 0600 "$key_file" 2>/dev/null || true
-    unset secret
-  fi
-
-  printf '%s\n' "$dir"
-}
-
-# _investigator_cred_cleanup_watcher <container_id> <cred_dir>
-# Blocks on `docker wait` — which returns on ANY container exit: success,
-# failure, or kill — then unconditionally removes the credential directory.
-# Meant to run backgrounded so the non-blocking `docker run -d` launch can
-# return immediately while this reaps the credential once the container is
-# actually done with it.
-#
-# Investigator containers are short-lived and per-invocation (story S10 owns
-# that lifecycle guarantee): parking a sweep means the container has already
-# exited, so this exit-triggered cleanup always fires and is never skipped by
-# a long-lived container that "parks" instead of exiting. No park-detection
-# state is kept here deliberately — under S10's model that state does not
-# occur in a live container, and adding it here would create a second,
-# divergent answer to a question S10 has already settled.
-_investigator_cred_cleanup_watcher() {
-  local container_id="$1" cred_dir="$2"
-  [[ -n "$cred_dir" ]] || return 0
-  docker wait "$container_id" >/dev/null 2>&1 || true
-  rm -rf "$cred_dir" 2>/dev/null || true
-}
-
 usage() {
   cat <<'EOF'
 Usage: agent-dispatch.sh <command> [args...]
@@ -1270,8 +1104,7 @@ Commands:
   cleanup-stale-reviews                     Remove exited review containers that did not clean up
                                             their clone directory on exit.
   launch-investigator --sweep-dir <DIR> --mode <plan|LANE_ID>
-                      [--cred-name <NAME>] [--lane-entrypoint <SCRIPT>]
-                      [--harness <ID>] [--model <ID>]
+                      [--lane-entrypoint <SCRIPT>] [--harness <ID>] [--model <ID>]
                                             Launch a read-only investigator container (Issue #3903)
                                             against an existing security-review sweep directory.
                                             /workspace is mounted :ro, no GH_TOKEN, no git identity.
@@ -1279,14 +1112,16 @@ Commands:
                                             execs `claude -p` with --disallowedTools. Any other mode
                                             is a lane id: mounts <sweep>/plan ro, <sweep>/lanes/<id>
                                             rw as /workspace-out, and execs --lane-entrypoint's script.
-                                            --cred-name delivers one OS-keychain key as a 0600 file
-                                            in a memory-backed, :ro-mounted directory removed on exit.
                                             --harness/--model (Issue #3932) select a subscription
-                                            agent harness instead: --harness claude mounts
+                                            agent harness: --harness claude mounts
                                             ~/.claude/.credentials.json read-only (plan mode's own
                                             mount is separate and untouched) and both flags set
                                             CFGMS_SECURITY_REVIEW_HARNESS/_MODEL/_LANE_ID in the
-                                            container. Only `claude` is wired today.
+                                            container. Only `claude` is wired today. This is the
+                                            only credential-delivery mechanism for lane mode (Issue
+                                            #3933 retired the OS-keychain per-lane credential-name
+                                            flag in full, with the three REST lanes that were its
+                                            only callers).
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
@@ -2843,7 +2678,6 @@ PROMPT_EOF
     #     never read or write another lane's findings or manifest.json
     inv_sweep_dir=""
     inv_mode=""
-    inv_cred_name=""
     inv_lane_entrypoint=""
     inv_harness=""
     inv_model=""
@@ -2851,7 +2685,6 @@ PROMPT_EOF
       case "$1" in
         --sweep-dir)       inv_sweep_dir="${2:?--sweep-dir requires a value}"; shift 2 ;;
         --mode)            inv_mode="${2:?--mode requires a value}"; shift 2 ;;
-        --cred-name)       inv_cred_name="${2:?--cred-name requires a value}"; shift 2 ;;
         --lane-entrypoint) inv_lane_entrypoint="${2:?--lane-entrypoint requires a value}"; shift 2 ;;
         --harness)         inv_harness="${2:?--harness requires a value}"; shift 2 ;;
         --model)           inv_model="${2:?--model requires a value}"; shift 2 ;;
@@ -2982,22 +2815,10 @@ PROMPT_EOF
       inv_out_mount=(-v "${inv_lane_dir}:/workspace-out:rw")
     fi
 
-    # Credential delivery — see the launch-investigator credential path block
-    # above this case statement for why this is the sole owner of mount/env/
-    # keychain logic rather than something each lane story carries itself.
-    inv_cred_dir=""
-    cred_mount=()
-    cred_env=()
-    if [[ -n "$inv_cred_name" ]]; then
-      if ! inv_cred_dir=$(_investigator_prepare_cred_dir "${inv_sweep_id_safe}-${inv_mode_safe}" "$inv_cred_name"); then
-        echo "LAUNCH_FAILED:${container_name}:credential_unavailable"
-        exit 1
-      fi
-      cred_mount=(-v "${inv_cred_dir}:/run/cfgms/security-review-cred:ro")
-      cred_env=(-e "CFGMS_SECURITY_REVIEW_CRED_FILE=/run/cfgms/security-review-cred/${inv_cred_name}.key")
-    fi
-
-    # Harness session credential (Issue #3932, epic #3927's contract C2).
+    # Harness session credential (Issue #3932, epic #3927's contract C2) --
+    # the ONLY credential-delivery mechanism for lane mode (Issue #3933
+    # retired the OS-keychain per-lane credential-name flag in full, along
+    # with the three REST lanes that were its only callers).
     # Generalizes the plan-mode-only mount two blocks up
     # (`claude_creds_mount`, left untouched — plan mode's own invocation is
     # unaffected by this flag) so a lane can authenticate as a subscription
@@ -3026,7 +2847,6 @@ PROMPT_EOF
     if [[ -n "$inv_lane_entrypoint" ]]; then
       if [[ ! -f "$inv_lane_entrypoint" ]]; then
         echo "ERROR: --lane-entrypoint not found: ${inv_lane_entrypoint}"
-        rm -rf "${inv_cred_dir}" 2>/dev/null || true
         exit 1
       fi
       inv_lane_entrypoint_mount=(-v "${inv_lane_entrypoint}:/usr/local/bin/investigator-lane-entrypoint.py:ro")
@@ -3069,7 +2889,6 @@ PROMPT_EOF
       "${claude_creds_mount[@]}" \
       "${inv_plan_mount[@]}" \
       "${inv_out_mount[@]}" \
-      "${cred_mount[@]}" \
       "${inv_harness_creds_mount[@]}" \
       "${inv_lane_entrypoint_mount[@]}" \
       -v "${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh:/usr/local/bin/investigator-entrypoint.sh:ro" \
@@ -3079,21 +2898,15 @@ PROMPT_EOF
       -e "CFGMS_AGENT_MODE=true" \
       -e "CFGMS_INVESTIGATOR_MODE=${inv_mode}" \
       -e "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=${inv_disallowed}" \
-      "${cred_env[@]}" \
       "${inv_harness_env[@]}" \
       -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
       --entrypoint /usr/local/bin/investigator-entrypoint.sh \
       cfg-agent:latest \
       "${inv_mode}" 2>&1); then
       echo "LAUNCHED_INVESTIGATOR:${inv_mode}:${container_id}"
-      if [[ -n "$inv_cred_dir" ]]; then
-        _investigator_cred_cleanup_watcher "$container_id" "$inv_cred_dir" &
-        disown 2>/dev/null || true
-      fi
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
       ledger_append_launch_failed "$container_name" "investigator-${inv_mode_safe}"
-      rm -rf "${inv_cred_dir}" 2>/dev/null || true
       exit 1
     fi
     ;;

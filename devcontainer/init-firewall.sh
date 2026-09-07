@@ -68,13 +68,14 @@ echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf >/dev/null
 # /etc/dnsmasq-allowlist.d/<harness>.conf. Exactly one fragment is loaded,
 # named by CFGMS_SECURITY_REVIEW_HARNESS -- the same env var
 # agent-dispatch.sh launch-investigator's --harness flag sets in the
-# container (Issue #3932). Every existing dev/review/fix agent container,
-# and any investigator launch that does not pass --harness (plan mode's own
-# invocation, and the three pre-#3932 REST finder lanes), never sets that
-# variable and falls back to "legacy" -- a fragment holding exactly today's
-# full provider domain set, so none of those keep resolving anything
-# different than before this story. STORY-5b retires "legacy" when the REST
-# lanes go.
+# container (Issue #3932). Every existing dev/review/fix agent container --
+# and plan mode's own investigator invocation, which never passes --harness
+# either -- never sets that variable and falls back to "claude": every one of
+# those containers runs Claude Code, so resolving exactly the Claude harness's
+# own domains is the correct default, not a legacy compatibility shim (Issue
+# #3933 retired the old "legacy" fragment, which existed only for the three
+# REST lanes deleted by that story, along with api.openai.com/ollama.com from
+# every fragment and the base file).
 #
 # An unrecognized harness value aborts the container: fail closed, never
 # fall back to loading every fragment (which would silently reopen the
@@ -82,7 +83,7 @@ echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf >/dev/null
 # validated against the same strict shape launch-investigator's own --mode
 # already enforces before it is ever used to build a path, so a value
 # containing `/` or `..` cannot escape the allowlist directory.
-firewall_harness="${CFGMS_SECURITY_REVIEW_HARNESS:-legacy}"
+firewall_harness="${CFGMS_SECURITY_REVIEW_HARNESS:-claude}"
 if [[ ! "$firewall_harness" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$firewall_harness" == *".."* ]]; then
     echo "ERROR: invalid harness value '${firewall_harness}'; refusing to start" >&2
     exit 1

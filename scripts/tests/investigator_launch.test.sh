@@ -197,8 +197,6 @@ export DOCKER_CALL_LOG="${SANDBOX}/docker_calls.log"
 plan_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
@@ -215,43 +213,28 @@ check_contains "rendered disallowed-tools env var refuses curl" "$run_call" "Bas
 check_contains "rendered disallowed-tools env var refuses wget" "$run_call" "Bash(wget:*)"
 
 : > "$DOCKER_CALL_LOG"
-cat > "${FAKEBIN}/secret-tool" <<'STUB'
-#!/usr/bin/env bash
-printf 'FAKE_SECRET_FOR_TEST'
-STUB
-chmod +x "${FAKEBIN}/secret-tool"
-
-# --lane-entrypoint must point at an existing file; use the credential loader
-# itself as an inert stand-in script for this rendering test (its content is
-# irrelevant here -- only the mount is asserted).
-LOADER_STAND_IN="${REPO_ROOT}/scripts/load-security-review-credentials.sh"
+# --lane-entrypoint must point at an existing file; use this test script
+# itself as an inert stand-in (its content is irrelevant here -- only the
+# mount is asserted). Lane mode now authenticates via --harness/--model
+# (Issue #3933 retired the --cred-name/OS-keychain mechanism in full).
+LANE_ENTRYPOINT_STAND_IN="${SCRIPT_DIR}/investigator_launch.test.sh"
 lane_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-lane" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode anthropic-opus5 \
-    --cred-name TEST_API_KEY --lane-entrypoint "$LOADER_STAND_IN" 2>&1)
-check_contains "lane mode launch reports LAUNCHED_INVESTIGATOR" "$lane_out" "LAUNCHED_INVESTIGATOR:anthropic-opus5:fake-container-id"
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-sonnet5 \
+    --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "lane mode launch reports LAUNCHED_INVESTIGATOR" "$lane_out" "LAUNCHED_INVESTIGATOR:claude-sonnet5:fake-container-id"
 
 lane_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
-check_contains "lane mode mounts its own lane dir rw" "$lane_run_call" "${SWEEP_DIR}/lanes/anthropic-opus5:/workspace-out:rw"
+check_contains "lane mode mounts its own lane dir rw" "$lane_run_call" "${SWEEP_DIR}/lanes/claude-sonnet5:/workspace-out:rw"
 check_contains "lane mode mounts plan/ read-only" "$lane_run_call" "${SWEEP_DIR}/plan:/workspace-plan:ro"
-check_not_contains "lane mode does not mount any other lane" "$lane_run_call" "/lanes/anthropic-opus5:/workspace-plan"
+check_not_contains "lane mode does not mount any other lane" "$lane_run_call" "/lanes/claude-sonnet5:/workspace-plan"
 check_not_contains "lane mode has no GH_TOKEN" "$lane_run_call" "GH_TOKEN"
-check_contains "lane mode delivers the credential as a file-path env var" "$lane_run_call" "CFGMS_SECURITY_REVIEW_CRED_FILE=/run/cfgms/security-review-cred/TEST_API_KEY.key"
-# Lane mode is the one that holds a plaintext provider key on disk AND reads
-# raw third-party model output, so its egress containment matters at least as
-# much as the planner's.
+check_contains "lane mode delivers harness credentials read-only" "$lane_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+# Lane mode reads raw third-party model output, so its egress containment
+# matters at least as much as the planner's.
 check_contains "lane mode grants NET_ADMIN for the firewall init" "$lane_run_call" "--cap-add NET_ADMIN"
-check_not_contains "the credential value is never passed as -e KEY=<value>" "$lane_run_call" "FAKE_SECRET_FOR_TEST"
-
-if grep -q "FAKE_SECRET_FOR_TEST" "$DOCKER_CALL_LOG"; then
-  bad "no credential value appears in any emitted log line (docker call log)" "found a match"
-else
-  ok "no credential value appears in any emitted log line (docker call log)"
-fi
 
 echo ""
 echo "== REQUIRED TEST evidence — --harness/--model generalize the credential mount"
@@ -268,12 +251,10 @@ check_contains "the --harness claude mount is read-only, distinct from plan mode
 : > "$DOCKER_CALL_LOG"
 harness_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-harness" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-sonnet5 \
-    --harness claude --model sonnet-5 --lane-entrypoint "$LOADER_STAND_IN" 2>&1)
+    --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "harness-mode launch reports LAUNCHED_INVESTIGATOR" "$harness_out" "LAUNCHED_INVESTIGATOR:claude-sonnet5:fake-container-id"
 
 harness_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
@@ -286,12 +267,10 @@ check_not_contains "harness-mode launch has no GH_TOKEN" "$harness_run_call" "GH
 : > "$DOCKER_CALL_LOG"
 unwired_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-unwired" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode stub-lane \
-    --harness stub --model stubmodel --lane-entrypoint "$LOADER_STAND_IN" 2>&1)
+    --harness stub --model stubmodel --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "an unwired --harness still dispatches (env vars set, no error)" "$unwired_out" "LAUNCHED_INVESTIGATOR:stub-lane:fake-container-id"
 unwired_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "an unwired --harness still sets CFGMS_SECURITY_REVIEW_HARNESS" "$unwired_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
@@ -321,8 +300,6 @@ for bad_mode in ".." "." "../.." "lanes/../../.." "a/b" "/etc" "$rel_escape" ".h
   set +e
   trav_out=$(PATH="${FAKEBIN}:${PATH}" \
     CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
-    CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-trav" \
-    CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
     CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
     HOME="${SANDBOX}/HOME" \
     bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode "$bad_mode" 2>&1)
@@ -373,8 +350,6 @@ for escape_mode in plan escapelane; do
   plan_escape_out=$(PATH="${FAKEBIN}:${PATH}" \
     CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
     CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-    CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-planlink" \
-    CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
     CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
     HOME="${SANDBOX}/HOME" \
     bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_PLANLINK" --mode "$escape_mode" 2>&1)
@@ -402,26 +377,11 @@ else
 fi
 
 echo ""
-echo "== REQUIRED TEST evidence — --cred-name path traversal is refused at launch =="
-: > "$DOCKER_CALL_LOG"
-set +e
-cred_trav_out=$(PATH="${FAKEBIN}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-credtrav" \
-  CFGMS_TEST_FSTYPE_OVERRIDE="tmpfs" \
-  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
-  HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode credtravlane \
-    --cred-name "../../outside/STOLEN" --lane-entrypoint "$LOADER_STAND_IN" 2>&1)
-cred_trav_rc=$?
-set -e
-check_contains "launch fails when --cred-name traverses" "$cred_trav_out" "LAUNCH_FAILED"
-if [[ "$cred_trav_rc" -ne 0 ]]; then ok "traversing --cred-name exits non-zero"; else bad "traversing --cred-name exits non-zero" "exited 0"; fi
-if find "$SANDBOX" -name 'STOLEN.key' 2>/dev/null | grep -q .; then
-  bad "no key file is written outside the credential directory" "found a STOLEN.key"
-else
-  ok "no key file is written outside the credential directory"
-fi
+echo "== REQUIRED TEST evidence — the API-key credential mechanism is retired in"
+echo "   full (Issue #3933): --cred-name no longer exists anywhere in launch-investigator =="
+check_not_contains "no --cred-name flag parsing remains" "$launch_block_code" '--cred-name'
+check_not_contains "_investigator_prepare_cred_dir no longer defined" "$dispatch_src" '_investigator_prepare_cred_dir'
+check_not_contains "_investigator_cred_cleanup_watcher no longer defined" "$dispatch_src" '_investigator_cred_cleanup_watcher'
 
 echo ""
 echo "== functional: container-exists guard refuses a duplicate launch =="
@@ -437,7 +397,6 @@ chmod +x "${FAKEBIN}/docker"
 set +e
 dup_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
 dup_rc=$?
@@ -471,7 +430,6 @@ set +e
 reap_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-reap" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
 reap_rc=$?
@@ -500,7 +458,6 @@ set +e
 running_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
-  CFGMS_TEST_SECURITY_REVIEW_CRED_BASE="${SANDBOX}/credbase-running" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
 running_rc=$?

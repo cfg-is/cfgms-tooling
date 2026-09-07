@@ -18,6 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import basedir  # noqa: E402
 import manifest  # noqa: E402
 
+# A stand-in for the roster-derived lane_dir_name tuple security-review.sh
+# builds from CFGMS_SECURITY_REVIEW_LANES via roster.py::parse_roster() --
+# manifest.py itself takes `lanes` as a required argument (Issue #3933) and
+# has no default of its own to fall back to.
+TEST_LANES: tuple[str, ...] = ("claude-sonnet-5", "claude-opus-5")
+
 FAILURES: list[str] = []
 
 
@@ -140,7 +146,7 @@ def test_create_sweep_writes_manifest_with_required_fields():
         full_sha = init_real_git_repo(repo)
         env = {"CFGMS_SECURITY_REVIEW_BASE": base}
         with mock.patch.dict(os.environ, env, clear=True):
-            sweep_dir = manifest.create_sweep("HEAD", repo_root=repo)
+            sweep_dir = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
 
         manifest_path = os.path.join(sweep_dir, "manifest.json")
         with open(manifest_path) as f:
@@ -153,7 +159,7 @@ def test_create_sweep_writes_manifest_with_required_fields():
         check(data.get("ref") == "HEAD", "create_sweep: manifest ref matches the ref as given")
         check(data.get("status") == "planning", "create_sweep: manifest status starts as 'planning'", data.get("status"))
         check(
-            data.get("lanes") == list(manifest.LANES),
+            data.get("lanes") == list(TEST_LANES),
             "create_sweep: manifest lanes matches the configured lane-id list",
             str(data.get("lanes")),
         )
@@ -164,11 +170,11 @@ def test_create_sweep_creates_directory_skeleton():
         init_real_git_repo(repo)
         env = {"CFGMS_SECURITY_REVIEW_BASE": base}
         with mock.patch.dict(os.environ, env, clear=True):
-            sweep_dir = manifest.create_sweep("HEAD", repo_root=repo)
+            sweep_dir = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
 
         check(os.path.isdir(os.path.join(sweep_dir, "plan")), "create_sweep: creates plan/")
         check(os.path.isdir(os.path.join(sweep_dir, "report")), "create_sweep: creates report/")
-        for lane in manifest.LANES:
+        for lane in TEST_LANES:
             check(
                 os.path.isdir(os.path.join(sweep_dir, "lanes", lane)),
                 f"create_sweep: creates lanes/{lane}/",
@@ -183,7 +189,7 @@ def test_create_sweep_is_idempotent():
         init_real_git_repo(repo)
         env = {"CFGMS_SECURITY_REVIEW_BASE": base}
         with mock.patch.dict(os.environ, env, clear=True):
-            sweep_dir = manifest.create_sweep("HEAD", repo_root=repo)
+            sweep_dir = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
 
             manifest_path = os.path.join(sweep_dir, "manifest.json")
             with open(manifest_path) as f:
@@ -199,7 +205,7 @@ def test_create_sweep_is_idempotent():
 
             raised = False
             try:
-                sweep_dir_again = manifest.create_sweep("HEAD", repo_root=repo)
+                sweep_dir_again = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
             except OSError:
                 raised = True
 
@@ -222,7 +228,7 @@ def test_create_sweep_manifest_written_atomically():
         init_real_git_repo(repo)
         env = {"CFGMS_SECURITY_REVIEW_BASE": base}
         with mock.patch.dict(os.environ, env, clear=True):
-            sweep_dir = manifest.create_sweep("HEAD", repo_root=repo)
+            sweep_dir = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
 
         manifest_path = os.path.join(sweep_dir, "manifest.json")
         tmp_path = f"{manifest_path}.tmp"
@@ -243,7 +249,7 @@ def test_create_sweep_never_creates_sweep_dir_when_basedir_fails():
         raised = False
         with mock.patch.dict(os.environ, env, clear=True):
             try:
-                manifest.create_sweep("HEAD", repo_root=repo)
+                manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
             except basedir.BaseDirError:
                 raised = True
         check(raised, "create_sweep: propagates BaseDirError when base-dir resolution fails")
@@ -264,11 +270,53 @@ def test_create_sweep_delegates_to_basedir_resolve_base_dir():
         ) as mock_resolve:
             raised = False
             try:
-                manifest.create_sweep("HEAD", repo_root=repo)
+                manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
             except basedir.BaseDirError:
                 raised = True
         check(raised, "create_sweep: raises the exact error basedir.resolve_base_dir raises")
         check(mock_resolve.called, "create_sweep: calls basedir.resolve_base_dir()")
+
+
+def test_create_sweep_lanes_is_required_with_no_module_default():
+    # [REQUIRED TEST] Issue #3933: the old hardcoded LANES tuple is gone, and
+    # create_sweep() takes no default for `lanes` -- a caller that omits it
+    # gets a TypeError, never a silent fallback to a hardcoded three-lane set.
+    check(not hasattr(manifest, "LANES"), "manifest module no longer defines a LANES constant")
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
+        init_real_git_repo(repo)
+        env = {"CFGMS_SECURITY_REVIEW_BASE": base}
+        raised_type_error = False
+        with mock.patch.dict(os.environ, env, clear=True):
+            try:
+                manifest.create_sweep("HEAD", repo_root=repo)  # no `lanes` -- must not silently succeed
+            except TypeError:
+                raised_type_error = True
+        check(raised_type_error, "create_sweep: omitting `lanes` raises TypeError, never a hardcoded fallback")
+
+
+def test_create_sweep_lanes_reflects_whatever_roster_derived_tuple_is_passed():
+    # [REQUIRED TEST] manifest.json's `lanes` field is exactly whatever the
+    # caller (security-review.sh, sourcing CFGMS_SECURITY_REVIEW_LANES via
+    # roster.py) passed in -- not a fixed set this module knows about itself.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
+        init_real_git_repo(repo)
+        roster_lanes = ("codex-gpt-terra", "opencode-qwen", "claude-sonnet-5")
+        env = {"CFGMS_SECURITY_REVIEW_BASE": base}
+        with mock.patch.dict(os.environ, env, clear=True):
+            sweep_dir = manifest.create_sweep("HEAD", lanes=roster_lanes, repo_root=repo)
+
+        with open(os.path.join(sweep_dir, "manifest.json")) as f:
+            data = json.load(f)
+        check(
+            data.get("lanes") == list(roster_lanes),
+            "create_sweep: manifest lanes matches an arbitrary roster-derived tuple, not a hardcoded set",
+            str(data.get("lanes")),
+        )
+        for lane in roster_lanes:
+            check(
+                os.path.isdir(os.path.join(sweep_dir, "lanes", lane)),
+                f"create_sweep: creates lanes/{lane}/ for the roster-derived lane",
+            )
 
 
 def main() -> int:

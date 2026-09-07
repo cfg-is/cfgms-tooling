@@ -23,6 +23,19 @@ This module adds no base-directory logic of its own: `create_sweep()` calls
 `basedir.resolve_base_dir()` and lets `BaseDirError` propagate unmodified, so
 a fail-closed condition there (in-repo path, unwritable, undetectable repo
 root) aborts before any sweep directory is created -- never a fallback.
+
+**`lanes` is a required argument, not a module default (Issue #3933, epic
+#3927's switchover cutover).** Before this story, `LANES` was a hardcoded
+tuple of the three REST lanes' directory names -- the single source of truth
+every harness story referenced. Those lanes are deleted by this same story,
+and the roster mechanism (`roster.py`, Issue #3932's contract C5) is now the
+only source of lane identity: `security-review.sh` resolves
+`CFGMS_SECURITY_REVIEW_LANES` via `roster.py::parse_roster()` into a list of
+`lane_dir_name` values and passes that tuple to `create_sweep()` explicitly.
+A module-level default here would be exactly the kind of standing,
+unreachable-in-production fallback the epic's architectural correction
+exists to close -- so there is none: a caller that does not know its lanes
+yet cannot create a sweep.
 """
 from __future__ import annotations
 
@@ -35,12 +48,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import basedir  # noqa: E402
-
-# Matches the epic's example paths (lanes/anthropic-opus5/, lanes/openai-gpt56-sol/,
-# lanes/ollama-qwen/) exactly -- every other harness story references these
-# lane-directory names, so this list is the single source of truth for them.
-LANES: tuple[str, ...] = ("anthropic-opus5", "openai-gpt56-sol", "ollama-qwen")
-
 
 class ManifestError(Exception):
     """Raised when `ref` cannot be resolved to a commit sha via git."""
@@ -85,10 +92,14 @@ def compute_sweep_id(ref: str, repo_root: str | None = None) -> tuple[str, str, 
 
 def create_sweep(
     ref: str,
-    lanes: tuple[str, ...] = LANES,
+    lanes: tuple[str, ...],
     repo_root: str | None = None,
 ) -> str:
     """Create (or resume) the on-disk sweep tree for `ref`.
+
+    `lanes` is the roster-derived list of `lane_dir_name` values
+    (`roster.py::parse_roster()`, e.g. `("claude-sonnet-5",)`) -- required,
+    with no module-level default (see the module docstring).
 
     Returns the sweep directory path. Idempotent: a second call against the
     same resolved sweep id creates no new directories that do not already

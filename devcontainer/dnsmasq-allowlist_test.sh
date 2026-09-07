@@ -90,19 +90,13 @@ assert_blocked() {
     fi
 }
 
-echo "=== dnsmasq-allowlist.conf: OpenAI + Ollama Cloud entries (Issue #3905) ==="
+echo "=== dnsmasq-allowlist.conf: Claude harness domains, REST-lane entries retired (Issue #3933) ==="
 start_dnsmasq
 
 echo ""
-echo "--- new entries resolve ---"
-assert_resolves "api.openai.com" "OpenAI finder-lane API hostname resolves"
-assert_resolves "ollama.com" "Ollama Cloud finder-lane API hostname resolves"
-
-echo ""
-echo "--- api.openai.com label was not accidentally widened to the apex ---"
-# api.openai.com is added as a narrow label, not the bare apex openai.com.
-# A sibling subdomain, and the bare apex itself, must still be blocked —
-# proving dnsmasq's server=/<domain>/ matching only covers api.openai.com.
+echo "--- REST lanes' entries are gone (Issue #3933 deleted the lanes that needed them) ---"
+assert_blocked "api.openai.com" "api.openai.com no longer resolves"
+assert_blocked "ollama.com" "ollama.com no longer resolves"
 assert_blocked "chat.openai.com" "unrelated openai.com subdomain still blocked"
 assert_blocked "openai.com" "bare openai.com apex still blocked"
 
@@ -110,6 +104,8 @@ echo ""
 echo "--- existing entries untouched ---"
 assert_resolves "github.com" "pre-existing GitHub entry still resolves"
 assert_resolves "anthropic.com" "pre-existing Anthropic entry still resolves"
+assert_resolves "claude.ai" "pre-existing claude.ai entry still resolves"
+assert_resolves "claude.com" "pre-existing claude.com entry still resolves"
 
 echo ""
 echo "--- unrelated domains remain blocked ---"
