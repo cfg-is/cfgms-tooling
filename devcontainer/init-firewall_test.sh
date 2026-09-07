@@ -87,15 +87,17 @@ assert_eq() {
 [[ -f "$BASE_CONF" ]] || { echo "FAIL: expected file not found: $BASE_CONF" >&2; exit 1; }
 [[ -f "${FRAGMENT_DIR}/claude.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/claude.conf" >&2; exit 1; }
 [[ -f "${FRAGMENT_DIR}/codex.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/codex.conf" >&2; exit 1; }
+[[ -f "${FRAGMENT_DIR}/opencode.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/opencode.conf" >&2; exit 1; }
 [[ ! -f "${FRAGMENT_DIR}/legacy.conf" ]] || { echo "FAIL: legacy.conf should have been retired (Issue #3933): ${FRAGMENT_DIR}/legacy.conf still exists" >&2; exit 1; }
 
 echo "=== init-firewall.sh: per-harness egress fragment selection (Issue #3932) ==="
 
 echo ""
-echo "--- REQUIRED TEST: Issue #3935 adds no domain to the base allowlist file ---"
+echo "--- REQUIRED TEST: Issue #3935/#3936 add no domain to the base allowlist file ---"
 base_src="$(cat "$BASE_CONF")"
 assert_not_contains "$base_src" "openai.com" "base conf carries no openai.com entry (Codex's domains live only in codex.conf)"
 assert_not_contains "$base_src" "chatgpt.com" "base conf carries no chatgpt.com entry (Codex's domains live only in codex.conf)"
+assert_not_contains "$base_src" "opencode.ai" "base conf carries no opencode.ai entry (OpenCode's domain lives only in opencode.conf)"
 
 # ----------------------------------------------------------------------------
 # Strategy 1: stubbed sudo/iptables/dnsmasq/etc — real init-firewall.sh logic
@@ -186,16 +188,30 @@ frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_li
 assert_eq "$frag_count" "1" "--harness codex launch loads at most one fragment"
 
 echo ""
+echo "--- --harness opencode (CFGMS_SECURITY_REVIEW_HARNESS=opencode): loads base + opencode.conf ---"
+: > "$CALL_LOG"
+set +e
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=opencode CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "--harness opencode launch exits 0"
+call_line="$(cat "$CALL_LOG")"
+assert_contains "$call_line" "--conf-file=${BASE_CONF}" "--harness opencode launch loads the base conf"
+assert_contains "$call_line" "--conf-file=${FRAGMENT_DIR}/opencode.conf" "--harness opencode launch loads the opencode fragment"
+assert_not_contains "$call_line" "claude.conf" "--harness opencode launch does not also load the claude fragment"
+assert_not_contains "$call_line" "codex.conf" "--harness opencode launch does not also load the codex fragment"
+frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_line" | wc -l)
+assert_eq "$frag_count" "1" "--harness opencode launch loads at most one fragment"
+
+echo ""
 echo "--- REQUIRED TEST: an unrecognized harness value fails to start ---"
 # Reverting the fail-closed branch (so an unrecognized value falls back to
 # loading every fragment, or is ignored) makes this block fail: dnsmasq
-# would be invoked and the launch would exit 0. "opencode" is included even
-# though it is a legitimate future harness name (STORY-8) -- no fragment
-# file exists for it yet, so it must fail closed exactly like a nonsense
-# value until its own story adds opencode.conf. "codex" is no longer in
-# this list -- Issue #3935 gave it a real fragment, so it must now succeed
-# (see the positive block above) rather than fail closed.
-for bad_harness in bogus-harness-xyz "../etc" "opencode"; do
+# would be invoked and the launch would exit 0. "codex" and "opencode" are
+# no longer in this list -- Issues #3935/#3936 gave them real fragments, so
+# they must now succeed (see the positive blocks above) rather than fail
+# closed.
+for bad_harness in bogus-harness-xyz "../etc" "totally-unknown-harness"; do
     : > "$CALL_LOG"
     set +e
     bad_out=$(CFGMS_SECURITY_REVIEW_HARNESS="$bad_harness" CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
@@ -374,6 +390,88 @@ assert_blocked_dns2 "claude.com" "base+codex: claude.com is NOT reachable (no cr
 assert_blocked_dns2 "api.openai.com" "base+codex: api.openai.com is NOT reachable (Issue #3935 -- distinct from Codex's own auth.openai.com/chatgpt.com, never a reinstatement of the deleted REST lane's egress)"
 assert_blocked_dns2 "ollama.com" "base+codex: ollama.com is NOT reachable (Issue #3933)"
 assert_blocked_dns2 "example.com" "base+codex: domain absent from allowlist still blocked"
+
+kill "$DNSMASQ_PID" 2>/dev/null || true
+wait "$DNSMASQ_PID" 2>/dev/null || true
+DNSMASQ_PID=""
+
+echo ""
+echo "--- REQUIRED TEST: a --harness opencode launch resolves exactly the OpenCode"
+echo "    domain and does NOT resolve anthropic.com/claude.ai/claude.com or the"
+echo "    Codex fragment's domains (Issue #3936) -- the same single-image-safety"
+echo "    proof the Codex block above establishes, extended to a third harness ---"
+PORT3=15356
+LOG_FILE3="$(mktemp -t init-firewall-test-opencode.XXXXXX.log)"
+DNSMASQ_PID=""
+cleanup_dnsmasq3() {
+    if [[ -n "$DNSMASQ_PID" ]] && kill -0 "$DNSMASQ_PID" 2>/dev/null; then
+        kill "$DNSMASQ_PID" 2>/dev/null || true
+        wait "$DNSMASQ_PID" 2>/dev/null || true
+    fi
+    rm -f "$LOG_FILE3"
+}
+trap 'cleanup_stubs; cleanup_dnsmasq3' EXIT
+
+dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/opencode.conf" \
+    --listen-address=127.0.0.1 --port="$PORT3" --no-daemon --log-facility=- >"$LOG_FILE3" 2>&1 &
+DNSMASQ_PID=$!
+
+ready=0
+for _ in $(seq 1 20); do
+    if dig +short +time=1 +tries=1 @127.0.0.1 -p "$PORT3" github.com >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+if [[ "$ready" -ne 1 ]]; then
+    echo "ERROR: dnsmasq did not become ready on port $PORT3" >&2
+    cat "$LOG_FILE3" >&2 || true
+    exit 1
+fi
+
+dns_status3() {
+    local domain="$1"
+    dig +time=3 +tries=1 @127.0.0.1 -p "$PORT3" "$domain" A +noall +comment 2>/dev/null \
+        | grep -oP '(?<=status: )[A-Z]+' || echo "QUERY_FAILED"
+}
+assert_resolves3() {
+    local domain="$1" msg="$2"
+    local status
+    status=$(dns_status3 "$domain")
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$status" == "NOERROR" ]]; then
+        echo "    ✓ $msg ($domain -> $status)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        _fail "$msg — expected NOERROR for $domain, got $status"
+    fi
+}
+assert_blocked_dns3() {
+    local domain="$1" msg="$2"
+    local status
+    status=$(dns_status3 "$domain")
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$status" == "REFUSED" ]]; then
+        echo "    ✓ $msg ($domain -> $status)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        _fail "$msg — expected REFUSED for $domain, got $status"
+    fi
+}
+
+assert_resolves3 "github.com" "base+opencode: pre-existing GitHub entry still resolves"
+assert_resolves3 "opencode.ai" "base+opencode: opencode.ai resolves"
+assert_resolves3 "api.opencode.ai" "base+opencode: api.opencode.ai (subdomain) resolves"
+assert_blocked_dns3 "anthropic.com" "base+opencode: anthropic.com is NOT reachable (no cross-harness bleed)"
+assert_blocked_dns3 "claude.ai" "base+opencode: claude.ai is NOT reachable (no cross-harness bleed)"
+assert_blocked_dns3 "claude.com" "base+opencode: claude.com is NOT reachable (no cross-harness bleed)"
+assert_blocked_dns3 "auth.openai.com" "base+opencode: auth.openai.com is NOT reachable (Codex fragment's domain, no cross-harness bleed)"
+assert_blocked_dns3 "chatgpt.com" "base+opencode: chatgpt.com is NOT reachable (Codex fragment's domain, no cross-harness bleed)"
+assert_blocked_dns3 "api.openai.com" "base+opencode: api.openai.com is NOT reachable"
+assert_blocked_dns3 "ollama.com" "base+opencode: ollama.com is NOT reachable (Issue #3933)"
+assert_blocked_dns3 "openrouter.ai" "base+opencode: openrouter.ai is NOT reachable (a third-party-API-key provider OpenCode can proxy to, never this harness's own account flow)"
+assert_blocked_dns3 "example.com" "base+opencode: domain absent from allowlist still blocked"
 
 kill "$DNSMASQ_PID" 2>/dev/null || true
 wait "$DNSMASQ_PID" 2>/dev/null || true

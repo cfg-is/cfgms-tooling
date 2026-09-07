@@ -403,6 +403,73 @@ claude_still_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call" "${NO_CODEX_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 
 echo ""
+echo "== REQUIRED TEST — --harness opencode mounts"
+echo "   ~/.local/share/opencode/auth.json read-only, sets"
+echo "   CFGMS_SECURITY_REVIEW_HARNESS=opencode/_MODEL, and never mounts the Claude"
+echo "   or Codex credential files (Issue #3936) =="
+mkdir -p "${SANDBOX}/HOME/.local/share/opencode"
+echo '{"opencode":{}}' > "${SANDBOX}/HOME/.local/share/opencode/auth.json"
+
+: > "$DOCKER_CALL_LOG"
+opencode_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode opencode-bigpickle \
+    --harness opencode --model big-pickle --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "--harness opencode launch reports LAUNCHED_INVESTIGATOR" "$opencode_out" "LAUNCHED_INVESTIGATOR:opencode-bigpickle:fake-container-id"
+
+opencode_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "--harness opencode mounts ~/.local/share/opencode/auth.json read-only" "$opencode_run_call" "${SANDBOX}/HOME/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro"
+check_contains "--harness opencode sets CFGMS_SECURITY_REVIEW_HARNESS=opencode" "$opencode_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=opencode"
+check_contains "--model big-pickle sets CFGMS_SECURITY_REVIEW_MODEL=big-pickle" "$opencode_run_call" "CFGMS_SECURITY_REVIEW_MODEL=big-pickle"
+check_contains "--mode opencode-bigpickle sets CFGMS_SECURITY_REVIEW_LANE_ID=opencode-bigpickle" "$opencode_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=opencode-bigpickle"
+check_not_contains "--harness opencode never mounts the Claude credential file" "$opencode_run_call" ".claude/.credentials.json"
+check_not_contains "--harness opencode never mounts the Codex credential file" "$opencode_run_call" ".codex/auth.json"
+check_not_contains "--harness opencode launch has no GH_TOKEN" "$opencode_run_call" "GH_TOKEN"
+
+echo ""
+echo "== REQUIRED TEST — an opencode lane with no"
+echo "   ~/.local/share/opencode/auth.json on the host fails closed as a recorded,"
+echo "   skippable credential_unavailable, and never mounts a broken/nonexistent"
+echo "   path (Issue #3936) =="
+NO_OPENCODE_HOME="${SANDBOX}/HOME-no-opencode"
+mkdir -p "${NO_OPENCODE_HOME}/.claude"
+echo '{}' > "${NO_OPENCODE_HOME}/.claude/.credentials.json"
+: > "$DOCKER_CALL_LOG"
+set +e
+opencode_missing_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="$NO_OPENCODE_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode opencode-missing-creds \
+    --harness opencode --model big-pickle --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+opencode_missing_rc=$?
+set -e
+if [[ "$opencode_missing_rc" -ne 0 ]]; then
+  ok "an opencode lane with no host credential exits non-zero"
+else
+  bad "an opencode lane with no host credential exits non-zero" "exited 0"
+fi
+check_contains "the failure is reported as credential_unavailable (matches security-review.sh's intentional-skip pattern)" "$opencode_missing_out" "credential_unavailable"
+check_not_contains "no container is ever dispatched for the missing-credential opencode lane" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+
+echo ""
+echo "== REQUIRED TEST — a claude lane still dispatches normally even though this"
+echo "   file's opencode harness has no credential on the host (C5's 'never"
+echo "   silently substituted' property, extended to a third harness) =="
+: > "$DOCKER_CALL_LOG"
+claude_still_out2=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="$NO_OPENCODE_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-still-fine-2 \
+    --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "a claude lane on the same (opencode-credential-less) host still dispatches" "$claude_still_out2" "LAUNCHED_INVESTIGATOR:claude-still-fine-2:fake-container-id"
+claude_still_run_call2="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call2" "${NO_OPENCODE_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+
+echo ""
 echo "== REQUIRED TEST evidence — --mode path traversal cannot widen the writable mount =="
 # The writable mount path is built from the RAW --mode value, so --mode is
 # validated as a lane id. The `tr`-sanitized $inv_mode_safe is for the

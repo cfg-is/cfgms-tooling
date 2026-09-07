@@ -1115,12 +1115,16 @@ Commands:
                                             --harness/--model (Issue #3932) select a subscription
                                             agent harness: --harness claude mounts
                                             ~/.claude/.credentials.json read-only, --harness codex
-                                            mounts ~/.codex/auth.json read-only (Issue #3935; fails
-                                            closed with LAUNCH_FAILED:...:credential_unavailable if
-                                            the file is missing), and both flags set
+                                            mounts ~/.codex/auth.json read-only (Issue #3935),
+                                            --harness opencode mounts
+                                            ~/.local/share/opencode/auth.json read-only (Issue #3936;
+                                            codex/opencode both fail closed with
+                                            LAUNCH_FAILED:...:credential_unavailable if the file is
+                                            missing), and all flags set
                                             CFGMS_SECURITY_REVIEW_HARNESS/_MODEL/_LANE_ID in the
-                                            container. `claude`/`codex` are wired; any other harness
-                                            id gets NO credential mount. Credential delivery is
+                                            container. `claude`/`codex`/`opencode` are wired; any
+                                            other harness id gets NO credential mount. Credential
+                                            delivery is
                                             harness-gated in both modes — plan mode mounts a wired
                                             harness's credential (read-only) only when --harness
                                             selects that harness (or, for claude, is omitted), so a
@@ -2309,6 +2313,16 @@ PYEOF
       warnings=$((warnings + 1))
     fi
 
+    # OpenCode CLI version check (Issue #3936) — the third subscription agent
+    # harness the security review harness dispatches. Same single
+    # binary-presence probe pattern as the codex check above.
+    opencode_version=$(docker run --rm --entrypoint opencode cfg-agent:latest --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "unknown")
+    echo "INFO:opencode_version:${opencode_version}"
+    if [[ "$opencode_version" == "unknown" ]]; then
+      echo "WARN:opencode_version:opencode binary missing or version check failed — run /agent-setup rebuild"
+      warnings=$((warnings + 1))
+    fi
+
     # Credentials check — agents bind-mount the host credentials file directly.
     if [[ -f "$HOME/.claude/.credentials.json" ]]; then
       echo "INFO:creds:Host credentials file present (bind-mounted into agents)"
@@ -2876,11 +2890,12 @@ PROMPT_EOF
     # /home/agent/.claude/.credentials.json. Since Issue #3937 multi-planner
     # dispatch, `--mode plan --harness <id>` is a real call shape; the plan
     # branch above therefore mounts nothing of its own when `--harness` is
-    # present. `claude` and `codex` are wired (Issue #3935; STORY-8 adds
-    # opencode); an unrecognized harness id gets the env vars below but no
-    # credential mount, which is a deliberate no-op rather than a hard
-    # failure — the roster mechanism (C5) is proven in this story against a
-    # stub harness that legitimately has no credential file of its own.
+    # present. `claude`, `codex`, and `opencode` are wired (Issue #3935;
+    # Issue #3936 adds opencode); an unrecognized harness id gets the env
+    # vars below but no credential mount, which is a deliberate no-op rather
+    # than a hard failure — the roster mechanism (C5) is proven in this
+    # story against a stub harness that legitimately has no credential file
+    # of its own.
     inv_harness_creds_mount=()
     inv_harness_env=()
     if [[ -n "$inv_harness" ]]; then
@@ -2911,6 +2926,26 @@ PROMPT_EOF
             exit 1
           fi
           inv_harness_creds_mount=(-v "${HOME}/.codex/auth.json:/home/agent/.codex/auth.json:ro")
+          ;;
+        opencode)
+          # OpenCode's own session credential (Issue #3936): confirmed
+          # against the installed CLI (`opencode providers list
+          # --print-logs --log-level DEBUG`, which prints "Credentials
+          # ~/.local/share/opencode/auth.json" directly) --
+          # $XDG_DATA_HOME/opencode/auth.json, default
+          # ~/.local/share/opencode/auth.json, the OpenCode Zen account
+          # analogue of Codex's ~/.codex/auth.json above. Same
+          # existence-gated fail-closed shape as codex: a host that has
+          # never run `opencode auth login` fails the launch closed with
+          # credential_unavailable, which security-review.sh's
+          # _is_intentional_dispatch_skip already recognizes, rather than
+          # mounting a nonexistent host path with undefined effective
+          # contents.
+          if [[ ! -f "${HOME}/.local/share/opencode/auth.json" ]]; then
+            echo "LAUNCH_FAILED:${container_name}:credential_unavailable:no opencode session found at ${HOME}/.local/share/opencode/auth.json -- run 'opencode auth login' on the host"
+            exit 1
+          fi
+          inv_harness_creds_mount=(-v "${HOME}/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro")
           ;;
       esac
       inv_harness_env=(

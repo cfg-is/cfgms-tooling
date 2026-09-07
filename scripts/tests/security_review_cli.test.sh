@@ -65,8 +65,9 @@ DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
 SECURITY_REVIEW_DIR="${REPO_ROOT}/.claude/scripts/security-review"
 CLAUDE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/claude_lane.py"
 CODEX_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/codex_lane.py"
+OPENCODE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/opencode_lane.py"
 
-for f in "$CLI" "$DISPATCH" "$CLAUDE_LANE_SCRIPT" "$CODEX_LANE_SCRIPT"; do
+for f in "$CLI" "$DISPATCH" "$CLAUDE_LANE_SCRIPT" "$CODEX_LANE_SCRIPT" "$OPENCODE_LANE_SCRIPT"; do
   [[ -f "$f" ]] || { printf 'FAIL: expected file not found: %s\n' "$f" >&2; exit 1; }
 done
 [[ -x "$CLI" ]] || { printf 'FAIL: %s is not executable\n' "$CLI" >&2; exit 1; }
@@ -816,6 +817,106 @@ fi
 [[ -f "${SWEEP_DIR_PARTIAL_CRED}/report/consolidated.md" ]] \
   && ok "the consolidator still ran despite the codex lane's credential-unavailable skip" \
   || bad "the consolidator still ran despite the codex lane's credential-unavailable skip" "not found"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TEST (Issue #3936) -- the SAME harness configured TWICE with
+# different models. Epic #3927's C5 roster example is exactly this shape
+# (`opencode:<qwen-id>,opencode:<glm-id>`); the codex block above proved "a
+# second harness needs no dispatch-loop change", this block proves the
+# narrower, and previously untested, claim: "a second MODEL on an existing
+# harness needs no dispatch-loop change either" -- both roster entries
+# resolve to the literal SAME opencode_lane.py file (byte-for-byte, not two
+# copies), so there is no code difference between the two lanes at all, only
+# a different --model value threaded through the same script.
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "== REQUIRED TEST — CFGMS_SECURITY_REVIEW_LANES=opencode:<model-a>,"
+echo "   opencode:<model-b> dispatches two independently-tracked lane"
+echo "   directories using the SAME opencode_lane.py script for both, with no"
+echo "   code change between them (Issue #3936, epic #3927's C5 same-harness-"
+echo "   multiple-models property) =="
+SUB_TWOMODEL="${SANDBOX}/case-opencode-two-models"
+setup_sub_sandbox "$SUB_TWOMODEL"
+mkdir -p "${SUB_TWOMODEL}/HOME/.local/share/opencode"
+echo '{"opencode":{}}' > "${SUB_TWOMODEL}/HOME/.local/share/opencode/auth.json"
+
+TWOMODEL_ENTRYPOINT_DIR="${SANDBOX}/opencode-two-model-lane-entrypoints"
+mkdir -p "$TWOMODEL_ENTRYPOINT_DIR"
+cp "$OPENCODE_LANE_SCRIPT" "${TWOMODEL_ENTRYPOINT_DIR}/opencode_lane.py"
+twomodel_entrypoint_file_count="$(find "$TWOMODEL_ENTRYPOINT_DIR" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')"
+check_eq "the opencode two-model fixture mounts exactly one lane script, no siblings" "$twomodel_entrypoint_file_count" "1"
+
+# Stub `opencode` binary (Issue #3936): reads the same
+# CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE env var contract
+# opencode_lane.py::call_opencode_harness sets -- matching the stub `claude`
+# binary's convention above, since opencode_lane.py captures its result via
+# the model's own `write` tool exactly like claude_lane.py does, never via
+# an argv-named file the way the stub `codex` binary above works.
+TWOMODEL_BIN_DIR="${SANDBOX}/opencode-two-model-harness-bins"
+mkdir -p "$TWOMODEL_BIN_DIR"
+cat > "${TWOMODEL_BIN_DIR}/opencode" <<'OPENCODE_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+output_path="${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
+outcome="${STUB_OPENCODE_OUTCOME:-complete}"
+case "$outcome" in
+  complete)
+    printf '{"findings":[]}' > "$output_path"
+    exit 0
+    ;;
+  parked)
+    echo "stub opencode: rate limit exceeded, try again later"
+    exit 0
+    ;;
+  refused)
+    echo "stub opencode: declining to review this content"
+    exit 0
+    ;;
+  failed)
+    echo "stub opencode: simulated crash" >&2
+    exit 1
+    ;;
+  *)
+    echo "stub opencode: unrecognized STUB_OPENCODE_OUTCOME=${outcome}" >&2
+    exit 1
+    ;;
+esac
+OPENCODE_STUB
+chmod +x "${TWOMODEL_BIN_DIR}/opencode"
+
+twomodel_out=$(CFGMS_SECURITY_REVIEW_LANES="opencode:model-qwen,opencode:model-glm" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOMODEL_ENTRYPOINT_DIR" \
+  STUB_CLAUDE_BIN_DIR="$TWOMODEL_BIN_DIR" \
+  STUB_PLAN_STEP_COUNT=2 \
+  run_cli "$SUB_TWOMODEL" launch HEAD 2>"${SUB_TWOMODEL}/stderr.log")
+twomodel_rc=$?
+check_eq "opencode two-model roster launch exits 0" "$twomodel_rc" "0"
+SWEEP_DIR_TWOMODEL="$(dirname "$(dirname "$twomodel_out")")"
+
+for step in step-001 step-002; do
+  [[ -f "${SWEEP_DIR_TWOMODEL}/lanes/opencode-model-qwen/${step}.findings.json" ]] \
+    && ok "opencode-model-qwen lane produced ${step} findings (real opencode_lane.py run)" \
+    || bad "opencode-model-qwen lane produced ${step} findings (real opencode_lane.py run)" "not found"
+  [[ -f "${SWEEP_DIR_TWOMODEL}/lanes/opencode-model-glm/${step}.findings.json" ]] \
+    && ok "opencode-model-glm lane produced ${step} findings (real opencode_lane.py run)" \
+    || bad "opencode-model-glm lane produced ${step} findings (real opencode_lane.py run)" "not found"
+done
+
+twomodel_call_log="$(cat "${SUB_TWOMODEL}/docker_calls.log")"
+check_contains "model-qwen lane dispatched via launch-investigator --harness opencode" "$twomodel_call_log" "opencode-model-qwen"
+check_contains "model-glm lane dispatched via launch-investigator --harness opencode" "$twomodel_call_log" "opencode-model-glm"
+twomodel_qwen_call="$(grep ' opencode-model-qwen$' "${SUB_TWOMODEL}/docker_calls.log" || true)"
+twomodel_glm_call="$(grep ' opencode-model-glm$' "${SUB_TWOMODEL}/docker_calls.log" || true)"
+check_contains "model-qwen container carries CFGMS_SECURITY_REVIEW_MODEL=model-qwen" "$twomodel_qwen_call" "CFGMS_SECURITY_REVIEW_MODEL=model-qwen"
+check_contains "model-glm container carries CFGMS_SECURITY_REVIEW_MODEL=model-glm" "$twomodel_glm_call" "CFGMS_SECURITY_REVIEW_MODEL=model-glm"
+check_contains "model-qwen container mounted the OpenCode credential read-only" "$twomodel_qwen_call" "${SUB_TWOMODEL}/HOME/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro"
+check_contains "model-glm container mounted the OpenCode credential read-only" "$twomodel_glm_call" "${SUB_TWOMODEL}/HOME/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro"
+check_not_contains "security-review.sh needed no opencode-specific source change to dispatch this two-model roster" "$cli_src" "opencode"
+
+report_twomodel="$(cat "${SWEEP_DIR_TWOMODEL}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "consolidated report picked up the opencode-model-qwen lane" "$report_twomodel" "opencode-model-qwen"
+check_contains "consolidated report picked up the opencode-model-glm lane" "$report_twomodel" "opencode-model-glm"
 
 echo ""
 echo "== REQUIRED TEST — roster.py rejects a malformed CFGMS_SECURITY_REVIEW_LANES"

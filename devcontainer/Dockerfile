@@ -170,6 +170,19 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 ARG CODEX_CLI_VERSION=0.153.4
 RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 
+# OpenCode CLI — pinned, never @latest (same supply-chain rule as Claude Code
+# and Codex above; see dependency-pin-check.yml). This is the third
+# subscription agent harness the security review harness dispatches (Issue
+# #3936, epic #3927) — `opencode_lane.py` invokes this binary as a
+# subprocess, authenticated by the operator's own
+# `~/.local/share/opencode/auth.json` OpenCode Zen account session
+# (`agent-dispatch.sh launch-investigator --harness opencode`), never an
+# OS-keychain API key. The npm package is `opencode-ai`, confirmed against
+# the package actually installed for this story (its own package.json
+# declares `"bin": {"opencode": "./bin/opencode.exe"}`).
+ARG OPENCODE_CLI_VERSION=1.18.29
+RUN npm install -g "opencode-ai@${OPENCODE_CLI_VERSION}"
+
 # Non-root agent user with sudo for iptables only
 RUN useradd -m -s /bin/bash agent \
     && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
