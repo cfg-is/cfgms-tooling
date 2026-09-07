@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import basedir  # noqa: E402
 import metadata  # noqa: E402
 import planner  # noqa: E402
+import roster  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -866,6 +867,412 @@ def test_finalize_invalid_step_logs_single_safe_record():
                 "finalize: the forged text survives, escaped, inside the record's field",
                 repr(output),
             )
+
+
+# --- merge_steps_by_scope() / C6 multi-planner merge (Issue #3937) -----------
+#
+# NOTE on the single-planner regression requirement: every `test_finalize_*`
+# test above calls `planner.finalize(sweep_dir)` exactly as STORY-1 wrote it
+# -- no new parameter, no new required setup -- and every one of them still
+# passes (confirmed by running this file). That is this story's evidence that
+# the single-planner path is unregressed: C6's multi-planner merge is reached
+# only through the new `merge_steps_by_scope()` / `finalize_multi_planner()`
+# functions below, never through `finalize()` itself.
+
+def test_merge_steps_by_scope_unions_files_and_planners_for_overlapping_scope():
+    # REQUIRED TEST: two planner passes proposing the same scope with
+    # different file lists merge into exactly one step, with `files` the
+    # union of both proposals and `planners` listing both planner ids.
+    step_a = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go", "pkg/example/other.go"],
+        files=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+    )
+    step_b = valid_step(
+        "step-001",
+        scope=["pkg/example/other.go", "pkg/example/thing.go"],
+        files=["pkg/example/other.go", "pkg/example/extra.go"],
+        planners=["codex-gpt-terra"],
+    )
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+
+    check(len(merged) == 1, "merge_steps_by_scope: overlapping scopes collapse into exactly one step", str(merged))
+    if merged:
+        m = merged[0]
+        check(
+            set(m["files"]) == {"pkg/example/thing.go", "pkg/example/other.go", "pkg/example/extra.go"},
+            "merge_steps_by_scope: files is the union of every proposal for the scope",
+            str(m["files"]),
+        )
+        check(
+            set(m["planners"]) == {"claude-fable-5-1", "codex-gpt-terra"},
+            "merge_steps_by_scope: planners lists every planner id that proposed the scope",
+            str(m["planners"]),
+        )
+        check(m["step_id"] == "step-001", "merge_steps_by_scope: merged step is renumbered from 1", m["step_id"])
+        check(m["sweep_id"] == step_a["sweep_id"], "merge_steps_by_scope: sweep_id is preserved")
+        check(m["commit_sha"] == step_a["commit_sha"], "merge_steps_by_scope: commit_sha is preserved")
+
+
+def test_merge_steps_by_scope_keeps_distinct_scopes_separate():
+    step_a = valid_step("step-001", scope=["pkg/a/a.go"], planners=["planner-a"])
+    step_b = valid_step("step-002", scope=["pkg/b/b.go"], planners=["planner-b"])
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+
+    check(len(merged) == 2, "merge_steps_by_scope: two distinct scopes stay two separate steps", str(merged))
+    scopes = {tuple(sorted(m["scope"])) for m in merged}
+    check(
+        scopes == {("pkg/a/a.go",), ("pkg/b/b.go",)},
+        "merge_steps_by_scope: each step keeps its own scope",
+        str(scopes),
+    )
+    check(
+        {m["step_id"] for m in merged} == {"step-001", "step-002"},
+        "merge_steps_by_scope: distinct scopes are numbered sequentially",
+        str({m["step_id"] for m in merged}),
+    )
+
+
+def test_merge_steps_by_scope_treats_equivalent_string_and_list_scope_as_the_same():
+    # A single-package scope may be written as a bare string by one planner
+    # and an equivalent one-element list by another (validate_step accepts
+    # both shapes) -- they must still merge into one step, not two.
+    step_a = valid_step("step-001", scope="pkg/example", files=["pkg/example/a.go"], planners=["planner-a"])
+    step_b = valid_step("step-001", scope=["pkg/example"], files=["pkg/example/b.go"], planners=["planner-b"])
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+
+    check(len(merged) == 1, "merge_steps_by_scope: a bare-string scope and its equivalent one-element list merge together", str(merged))
+    if merged:
+        check(
+            set(merged[0]["files"]) == {"pkg/example/a.go", "pkg/example/b.go"},
+            "merge_steps_by_scope: files still union across the two shapes",
+            str(merged[0]["files"]),
+        )
+
+
+def test_merge_steps_by_scope_is_idempotent_on_an_already_merged_list():
+    step = valid_step("step-001", scope=["pkg/a/a.go"], files=["pkg/a/a.go"], planners=["planner-a", "planner-b"])
+    once = planner.merge_steps_by_scope([step])
+    twice = planner.merge_steps_by_scope(once)
+    check(once == twice, "merge_steps_by_scope: merging an already-merged list changes nothing", str((once, twice)))
+
+
+# --- launch() multi-planner dispatch (C6) ------------------------------------
+
+def test_launch_single_planner_default_is_unchanged_by_the_planners_parameter():
+    # REQUIRED TEST (regression anchor): passing no `planners` argument at
+    # all -- the exact call every pre-C6 caller makes -- must still produce
+    # the exact single hardcoded invocation. This duplicates
+    # test_launch_invokes_agent_dispatch_with_plan_mode's assertion
+    # deliberately, as an explicit anchor for the "unchanged" requirement.
+    with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
+        os.makedirs(os.path.join(sweep_dir, "plan"))
+        with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
+            f.write("prompt text\n")
+
+        stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
+        write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
+        log_path = os.path.join(bin_dir, "stub.log")
+
+        env_backup = os.environ.get("STUB_LOG")
+        os.environ["STUB_LOG"] = log_path
+        try:
+            planner.launch(sweep_dir, dispatch_script=stub_path, planners=None)
+        finally:
+            if env_backup is None:
+                os.environ.pop("STUB_LOG", None)
+            else:
+                os.environ["STUB_LOG"] = env_backup
+
+        with open(log_path) as f:
+            invoked_args = f.read().strip()
+        check(
+            invoked_args == f"ARGS:launch-investigator --sweep-dir {sweep_dir} --mode plan",
+            "launch: planners=None still invokes the exact single hardcoded call, no --harness/--model",
+            invoked_args,
+        )
+
+
+def test_launch_multi_planner_dispatches_one_container_per_roster_entry():
+    with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
+        os.makedirs(os.path.join(sweep_dir, "plan"))
+        with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
+            f.write("prompt text for planners\n")
+
+        stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
+        write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
+        log_path = os.path.join(bin_dir, "stub.log")
+
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        env_backup = os.environ.get("STUB_LOG")
+        os.environ["STUB_LOG"] = log_path
+        try:
+            output = planner.launch(sweep_dir, dispatch_script=stub_path, planners=lanes)
+        finally:
+            if env_backup is None:
+                os.environ.pop("STUB_LOG", None)
+            else:
+                os.environ["STUB_LOG"] = env_backup
+
+        check("LAUNCHED_INVESTIGATOR:plan:" in output, "launch: multi-planner returns launch output for every entry")
+        with open(log_path) as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        check(len(lines) == 2, "launch: multi-planner dispatches exactly one launch-investigator call per roster entry", str(lines))
+
+        for lane in lanes:
+            lane_sweep_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, lane.lane_dir_name)
+            expected = (
+                f"ARGS:launch-investigator --sweep-dir {lane_sweep_dir} --mode plan "
+                f"--harness {lane.harness} --model {lane.model}"
+            )
+            check(expected in lines, f"launch: {lane.lane_dir_name} dispatched with its own --sweep-dir/--harness/--model", str(lines))
+            prompt_copy = os.path.join(lane_sweep_dir, "plan", planner.PROMPT_FILENAME)
+            check(os.path.isfile(prompt_copy), f"launch: {lane.lane_dir_name} got its own copy of the prepared prompt")
+            with open(prompt_copy) as f:
+                check(f.read() == "prompt text for planners\n", f"launch: {lane.lane_dir_name}'s prompt copy matches the prepared prompt")
+
+
+def test_launch_multi_planner_attempts_every_entry_even_if_one_fails():
+    # One bad entry must not stop the others from dispatching (matches
+    # security-review.sh's dispatch_roster_lanes for finder lanes).
+    with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
+        os.makedirs(os.path.join(sweep_dir, "plan"))
+        with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
+            f.write("prompt\n")
+
+        stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
+        log_path = os.path.join(bin_dir, "stub.log")
+        write_stub_script(
+            stub_path,
+            """#!/usr/bin/env bash
+set -uo pipefail
+echo "ARGS:$*" >> "$STUB_LOG"
+case "$*" in
+  *"--harness codex"*) echo "LAUNCH_FAILED:boom" >&2; exit 1 ;;
+  *) echo "LAUNCHED_INVESTIGATOR:plan:deadbeef"; exit 0 ;;
+esac
+""",
+        )
+
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        env_backup = os.environ.get("STUB_LOG")
+        os.environ["STUB_LOG"] = log_path
+        try:
+            raised = False
+            try:
+                planner.launch(sweep_dir, dispatch_script=stub_path, planners=lanes)
+            except planner.PlannerError as exc:
+                raised = True
+                check("codex-gpt-terra" in str(exc), "launch: the raised error names the failing entry", str(exc))
+        finally:
+            if env_backup is None:
+                os.environ.pop("STUB_LOG", None)
+            else:
+                os.environ["STUB_LOG"] = env_backup
+
+        check(raised, "launch: raises PlannerError when any roster entry fails to dispatch")
+        with open(log_path) as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        check(len(lines) == 2, "launch: the claude entry is still attempted despite codex's failure", str(lines))
+
+
+# --- finalize_multi_planner() (C6) -------------------------------------------
+
+def _write_planner_step(sweep_dir: str, lane_dir_name: str, filename: str, data: object) -> None:
+    lane_plan_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, lane_dir_name, "plan")
+    os.makedirs(lane_plan_dir, exist_ok=True)
+    write_step(lane_plan_dir, filename, data)
+
+
+def test_finalize_multi_planner_merges_overlapping_scopes_from_two_planners():
+    # REQUIRED TEST: given two planner passes proposing overlapping scopes
+    # with different file lists, the merged plan produces exactly one step
+    # per distinct scope, with files the union of both proposals and
+    # planners listing both planner ids.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir,
+            "claude-fable-5-1",
+            "step-001.json",
+            valid_step("step-001", scope=["pkg/example/thing.go"], files=["pkg/example/thing.go"]),
+        )
+        _write_planner_step(
+            sweep_dir,
+            "codex-gpt-terra",
+            "step-001.json",
+            valid_step("step-001", scope=["pkg/example/thing.go"], files=["pkg/example/extra.go"]),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds when both planners contribute a valid step", str(errors))
+
+        merged_files = sorted(os.listdir(os.path.join(sweep_dir, "plan")))
+        step_files = [f for f in merged_files if planner.STEP_FILENAME_RE.match(f)]
+        check(len(step_files) == 1, "finalize_multi_planner: exactly one merged step for the overlapping scope", str(step_files))
+
+        with open(os.path.join(sweep_dir, "plan", step_files[0])) as f:
+            merged = json.load(f)
+        check(
+            set(merged["files"]) == {"pkg/example/thing.go", "pkg/example/extra.go"},
+            "finalize_multi_planner: files is the union of both planners' proposals",
+            str(merged["files"]),
+        )
+        check(
+            set(merged["planners"]) == {"claude-fable-5-1", "codex-gpt-terra"},
+            "finalize_multi_planner: planners lists both planner ids",
+            str(merged["planners"]),
+        )
+
+
+def test_finalize_multi_planner_keeps_non_overlapping_scopes_from_each_planner():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"], files=["pkg/a/a.go"]),
+        )
+        _write_planner_step(
+            sweep_dir, "codex-gpt-terra", "step-001.json",
+            valid_step("step-001", scope=["pkg/b/b.go"], files=["pkg/b/b.go"]),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds with two distinct scopes", str(errors))
+
+        step_files = [f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f)]
+        check(len(step_files) == 2, "finalize_multi_planner: non-overlapping scopes stay as two separate steps", str(step_files))
+
+
+def test_finalize_multi_planner_fails_closed_when_zero_steps_survive():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1")
+        # No step files written under the planner's directory at all.
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is False, "finalize_multi_planner: zero surviving steps across every planner is a failure")
+        check(
+            os.path.isfile(os.path.join(sweep_dir, "plan", planner.FAILURE_MARKER_FILENAME)),
+            "finalize_multi_planner: writes PLANNING_FAILED when nothing survives",
+        )
+
+
+def test_finalize_multi_planner_fails_closed_on_missing_sweep_context():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        lanes = roster.parse_roster("claude:fable-5-1")
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"]),
+        )
+        # No .plan-context.json written -- must fail closed exactly like
+        # the single-planner finalize() does.
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is False, "finalize_multi_planner: a missing sweep context fails closed")
+        check(
+            any(planner.CONTEXT_FILENAME in e for e in errors),
+            "finalize_multi_planner: reports the missing sweep context as the reason",
+            str(errors),
+        )
+        check(
+            os.path.isfile(os.path.join(sweep_dir, "plan", planner.FAILURE_MARKER_FILENAME)),
+            "finalize_multi_planner: writes PLANNING_FAILED on missing context",
+        )
+
+
+def test_finalize_multi_planner_excludes_only_the_invalid_step():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"]),
+        )
+        # Invalid: spans two top-level subtrees.
+        _write_planner_step(
+            sweep_dir, "codex-gpt-terra", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go", "features/x/y.go"]),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: one valid planner proposal is enough to succeed", str(errors))
+        check(len(errors) >= 1, "finalize_multi_planner: the invalid proposal's error is still reported", str(errors))
+
+        step_files = [f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f)]
+        check(len(step_files) == 1, "finalize_multi_planner: only the valid proposal survives into the merged plan", str(step_files))
+
+
+def test_finalize_multi_planner_single_configured_planner_matches_a_plain_merge():
+    # The "ordinary case" from a roster of exactly one entry: with only one
+    # planner contributing, merging is a no-op -- one step in, one step out,
+    # `planners` naming just that one entry.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1")
+
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"], files=["pkg/a/a.go"]),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: a single-entry roster still succeeds", str(errors))
+
+        step_files = [f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f)]
+        check(len(step_files) == 1, "finalize_multi_planner: a single-entry roster produces exactly one step")
+        with open(os.path.join(sweep_dir, "plan", step_files[0])) as f:
+            merged = json.load(f)
+        check(merged["planners"] == ["claude-fable-5-1"], "finalize_multi_planner: planners names the one configured entry", merged["planners"])
+
+
+# --- CLI env-var wiring (CFGMS_SECURITY_REVIEW_PLANNERS) ---------------------
+
+def _with_env(name: str, value: str | None, fn):
+    backup = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        return fn()
+    finally:
+        if backup is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = backup
+
+
+def test_planners_from_env_returns_none_when_unset():
+    result = _with_env("CFGMS_SECURITY_REVIEW_PLANNERS", None, planner._planners_from_env)
+    check(result is None, "_planners_from_env: returns None when CFGMS_SECURITY_REVIEW_PLANNERS is unset", repr(result))
+
+
+def test_planners_from_env_parses_a_configured_roster():
+    result = _with_env("CFGMS_SECURITY_REVIEW_PLANNERS", "claude:fable-5-1", planner._planners_from_env)
+    check(
+        result == [roster.Lane(harness="claude", model="fable-5-1", lane_dir_name="claude-fable-5-1")],
+        "_planners_from_env: parses a configured single-entry roster",
+        str(result),
+    )
+
+
+def test_planners_from_env_raises_on_malformed_value():
+    raised = False
+    try:
+        _with_env("CFGMS_SECURITY_REVIEW_PLANNERS", "not-a-valid-entry", planner._planners_from_env)
+    except roster.RosterError:
+        raised = True
+    check(raised, "_planners_from_env: raises RosterError on a malformed CFGMS_SECURITY_REVIEW_PLANNERS value")
 
 
 def test_detect_repo_root_delegates_to_shared_basedir_implementation():

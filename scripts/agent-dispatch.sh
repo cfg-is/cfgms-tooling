@@ -1114,10 +1114,14 @@ Commands:
                                             rw as /workspace-out, and execs --lane-entrypoint's script.
                                             --harness/--model (Issue #3932) select a subscription
                                             agent harness: --harness claude mounts
-                                            ~/.claude/.credentials.json read-only (plan mode's own
-                                            mount is separate and untouched) and both flags set
+                                            ~/.claude/.credentials.json read-only and both flags set
                                             CFGMS_SECURITY_REVIEW_HARNESS/_MODEL/_LANE_ID in the
-                                            container. Only `claude` is wired today. This is the
+                                            container. Only `claude` is wired today; any other
+                                            harness id gets NO credential mount. Credential delivery
+                                            is harness-gated in both modes — plan mode mounts the
+                                            Claude credential (read-only) only when --harness is
+                                            omitted, so a non-claude planner never receives it and
+                                            --harness claude yields exactly one mount. This is the
                                             only credential-delivery mechanism for lane mode (Issue
                                             #3933 retired the OS-keychain per-lane credential-name
                                             flag in full, with the three REST lanes that were its
@@ -2787,9 +2791,38 @@ PROMPT_EOF
     fi
 
     if [[ "$inv_mode" == "plan" ]]; then
-      gate_credentials_for_launch
       inv_out_mount=(-v "${inv_plan_dir}:/workspace-out:rw")
-      claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json")
+      # Credential delivery is gated on the HARNESS ID in plan mode exactly as
+      # it already is in lane mode (`inv_harness_creds_mount` below), and the
+      # mount is read-only in both. Multi-planner dispatch (Issue #3937) made
+      # `--mode plan` reachable with `--harness`/`--model`, which this branch
+      # predates: before that, plan mode was only ever launched without
+      # `--harness`, so the unconditional Claude mount always matched the
+      # harness that ran. Combining the two would have (a) handed the host's
+      # live Claude OAuth session to a container running a THIRD-PARTY harness
+      # that deliberately ingests untrusted repository source and third-party
+      # model output, and (b) for `--harness claude`, emitted two `-v` flags
+      # with the same container destination and conflicting rw/ro modes.
+      #
+      # So: mount the Claude credential here ONLY on the no-`--harness` legacy
+      # invocation, and let the harness block below be the single owner of the
+      # mount whenever `--harness` is supplied. An unwired harness gets no
+      # credential at all; investigator-entrypoint.sh's plan branch then fails
+      # closed on its own `~/.claude/.credentials.json` check rather than
+      # running with someone else's session.
+      #
+      # :ro, not rw. The container refreshes an OAuth token in memory for the
+      # life of the process; it never needs to write back to the host file, and
+      # rw let a container that ingests untrusted input overwrite the host's
+      # live credential. Lane mode has always mounted this :ro and drives the
+      # same `claude` CLI (lanes/claude_lane.py), so read-only is proven for
+      # this exact binary.
+      if [[ -z "$inv_harness" || "$inv_harness" == "claude" ]]; then
+        gate_credentials_for_launch
+      fi
+      if [[ -z "$inv_harness" ]]; then
+        claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+      fi
     else
       # Second, independent check on the same property the lane-id pattern
       # above enforces syntactically: the thing about to be mounted rw must
@@ -2819,15 +2852,18 @@ PROMPT_EOF
     # the ONLY credential-delivery mechanism for lane mode (Issue #3933
     # retired the OS-keychain per-lane credential-name flag in full, along
     # with the three REST lanes that were its only callers).
-    # Generalizes the plan-mode-only mount two blocks up
-    # (`claude_creds_mount`, left untouched — plan mode's own invocation is
-    # unaffected by this flag) so a lane can authenticate as a subscription
-    # agent harness's own session instead of an OS-keychain API key. Only
-    # `claude` is wired for this story (STORY-7/8 add codex/opencode); an
-    # unrecognized harness id gets the env vars below but no credential
-    # mount, which is a deliberate no-op rather than a hard failure — the
-    # roster mechanism (C5) is proven in this story against a stub harness
-    # that legitimately has no credential file of its own.
+    # Supersedes the mount two blocks up (`claude_creds_mount`) whenever
+    # `--harness` is supplied, in EITHER mode, so a container can authenticate
+    # as a subscription agent harness's own session instead of an OS-keychain
+    # API key — and so exactly one `-v` ever targets
+    # /home/agent/.claude/.credentials.json. Since Issue #3937 multi-planner
+    # dispatch, `--mode plan --harness <id>` is a real call shape; the plan
+    # branch above therefore mounts nothing of its own when `--harness` is
+    # present. Only `claude` is wired for this story (STORY-7/8 add
+    # codex/opencode); an unrecognized harness id gets the env vars below but
+    # no credential mount, which is a deliberate no-op rather than a hard
+    # failure — the roster mechanism (C5) is proven in this story against a
+    # stub harness that legitimately has no credential file of its own.
     inv_harness_creds_mount=()
     inv_harness_env=()
     if [[ -n "$inv_harness" ]]; then

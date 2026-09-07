@@ -40,6 +40,21 @@ check_not_contains() {
   if [[ "$hay" != *"$needle"* ]]; then ok "$desc"
   else bad "$desc" "must NOT contain: ${needle}"; fi
 }
+# check_cred_mount_count <desc> <rendered-run-argv> <want> — counts how many
+# `-v` flags in one rendered `docker run` target the container-side
+# credential path. Docker rejects two mounts with the same destination, so
+# "exactly one" is a launchability property, not only a hygiene one; the
+# destination string appears once per `-v` and nowhere else in the argv.
+CRED_DEST="/home/agent/.claude/.credentials.json"
+check_cred_mount_count() {
+  local desc="$1" hay="$2" want="$3" got
+  # `grep -o` exits 1 on no match, which under `set -e -o pipefail` would
+  # abort the run instead of reporting zero mounts -- zero is the expected
+  # answer for a non-claude harness, so it must be a value, not a failure.
+  got=$( { grep -o -- "$CRED_DEST" <<<"$hay" || true; } | wc -l | tr -d ' ')
+  if [[ "$got" == "$want" ]]; then ok "$desc"
+  else bad "$desc" "want ${want} mount(s) of ${CRED_DEST}, got ${got}"; fi
+}
 # strip_comments <text> — drops full-line `#` comments before a "never does
 # X" check, so the check asserts on actual code, not on this file's own
 # prose explaining why it deliberately avoids X (which necessarily contains
@@ -211,6 +226,8 @@ check_contains "rendered docker run carries the disallowed-tools env var" "$run_
 check_contains "rendered docker run grants NET_ADMIN" "$run_call" "--cap-add NET_ADMIN"
 check_contains "rendered disallowed-tools env var refuses curl" "$run_call" "Bash(curl:*)"
 check_contains "rendered disallowed-tools env var refuses wget" "$run_call" "Bash(wget:*)"
+check_contains "plan mode without --harness mounts the Claude credential read-only" "$run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_cred_mount_count "plan mode without --harness renders exactly one credential mount" "$run_call" 1
 
 : > "$DOCKER_CALL_LOG"
 # --lane-entrypoint must point at an existing file; use this test script
@@ -238,15 +255,17 @@ check_contains "lane mode grants NET_ADMIN for the firewall init" "$lane_run_cal
 
 echo ""
 echo "== REQUIRED TEST evidence — --harness/--model generalize the credential mount"
-echo "   without changing plan mode's own invocation (Issue #3932, epic #3927's C2) =="
+echo "   (Issue #3932, epic #3927's C2) =="
 check_contains "launch-investigator accepts --harness" "$launch_block_code" '--harness)'
 check_contains "launch-investigator accepts --model" "$launch_block_code" '--model)'
 check_contains "usage() documents --harness/--model" "$dispatch_src" '--harness <ID>'
-# Plan mode's own credential mount variable must remain byte-for-byte the
-# same (still no ":ro" suffix) -- the --harness generalization is a
-# separate mount/env block, never a rewrite of this line.
-check_contains "plan mode's own credential mount is untouched (still writable, unchanged)" "$launch_block_code" 'claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json")'
-check_contains "the --harness claude mount is read-only, distinct from plan mode's mount" "$launch_block_code" 'inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
+# EVERY credential mount rendered by this case block is read-only. Since
+# Issue #3937's multi-planner dispatch, `--mode plan` is reachable with
+# `--harness`, so a writable Claude credential in plan mode would be handed
+# to whichever harness the roster names.
+check_not_contains "no credential mount in this block is writable" "$launch_block_code" '.credentials.json:/home/agent/.claude/.credentials.json"'
+check_contains "plan mode's own credential mount is read-only" "$launch_block_code" 'claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
+check_contains "the --harness claude mount is read-only" "$launch_block_code" 'inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
 
 : > "$DOCKER_CALL_LOG"
 harness_out=$(PATH="${FAKEBIN}:${PATH}" \
@@ -275,6 +294,48 @@ check_contains "an unwired --harness still dispatches (env vars set, no error)" 
 unwired_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "an unwired --harness still sets CFGMS_SECURITY_REVIEW_HARNESS" "$unwired_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
 check_not_contains "an unwired --harness gets no claude credential mount" "$unwired_run_call" ".claude/.credentials.json"
+
+echo ""
+echo '== REQUIRED TEST evidence — "--mode plan --harness <id>" is harness-gated'
+echo "   (Issue #3937 multi-planner dispatch) =="
+# Multi-planner dispatch (planner.py) is the first caller to combine
+# `--mode plan` with `--harness`/`--model`. Two properties are asserted on
+# the RENDERED argv, because both are invisible in the single-planner path:
+#   1. A non-claude planner must not receive the host's live Claude OAuth
+#      session -- that container runs a third-party harness that ingests
+#      untrusted repository source and third-party model output.
+#   2. `--harness claude` must render exactly ONE `-v` for the credential
+#      destination. Two mounts with the same destination and conflicting
+#      rw/ro modes are rejected by the daemon (and, if tolerated, leave the
+#      effective mode of a live credential file undefined).
+: > "$DOCKER_CALL_LOG"
+plan_harness_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan \
+    --harness claude --model sonnet-5 2>&1)
+check_contains "plan mode with --harness claude launches" "$plan_harness_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
+plan_harness_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_cred_mount_count "plan --harness claude renders exactly one credential mount" "$plan_harness_run_call" 1
+check_contains "plan --harness claude mounts the credential read-only" "$plan_harness_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "plan --harness claude sets CFGMS_SECURITY_REVIEW_HARNESS=claude" "$plan_harness_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
+check_contains "plan --harness claude still mounts plan/ as /workspace-out:rw" "$plan_harness_run_call" "${SWEEP_DIR}/plan:/workspace-out:rw"
+
+: > "$DOCKER_CALL_LOG"
+plan_foreign_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan \
+    --harness stub --model stubmodel 2>&1)
+check_contains "plan mode with a non-claude --harness launches" "$plan_foreign_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
+plan_foreign_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_cred_mount_count "plan --harness stub renders NO credential mount" "$plan_foreign_run_call" 0
+check_not_contains "plan --harness stub never sees the host Claude credential" "$plan_foreign_run_call" ".claude/.credentials.json"
+check_contains "plan --harness stub still sets CFGMS_SECURITY_REVIEW_HARNESS" "$plan_foreign_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
 
 echo ""
 echo "== REQUIRED TEST evidence — --mode path traversal cannot widen the writable mount =="

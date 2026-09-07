@@ -92,6 +92,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import basedir  # noqa: E402
 import metadata  # noqa: E402
+import roster  # noqa: E402
 import schema  # noqa: E402
 
 PROMPT_FILENAME = ".investigator-plan-prompt.md"
@@ -99,10 +100,18 @@ CONTEXT_FILENAME = ".plan-context.json"
 FAILURE_MARKER_FILENAME = "PLANNING_FAILED"
 STEP_FILENAME_RE = re.compile(r"^step-(\d{3,})\.json$")
 
-# The identifier this story's single planner records in every step's
-# `planners` field. C6 (multi-planner merge) is out of scope here; this is
-# deliberately a fixed constant rather than something read from config, so
-# there is exactly one planner identity until C6 introduces a roster.
+# Sub-sweep-dirs for multi-planner dispatch (C6) live under this directory,
+# one per roster entry, named for that entry's own `lane_dir_name` -- see
+# `launch()`'s multi-planner path and `finalize_multi_planner()`.
+PLANNERS_SUBDIR = "planners"
+
+# The identifier the single, hardcoded planner records in every step's
+# `planners` field when `CFGMS_SECURITY_REVIEW_PLANNERS` (C6, epic #3927's
+# contract C5) is unset -- the legacy path this story must not regress.
+# When a roster IS configured, each entry's own `roster.Lane.lane_dir_name`
+# is its planner identity instead (see `finalize_multi_planner()`), the same
+# "harness-model pair names the directory" convention C5 already uses for
+# finder lanes -- this constant is never used on that path.
 PLANNER_ID = "metadata-only-planner"
 
 
@@ -242,14 +251,59 @@ def default_dispatch_script(repo_root: str | None = None) -> str:
     return os.path.join(root, ".claude", "scripts", "agent-dispatch.sh")
 
 
-def launch(sweep_dir: str, repo_root: str | None = None, dispatch_script: str | None = None) -> str:
+def launch(
+    sweep_dir: str,
+    repo_root: str | None = None,
+    dispatch_script: str | None = None,
+    planners: "list[roster.Lane] | None" = None,
+) -> str:
     """Invoke `agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --mode plan`.
 
-    Fire-and-forget: returns as soon as the launch command returns, exactly
-    like the underlying `docker run -d`. This function's only job is to prove
-    the planner dispatches through the one launch primitive #3903 built --
-    it adds no launch mechanism of its own. Raises `PlannerError` if the
-    prompt has not been written yet or the launch command exits non-zero.
+    `planners` is `None` by default, which preserves this function's
+    original, single hardcoded call exactly as it has always been -- no
+    `--harness`/`--model` flags, one container, writing directly into
+    `<sweep_dir>/plan/`. That is the legacy path this story must not
+    regress (STORY-1's tests call `launch()` this way and must keep passing
+    unmodified).
+
+    When `planners` holds a roster (C6, epic #3927's contract C5 --
+    `CFGMS_SECURITY_REVIEW_PLANNERS`, parsed by `roster.parse_roster()`),
+    this dispatches one plan-mode investigator PER entry, each with that
+    entry's own `--harness`/`--model` (STORY-5a's plumbing). Each planner
+    gets its own `<sweep_dir>/planners/<lane_dir_name>/` sub-sweep-dir rather
+    than the shared `<sweep_dir>/plan/` the legacy path writes into:
+    `agent-dispatch.sh launch-investigator --mode plan` always mounts
+    `<the --sweep-dir you pass>/plan` writable as the container's only
+    output directory and derives the container name from that same
+    `--sweep-dir`'s basename, so two planners sharing one `--sweep-dir`
+    would collide both on the container name and on `step-NNN.json`
+    filenames written concurrently by independent containers. A copy of the
+    already-prepared prompt is placed in each sub-sweep-dir's own `plan/`
+    before dispatch, since that is where the container looks for it
+    (`investigator-entrypoint.sh`'s plan mode reads
+    `/workspace-out/.investigator-plan-prompt.md`) and every planner reviews
+    the same metadata regardless of which harness/model executes it.
+    `finalize_multi_planner()` is what later reads these directories back
+    and merges their output by scope.
+
+    Credential delivery for these containers is the launcher's business and
+    is gated there on the harness id: `agent-dispatch.sh` mounts the host's
+    Claude session ONLY for the no-`--harness` legacy call above and for
+    `--harness claude`, read-only in both cases. A roster entry naming a
+    harness that is not yet wired gets no credential and its container fails
+    closed in `investigator-entrypoint.sh` -- this function never needs, and
+    must never grow, harness-specific credential handling of its own.
+
+    Fire-and-forget per entry: returns as soon as every launch command has
+    returned, exactly like the underlying `docker run -d`. Every entry is
+    still attempted even if an earlier one fails to launch (matching
+    `security-review.sh`'s `dispatch_roster_lanes` -- one bad entry must not
+    stop the others from dispatching); `PlannerError` is raised once, after
+    every entry has been attempted, summarizing every failure.
+
+    Raises `PlannerError` if the prompt has not been written yet, if
+    `agent-dispatch.sh` cannot be found, or if any launch command exits
+    non-zero.
     """
     prompt_path = os.path.join(sweep_dir, "plan", PROMPT_FILENAME)
     if not os.path.isfile(prompt_path):
@@ -261,22 +315,68 @@ def launch(sweep_dir: str, repo_root: str | None = None, dispatch_script: str | 
     if not os.path.isfile(script):
         raise PlannerError(f"agent-dispatch.sh not found at {script}")
 
-    try:
-        result = subprocess.run(
-            [script, "launch-investigator", "--sweep-dir", sweep_dir, "--mode", "plan"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise PlannerError(f"launch-investigator failed to run: {exc}") from exc
+    if not planners:
+        try:
+            result = subprocess.run(
+                [script, "launch-investigator", "--sweep-dir", sweep_dir, "--mode", "plan"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise PlannerError(f"launch-investigator failed to run: {exc}") from exc
 
-    if result.returncode != 0:
-        raise PlannerError(
-            f"launch-investigator exited {result.returncode}: "
-            f"{result.stdout.strip()} {result.stderr.strip()}"
-        )
-    return result.stdout
+        if result.returncode != 0:
+            raise PlannerError(
+                f"launch-investigator exited {result.returncode}: "
+                f"{result.stdout.strip()} {result.stderr.strip()}"
+            )
+        return result.stdout
+
+    with open(prompt_path, "r") as f:
+        prompt_text = f.read()
+
+    outputs: list[str] = []
+    failures: list[str] = []
+    for lane in planners:
+        lane_plan_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan")
+        os.makedirs(lane_plan_dir, exist_ok=True)
+        atomic_write.write_text_atomic(os.path.join(lane_plan_dir, PROMPT_FILENAME), prompt_text)
+
+        try:
+            result = subprocess.run(
+                [
+                    script,
+                    "launch-investigator",
+                    "--sweep-dir",
+                    os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name),
+                    "--mode",
+                    "plan",
+                    "--harness",
+                    lane.harness,
+                    "--model",
+                    lane.model,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append(f"{lane.lane_dir_name}: launch-investigator failed to run: {exc}")
+            continue
+
+        if result.returncode != 0:
+            failures.append(
+                f"{lane.lane_dir_name}: launch-investigator exited {result.returncode}: "
+                f"{result.stdout.strip()} {result.stderr.strip()}"
+            )
+            continue
+
+        outputs.append(result.stdout)
+
+    if failures:
+        raise PlannerError("planner dispatch failed for one or more roster entries: " + "; ".join(failures))
+    return "".join(outputs)
 
 
 def _scope_paths(scope: object) -> list[str] | None:
@@ -368,6 +468,93 @@ def validate_step(data: object, filename: str) -> list[str]:
                 )
 
     return errors
+
+
+def _scope_key(scope: object) -> tuple[str, ...] | None:
+    """A merge key that treats two proposals as "the same scope" (C6) when
+    they name the same set of paths, regardless of list order or of one
+    planner writing a single-package `scope` as a bare string where another
+    wrote the equivalent one-element list -- `_scope_paths()` already
+    normalizes both shapes to a list, so only de-duplication and ordering
+    remain here. Returns `None` for a `scope` `_scope_paths()` cannot make
+    sense of; `merge_steps_by_scope()` skips those (already-validated input
+    is not expected to hit this)."""
+    paths = _scope_paths(scope)
+    if paths is None:
+        return None
+    return tuple(sorted(set(paths)))
+
+
+def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
+    """Merges already-validated plan steps by C6's rule (epic #3927): one
+    merged step per distinct `scope`, `files` the union of every proposal for
+    that scope, `planners` recording every planner id that proposed it. A
+    scope is reviewed once per lane regardless of how many planners proposed
+    it -- this function is what makes that true, by collapsing every
+    proposal for the same scope into one step before any lane ever sees it.
+
+    `files` and `planners` are unioned in first-seen order and de-duplicated
+    -- not sorted -- so which planner "discovered" a file or a scope first is
+    still visible in the ordering, and merging is idempotent (merging an
+    already-merged list changes nothing). Merged steps are numbered
+    `step-001`, `step-002`, ... in the order their scope was first seen
+    across `steps`: the merged output is a new plan, not any single
+    planner's own numbering, so two planners that both happened to call
+    something `step-001` can never collide.
+
+    `sweep_id`/`commit_sha`/`description` are taken from the first proposal
+    seen for a scope. Every candidate passed in must already carry the same
+    `sweep_id`/`commit_sha` -- both are injected from the one sweep-wide
+    `.plan-context.json` sidecar before any step reaches this function -- so
+    there is no real conflict to resolve between proposals, only an
+    arbitrary pick between identical values.
+
+    Callers are expected to have already run each input step through
+    `validate_step()`; this function does no validation of its own and
+    silently drops any step whose `scope` `_scope_paths()` cannot parse.
+    """
+    groups: dict[tuple[str, ...], dict] = {}
+    order: list[tuple[str, ...]] = []
+
+    for step in steps:
+        key = _scope_key(step.get("scope"))
+        if key is None:
+            continue
+
+        if key not in groups:
+            groups[key] = {
+                "sweep_id": step.get("sweep_id"),
+                "commit_sha": step.get("commit_sha"),
+                "scope": step.get("scope"),
+                "description": step.get("description"),
+                "files": [],
+                "planners": [],
+            }
+            order.append(key)
+
+        merged = groups[key]
+        for f in step.get("files") or []:
+            if f not in merged["files"]:
+                merged["files"].append(f)
+        for p in step.get("planners") or []:
+            if p not in merged["planners"]:
+                merged["planners"].append(p)
+
+    merged_steps: list[dict] = []
+    for index, key in enumerate(order, start=1):
+        g = groups[key]
+        merged_steps.append(
+            {
+                "step_id": f"step-{index:03d}",
+                "sweep_id": g["sweep_id"],
+                "commit_sha": g["commit_sha"],
+                "scope": g["scope"],
+                "description": g["description"],
+                "files": g["files"],
+                "planners": g["planners"],
+            }
+        )
+    return merged_steps
 
 
 def _discover_step_files(plan_dir: str) -> list[str]:
@@ -513,6 +700,130 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     return True, errors
 
 
+def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tuple[bool, list[str]]:
+    """`finalize()` for more than one configured planner (C6, Issue #3937,
+    epic #3927). Never called by the legacy single-planner path -- that
+    path calls `finalize()` unmodified, above, and this function's behavior
+    has no effect on it.
+
+    Each `planners` entry ran its own investigator into its own
+    `<sweep_dir>/planners/<lane_dir_name>/plan/` (`launch()`'s multi-planner
+    dispatch) rather than the shared `<sweep_dir>/plan/` a single-planner
+    sweep writes into directly, so this function validates each planner's
+    own directory independently first -- same per-step exclusion, same
+    sweep-context injection from the one sweep-wide sidecar, same
+    fail-closed-on-missing-or-malformed-sidecar rule `finalize()` applies --
+    using that entry's own `lane_dir_name` as the `planners` identity
+    recorded on its steps (never the fixed `PLANNER_ID`, which is the
+    single-hardcoded-planner's identity only). Every validated proposal
+    across every planner is then merged by scope (`merge_steps_by_scope()`)
+    and the merged result is written into the canonical `<sweep_dir>/plan/`
+    -- the one place every lane and the consolidator already read from, so
+    nothing downstream needs to know more than one planner ran.
+
+    Returns `(True, errors)` when at least one merged step survives, exactly
+    like `finalize()`. Returns `(False, errors)` -- with `plan/PLANNING_FAILED`
+    written -- when the sweep context is missing/malformed, or when zero
+    steps survive validation across every configured planner: an empty
+    merged plan must never look like "nothing to review" any more than an
+    empty single-planner plan does.
+    """
+    plan_dir = os.path.join(sweep_dir, "plan")
+    os.makedirs(plan_dir, exist_ok=True)
+    context = _read_sweep_context(sweep_dir)
+
+    errors: list[str] = []
+
+    if context is None:
+        reason = (
+            f"missing or malformed sweep context ({CONTEXT_FILENAME}); "
+            "sweep_id/commit_sha/planners cannot be established"
+        )
+        schema.log_event("missing_plan_context", sweep_dir=sweep_dir, errors=[reason])
+        errors.append(reason)
+        _write_failure_marker(plan_dir, errors)
+        return False, errors
+
+    candidates: list[dict] = []
+    for lane in planners:
+        lane_plan_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan")
+        for filename in _discover_step_files(lane_plan_dir):
+            path = os.path.join(lane_plan_dir, filename)
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as exc:
+                label = f"{lane.lane_dir_name}/{filename}"
+                schema.log_event("invalid_plan_step", filename=label, errors=[str(exc)])
+                errors.append(f"{label}: could not parse as JSON: {exc}")
+                continue
+
+            if isinstance(data, dict):
+                data["sweep_id"] = context["sweep_id"]
+                data["commit_sha"] = context["commit_sha"]
+                data["planners"] = [lane.lane_dir_name]
+
+            step_errors = validate_step(data, filename)
+            if step_errors:
+                label = f"{lane.lane_dir_name}/{filename}"
+                schema.log_event("invalid_plan_step", filename=label, errors=step_errors)
+                errors.extend(f"{lane.lane_dir_name}/{e}" for e in step_errors)
+                continue
+
+            candidates.append(data)
+
+    if not candidates:
+        errors.append("no step-NNN.json files survived validation across any configured planner")
+        _write_failure_marker(plan_dir, errors)
+        return False, errors
+
+    merged = merge_steps_by_scope(candidates)
+
+    for filename in _discover_step_files(plan_dir):
+        try:
+            os.remove(os.path.join(plan_dir, filename))
+        except OSError:
+            pass
+
+    for step in merged:
+        step_filename = f"{step['step_id']}.json"
+        step_errors = validate_step(step, step_filename)
+        if step_errors:
+            # Unreachable in practice: every candidate already validated
+            # individually, and merging only unions `files`/`planners`
+            # across already-valid values -- kept as a defensive guard
+            # rather than an assumption.
+            errors.extend(step_errors)
+            continue
+        atomic_write.write_json_atomic(os.path.join(plan_dir, step_filename), step)
+
+    if not _discover_step_files(plan_dir):
+        _write_failure_marker(plan_dir, errors)
+        return False, errors
+
+    return True, errors
+
+
+def _planners_from_env() -> "list[roster.Lane] | None":
+    """Parses `CFGMS_SECURITY_REVIEW_PLANNERS` (C6, epic #3927's contract C5)
+    for the CLI, or returns `None` when it is unset -- the single hardcoded
+    planner remains the default when nothing configures a roster. Raises
+    `roster.RosterError` on a malformed value, exactly like
+    `CFGMS_SECURITY_REVIEW_LANES` already fails closed in
+    `security-review.sh` for finder lanes: a configuration mistake here must
+    surface loudly, never fall back silently to the single-planner path.
+
+    Python callers (`launch()`/`finalize_multi_planner()`) always take the
+    roster as an explicit argument instead of reading this environment
+    variable themselves, so tests exercise the multi-planner path without
+    mutating process environment.
+    """
+    value = os.environ.get("CFGMS_SECURITY_REVIEW_PLANNERS")
+    if not value or not value.strip():
+        return None
+    return roster.parse_roster(value)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -544,14 +855,28 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.action == "launch":
         try:
-            output = launch(args.sweep_dir, repo_root=args.repo_root)
+            planners = _planners_from_env()
+        except roster.RosterError as exc:
+            print(f"ERROR: could not parse CFGMS_SECURITY_REVIEW_PLANNERS: {exc}", file=sys.stderr)
+            return 1
+        try:
+            output = launch(args.sweep_dir, repo_root=args.repo_root, planners=planners)
         except PlannerError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         print(output, end="")
         return 0
 
-    ok, errors = finalize(args.sweep_dir)
+    try:
+        planners = _planners_from_env()
+    except roster.RosterError as exc:
+        print(f"ERROR: could not parse CFGMS_SECURITY_REVIEW_PLANNERS: {exc}", file=sys.stderr)
+        return 1
+
+    if planners:
+        ok, errors = finalize_multi_planner(args.sweep_dir, planners)
+    else:
+        ok, errors = finalize(args.sweep_dir)
     if not ok:
         print("PLANNING_FAILED:" + "; ".join(errors), file=sys.stderr)
         return 1
