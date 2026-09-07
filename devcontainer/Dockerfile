@@ -160,6 +160,16 @@ RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.9
 ARG CLAUDE_CODE_VERSION=2.1.258
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+# Codex CLI — pinned, never @latest (same supply-chain rule as Claude Code
+# above; see dependency-pin-check.yml). This is the second subscription
+# agent harness the security review harness dispatches (Issue #3935,
+# epic #3927) — `codex_lane.py` invokes this binary as a subprocess,
+# authenticated by the operator's own `~/.codex/auth.json` session
+# (`agent-dispatch.sh launch-investigator --harness codex`), never an
+# OS-keychain API key.
+ARG CODEX_CLI_VERSION=0.153.4
+RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
+
 # Non-root agent user with sudo for iptables only
 RUN useradd -m -s /bin/bash agent \
     && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \

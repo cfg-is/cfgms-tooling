@@ -64,8 +64,9 @@ CLI="${REPO_ROOT}/.claude/scripts/security-review.sh"
 DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
 SECURITY_REVIEW_DIR="${REPO_ROOT}/.claude/scripts/security-review"
 CLAUDE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/claude_lane.py"
+CODEX_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/codex_lane.py"
 
-for f in "$CLI" "$DISPATCH" "$CLAUDE_LANE_SCRIPT"; do
+for f in "$CLI" "$DISPATCH" "$CLAUDE_LANE_SCRIPT" "$CODEX_LANE_SCRIPT"; do
   [[ -f "$f" ]] || { printf 'FAIL: expected file not found: %s\n' "$f" >&2; exit 1; }
 done
 [[ -x "$CLI" ]] || { printf 'FAIL: %s is not executable\n' "$CLI" >&2; exit 1; }
@@ -671,6 +672,150 @@ check_contains "roster-dispatched container carries CFGMS_SECURITY_REVIEW_LANE_I
 
 report_roster="$(cat "${SWEEP_DIR_ROSTER}/report/consolidated.md" 2>/dev/null || true)"
 check_contains "consolidated report picked up the roster-dispatched claude lane (existing consolidator, unmodified)" "$report_roster" "claude-stubmodel"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TEST (Issue #3935) -- a second, independent harness in the roster.
+# Two independent lane directories for the same step plan, dispatched by the
+# SAME dispatch_roster_lanes loop this file already proved for one harness --
+# `codex` needed zero changes to security-review.sh's dispatch loop (the
+# structural check below proves it: "codex" does not appear in this script's
+# source at all). Reuses the shared FAKEBIN docker stub above (unmodified) --
+# a `codex:<model>` roster entry resolves to `codex_lane.py` by the SAME
+# `${harness}_lane.py` naming convention `dispatch_roster_lanes` already uses
+# for `claude`, so the shared stub's "spawn the real, unmodified lane
+# entrypoint" behavior needs no per-harness special-casing to run it too.
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "== REQUIRED TEST — CFGMS_SECURITY_REVIEW_LANES=claude:<model>,codex:<model>"
+echo "   dispatches two independent lane directories for the same step plan, with"
+echo "   NO change to security-review.sh's dispatch loop (Issue #3935) =="
+SUB_TWOHARNESS="${SANDBOX}/case-two-harness"
+setup_sub_sandbox "$SUB_TWOHARNESS"
+mkdir -p "${SUB_TWOHARNESS}/HOME/.codex"
+echo '{"tokens":{}}' > "${SUB_TWOHARNESS}/HOME/.codex/auth.json"
+
+TWOHARNESS_ENTRYPOINT_DIR="${SANDBOX}/two-harness-lane-entrypoints"
+mkdir -p "$TWOHARNESS_ENTRYPOINT_DIR"
+cp "$CLAUDE_LANE_SCRIPT" "${TWOHARNESS_ENTRYPOINT_DIR}/claude_lane.py"
+cp "$CODEX_LANE_SCRIPT" "${TWOHARNESS_ENTRYPOINT_DIR}/codex_lane.py"
+
+# A stub `codex` binary alongside a copy of the stub `claude` binary above --
+# `codex_lane.py::call_codex_harness` names its output file as an argv value
+# (`--output-last-message <path>`, the CLI's own real flag -- see
+# codex_lane.py's module docstring), never an env var, so this stub parses
+# argv for it instead of reading CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE the
+# way the stub claude binary does.
+TWOHARNESS_BIN_DIR="${SANDBOX}/two-harness-harness-bins"
+mkdir -p "$TWOHARNESS_BIN_DIR"
+cp "${STUB_CLAUDE_BIN_DIR}/claude" "${TWOHARNESS_BIN_DIR}/claude"
+cat > "${TWOHARNESS_BIN_DIR}/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+outcome="${STUB_CODEX_OUTCOME:-complete}"
+output_path=""
+prev=""
+for a in "$@"; do
+  if [[ "$prev" == "--output-last-message" ]]; then
+    output_path="$a"
+  fi
+  prev="$a"
+done
+: "${output_path:?no --output-last-message found in argv}"
+case "$outcome" in
+  complete)
+    printf '{"findings":[]}' > "$output_path"
+    exit 0
+    ;;
+  parked)
+    echo "stub codex: rate limit exceeded, try again later"
+    exit 0
+    ;;
+  refused)
+    echo "stub codex: declining to review this content"
+    exit 0
+    ;;
+  failed)
+    echo "stub codex: simulated crash" >&2
+    exit 1
+    ;;
+  *)
+    echo "stub codex: unrecognized STUB_CODEX_OUTCOME=${outcome}" >&2
+    exit 1
+    ;;
+esac
+CODEX_STUB
+chmod +x "${TWOHARNESS_BIN_DIR}/claude" "${TWOHARNESS_BIN_DIR}/codex"
+
+twoharness_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x,codex:model-y" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
+  STUB_CLAUDE_BIN_DIR="$TWOHARNESS_BIN_DIR" \
+  STUB_PLAN_STEP_COUNT=2 \
+  run_cli "$SUB_TWOHARNESS" launch HEAD 2>"${SUB_TWOHARNESS}/stderr.log")
+twoharness_rc=$?
+check_eq "two-harness roster launch exits 0" "$twoharness_rc" "0"
+SWEEP_DIR_TWOHARNESS="$(dirname "$(dirname "$twoharness_out")")"
+
+for step in step-001 step-002; do
+  [[ -f "${SWEEP_DIR_TWOHARNESS}/lanes/claude-model-x/${step}.findings.json" ]] \
+    && ok "claude-model-x lane produced ${step} findings" \
+    || bad "claude-model-x lane produced ${step} findings" "not found"
+  [[ -f "${SWEEP_DIR_TWOHARNESS}/lanes/codex-model-y/${step}.findings.json" ]] \
+    && ok "codex-model-y lane produced ${step} findings (real codex_lane.py run)" \
+    || bad "codex-model-y lane produced ${step} findings (real codex_lane.py run)" "not found"
+done
+
+twoharness_call_log="$(cat "${SUB_TWOHARNESS}/docker_calls.log")"
+check_contains "codex lane dispatched via launch-investigator --harness codex" "$twoharness_call_log" "CFGMS_SECURITY_REVIEW_HARNESS=codex"
+check_contains "codex lane's container carries CFGMS_SECURITY_REVIEW_MODEL=model-y" "$twoharness_call_log" "CFGMS_SECURITY_REVIEW_MODEL=model-y"
+check_contains "codex lane mounted ~/.codex/auth.json read-only, never the Claude credential" "$twoharness_call_log" "${SUB_TWOHARNESS}/HOME/.codex/auth.json:/home/agent/.codex/auth.json:ro"
+check_not_contains "security-review.sh needed no codex-specific source change to dispatch this two-harness roster" "$cli_src" "codex"
+
+report_twoharness="$(cat "${SWEEP_DIR_TWOHARNESS}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "consolidated report picked up the claude lane of the two-harness roster" "$report_twoharness" "claude-model-x"
+check_contains "consolidated report picked up the codex lane of the two-harness roster" "$report_twoharness" "codex-model-y"
+
+echo ""
+echo "== REQUIRED TEST — a codex lane that fails to launch (no ~/.codex/auth.json on"
+echo "   the host) is recorded as a credential-unavailable skip, the claude lane"
+echo "   still dispatches, and the consolidator still runs (Issue #3935; C5's"
+echo "   'never silently substituted' property, now testable with two harnesses --"
+echo "   reverting to a code path that skips or substitutes the failing lane"
+echo "   silently, rather than recording it and moving on, makes this fail) =="
+SUB_PARTIAL_CRED="${SANDBOX}/case-codex-cred-missing"
+setup_sub_sandbox "$SUB_PARTIAL_CRED"
+# Deliberately no ${SUB_PARTIAL_CRED}/HOME/.codex/auth.json -- the codex
+# lane's host-side credential-availability gate (agent-dispatch.sh) must
+# fail it closed, as a documented skip, before any container is dispatched
+# for it.
+
+partial_cred_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-a,codex:model-z" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
+  STUB_PLAN_STEP_COUNT=2 \
+  run_cli "$SUB_PARTIAL_CRED" launch HEAD 2>"${SUB_PARTIAL_CRED}/stderr.log")
+partial_cred_rc=$?
+check_eq "launch exits 0 when only the codex lane's credential is missing (a documented skip, not a real failure)" "$partial_cred_rc" "0"
+SWEEP_DIR_PARTIAL_CRED="$(dirname "$(dirname "$partial_cred_out")")"
+
+partial_cred_stderr="$(cat "${SUB_PARTIAL_CRED}/stderr.log")"
+check_contains "the codex lane's skip is logged as credential_unavailable" "$partial_cred_stderr" "credential_unavailable"
+check_contains "the codex lane's skip names the codex-model-z lane" "$partial_cred_stderr" "codex-model-z"
+
+[[ -f "${SWEEP_DIR_PARTIAL_CRED}/lanes/claude-model-a/step-001.findings.json" \
+  && -f "${SWEEP_DIR_PARTIAL_CRED}/lanes/claude-model-a/step-002.findings.json" ]] \
+  && ok "the claude lane still dispatched and completed both steps despite the codex lane's missing credential" \
+  || bad "the claude lane still dispatched and completed both steps despite the codex lane's missing credential" "missing findings"
+
+if [[ -d "${SWEEP_DIR_PARTIAL_CRED}/lanes/codex-model-z" ]] \
+  && [[ -z "$(find "${SWEEP_DIR_PARTIAL_CRED}/lanes/codex-model-z" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  ok "the codex lane's own directory is empty -- never silently substituted with another lane's output"
+else
+  bad "the codex lane's own directory is empty" "found unexpected content or directory missing"
+fi
+
+[[ -f "${SWEEP_DIR_PARTIAL_CRED}/report/consolidated.md" ]] \
+  && ok "the consolidator still ran despite the codex lane's credential-unavailable skip" \
+  || bad "the consolidator still ran despite the codex lane's credential-unavailable skip" "not found"
 
 echo ""
 echo "== REQUIRED TEST — roster.py rejects a malformed CFGMS_SECURITY_REVIEW_LANES"

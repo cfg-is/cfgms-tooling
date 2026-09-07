@@ -1114,18 +1114,22 @@ Commands:
                                             rw as /workspace-out, and execs --lane-entrypoint's script.
                                             --harness/--model (Issue #3932) select a subscription
                                             agent harness: --harness claude mounts
-                                            ~/.claude/.credentials.json read-only and both flags set
+                                            ~/.claude/.credentials.json read-only, --harness codex
+                                            mounts ~/.codex/auth.json read-only (Issue #3935; fails
+                                            closed with LAUNCH_FAILED:...:credential_unavailable if
+                                            the file is missing), and both flags set
                                             CFGMS_SECURITY_REVIEW_HARNESS/_MODEL/_LANE_ID in the
-                                            container. Only `claude` is wired today; any other
-                                            harness id gets NO credential mount. Credential delivery
-                                            is harness-gated in both modes — plan mode mounts the
-                                            Claude credential (read-only) only when --harness is
-                                            omitted, so a non-claude planner never receives it and
-                                            --harness claude yields exactly one mount. This is the
-                                            only credential-delivery mechanism for lane mode (Issue
-                                            #3933 retired the OS-keychain per-lane credential-name
-                                            flag in full, with the three REST lanes that were its
-                                            only callers).
+                                            container. `claude`/`codex` are wired; any other harness
+                                            id gets NO credential mount. Credential delivery is
+                                            harness-gated in both modes — plan mode mounts a wired
+                                            harness's credential (read-only) only when --harness
+                                            selects that harness (or, for claude, is omitted), so a
+                                            planner never receives another harness's credential and
+                                            each wired --harness value yields exactly one mount. This
+                                            is the only credential-delivery mechanism for lane mode
+                                            (Issue #3933 retired the OS-keychain per-lane
+                                            credential-name flag in full, with the three REST lanes
+                                            that were its only callers).
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
@@ -2292,6 +2296,19 @@ PYEOF
       warnings=$((warnings + 1))
     fi
 
+    # Codex CLI version check (Issue #3935) — the second subscription agent
+    # harness the security review harness dispatches. Mirrors the cfg-version
+    # check above (a single binary-presence probe) rather than the Claude
+    # host-vs-container diff above it: there is no host-side `codex` install
+    # to compare against in every dev environment the way Claude Code is
+    # installed for interactive use.
+    codex_version=$(docker run --rm --entrypoint codex cfg-agent:latest --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "unknown")
+    echo "INFO:codex_version:${codex_version}"
+    if [[ "$codex_version" == "unknown" ]]; then
+      echo "WARN:codex_version:codex binary missing or version check failed — run /agent-setup rebuild"
+      warnings=$((warnings + 1))
+    fi
+
     # Credentials check — agents bind-mount the host credentials file directly.
     if [[ -f "$HOME/.claude/.credentials.json" ]]; then
       echo "INFO:creds:Host credentials file present (bind-mounted into agents)"
@@ -2859,9 +2876,9 @@ PROMPT_EOF
     # /home/agent/.claude/.credentials.json. Since Issue #3937 multi-planner
     # dispatch, `--mode plan --harness <id>` is a real call shape; the plan
     # branch above therefore mounts nothing of its own when `--harness` is
-    # present. Only `claude` is wired for this story (STORY-7/8 add
-    # codex/opencode); an unrecognized harness id gets the env vars below but
-    # no credential mount, which is a deliberate no-op rather than a hard
+    # present. `claude` and `codex` are wired (Issue #3935; STORY-8 adds
+    # opencode); an unrecognized harness id gets the env vars below but no
+    # credential mount, which is a deliberate no-op rather than a hard
     # failure — the roster mechanism (C5) is proven in this story against a
     # stub harness that legitimately has no credential file of its own.
     inv_harness_creds_mount=()
@@ -2870,6 +2887,30 @@ PROMPT_EOF
       case "$inv_harness" in
         claude)
           inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+          ;;
+        codex)
+          # Codex's own session credential (Issue #3935): $CODEX_HOME/auth.json,
+          # default ~/.codex/auth.json — confirmed against the installed CLI
+          # (`codex login`, `codex doctor`), the ChatGPT-subscription analogue
+          # of Claude's ~/.claude/.credentials.json above. Unlike `claude`
+          # (gated on host token freshness only via `gate_credentials_for_launch`
+          # in plan mode, never on file existence in lane mode), codex is the
+          # first wired lane-mode harness whose credential can be genuinely
+          # absent on a host that has never run `codex login` — mounting a
+          # nonexistent host path leaves the mount's effective contents
+          # undefined rather than failing loudly. Checked here, before any
+          # docker call: a missing file fails closed with
+          # "credential_unavailable" in the message, which
+          # `security-review.sh`'s `_is_intentional_dispatch_skip` already
+          # matches (same substring `gate_credentials_for_launch`'s own
+          # DISPATCH_DEFERRED path documents), so a codex lane missing its
+          # credential is recorded and skipped without ever blocking another
+          # roster lane's dispatch or the consolidator run.
+          if [[ ! -f "${HOME}/.codex/auth.json" ]]; then
+            echo "LAUNCH_FAILED:${container_name}:credential_unavailable:no codex session found at ${HOME}/.codex/auth.json -- run 'codex login' on the host"
+            exit 1
+          fi
+          inv_harness_creds_mount=(-v "${HOME}/.codex/auth.json:/home/agent/.codex/auth.json:ro")
           ;;
       esac
       inv_harness_env=(
