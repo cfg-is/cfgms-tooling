@@ -107,13 +107,22 @@ echo "== REQUIRED TEST evidence — planner mode passes --disallowedTools =="
 # the literal contiguous phrase — matching how agent-dispatch.sh constructs it
 # to avoid tripping the "No raw 'gh issue create' in pipeline scripts" CI gate
 # (label-decommission-gate.yml) on this legitimate blocklist reference.
-check_contains "disallowed tools list blocks Edit/Write/MultiEdit/NotebookEdit" "$launch_block" 'inv_disallowed="Edit,Write,MultiEdit,NotebookEdit,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"'
+check_contains "disallowed tools list blocks Edit/Write/MultiEdit/NotebookEdit/Read/Grep" "$launch_block" 'inv_disallowed="Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"'
 check_contains "disallowed tools list refuses curl" "$launch_block" 'Bash(curl:*)'
 check_contains "disallowed tools list refuses wget" "$launch_block" 'Bash(wget:*)'
 check_contains "gh issue verb is defined via a variable, not inlined" "$launch_block" 'inv_gh_issue_verb="issue"'
 check_contains "disallowed tools list is forwarded to the container as an env var" "$launch_block" 'CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=${inv_disallowed}'
 entrypoint_src="$(cat "$ENTRYPOINT")"
 check_contains "investigator-entrypoint.sh passes --disallowedTools to claude in plan mode" "$entrypoint_src" '--disallowedTools "$DISALLOWED_TOOLS"'
+
+echo ""
+echo "== REQUIRED TEST evidence — planner mode loads the investigator agent profile"
+echo "   (Issue #3938: --agent selects .claude/agents/investigator.md as this"
+echo "   session's tools, so its 'no Read, no Grep' claim is actually enforced,"
+echo "   not just documented) =="
+check_contains "investigator-entrypoint.sh loads the investigator profile via --agent" "$entrypoint_src" 'claude --dangerously-skip-permissions --agent investigator -p'
+check_contains "disallowed-tools list also denies Read as defense-in-depth" "$launch_block" 'NotebookEdit,Read,Grep,Bash(curl:*)'
+check_contains "disallowed-tools list also denies Grep as defense-in-depth" "$launch_block" 'Read,Grep,Bash(curl:*)'
 
 echo ""
 echo "== egress containment — NET_ADMIN granted and the firewall init actually invoked =="
@@ -223,6 +232,7 @@ check_not_contains "rendered docker run has no GH_TOKEN" "$run_call" "GH_TOKEN"
 check_contains "rendered docker run mounts plan/ as /workspace-out:rw" "$run_call" "${SWEEP_DIR}/plan:/workspace-out:rw"
 check_not_contains "rendered docker run does not mount the bare sweep dir" "$run_call" "${SWEEP_DIR}:/workspace"
 check_contains "rendered docker run carries the disallowed-tools env var" "$run_call" "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=Edit,Write,MultiEdit"
+check_contains "rendered disallowed-tools env var denies Read" "$run_call" "NotebookEdit,Read,Grep,Bash(curl:*)"
 check_contains "rendered docker run grants NET_ADMIN" "$run_call" "--cap-add NET_ADMIN"
 check_contains "rendered disallowed-tools env var refuses curl" "$run_call" "Bash(curl:*)"
 check_contains "rendered disallowed-tools env var refuses wget" "$run_call" "Bash(wget:*)"

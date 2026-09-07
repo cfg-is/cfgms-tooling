@@ -2800,7 +2800,16 @@ PROMPT_EOF
     # can send the credentials it holds. They are listed because the two
     # obvious hand-reachable exfiltration verbs are free to refuse, and a
     # refusal is visible in the transcript where a dropped packet is not.
-    inv_disallowed="Edit,Write,MultiEdit,NotebookEdit,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"
+    # Read/Grep are defense-in-depth on top of investigator-entrypoint.sh's
+    # `--agent investigator` (Issue #3938): that flag loads
+    # .claude/agents/investigator.md's `tools: Bash, Glob` as the session's
+    # actual tool surface, so Read/Grep are already absent from the model's
+    # tool list before this flag is ever evaluated. Listing them here too
+    # means a future edit that widens the investigator profile's `tools:`
+    # line, or drops --agent from the entrypoint invocation, still leaves
+    # this CLI-level denial in place rather than depending on one control
+    # alone for the metadata-only boundary AC2 requires.
+    inv_disallowed="Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"
     # <sweep>/plan is bind-mounted in BOTH modes — rw as /workspace-out in plan
     # mode, ro as /workspace-plan into every lane — so it is resolved and
     # verified once, here, for both. This is the same check the lanes/ guard

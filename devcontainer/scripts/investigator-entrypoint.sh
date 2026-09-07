@@ -97,8 +97,18 @@ case "$MODE" in
     # physically impossible. Cheap to add on top regardless.
     DISALLOWED_TOOLS="${CFGMS_INVESTIGATOR_DISALLOWED_TOOLS:?CFGMS_INVESTIGATOR_DISALLOWED_TOOLS must be set by the launcher}"
 
+    # --agent investigator (Issue #3938) loads .claude/agents/investigator.md
+    # as this session's actual persona, including its `tools: Bash, Glob`
+    # frontmatter -- before this flag existed here, that file described a
+    # boundary no invocation of `claude` ever loaded, so the profile's tool
+    # restriction was inert regardless of what the file claimed. Confirmed
+    # directly against the installed CLI: a session started with `--agent
+    # investigator` self-reports having no Read/Grep tool and falls back to
+    # `Bash` metadata commands when asked to inspect file contents.
+    # --disallowedTools above still runs on top of it, per the comment on
+    # inv_disallowed in agent-dispatch.sh.
     echo "Starting investigator (mode=plan)..."
-    exec claude --dangerously-skip-permissions -p "$(cat "$PROMPT_FILE")" \
+    exec claude --dangerously-skip-permissions --agent investigator -p "$(cat "$PROMPT_FILE")" \
       --disallowedTools "$DISALLOWED_TOOLS"
     ;;
   *)
