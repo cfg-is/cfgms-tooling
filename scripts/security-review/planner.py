@@ -160,11 +160,12 @@ def build_prompt(md: dict, sweep_id: str) -> str:
     schema, the bounded-scope rule, and the Bash-heredoc write mechanism the
     model must use because `Write` is not among its `Bash, Glob` tools.
 
-    The model is deliberately never asked for `sweep_id`, `commit_sha`, or
-    `planners` -- `finalize()` injects all three from `prepare()`'s own
-    sweep context afterward, discarding whatever (if anything) a step file
-    already contains for them. A model is not a trustworthy source for a
-    sweep's own identity, so it is never asked to be one.
+    The model is deliberately never asked for `sweep_id`, `commit_sha`,
+    `planners`, or a hypothesis's own `planner` field -- `finalize()` injects
+    all of these from `prepare()`'s own sweep context afterward, discarding
+    whatever (if anything) a step file already contains for them. A model is
+    not a trustworthy source for a sweep's own identity, so it is never asked
+    to be one (Issue #3958).
     """
     payload = metadata.render_payload(md)
     return f"""You are the metadata-only step planner for security-review sweep `{sweep_id}`.
@@ -187,6 +188,13 @@ never a scope that spans two different second-level directories under the same t
 This applies to any real, reviewable subtree in the repository (for example `pkg/`, `features/`,
 `cmd/`, `web/src/`, `internal/`, `api/proto/`) -- not just the four named as examples here.
 
+For each step, propose one or more concrete hypotheses about what a later review pass should
+investigate in that scope. A hypothesis is a specific, falsifiable claim about a security
+property -- not a restatement of the scope's name, and not "review this code for bugs." Base
+each hypothesis only on what the metadata (package/directory names, paths) suggests the code
+might do; you have not read any file's contents, so ground every hypothesis in that, not in
+invented specifics.
+
 For each step, use `Glob` to list the actual files inside the scope you chose (e.g.
 `pkg/example/*.go`) and record their repository-relative paths under `files`. `Glob` returns file
 names only, never file contents -- do not attempt to read any file's contents (via `cat`,
@@ -200,7 +208,13 @@ create each file with a Bash heredoc, for example:
     {{
       "step_id": "step-001",
       "scope": ["pkg/example/thing.go", "pkg/example/other.go"],
-      "description": "one-sentence description of what this step reviews",
+      "hypotheses": [
+        {{
+          "id": "h1",
+          "objective": "what security property or vulnerability class is being investigated",
+          "required_evidence": "what evidence in the code would confirm or refute this"
+        }}
+      ],
       "files": ["pkg/example/thing.go", "pkg/example/other.go"]
     }}
     JSON
@@ -213,7 +227,14 @@ Rules for every step file:
 - `scope`: a JSON array of the repository-relative paths (or a single package directory path)
   this step covers. Every path must come from the metadata above, and every path in a single
   step's scope must resolve to the same top-level subtree (see the bounded-scope rule above).
-- `description`: one sentence describing what this step reviews.
+- `hypotheses`: a JSON array of at least one hypothesis object. Each entry has:
+  - `id`: a short identifier unique within this step's own hypotheses list (e.g. `h1`, `h2`) --
+    it does not need to be unique across steps or across other planners.
+  - `objective`: what security property or vulnerability class is being investigated in this
+    scope.
+  - `required_evidence`: what evidence in the code would confirm or refute this hypothesis.
+  - Do NOT include a `planner` field on any hypothesis -- it is filled in for you, exactly like
+    `sweep_id`/`commit_sha`/`planners` at the step level.
 - `files`: a JSON array of the repository-relative file paths inside this step's scope, as
   returned by `Glob` -- may be empty if the scope names files directly rather than a directory.
 - Do NOT include `sweep_id`, `commit_sha`, or `planners` -- these are filled in for you.
@@ -564,20 +585,141 @@ def _scope_key(scope: object) -> tuple[str, ...] | None:
     return tuple(sorted(set(paths)))
 
 
+def _hypothesis_provenance(hypothesis: dict) -> "tuple[str, str] | None":
+    """The `(planner, original planner-issued id)` pair a hypothesis is
+    de-duplicated and disambiguated on, or `None` when it carries no usable
+    one (Issue #3958).
+
+    Both components are harness-owned, not model-owned: `planner` is injected
+    per-lane by `_inject_hypothesis_provenance()`, and any `original_id` a
+    model wrote is deleted by that same function before a proposal ever
+    reaches a merge. An `original_id` still seen here is therefore one this
+    module wrote on a previous merge pass, which is what makes
+    `merge_steps_by_scope()` idempotent.
+
+    Only a non-empty string is accepted for either component, with a fallback
+    from `original_id` to `id` -- never `hypothesis.get(...)` straight into a
+    key. A value of any other type (a list, `None`, a nested object) is
+    ignored rather than keyed on: keying on raw model-shaped values made an
+    unhashable one raise `TypeError` out of `merge_steps_by_scope()`, past
+    `main()`'s `RosterError`-only handler, so neither the `PLANNING_FAILED`
+    marker nor the rejected-proposals record was ever written; and a `None`
+    one propagated into the merged step's `id`, whose post-merge
+    `validate_step()` rejection then discarded a DIFFERENT planner's
+    legitimate hypotheses for that same shared scope.
+    """
+    planner_id = hypothesis.get("planner")
+    if not (isinstance(planner_id, str) and planner_id):
+        return None
+    for field in ("original_id", "id"):
+        value = hypothesis.get(field)
+        if isinstance(value, str) and value:
+            return (planner_id, value)
+    return None
+
+
+def _merge_hypotheses(hypotheses: "list[dict]") -> "list[dict]":
+    """Union a group of already-provenanced hypotheses (Issue #3958),
+    de-duplicating and disambiguating without ever dropping a proposal.
+
+    A hypothesis's `id` is only unique within the step/planner that proposed
+    it, never globally -- two different planners proposing the same scope
+    are expected to independently mint the same `id` string (e.g. both
+    calling their first hypothesis `h1`), and that must not collapse them
+    into one. Every entry here already carries a `planner` field (injected by
+    `finalize()`/`finalize_multi_planner()` before this function ever runs),
+    so de-duplication keys on `(planner, original id)` -- see
+    `_hypothesis_provenance()` for why neither component is ever read
+    straight from the model's own bytes.
+
+    De-duplication additionally requires the two entries' remaining content
+    to be equal. A repeated `(planner, id)` pair carrying the SAME objective
+    and required_evidence is the same hypothesis seen again (what merging an
+    already-merged list produces), and is dropped; one carrying DIFFERENT
+    content is a second, distinct proposal that happens to reuse an id its
+    planner is free to reuse -- `validate_hypothesis()` requires ids to be
+    unique only within the step that proposed them -- and is kept, because
+    nothing here may silently drop a proposal.
+
+    When two or more different planners share the same `id` string, this
+    function disambiguates the merged output's `id` field by namespacing it
+    with the planner (`<planner>:<id>`) -- the original planner-issued `id`
+    is preserved intact under `original_id` regardless, for traceability.
+    Ids that never collide are left exactly as their planner wrote them.
+
+    An entry with no usable provenance at all is passed through untouched:
+    never keyed, never namespaced, never given an `original_id` this module
+    did not derive, and never dropped. Its own shape defect is the post-merge
+    `validate_step()`'s to reject, one step at a time, not this function's to
+    guess at.
+
+    Idempotent: an entry already carrying `original_id` (from a previous
+    merge) is deduplicated and re-disambiguated on that same original value,
+    so merging an already-merged list reproduces the identical result.
+    """
+    seen: dict[tuple[str, str], list[dict]] = {}
+    collected: list[dict] = []
+    provenances: list["tuple[str, str] | None"] = []
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict):
+            continue
+        provenance = _hypothesis_provenance(hypothesis)
+        merged_hypothesis = dict(hypothesis)
+        if provenance is None:
+            merged_hypothesis.pop("original_id", None)
+            collected.append(merged_hypothesis)
+            provenances.append(None)
+            continue
+        payload = {
+            key: value
+            for key, value in merged_hypothesis.items()
+            if key not in ("id", "original_id")
+        }
+        already_seen = seen.setdefault(provenance, [])
+        if any(payload == earlier for earlier in already_seen):
+            continue
+        already_seen.append(payload)
+        merged_hypothesis["original_id"] = provenance[1]
+        collected.append(merged_hypothesis)
+        provenances.append(provenance)
+
+    planners_by_original_id: dict[str, set] = {}
+    for provenance in provenances:
+        if provenance is not None:
+            planners_by_original_id.setdefault(provenance[1], set()).add(provenance[0])
+
+    for hypothesis, provenance in zip(collected, provenances):
+        if provenance is None:
+            continue
+        planner_id, original_id = provenance
+        if len(planners_by_original_id[original_id]) > 1:
+            hypothesis["id"] = f"{planner_id}:{original_id}"
+        else:
+            hypothesis["id"] = original_id
+
+    return collected
+
+
 def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
     """Merges already-validated plan steps by C6's rule (epic #3927): one
     merged step per distinct `scope`, `files` the union of every proposal for
-    that scope, `planners` recording every planner id that proposed it. A
-    scope is reviewed once per lane regardless of how many planners proposed
-    it -- this function is what makes that true, by collapsing every
-    proposal for the same scope into one step before any lane ever sees it.
+    that scope, `planners` recording every planner id that proposed it, and
+    `hypotheses` the union of every proposal's hypotheses (Issue #3958) --
+    never collapsed down to one planner's proposal, which was C6's original
+    defect for the free-text `description` field this replaces. A scope is
+    reviewed once per lane regardless of how many planners proposed it --
+    this function is what makes that true, by collapsing every proposal for
+    the same scope into one step before any lane ever sees it.
 
     `files` and `planners` are unioned in first-seen order and de-duplicated
     -- not sorted -- so which planner "discovered" a file or a scope first is
     still visible in the ordering, and merging is idempotent (merging an
-    already-merged list changes nothing). Merged steps are numbered
-    `step-001`, `step-002`, ... in the order their scope was first seen
-    across `steps`: the merged output is a new plan, not any single
+    already-merged list changes nothing). `hypotheses` is unioned the same
+    way, via `_merge_hypotheses()`, which additionally disambiguates two
+    different planners' independently-minted, colliding `id` strings rather
+    than merely de-duplicating (see its own docstring). Merged steps are
+    numbered `step-001`, `step-002`, ... in the order their scope was first
+    seen across `steps`: the merged output is a new plan, not any single
     planner's own numbering, so two planners that both happened to call
     something `step-001` can never collide.
 
@@ -586,7 +728,9 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
     `sweep_id`/`commit_sha` -- both are injected from the one sweep-wide
     `.plan-context.json` sidecar before any step reaches this function -- so
     there is no real conflict to resolve between proposals, only an
-    arbitrary pick between identical values.
+    arbitrary pick between identical values. `description` is optional
+    backward-readable context, never load-bearing, so an arbitrary pick
+    between proposals is fine there too.
 
     Callers are expected to have already run each input step through
     `validate_step()`; this function does no validation of its own and
@@ -608,6 +752,7 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
                 "description": step.get("description"),
                 "files": [],
                 "planners": [],
+                "hypotheses": [],
             }
             order.append(key)
 
@@ -618,6 +763,7 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
         for p in step.get("planners") or []:
             if p not in merged["planners"]:
                 merged["planners"].append(p)
+        merged["hypotheses"].extend(step.get("hypotheses") or [])
 
     merged_steps: list[dict] = []
     for index, key in enumerate(order, start=1):
@@ -631,6 +777,7 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
                 "description": g["description"],
                 "files": g["files"],
                 "planners": g["planners"],
+                "hypotheses": _merge_hypotheses(g["hypotheses"]),
             }
         )
     return merged_steps
@@ -696,6 +843,39 @@ def _read_sweep_context(sweep_dir: str) -> dict[str, str] | None:
     return {"sweep_id": sweep_id, "commit_sha": commit_sha}
 
 
+def _inject_hypothesis_provenance(data: dict, planner_id: str) -> None:
+    """Make every hypothesis in `data["hypotheses"]` carry only harness-owned
+    provenance (Issue #3958):
+
+    - `planner` is overwritten with `planner_id` from the sweep's own
+      authoritative context, never trusting whatever (if anything) the model
+      wrote for that field, exactly like `data["planners"]` at the step level.
+    - `original_id` is DELETED. It is written solely by `_merge_hypotheses()`,
+      which records the planner-issued id a merged, possibly namespaced `id`
+      came from; nothing upstream of a merge may supply it. `schema.
+      validate_hypothesis()` checks only the four required fields and strips
+      no unknown keys, so a fully schema-valid step file can carry a planted
+      `original_id` -- and that value is what merging keys de-duplication and
+      cross-planner namespacing on. Left in place, a planner could reuse one
+      original id to collapse two of its own distinct proposals, or emit a
+      non-string one to break the merge for a scope it shares with another
+      planner. Deleting it here keeps the file's own rule intact: no
+      model-written provenance survives into a finalized plan.
+
+    A no-op when `data["hypotheses"]` is missing or not a list -- that shape
+    defect is `schema.validate_plan_step()`'s job to reject, not this
+    function's to paper over. Each list entry that is not itself a dict is
+    left alone for the same reason: `validate_hypothesis()` rejects it.
+    """
+    hypotheses = data.get("hypotheses")
+    if not isinstance(hypotheses, list):
+        return
+    for hypothesis in hypotheses:
+        if isinstance(hypothesis, dict):
+            hypothesis["planner"] = planner_id
+            hypothesis.pop("original_id", None)
+
+
 def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     """Validate whatever `step-*.json` files exist under `<sweep_dir>/plan/`.
 
@@ -704,14 +884,17 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     every other, independently valid step file is left in place. Before
     validating, `sweep_id`/`commit_sha`/`planners` are injected from
     `prepare()`'s own `<sweep_dir>/.plan-context.json`, discarding whatever a
-    step file already contained for those three fields, and the corrected
-    step is written back to disk.
+    step file already contained for those three fields, and every hypothesis
+    in the step's own `hypotheses` array gets its `planner` field overwritten
+    the same way (`_inject_hypothesis_provenance()`, Issue #3958) -- then the
+    corrected step is written back to disk.
 
     That injection is unconditional, and its absence is fatal: if step files
     exist but the sidecar is missing or malformed, every step is excluded and
     `PLANNING_FAILED` is written. There is no path on which a step's own
-    model-written `sweep_id`/`commit_sha` survives into a finalized plan, and
-    no path on which `planners` is left as the model wrote it.
+    model-written `sweep_id`/`commit_sha` survives into a finalized plan, no
+    path on which `planners` is left as the model wrote it, and no path on
+    which a hypothesis's `planner` field is left as the model wrote it.
 
     Returns `(True, errors)` when at least one step file survives validation
     -- `errors` describes whatever was excluded along the way, and is empty
@@ -774,6 +957,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
             data["sweep_id"] = context["sweep_id"]
             data["commit_sha"] = context["commit_sha"]
             data["planners"] = [PLANNER_ID]
+            _inject_hypothesis_provenance(data, PLANNER_ID)
 
         step_errors = validate_step(data, filename)
         if step_errors:
@@ -845,8 +1029,11 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     fail-closed-on-missing-or-malformed-sidecar rule `finalize()` applies --
     using that entry's own `lane_dir_name` as the `planners` identity
     recorded on its steps (never the fixed `PLANNER_ID`, which is the
-    single-hardcoded-planner's identity only). Every validated proposal
-    across every planner is then merged by scope (`merge_steps_by_scope()`)
+    single-hardcoded-planner's identity only) -- and, since Issue #3958, as
+    the `planner` provenance tagged onto every hypothesis in that entry's own
+    proposals, via the same `_inject_hypothesis_provenance()` `finalize()` uses.
+    Every validated proposal across every planner is then merged by scope
+    (`merge_steps_by_scope()`)
     and the merged result is written into the canonical `<sweep_dir>/plan/`
     -- the one place every lane and the consolidator already read from, so
     nothing downstream needs to know more than one planner ran.
@@ -913,6 +1100,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
                 data["sweep_id"] = context["sweep_id"]
                 data["commit_sha"] = context["commit_sha"]
                 data["planners"] = [lane.lane_dir_name]
+                _inject_hypothesis_provenance(data, lane.lane_dir_name)
 
             step_errors = validate_step(data, filename)
             if step_errors:

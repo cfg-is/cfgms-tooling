@@ -131,6 +131,14 @@ def test_end_to_end_switchover_proof() -> None:
             "commit_sha": commit_sha,
             "scope": "pkg/example",
             "description": "example package for the switchover integration test",
+            "hypotheses": [
+                {
+                    "id": "h1",
+                    "objective": "example objective for the switchover integration test",
+                    "required_evidence": "example evidence",
+                    "planner": "integration-test",
+                }
+            ],
             "files": ["pkg/example/thing.go"],
             "planners": ["integration-test"],
         }

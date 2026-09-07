@@ -56,6 +56,14 @@ def write_plan_step(plan_dir: str, step_id: str, **overrides) -> None:
         "commit_sha": COMMIT_SHA,
         "scope": "pkg/example",
         "description": "example scope",
+        "hypotheses": [
+            {
+                "id": "h1",
+                "objective": "example objective",
+                "required_evidence": "example evidence",
+                "planner": "planner-1",
+            }
+        ],
         "files": [],
         "planners": ["planner-1"],
     }

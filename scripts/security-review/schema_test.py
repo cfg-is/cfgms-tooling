@@ -270,13 +270,62 @@ def test_validate_step_envelope_missing_fields_distinct_errors():
     )
 
 
+def valid_hypothesis(**overrides) -> dict:
+    hypothesis = {
+        "id": "h1",
+        "objective": "tenant-scoped queries validate the caller's tenant before reading",
+        "required_evidence": "a query building a WHERE clause without a tenant_id parameter",
+        "planner": "metadata-only-planner",
+    }
+    hypothesis.update(overrides)
+    return hypothesis
+
+
+def test_validate_hypothesis_accepts_valid():
+    errors = schema.validate_hypothesis(valid_hypothesis())
+    check(errors == [], "validate_hypothesis: accepts a fully populated hypothesis", str(errors))
+
+
+def test_validate_hypothesis_rejects_non_object():
+    errors = schema.validate_hypothesis(["not", "an", "object"])
+    check(len(errors) == 1, "validate_hypothesis: a non-object payload is rejected with one error", str(errors))
+
+
+def test_validate_hypothesis_rejects_each_required_field_missing():
+    for field in schema.REQUIRED_HYPOTHESIS_FIELDS:
+        hypothesis = valid_hypothesis()
+        del hypothesis[field]
+        errors = schema.validate_hypothesis(hypothesis)
+        check(
+            any(field in e for e in errors),
+            f"validate_hypothesis: rejects a hypothesis missing '{field}'",
+            str(errors),
+        )
+
+
+def test_validate_hypothesis_rejects_each_required_field_empty_string():
+    for field in schema.REQUIRED_HYPOTHESIS_FIELDS:
+        hypothesis = valid_hypothesis(**{field: ""})
+        errors = schema.validate_hypothesis(hypothesis)
+        check(
+            any(field in e for e in errors),
+            f"validate_hypothesis: rejects a hypothesis with '{field}' as an empty string",
+            str(errors),
+        )
+
+
+def test_validate_hypothesis_rejects_non_string_field():
+    errors = schema.validate_hypothesis(valid_hypothesis(id=42))
+    check(any("id" in e for e in errors), "validate_hypothesis: rejects a non-string id", str(errors))
+
+
 def valid_plan_step(**overrides) -> dict:
     step = {
         "step_id": "step-007",
         "sweep_id": "2026-09-05T2312Z-9735bb32",
         "commit_sha": "9735bb32",
         "scope": "pkg/storage/providers/database",
-        "description": "PostgreSQL storage provider: stores, schema migration, CAS writes",
+        "hypotheses": [valid_hypothesis()],
         "files": ["pkg/storage/providers/database/case_store.go"],
         "planners": ["metadata-only-planner"],
     }
@@ -331,6 +380,62 @@ def test_validate_plan_step_rejects_empty_planners_list():
 def test_validate_plan_step_rejects_non_string_list_entries():
     errors = schema.validate_plan_step(valid_plan_step(files=["ok.go", 42]))
     check(any("files" in e for e in errors), "validate_plan_step: rejects a files entry that is not a string", str(errors))
+
+
+def test_validate_plan_step_rejects_empty_hypotheses_list():
+    # [REQUIRED TEST] a plan step with an empty hypotheses list is rejected.
+    errors = schema.validate_plan_step(valid_plan_step(hypotheses=[]))
+    check(
+        any("hypotheses" in e for e in errors),
+        "validate_plan_step: rejects an empty hypotheses list",
+        str(errors),
+    )
+
+
+def test_validate_plan_step_rejects_missing_hypotheses():
+    step = valid_plan_step()
+    del step["hypotheses"]
+    errors = schema.validate_plan_step(step)
+    check(
+        any("hypotheses" in e for e in errors),
+        "validate_plan_step: rejects a step with no hypotheses field at all",
+        str(errors),
+    )
+
+
+def test_validate_plan_step_rejects_non_list_hypotheses():
+    errors = schema.validate_plan_step(valid_plan_step(hypotheses="not-a-list"))
+    check(
+        any("hypotheses" in e for e in errors),
+        "validate_plan_step: rejects a non-list hypotheses value",
+        str(errors),
+    )
+
+
+def test_validate_plan_step_surfaces_nested_hypothesis_errors():
+    bad_hypothesis = valid_hypothesis()
+    del bad_hypothesis["objective"]
+    errors = schema.validate_plan_step(valid_plan_step(hypotheses=[bad_hypothesis]))
+    check(
+        any("hypotheses[0]" in e and "objective" in e for e in errors),
+        "validate_plan_step: a schema-invalid nested hypothesis is surfaced with its index",
+        str(errors),
+    )
+
+
+def test_validate_plan_step_does_not_require_description():
+    step = valid_plan_step()
+    step.pop("description", None)
+    errors = schema.validate_plan_step(step)
+    check(
+        errors == [],
+        "validate_plan_step: description is optional -- its absence is valid",
+        str(errors),
+    )
+    check(
+        "description" not in schema.REQUIRED_PLAN_STEP_FIELDS,
+        "validate_plan_step: description is no longer a required field",
+    )
 
 
 def test_safe_log_event_single_line_and_escaped():

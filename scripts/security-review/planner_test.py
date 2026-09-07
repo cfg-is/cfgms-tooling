@@ -97,6 +97,17 @@ def write_step(plan_dir: str, filename: str, data: object) -> None:
             json.dump(data, f)
 
 
+def valid_hypothesis(**overrides) -> dict:
+    hypothesis = {
+        "id": "h1",
+        "objective": "tenant-scoped queries validate the caller's tenant before reading",
+        "required_evidence": "a query building a WHERE clause without a tenant_id parameter",
+        "planner": planner.PLANNER_ID,
+    }
+    hypothesis.update(overrides)
+    return hypothesis
+
+
 def valid_step(
     step_id: str,
     scope: list[str] | str,
@@ -105,6 +116,7 @@ def valid_step(
     commit_sha: str = "abc1234",
     files: list[str] | None = None,
     planners: list[str] | None = None,
+    hypotheses: list[dict] | None = None,
 ) -> dict:
     return {
         "step_id": step_id,
@@ -114,6 +126,7 @@ def valid_step(
         "description": description,
         "files": files if files is not None else ["pkg/example/thing.go"],
         "planners": planners if planners is not None else [planner.PLANNER_ID],
+        "hypotheses": hypotheses if hypotheses is not None else [valid_hypothesis()],
     }
 
 
@@ -431,9 +444,11 @@ def test_validate_step_requires_step_id_to_match_filename():
 
 def test_validate_step_requires_all_fields():
     # REQUIRED TEST: matches C1's full seven-field shape -- step_id, sweep_id,
-    # commit_sha, scope, description, files, planners. `anthropic.py:537` and
-    # `openai.py:485` both demand sweep_id/commit_sha; a validator that never
-    # requires them accepts steps that silently produce zero API calls.
+    # commit_sha, scope, hypotheses, files, planners (Issue #3958 replaces
+    # `description` with `hypotheses` as the defining, required content).
+    # `anthropic.py:537` and `openai.py:485` both demand sweep_id/commit_sha;
+    # a validator that never requires them accepts steps that silently
+    # produce zero API calls.
     errors = planner.validate_step({}, "step-001.json")
     check(
         {
@@ -441,7 +456,7 @@ def test_validate_step_requires_all_fields():
             "step-001.json: missing required field: sweep_id",
             "step-001.json: missing required field: commit_sha",
             "step-001.json: missing required field: scope",
-            "step-001.json: missing required field: description",
+            "step-001.json: missing required field: hypotheses",
             "step-001.json: missing required field: files",
             "step-001.json: missing required field: planners",
         }
@@ -611,7 +626,8 @@ def test_finalize_injects_sweep_context_never_trusting_model_supplied_values():
         plan_dir = os.path.join(sweep_dir, "plan")
 
         # Simulate the model writing a step with a fabricated sweep_id and
-        # commit_sha, and no `planners` field at all.
+        # commit_sha, no `planners` field at all, and a hypothesis carrying a
+        # forged `planner` value.
         write_step(
             plan_dir,
             "step-001.json",
@@ -620,6 +636,14 @@ def test_finalize_injects_sweep_context_never_trusting_model_supplied_values():
                 "scope": ["pkg/a/a.go"],
                 "description": "reviews pkg/a",
                 "files": ["pkg/a/a.go"],
+                "hypotheses": [
+                    {
+                        "id": "h1",
+                        "objective": "reviews pkg/a for tenant scoping",
+                        "required_evidence": "a query missing a tenant_id filter",
+                        "planner": "some-other-planner-the-model-made-up",
+                    }
+                ],
                 "sweep_id": "some-other-sweep-the-model-made-up",
                 "commit_sha": "0" * 40,
             },
@@ -645,6 +669,11 @@ def test_finalize_injects_sweep_context_never_trusting_model_supplied_values():
             written["planners"] == [planner.PLANNER_ID],
             "finalize: planners is populated deterministically, never left to the model",
             written.get("planners"),
+        )
+        check(
+            written["hypotheses"][0]["planner"] == planner.PLANNER_ID,
+            "finalize: a hypothesis's planner field is overwritten from the sweep's own context, never the model's value",
+            written["hypotheses"],
         )
 
 
@@ -695,6 +724,14 @@ def test_finalize_ignores_a_context_sidecar_planted_inside_plan_dir():
                 "scope": ["pkg/a/a.go"],
                 "description": "reviews pkg/a",
                 "files": ["pkg/a/a.go"],
+                "hypotheses": [
+                    {
+                        "id": "h1",
+                        "objective": "reviews pkg/a for tenant scoping",
+                        "required_evidence": "a query missing a tenant_id filter",
+                        "planner": "forged",
+                    }
+                ],
                 "sweep_id": "attacker-chosen-sweep",
                 "commit_sha": "deadbeef" * 5,
                 "planners": ["forged"],
@@ -719,6 +756,11 @@ def test_finalize_ignores_a_context_sidecar_planted_inside_plan_dir():
             written["planners"] == [planner.PLANNER_ID],
             "finalize: planners is still the deterministic value, not the model's 'forged'",
             str(written.get("planners")),
+        )
+        check(
+            written["hypotheses"][0]["planner"] == planner.PLANNER_ID,
+            "finalize: a hypothesis's planner field is still the deterministic value, not the model's 'forged'",
+            str(written["hypotheses"]),
         )
 
 
@@ -1044,6 +1086,330 @@ def test_merge_steps_by_scope_is_idempotent_on_an_already_merged_list():
     check(once == twice, "merge_steps_by_scope: merging an already-merged list changes nothing", str((once, twice)))
 
 
+def test_merge_steps_by_scope_unions_hypotheses_from_two_planners_with_colliding_ids():
+    # [REQUIRED TEST]: two synthetic plan-step proposals for the identical
+    # scope, from two different planners, each carrying one distinct
+    # hypothesis both happening to use id="h1" -- the merged step's
+    # hypotheses list must have length 2, not 1 (the exact regression the old
+    # first-seen-`description`-wins behavior would produce for hypotheses).
+    step_a = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {
+                "id": "h1",
+                "objective": "tenant scoping on the read path",
+                "required_evidence": "a query missing a tenant_id filter",
+                "planner": "claude-fable-5-1",
+            }
+        ],
+    )
+    step_b = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["codex-gpt-terra"],
+        hypotheses=[
+            {
+                "id": "h1",
+                "objective": "input validation on the write path",
+                "required_evidence": "a write handler that never validates its payload size",
+                "planner": "codex-gpt-terra",
+            }
+        ],
+    )
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+
+    check(len(merged) == 1, "merge_steps_by_scope: the identical scope still collapses into one step", str(merged))
+    if merged:
+        hypotheses = merged[0]["hypotheses"]
+        check(
+            len(hypotheses) == 2,
+            "merge_steps_by_scope: both planners' colliding-id=h1 hypotheses survive, not just one",
+            str(hypotheses),
+        )
+        objectives = {h["objective"] for h in hypotheses}
+        check(
+            objectives == {"tenant scoping on the read path", "input validation on the write path"},
+            "merge_steps_by_scope: both distinct hypothesis objectives are present",
+            str(hypotheses),
+        )
+        planners_seen = {h["planner"] for h in hypotheses}
+        check(
+            planners_seen == {"claude-fable-5-1", "codex-gpt-terra"},
+            "merge_steps_by_scope: each hypothesis still carries its own originating planner",
+            str(hypotheses),
+        )
+        original_ids = {h["original_id"] for h in hypotheses}
+        check(
+            original_ids == {"h1"},
+            "merge_steps_by_scope: the original planner-issued id is preserved for traceability",
+            str(hypotheses),
+        )
+        ids = {h["id"] for h in hypotheses}
+        check(
+            ids == {"claude-fable-5-1:h1", "codex-gpt-terra:h1"},
+            "merge_steps_by_scope: colliding ids are disambiguated by namespacing with their planner",
+            str(hypotheses),
+        )
+
+
+def test_merge_steps_by_scope_does_not_namespace_a_non_colliding_hypothesis_id():
+    step_a = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {
+                "id": "h1",
+                "objective": "tenant scoping on the read path",
+                "required_evidence": "a query missing a tenant_id filter",
+                "planner": "claude-fable-5-1",
+            }
+        ],
+    )
+    step_b = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["codex-gpt-terra"],
+        hypotheses=[
+            {
+                "id": "h2",
+                "objective": "input validation on the write path",
+                "required_evidence": "a write handler that never validates its payload size",
+                "planner": "codex-gpt-terra",
+            }
+        ],
+    )
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+    check(len(merged) == 1, "merge_steps_by_scope: one merged step", str(merged))
+    if merged:
+        ids = {h["id"] for h in merged[0]["hypotheses"]}
+        check(
+            ids == {"h1", "h2"},
+            "merge_steps_by_scope: non-colliding ids are left exactly as their planner wrote them",
+            str(merged[0]["hypotheses"]),
+        )
+
+
+def test_merge_steps_by_scope_is_idempotent_with_hypotheses_present():
+    step_a = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {"id": "h1", "objective": "obj-a", "required_evidence": "ev-a", "planner": "claude-fable-5-1"}
+        ],
+    )
+    step_b = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["codex-gpt-terra"],
+        hypotheses=[
+            {"id": "h1", "objective": "obj-b", "required_evidence": "ev-b", "planner": "codex-gpt-terra"}
+        ],
+    )
+    once = planner.merge_steps_by_scope([step_a, step_b])
+    twice = planner.merge_steps_by_scope(once)
+    check(
+        once == twice,
+        "merge_steps_by_scope: re-merging an already-disambiguated hypothesis list changes nothing",
+        str((once, twice)),
+    )
+
+
+# --- `original_id` is harness-owned, never model-owned (Issue #3958) ---------
+#
+# `schema.validate_hypothesis()` checks the four required fields and strips no
+# unknown keys, so a fully schema-valid step file can carry a planted
+# `original_id` -- the very value merging keys de-duplication and cross-planner
+# namespacing on. These cover both halves of the fix: the merge itself never
+# trusts the field, and `_inject_hypothesis_provenance()` deletes it at the
+# boundary so a model's value never reaches the merge in the first place.
+
+def test_merge_steps_by_scope_does_not_crash_on_a_non_string_original_id():
+    # A list `original_id` used to be dropped straight into a set key ->
+    # `TypeError: unhashable type: 'list'` out of merge_steps_by_scope(), past
+    # main()'s RosterError-only handler, so neither PLANNING_FAILED nor
+    # rejected_proposals.json was ever written for the sweep.
+    step = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {
+                "id": "h1",
+                "objective": "obj-a",
+                "required_evidence": "ev-a",
+                "planner": "claude-fable-5-1",
+                "original_id": ["not", "a", "string"],
+            }
+        ],
+    )
+
+    merged = planner.merge_steps_by_scope([step])
+
+    check(len(merged) == 1, "merge_steps_by_scope: a non-string original_id does not raise", str(merged))
+    if merged:
+        hypotheses = merged[0]["hypotheses"]
+        check(
+            [h["id"] for h in hypotheses] == ["h1"],
+            "merge_steps_by_scope: a non-string original_id falls back to the hypothesis's own id",
+            str(hypotheses),
+        )
+        check(
+            planner.validate_step(merged[0], "step-001.json") == [],
+            "merge_steps_by_scope: the merged step is still schema-valid despite the planted original_id",
+            str(merged[0]),
+        )
+
+
+def test_merge_steps_by_scope_null_original_id_never_suppresses_another_planners_hypotheses():
+    # A null `original_id` used to become the merged hypothesis's `id`, whose
+    # post-merge validate_step() rejection discarded the WHOLE merged step --
+    # including the other planner's legitimate hypotheses for that shared
+    # scope, a cross-planner suppression channel.
+    step_a = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {
+                "id": "h1",
+                "objective": "hostile objective",
+                "required_evidence": "hostile evidence",
+                "planner": "claude-fable-5-1",
+                "original_id": None,
+            }
+        ],
+    )
+    step_b = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["codex-gpt-terra"],
+        hypotheses=[
+            {
+                "id": "h2",
+                "objective": "legitimate objective",
+                "required_evidence": "legitimate evidence",
+                "planner": "codex-gpt-terra",
+            }
+        ],
+    )
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+
+    check(len(merged) == 1, "merge_steps_by_scope: the shared scope still merges into one step", str(merged))
+    if merged:
+        check(
+            planner.validate_step(merged[0], "step-001.json") == [],
+            "merge_steps_by_scope: a null original_id never makes the whole merged step invalid",
+            str(merged[0]),
+        )
+        objectives = {h["objective"] for h in merged[0]["hypotheses"]}
+        check(
+            objectives == {"hostile objective", "legitimate objective"},
+            "merge_steps_by_scope: the other planner's hypothesis for that scope is not suppressed",
+            str(merged[0]["hypotheses"]),
+        )
+
+
+def test_merge_steps_by_scope_keeps_two_distinct_hypotheses_from_one_planner_sharing_an_id():
+    # De-duplication must mean "the same hypothesis seen again", never "a
+    # second, distinct proposal that reused an id its planner is free to
+    # reuse" -- validate_hypothesis() requires ids to be unique only within
+    # the step that proposed them.
+    step = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {
+                "id": "h1",
+                "objective": "tenant scoping on the read path",
+                "required_evidence": "a query missing a tenant_id filter",
+                "planner": "claude-fable-5-1",
+            },
+            {
+                "id": "h1",
+                "objective": "input validation on the write path",
+                "required_evidence": "a write handler that never validates its payload size",
+                "planner": "claude-fable-5-1",
+            },
+        ],
+    )
+
+    merged = planner.merge_steps_by_scope([step])
+
+    check(len(merged) == 1, "merge_steps_by_scope: one merged step", str(merged))
+    if merged:
+        objectives = {h["objective"] for h in merged[0]["hypotheses"]}
+        check(
+            objectives
+            == {"tenant scoping on the read path", "input validation on the write path"},
+            "merge_steps_by_scope: two distinct same-planner hypotheses sharing an id are both kept",
+            str(merged[0]["hypotheses"]),
+        )
+
+
+def test_finalize_multi_planner_deletes_a_model_written_original_id():
+    # [REQUIRED TEST] End to end through the real finalize path: a planner
+    # plants an `original_id` naming ANOTHER of its own hypotheses, which
+    # would collapse the two into one at merge time. The boundary injection
+    # must delete it, exactly as it overwrites `planner`, so no model-written
+    # provenance survives into a finalized plan.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1")
+
+        _write_planner_step(
+            sweep_dir,
+            "claude-fable-5-1",
+            "step-001.json",
+            valid_step(
+                "step-001",
+                scope=["pkg/example/thing.go"],
+                hypotheses=[
+                    {
+                        "id": "h1",
+                        "objective": "tenant scoping on the read path",
+                        "required_evidence": "a query missing a tenant_id filter",
+                        "planner": "claude-fable-5-1",
+                    },
+                    {
+                        "id": "h2",
+                        "objective": "input validation on the write path",
+                        "required_evidence": "a write handler that never validates its payload size",
+                        "planner": "claude-fable-5-1",
+                        "original_id": "h1",
+                    },
+                ],
+            ),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds despite the planted original_id", str(errors))
+
+        step_files = [f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f)]
+        check(len(step_files) == 1, "finalize_multi_planner: one merged step", str(step_files))
+        with open(os.path.join(sweep_dir, "plan", step_files[0])) as f:
+            merged = json.load(f)
+
+        hypotheses = merged["hypotheses"]
+        check(
+            len(hypotheses) == 2,
+            "finalize_multi_planner: a planted original_id cannot collapse two distinct hypotheses",
+            str(hypotheses),
+        )
+        check(
+            {h["original_id"] for h in hypotheses} == {"h1", "h2"},
+            "finalize_multi_planner: every original_id is derived from the hypothesis's own id, not the planted value",
+            str(hypotheses),
+        )
+
+
 # --- launch() multi-planner dispatch (C6) ------------------------------------
 
 def test_launch_single_planner_default_is_unchanged_by_the_planners_parameter():
@@ -1229,6 +1595,79 @@ def test_finalize_multi_planner_merges_overlapping_scopes_from_two_planners():
             set(merged["planners"]) == {"claude-fable-5-1", "codex-gpt-terra"},
             "finalize_multi_planner: planners lists both planner ids",
             str(merged["planners"]),
+        )
+
+
+def test_finalize_multi_planner_tags_and_unions_hypotheses_from_two_planners():
+    # Issue #3958: each planner's own hypotheses get their `planner` field
+    # injected from that entry's own lane_dir_name (never trusted from the
+    # model), and merge_steps_by_scope() unions both planners' hypotheses
+    # rather than keeping only one -- even though both entries independently
+    # wrote the default hypothesis id "h1".
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir,
+            "claude-fable-5-1",
+            "step-001.json",
+            valid_step(
+                "step-001",
+                scope=["pkg/example/thing.go"],
+                hypotheses=[
+                    {
+                        "id": "h1",
+                        "objective": "tenant scoping on the read path",
+                        "required_evidence": "a query missing a tenant_id filter",
+                        "planner": "some-forged-value",
+                    }
+                ],
+            ),
+        )
+        _write_planner_step(
+            sweep_dir,
+            "codex-gpt-terra",
+            "step-001.json",
+            valid_step(
+                "step-001",
+                scope=["pkg/example/thing.go"],
+                hypotheses=[
+                    {
+                        "id": "h1",
+                        "objective": "input validation on the write path",
+                        "required_evidence": "a write handler that never validates its payload size",
+                        "planner": "another-forged-value",
+                    }
+                ],
+            ),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds with both planners' hypotheses", str(errors))
+
+        step_files = [f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f)]
+        check(len(step_files) == 1, "finalize_multi_planner: one merged step for the shared scope", str(step_files))
+        with open(os.path.join(sweep_dir, "plan", step_files[0])) as f:
+            merged = json.load(f)
+
+        hypotheses = merged["hypotheses"]
+        check(
+            len(hypotheses) == 2,
+            "finalize_multi_planner: both planners' colliding-id=h1 hypotheses survive",
+            str(hypotheses),
+        )
+        planners_seen = {h["planner"] for h in hypotheses}
+        check(
+            planners_seen == {"claude-fable-5-1", "codex-gpt-terra"},
+            "finalize_multi_planner: each hypothesis's planner is its own lane_dir_name, never the forged model value",
+            str(hypotheses),
+        )
+        ids = {h["id"] for h in hypotheses}
+        check(
+            ids == {"claude-fable-5-1:h1", "codex-gpt-terra:h1"},
+            "finalize_multi_planner: the colliding ids are disambiguated by planner namespace",
+            str(hypotheses),
         )
 
 

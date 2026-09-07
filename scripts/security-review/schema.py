@@ -35,7 +35,22 @@ Three shapes are validated here:
   silently `continue`d past every step that lacked them — zero API calls,
   zero files written, and nothing about it visible from inside either side of
   that contract. `validate_plan_step` is now the single shared definition of
-  the shape, so a step can only be malformed once, in one place.
+  the shape, so a step can only be malformed once, in one place. Since Issue
+  #3958, a step's defining content is a non-empty `hypotheses` array (see
+  `validate_hypothesis`) rather than a single free-text `description` —
+  `description` is now optional, kept only for backward-readability of a
+  human summary a planner may still choose to write.
+
+- A **hypothesis** (`validate_hypothesis`): one structured, planner-originated
+  claim a later review pass should investigate, carried in a plan step's
+  `hypotheses` array (Issue #3958, epic #3950). Requires `id` (unique within
+  the step that proposed it, not globally — two different planners are
+  expected to independently mint the same `id` string, e.g. both calling
+  their first hypothesis `h1`), `objective` (what security property is being
+  investigated), `required_evidence` (what would confirm or refute it), and
+  `planner` (which planner proposed it — injected from the sweep's own
+  authoritative context by `planner.finalize()`/`finalize_multi_planner()`,
+  never trusted from the model, exactly like a step's own `planners` field).
 
 Also provides `safe_log_event`/`log_event`: this module and its siblings
 (resume.py, basedir.py) log diagnostic text that can carry model-generated or
@@ -84,9 +99,16 @@ REQUIRED_PLAN_STEP_FIELDS = (
     "sweep_id",
     "commit_sha",
     "scope",
-    "description",
+    "hypotheses",
     "files",
     "planners",
+)
+
+REQUIRED_HYPOTHESIS_FIELDS = (
+    "id",
+    "objective",
+    "required_evidence",
+    "planner",
 )
 
 
@@ -177,18 +199,51 @@ def _non_empty_string_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(v, str) and v for v in value)
 
 
+def validate_hypothesis(hypothesis: object) -> list[str]:
+    """Return a list of validation errors; empty list means valid.
+
+    Never raises on malformed input -- a caller checks `errors == []`, same
+    shape as `validate_finding`/`validate_step_envelope`/`validate_plan_step`.
+
+    All four required fields (`id`, `objective`, `required_evidence`,
+    `planner`) must be non-empty strings. `id` is unique only within the
+    step that proposed the hypothesis, not globally -- this function does
+    not, and cannot, check cross-step or cross-planner uniqueness; that is
+    `planner.merge_steps_by_scope()`'s job when two planners' proposals for
+    the same scope are unioned.
+    """
+    if not isinstance(hypothesis, dict):
+        return ["hypothesis must be a JSON object"]
+
+    errors: list[str] = []
+    for field in REQUIRED_HYPOTHESIS_FIELDS:
+        if field not in hypothesis:
+            errors.append(f"missing required field: {field}")
+            continue
+        value = hypothesis[field]
+        if not isinstance(value, str) or value == "":
+            errors.append(f"field {field} must be a non-empty string, got {value!r}")
+
+    return errors
+
+
 def validate_plan_step(step: object) -> list[str]:
     """Return a list of validation errors; empty list means valid.
 
     Never raises on malformed input -- a caller checks `errors == []`, same
     shape as `validate_finding`/`validate_step_envelope`.
 
-    `step_id`/`sweep_id`/`commit_sha`/`description` must each be a non-empty
-    string. `scope` must be a non-empty string or a non-empty list of
-    non-empty strings. `files` must be a list of non-empty strings (may be
-    empty -- a step can legitimately name zero concrete files while still
-    describing a scope). `planners` must be a non-empty list of non-empty
-    strings: a step always has at least one planner that proposed it.
+    `step_id`/`sweep_id`/`commit_sha` must each be a non-empty string. `scope`
+    must be a non-empty string or a non-empty list of non-empty strings.
+    `files` must be a list of non-empty strings (may be empty -- a step can
+    legitimately name zero concrete files while still describing a scope).
+    `planners` must be a non-empty list of non-empty strings: a step always
+    has at least one planner that proposed it. `hypotheses` must be a
+    non-empty list, each entry validated via `validate_hypothesis` -- a plan
+    step's defining content since Issue #3958 is what it proposes to
+    investigate, not a single free-text sentence. `description`, if present,
+    is not validated: it is optional, backward-readable human context only,
+    never load-bearing for anything downstream.
 
     This function validates shape only. It does not, and cannot, verify that
     `sweep_id`/`commit_sha` are the *correct* values for the sweep a step was
@@ -207,7 +262,7 @@ def validate_plan_step(step: object) -> list[str]:
             continue
         value = step[field]
 
-        if field in ("step_id", "sweep_id", "commit_sha", "description"):
+        if field in ("step_id", "sweep_id", "commit_sha"):
             if not isinstance(value, str) or value == "":
                 errors.append(f"field {field} must be a non-empty string, got {value!r}")
         elif field == "scope":
@@ -227,6 +282,15 @@ def validate_plan_step(step: object) -> list[str]:
                 errors.append(
                     f"field planners must be a non-empty list of non-empty strings, got {value!r}"
                 )
+        elif field == "hypotheses":
+            if not (isinstance(value, list) and value):
+                errors.append(
+                    f"field hypotheses must be a non-empty list, got {value!r}"
+                )
+            else:
+                for index, hypothesis in enumerate(value):
+                    for hyp_error in validate_hypothesis(hypothesis):
+                        errors.append(f"hypotheses[{index}]: {hyp_error}")
 
     return errors
 

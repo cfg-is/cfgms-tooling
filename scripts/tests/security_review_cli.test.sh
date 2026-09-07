@@ -276,7 +276,7 @@ printf '{"findings":[]}' > "${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
 AC3_CLAUDE_STUB
 chmod +x "${AC3_CLAUDE_BIN}/claude"
 cat > "${AC3_PLAN_DIR}/step-001.json" <<JSON
-{"step_id":"step-001","sweep_id":"ac3-sweep","commit_sha":"0000000000000000000000000000000000000000","scope":["pkg/example"],"description":"sole-file import check","files":[],"planners":["ac3-check"]}
+{"step_id":"step-001","sweep_id":"ac3-sweep","commit_sha":"0000000000000000000000000000000000000000","scope":["pkg/example"],"hypotheses":[{"id":"h1","objective":"sole-file import check","required_evidence":"the lane runs without ModuleNotFoundError","planner":"ac3-check"}],"files":[],"planners":["ac3-check"]}
 JSON
 
 set +e
@@ -318,6 +318,77 @@ STUB_CLAUDE_BIN_DIR="$(mktemp -d)"
 # under test elsewhere in this file, just also visible to this trap.
 cleanup_fixtures() { chmod -R u+w "$FAKEBIN" "$SANDBOX" "$STUB_CLAUDE_BIN_DIR" 2>/dev/null || true; rm -rf "$FAKEBIN" "$SANDBOX" "$STUB_CLAUDE_BIN_DIR"; }
 trap cleanup_fixtures EXIT
+
+# ----------------------------------------------------------------------------
+# Fixture repository (the repo every lane-executing case below reviews).
+#
+# Since Issue #3952 the planner and lane containers mount <sweep_dir>/snapshot
+# -- `git archive <commit_sha>` output -- at /workspace, never REPO_ROOT's
+# live working tree, and claude_lane.py's single-file import bootstrap
+# resolves schema.py/resume.py/terminal_state.py/harness_runner.py out of
+# that same mount via CFGMS_SECURITY_REVIEW_REPO_ROOT. So whatever repository
+# these cases point CFGMS_TEST_REPO_ROOT at supplies BOTH the reviewed content
+# AND the shared harness modules the lane subprocess imports -- from its HEAD
+# COMMIT, never from a working tree.
+#
+# Pointing that at this checkout therefore ran the lane against the LAST
+# COMMITTED copy of the harness while the host side (security-review.sh,
+# planner.py, schema.py, all resolved relative to $CLI's own location) ran the
+# working tree's. Any uncommitted change to the shared plan-step shape made
+# the two disagree and every step was rejected inside the lane
+# ("missing required field: ...") -- the file's own header claims
+# "schema.py ... run for real", and it was, just not the schema.py under test.
+#
+# A dedicated fixture repo whose single commit carries a COPY of this
+# checkout's live .claude/.devcontainer closes that: `git archive HEAD` now
+# yields the harness code as it exists in the working tree, so the lane
+# subprocess and the host-side planner validate against the same definitions.
+# This is the pattern the content-provenance case below already established
+# and documented at length (it passes today for exactly this reason); it is
+# hoisted here so every lane-executing case gets it, not just that one.
+# Reviewed content is deliberately tiny -- nothing in this file asserts on
+# this repository's real file inventory, only on the stub plan steps' own
+# scope/files -- which also keeps each launch's real snapshot extraction and
+# byte-for-byte verify_snapshot() pass cheap.
+seed_harness_fixture_repo() {
+  local dest="$1"
+  mkdir -p "$dest"
+  git -C "$dest" init --quiet
+  git -C "$dest" config user.email "test@example.com"
+  git -C "$dest" config user.name "Test"
+  # agent-dispatch.sh (invoked by the real dispatch below) and planner.py's
+  # default_dispatch_script() both resolve the harness's own files --
+  # agent-dispatch.sh itself, investigator-entrypoint.sh -- relative to
+  # CFGMS_TEST_REPO_ROOT, so both directories have to be here as real tracked
+  # files (an untracked file, or a directory symlink, is invisible to
+  # `git archive`'s tree walk and would leave the snapshot without a .claude
+  # at all).
+  cp -r "${REPO_ROOT}/.claude" "${dest}/.claude"
+  cp -r "${REPO_ROOT}/.devcontainer" "${dest}/.devcontainer"
+  # Byte-compiled caches of the very modules under test have no business in a
+  # snapshot that is verified byte-for-byte against its own commit.
+  find "${dest}/.claude" -type d -name '__pycache__' -prune -exec rm -rf {} +
+  # The two repo-relative paths the stub plan steps below name in their
+  # `scope`/`files`, so read_step_files() reads real content rather than
+  # logging a skipped read for every step.
+  mkdir -p "${dest}/pkg/example" "${dest}/pkg/other"
+  echo "package example" > "${dest}/pkg/example/file.go"
+  echo "package other" > "${dest}/pkg/other/file.go"
+}
+
+commit_harness_fixture_repo() {
+  local dest="$1"
+  git -C "$dest" add .claude .devcontainer pkg
+  git -C "$dest" commit --quiet -m "fixture: harness code and reviewable content"
+}
+
+HARNESS_FIXTURE_REPO="${SANDBOX}/harness-fixture-repo"
+seed_harness_fixture_repo "$HARNESS_FIXTURE_REPO"
+commit_harness_fixture_repo "$HARNESS_FIXTURE_REPO"
+fixture_committed_schema="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:.claude/scripts/security-review/schema.py | sha256sum | cut -d' ' -f1)"
+live_schema="$(sha256sum "${SECURITY_REVIEW_DIR}/schema.py" | cut -d' ' -f1)"
+check_eq "the fixture repo's HEAD commit carries this checkout's live schema.py (the lane imports it from there)" \
+  "$fixture_committed_schema" "$live_schema"
 
 # Stub harness CLI binary (Issue #3934) -- the ONLY thing lane mode stubs.
 # Reads the same env var contract claude_lane.py::call_claude_harness sets
@@ -407,14 +478,15 @@ if [[ "$mode" == "plan" ]]; then
     step_id=$(printf "step-%03d" "$i")
     step_file="${out_dir}/${step_id}.json"
     [[ -f "$step_file" ]] && continue
-    # The four fields the plan prompt actually asks the model for
-    # (step_id/scope/description/files). sweep_id, commit_sha and planners are
-    # deliberately absent: planner.py's prompt never asks for them and
-    # planner.finalize() injects all three from the sweep's own context
-    # sidecar, so a real plan-mode container never writes them either. A step
-    # missing `files` is rejected by schema.validate_plan_step() -- the shared
+    # The fields the plan prompt actually asks the model for
+    # (step_id/scope/hypotheses/files). sweep_id, commit_sha, planners, and
+    # each hypothesis's own `planner` field are deliberately absent:
+    # planner.py's prompt never asks for them and planner.finalize() injects
+    # all of them from the sweep's own context sidecar, so a real plan-mode
+    # container never writes them either. A step missing `files` or
+    # `hypotheses` is rejected by schema.validate_plan_step() -- the shared
     # C1 shape every lane reads -- and finalize() would drop it.
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"description":"stub step","files":["pkg/example/file.go"]}' \
+    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go"]}' \
       "$step_id" > "$step_file"
   done
 else
@@ -466,7 +538,7 @@ run_cli() {
   # (some cases below deliberately set a different, or no, roster).
   local sub="$1"; shift
   PATH="${FAKEBIN}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${sub}/ledger" \
   HOME="${sub}/HOME" \
@@ -613,7 +685,7 @@ SUB_NOROSTER="${SANDBOX}/case-no-roster"
 setup_sub_sandbox "$SUB_NOROSTER"
 set +e
 noroster_out=$(CFGMS_SECURITY_REVIEW_LANES="" PATH="${FAKEBIN}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_AGENT_LEDGER_DIR="${SUB_NOROSTER}/ledger" \
   HOME="${SUB_NOROSTER}/HOME" \
   CFGMS_SECURITY_REVIEW_BASE="${SUB_NOROSTER}/base" \
@@ -1070,7 +1142,7 @@ if [[ "$mode" == "plan" ]]; then
     step_id=$(printf "step-%03d" "$i")
     step_file="${out_dir}/${step_id}.json"
     [[ -f "$step_file" ]] && continue
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"description":"stub step","files":["pkg/example/file.go"]}' \
+    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go"]}' \
       "$step_id" > "$step_file"
   done
 else
@@ -1098,7 +1170,7 @@ chmod +x "${FAKEBIN2}/docker"
 run_cli2() {
   local sub="$1"; shift
   PATH="${FAKEBIN2}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${sub}/ledger" \
   HOME="${sub}/HOME" \
@@ -1173,7 +1245,7 @@ set +e
 fail_out=$(STUB_PLAN_STEP_COUNT=2 \
   STUB_FORCE_RUNNING_MODE="claude-model-b" \
   PATH="${FAKEBIN2}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX5}/ledger" \
   HOME="${SANDBOX5}/HOME" \
@@ -1217,7 +1289,7 @@ roster_fail_out=$(STUB_PLAN_STEP_COUNT=2 \
   CFGMS_SECURITY_REVIEW_LANES="claude:stubmodel" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="${SANDBOX7}/lane-entrypoints" \
   PATH="${FAKEBIN2}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX7}/ledger" \
   HOME="${SANDBOX7}/HOME" \
@@ -1256,7 +1328,10 @@ tamper_launch_rc=$?
 check_eq "launch exits 0 before any tampering" "$tamper_launch_rc" "0"
 SWEEP_DIR_TAMPER="$(dirname "$(dirname "$tamper_launch_out")")"
 
-TAMPER_TARGET="${SWEEP_DIR_TAMPER}/snapshot/CLAUDE.md"
+# Any file tracked in the fixture repo's own HEAD commit works here -- what
+# is under test is verify_snapshot()'s byte-for-byte comparison, not which
+# path it happens to disagree on.
+TAMPER_TARGET="${SWEEP_DIR_TAMPER}/snapshot/pkg/example/file.go"
 [[ -f "$TAMPER_TARGET" ]] && ok "the file this test will tamper with exists in the snapshot" \
   || bad "the file this test will tamper with exists in the snapshot" "not found: ${TAMPER_TARGET}"
 # create_snapshot() strips write bits from every extracted file -- this is
@@ -1279,7 +1354,7 @@ if [[ "$tamper_resume_rc" -ne 0 ]]; then
 else
   bad "resume exits non-zero after the snapshot is tampered" "exited 0"
 fi
-check_contains "resume reports the tampered path" "$tamper_resume_out" "CLAUDE.md"
+check_contains "resume reports the tampered path" "$tamper_resume_out" "pkg/example/file.go"
 check_contains "resume reports it as a snapshot verification failure" "$tamper_resume_out" "snapshot verification failed"
 check_not_contains "resume never prints the report path as if it completed cleanly" "$tamper_resume_out" "report/consolidated.md"
 check_not_contains "no container was dispatched for the tampered resume" "$(cat "${SUB_TAMPER}/docker_calls.log" 2>/dev/null || true)" "run -d"
@@ -1298,45 +1373,14 @@ echo "   checkout (the pre-#3952 behavior) would (Issue #3952, epic #3950's"
 echo "   D1) =="
 
 CONTENT_FIXTURE_REPO="$(mktemp -d)"
-git -C "$CONTENT_FIXTURE_REPO" init --quiet
-git -C "$CONTENT_FIXTURE_REPO" config user.email "test@example.com"
-git -C "$CONTENT_FIXTURE_REPO" config user.name "Test"
-# agent-dispatch.sh (invoked by the real dispatch below) and planner.py's
-# default_dispatch_script() both resolve the harness's own files --
-# agent-dispatch.sh itself, investigator-entrypoint.sh -- relative to
-# $REPO_ROOT/CFGMS_TEST_REPO_ROOT, which this test intentionally points at
-# this synthetic fixture instead of the real checkout. Copying (not
-# symlinking) these two directories in, as real tracked files, supplies the
-# harness's own code from the real checkout while leaving the fixture's OWN
-# git history -- the "reviewed content" this test controls -- completely
-# independent of the marker file below.
-#
-# These copies ARE committed, and that is deliberate: claude_lane.py's
-# CFGMS_SECURITY_REVIEW_REPO_ROOT import-bootstrap fallback resolves its
-# sibling modules (schema.py, terminal_state.py, ...) from
-# "<repo_root>/.claude/scripts/security-review", and after this story's
-# cutover, <repo_root> here is <sweep_dir>/snapshot -- git archive HEAD's
-# own output, not this working tree. An untracked file (or a directory
-# symlink, tried and reverted here -- `_walk_relative_files()`'s
-# `os.walk(..., followlinks=False)` never lists a directory-type symlink as
-# a file at all, so `verify_snapshot()` reports it "missing from snapshot"
-# even once `git archive` has faithfully extracted it) is invisible to
-# `git archive`'s tree walk, so `<sweep_dir>/snapshot` ended up without a
-# `.claude` at all; the sibling imports only kept working by accident, via
-# the harness's hardcoded `/workspace` fallback candidate matching this dev
-# sandbox's own checkout path -- a coincidence that does not hold on a CI
-# runner, where the checkout lives elsewhere and the same imports raise
-# ModuleNotFoundError (swallowed by this file's own docker stub's
-# `|| true`, so the lane silently never runs). Committing real copies makes
-# `git archive` include them as ordinary blobs, exactly like a real
-# checkout's own tracked `.claude/` would produce, so the fallback resolves
-# the same way everywhere, not just where the coincidence holds.
-cp -r "${REPO_ROOT}/.claude" "${CONTENT_FIXTURE_REPO}/.claude"
-cp -r "${REPO_ROOT}/.devcontainer" "${CONTENT_FIXTURE_REPO}/.devcontainer"
-mkdir -p "${CONTENT_FIXTURE_REPO}/pkg/example"
+# Same seeded fixture every other lane-executing case above uses (its own
+# comment explains why the harness's .claude/.devcontainer have to be real
+# tracked files in the fixture's OWN history rather than symlinks or
+# untracked copies), with this test's marker written over the seeded
+# pkg/example/file.go before the commit the sweep will pin to.
+seed_harness_fixture_repo "$CONTENT_FIXTURE_REPO"
 echo "COMMITTED_SNAPSHOT_MARKER_c3a91f" > "${CONTENT_FIXTURE_REPO}/pkg/example/file.go"
-git -C "$CONTENT_FIXTURE_REPO" add pkg .claude .devcontainer
-git -C "$CONTENT_FIXTURE_REPO" commit --quiet -m "init"
+commit_harness_fixture_repo "$CONTENT_FIXTURE_REPO"
 # Dirty the working tree AFTER the commit the sweep will pin to -- exactly
 # what "develop moves several times an hour" looks like between sweep
 # creation and container dispatch (this epic's own motivating scenario).
@@ -1465,12 +1509,12 @@ if [ "\$lane_dir_name" = "claude-model-a" ]; then
   # immediately, exactly like a real detached container does.
   (
     while [ ! -f "${MP_SANDBOX}/release-model-a" ]; do sleep 0.02; done
-    printf '{"step_id":"step-001","scope":["pkg/example/file.go"],"description":"stub-a","files":["pkg/example/file.go"]}' > "\${out_dir}/step-001.json"
+    printf '{"step_id":"step-001","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub-a objective","required_evidence":"stub-a evidence"}],"files":["pkg/example/file.go"]}' > "\${out_dir}/step-001.json"
     touch "${MP_SANDBOX}/exited-\${cid}"
   ) >/dev/null 2>&1 &
   disown
 elif [ "\$lane_dir_name" = "claude-model-b" ]; then
-  printf '{"step_id":"step-001","scope":["pkg/other/file.go"],"description":"stub-b","files":["pkg/other/file.go"]}' > "\${out_dir}/step-001.json"
+  printf '{"step_id":"step-001","scope":["pkg/other/file.go"],"hypotheses":[{"id":"h1","objective":"stub-b objective","required_evidence":"stub-b evidence"}],"files":["pkg/other/file.go"]}' > "\${out_dir}/step-001.json"
   touch "${MP_SANDBOX}/exited-\${cid}"
 else
   touch "${MP_SANDBOX}/exited-\${cid}"
@@ -1481,7 +1525,7 @@ chmod +x "${MP_FAKEBIN}/docker"
 
 set +e
 PATH="${MP_FAKEBIN}:${PATH}" \
-  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${MP_SANDBOX}/ledger" \
   HOME="${MP_SANDBOX}/HOME" \
