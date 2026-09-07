@@ -427,6 +427,231 @@ def test_frozen_plan_denominator_not_started_for_untouched_steps():
         )
 
 
+def test_findings_sorted_by_agreement_then_severity_then_confidence():
+    # REQUIRED TEST (Issue #3960): agreement.reported is the primary sort
+    # key, severity the secondary key -- a 2-lane low-severity finding must
+    # still outrank a 1-lane critical finding, because agreement is checked
+    # first regardless of severity (SKILL.md: "sorted by multi-lane
+    # agreement first, then severity, then confidence"). File/symbol names
+    # are chosen so a lexicographic sorted(groups.items()) would produce a
+    # different order ([aaa_two_lane_low, mmm_one_lane_critical,
+    # zzz_two_lane_critical]) than the agreement/severity-driven order
+    # below, so this test cannot pass by accident under the old sort.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "zzz_two_lane_critical.go": "package zzz\n",
+                "mmm_one_lane_critical.go": "package mmm\n",
+                "aaa_two_lane_low.go": "package aaa\n",
+            },
+        )
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha,
+                "laneA",
+                "step-001",
+                [
+                    finding(
+                        sha, "laneA", "step-001",
+                        file="zzz_two_lane_critical.go", symbol="Critical.Two",
+                        severity="critical", confidence="medium",
+                    ),
+                    finding(
+                        sha, "laneA", "step-001",
+                        file="mmm_one_lane_critical.go", symbol="Critical.One",
+                        severity="critical", confidence="medium",
+                    ),
+                    finding(
+                        sha, "laneA", "step-001",
+                        file="aaa_two_lane_low.go", symbol="Low.Two",
+                        severity="low", confidence="medium",
+                    ),
+                ],
+            ),
+        )
+        write(
+            os.path.join(sweep, "lanes", "laneB", "step-001.findings.json"),
+            complete_envelope(
+                sha,
+                "laneB",
+                "step-001",
+                [
+                    finding(
+                        sha, "laneB", "step-001",
+                        file="zzz_two_lane_critical.go", symbol="Critical.Two",
+                        severity="critical", confidence="medium",
+                    ),
+                    finding(
+                        sha, "laneB", "step-001",
+                        file="aaa_two_lane_low.go", symbol="Low.Two",
+                        severity="low", confidence="medium",
+                    ),
+                ],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        order = [(f["file"], f["symbol"]) for f in report["findings"]]
+        expected = [
+            ("zzz_two_lane_critical.go", "Critical.Two"),  # agreement 2, critical
+            ("aaa_two_lane_low.go", "Low.Two"),             # agreement 2, low
+            ("mmm_one_lane_critical.go", "Critical.One"),  # agreement 1, critical
+        ]
+        check(
+            order == expected,
+            "consolidate: findings sorted by agreement descending, then severity, "
+            "then confidence -- a 2-lane low outranks a 1-lane critical",
+            str(order),
+        )
+        lexicographic = sorted(order)
+        check(
+            order != lexicographic,
+            "consolidate: sanity -- fixture file/symbol names sort differently "
+            "under plain lexicographic order, so the assertion above could not "
+            "pass by accident under the old sorted(groups.items()) behavior",
+            str(order),
+        )
+
+
+def test_low_severity_low_confidence_single_lane_finding_survives_to_report():
+    # REQUIRED TEST (Issue #3960 / SC5): a schema-valid, low-severity,
+    # low-confidence finding reported by exactly one lane must survive
+    # _group_findings()/_finalize_findings() unfiltered and actually appear
+    # in render_markdown()'s rendered output -- proving the survives-to-the-
+    # report half of SC5, not merely a data-structure check. Neither
+    # function filters on severity or confidence today; this is a
+    # regression demonstration, not a bug fix.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/quiet/whisper.go": "package quiet\n"})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/quiet")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha,
+                "laneA",
+                "step-001",
+                [
+                    finding(
+                        sha, "laneA", "step-001",
+                        file="pkg/quiet/whisper.go", symbol="Whisper.Maybe",
+                        vuln_class="info-disclosure",
+                        severity="low", confidence="low",
+                        title="possibly-benign header echo",
+                    )
+                ],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        match = [
+            f for f in report["findings"]
+            if (f["file"], f["symbol"], f["vuln_class"])
+            == ("pkg/quiet/whisper.go", "Whisper.Maybe", "info-disclosure")
+        ]
+        check(
+            len(match) == 1,
+            "consolidate: a low/low single-lane finding is present in findings[] by exact key",
+            str(report["findings"]),
+        )
+        md = consolidate.render_markdown(report)
+        check(
+            "### info-disclosure — pkg/quiet/whisper.go :: Whisper.Maybe" in md,
+            "consolidate.md: the low/low finding's heading is rendered, not filtered out",
+            md,
+        )
+        check(
+            "low" in md and "possibly-benign header echo" in md,
+            "consolidate.md: the low/low finding's severity/confidence and title are rendered",
+            md,
+        )
+
+
+def test_skill_md_ranking_sentence_matches_shipped_sort_order():
+    # REQUIRED TEST (Issue #3960, Tech Lead/PO ruling on revision 2): mirrors
+    # #3955's mechanism exactly -- reads SKILL.md's live contents from disk
+    # rather than a copy-pasted literal, so a future rewrite that deletes the
+    # ranking sentence (the exact failure mode that let F4's policy sentence
+    # vanish under #3938/#3949 without any test catching it) fails this test
+    # loudly, and a rewrite that changes the shipped sort order without
+    # updating the sentence fails it too.
+    skill_path = (
+        Path(__file__).resolve().parent.parent.parent / "skills" / "security-review" / "SKILL.md"
+    )
+    skill_text = skill_path.read_text()
+    ranking_sentence = "sorted by multi-lane agreement first, then severity, then confidence"
+    check(
+        ranking_sentence in skill_text,
+        "SKILL.md: the F6 ranking-order sentence is present in the live file "
+        "(fails loudly if a future edit deletes it, per the F4-deletion incident)",
+        f"searched {skill_path}",
+    )
+
+    # Independently, a synthetic consolidate() fixture's actual output order
+    # must match that documented order: agreement, then severity, then
+    # confidence, all descending.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "zzz_high_agreement_medium_severity.go": "package a\n",
+                "aaa_low_agreement_high_severity.go": "package b\n",
+            },
+        )
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha,
+                "laneA",
+                "step-001",
+                [
+                    finding(
+                        sha, "laneA", "step-001",
+                        file="zzz_high_agreement_medium_severity.go", symbol="Fn.A",
+                        severity="medium", confidence="low",
+                    ),
+                    finding(
+                        sha, "laneA", "step-001",
+                        file="aaa_low_agreement_high_severity.go", symbol="Fn.B",
+                        severity="high", confidence="high",
+                    ),
+                ],
+            ),
+        )
+        write(
+            os.path.join(sweep, "lanes", "laneB", "step-001.findings.json"),
+            complete_envelope(
+                sha,
+                "laneB",
+                "step-001",
+                [
+                    finding(
+                        sha, "laneB", "step-001",
+                        file="zzz_high_agreement_medium_severity.go", symbol="Fn.A",
+                        severity="medium", confidence="low",
+                    ),
+                ],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        order = [f["symbol"] for f in report["findings"]]
+        check(
+            order == ["Fn.A", "Fn.B"],
+            "consolidate: shipped sort order matches SKILL.md's documented "
+            "agreement-first order -- a 2-lane medium/low outranks a "
+            "1-lane high/high",
+            str(order),
+        )
+        check(
+            [f["file"] for f in report["findings"]] != sorted(f["file"] for f in report["findings"]),
+            "consolidate: sanity -- fixture file names sort in the opposite order "
+            "lexicographically, so the assertion above could not pass by accident "
+            "under the old sorted(groups.items()) behavior",
+            str([f["file"] for f in report["findings"]]),
+        )
+
+
 def test_schema_invalid_findings_file_excluded_and_marked_failed():
     # REQUIRED TEST: uses #3901's actual validate_step_envelope/validate_finding
     # (via consolidate.py's own import), not a hand-typed "invalid-looking"

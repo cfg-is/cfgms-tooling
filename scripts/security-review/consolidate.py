@@ -62,6 +62,13 @@ import schema  # noqa: E402
 STEP_STATES = ("complete", "parked", "refused", "failed")
 NOT_STARTED = "not_started"
 
+# Rank tables for the findings sort order documented at SKILL.md's "sorted by
+# multi-lane agreement first, then severity, then confidence" sentence --
+# higher value sorts first (descending). Keys match schema.py's
+# SEVERITY_VALUES/CONFIDENCE_VALUES exactly.
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
 
 def _load_json(path: str):
     try:
@@ -289,6 +296,32 @@ def _eligible_lanes(step_ids: list[str], lane_step_state: dict[str, dict[str, st
     return eligible
 
 
+def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
+    """Sort key for one consolidated finding, matching `SKILL.md`'s documented
+    order exactly: multi-lane agreement first, then severity, then
+    confidence -- each descending -- with the `file`/`symbol`/`vuln_class`
+    key retained only as the final tiebreaker for two findings tied on all
+    three ranked fields, so output stays deterministic.
+
+    Severity/confidence are taken from the group's highest-ranked occurrence
+    via `max()` over `finding["occurrences"]`, not the first occurrence in
+    insertion order -- a group's occurrences can span multiple lanes that
+    reported different severities for the same underlying issue, and a group
+    where only the second-listed lane called it `critical` must still sort
+    as critical.
+    """
+    severity_rank = max(_SEVERITY_RANK[occ["severity"]] for occ in finding["occurrences"])
+    confidence_rank = max(_CONFIDENCE_RANK[occ["confidence"]] for occ in finding["occurrences"])
+    return (
+        -finding["agreement"]["reported"],
+        -severity_rank,
+        -confidence_rank,
+        finding["file"],
+        finding["symbol"],
+        finding["vuln_class"],
+    )
+
+
 def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]]) -> list[dict]:
     consolidated = []
     for (file_value, symbol, vuln_class), group in sorted(groups.items()):
@@ -311,6 +344,7 @@ def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]])
                 ),
             }
         )
+    consolidated.sort(key=_group_rank_key)
     return consolidated
 
 
