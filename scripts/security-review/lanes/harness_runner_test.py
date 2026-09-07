@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -24,6 +26,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness_runner  # noqa: E402
 import terminal_state  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+HARNESS_RUNNER_PATH = REPO_ROOT / ".claude/scripts/security-review/lanes/harness_runner.py"
+SKILL_MD_PATH = REPO_ROOT / ".claude/skills/security-review/SKILL.md"
 
 FAILURES: list[str] = []
 
@@ -91,6 +97,82 @@ def test_system_prompt_and_schema_description_are_distinct_constants():
     check(
         harness_runner.SYSTEM_PROMPT != harness_runner.OUTPUT_SCHEMA_DESCRIPTION,
         "SYSTEM_PROMPT and OUTPUT_SCHEMA_DESCRIPTION are defined as two distinct constants",
+    )
+
+
+# --- Confidence-retention policy: SKILL.md and SYSTEM_PROMPT must agree -----
+# (Issue #3955: SKILL.md's rewrite in #3949 deleted the only policy sentence
+# on this topic. This test reads both live sources at test time -- never a
+# copy-pasted literal of either file baked into the test -- so a future edit
+# to one side without the other fails here, not silently.)
+
+
+def test_old_suppression_wording_is_gone_from_harness_runner():
+    # REQUIRED TEST: the old "report only vulnerabilities you are confident
+    # are real" suppression instruction must not silently coexist with the
+    # new retention wording.
+    grep = subprocess.run(
+        ["grep", "-c", "confident are real", str(HARNESS_RUNNER_PATH)],
+        capture_output=True,
+        text=True,
+    )
+    count = int(grep.stdout.strip() or "0")
+    check(
+        count == 0,
+        "harness_runner.py contains zero occurrences of the old 'confident are real' suppression wording",
+        f"grep -c matched {count} time(s)",
+    )
+
+
+def test_system_prompt_and_skill_md_share_the_confidence_retention_phrase():
+    # REQUIRED TEST: a specific, agreed substring naming the retained-low-
+    # confidence policy must appear in both SYSTEM_PROMPT (read from the
+    # imported module) and the live contents of SKILL.md (read from disk).
+    # Markdown line-wraps a paragraph across source lines without changing its
+    # rendered meaning, so whitespace is normalized before the substring
+    # check -- otherwise a harmless re-wrap would falsely read as drift.
+    skill_md_text = re.sub(r"\s+", " ", SKILL_MD_PATH.read_text())
+    system_prompt_text = re.sub(r"\s+", " ", harness_runner.SYSTEM_PROMPT)
+
+    shared_phrases = (
+        "including low-confidence and low-severity candidates",
+        "do not filter for importance before reporting",
+    )
+    for phrase in shared_phrases:
+        in_prompt = phrase.lower() in system_prompt_text.lower()
+        in_skill = phrase.lower() in skill_md_text.lower()
+        check(
+            in_prompt and in_skill,
+            f"shared confidence-retention phrase present in both SYSTEM_PROMPT and SKILL.md: {phrase!r}",
+            f"in SYSTEM_PROMPT={in_prompt} in SKILL.md={in_skill}",
+        )
+
+
+def test_skill_md_confidence_policy_section_between_state_rule_and_reading_the_report():
+    skill_md_text = SKILL_MD_PATH.read_text()
+    headings = re.findall(r"^## (.+)$", skill_md_text, flags=re.MULTILINE)
+    state_rule = "The state rule, which is the whole safety property"
+    reading_report = "Reading the report"
+    confidence_headings = [h for h in headings if "confidence" in h.lower()]
+    check(
+        len(confidence_headings) == 1,
+        "SKILL.md has exactly one confidence-policy section heading",
+        str(confidence_headings),
+    )
+    if confidence_headings:
+        confidence_heading = confidence_headings[0]
+        check(
+            headings.index(state_rule) < headings.index(confidence_heading) < headings.index(reading_report),
+            "the confidence-policy section sits between the state-rule section and 'Reading the report'",
+            str(headings),
+        )
+
+
+def test_system_prompt_does_not_instruct_filtering_by_confidence():
+    check(
+        "report only vulnerabilities you are confident are real" not in harness_runner.SYSTEM_PROMPT.lower(),
+        "SYSTEM_PROMPT no longer instructs the model to report only high-confidence findings",
+        harness_runner.SYSTEM_PROMPT,
     )
 
 

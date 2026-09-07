@@ -107,6 +107,15 @@ its remaining steps and stops — the sweep is explicitly intended to span days,
 continue. `resume <sweep-id>` picks up exactly where it stopped: rescan the tree, run whatever is
 missing. The files on disk *are* the progress state — there is no separate database to corrupt.
 
+## Confidence policy
+
+A finder lane reports every security concern it is reasonably confident is grounded in the code
+it read, including low-confidence and low-severity candidates, each carrying its own confidence,
+severity, and a note of what evidence would raise or lower that confidence. Do not filter for
+importance before reporting: a lane must never discard a grounded candidate for being merely
+low-confidence, because a candidate dropped inside one lane can never be agreed or disagreed with
+by another lane — which is the entire value of running independent lanes at all.
+
 ## Reading the report
 
 `report/consolidated.md` opens with a per-lane × per-step coverage table — counts of `complete` /
