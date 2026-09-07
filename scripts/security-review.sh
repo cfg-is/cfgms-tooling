@@ -413,25 +413,30 @@ sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
 sys.path.insert(0, sec_dir)
 import consolidate  # noqa: E402
 
-lanes, step_ids, lane_step_state, _findings = consolidate.load_sweep(sweep_dir)
+lanes, step_ids, lane_step_state, _findings, plan_failed = consolidate.load_sweep(sweep_dir)
 coverage = consolidate.build_coverage_table(lanes, step_ids, lane_step_state)
 
 print(f"Sweep: {sweep_dir}")
-print(f"Steps discovered: {len(step_ids)}")
-print("")
-if not coverage:
-    print("(no lane output found for this sweep)")
+if plan_failed:
+    print("Coverage cannot be computed for this sweep: no plan survived planning")
+    print("(plan/PLANNING_FAILED is present or plan/ contains zero step-*.json files)")
 else:
-    print(f"{'Lane':<24}{'Complete':>10}{'Parked':>9}{'Refused':>10}{'Failed':>9}")
-    for row in coverage:
-        total = row["total_steps"]
-        print(
-            f"{row['lane']:<24}"
-            f"{str(row['complete']) + '/' + str(total):>10}"
-            f"{str(row['parked']) + '/' + str(total):>9}"
-            f"{str(row['refused']) + '/' + str(total):>10}"
-            f"{str(row['failed']) + '/' + str(total):>9}"
-        )
+    print(f"Steps discovered: {len(step_ids)}")
+    print("")
+    if not coverage:
+        print("(no lane output found for this sweep)")
+    else:
+        print(f"{'Lane':<24}{'Complete':>10}{'Parked':>9}{'Refused':>10}{'Failed':>9}{'Not started':>13}")
+        for row in coverage:
+            total = row["total_steps"]
+            print(
+                f"{row['lane']:<24}"
+                f"{str(row['complete']) + '/' + str(total):>10}"
+                f"{str(row['parked']) + '/' + str(total):>9}"
+                f"{str(row['refused']) + '/' + str(total):>10}"
+                f"{str(row['failed']) + '/' + str(total):>9}"
+                f"{str(row['not_started']) + '/' + str(total):>13}"
+            )
 PYEOF
 }
 

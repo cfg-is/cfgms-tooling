@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Findings consolidator for the security review harness (Issue #3904).
 
-Reads whatever `lanes/<lane>/step-*.findings.json` and `step-*.status.json`
-files currently exist under a sweep directory -- a sweep in any state of
-completeness, mid-run, fully complete, or partially parked -- and produces
-two files under `<sweep_dir>/report/`:
+Reads the frozen plan under `<sweep_dir>/plan/` (Issue #3953) -- the
+`step-*.json` files `planner.py`'s `finalize()`/`finalize_multi_planner()`
+write once and `resume` never regenerates -- for the set of step ids a sweep
+was supposed to cover, then reads whatever `lanes/<lane>/step-*.findings.json`
+and `step-*.status.json` files currently exist against that fixed
+denominator -- a sweep in any state of completeness, mid-run, fully complete,
+or partially parked -- and produces two files under `<sweep_dir>/report/`:
 
 - `consolidated.json` -- machine-readable findings, de-duplicated on
   `file` + `symbol` + `vuln_class` (never a line number, per
@@ -44,7 +47,6 @@ f-string interpolation of tainted content -- matching `resume.py`.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import subprocess
@@ -54,9 +56,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import basedir  # noqa: E402
+import planner  # noqa: E402
 import schema  # noqa: E402
 
 STEP_STATES = ("complete", "parked", "refused", "failed")
+NOT_STARTED = "not_started"
 
 
 def _load_json(path: str):
@@ -82,32 +86,59 @@ def _step_id_from_filename(filename: str, suffix: str) -> str:
     return filename[: -len(suffix)]
 
 
-def _discover_step_ids(sweep_dir: str, lanes: list[str]) -> list[str]:
-    step_ids: set[str] = set()
-    for lane in lanes:
-        lane_dir = os.path.join(sweep_dir, "lanes", lane)
-        for path in glob.glob(os.path.join(lane_dir, "step-*.findings.json")):
-            step_ids.add(_step_id_from_filename(os.path.basename(path), ".findings.json"))
-        for path in glob.glob(os.path.join(lane_dir, "step-*.status.json")):
-            step_ids.add(_step_id_from_filename(os.path.basename(path), ".status.json"))
-    return sorted(step_ids)
+def _discover_plan_step_ids(sweep_dir: str) -> list[str]:
+    """Read the frozen plan's step ids from `<sweep_dir>/plan/step-*.json`
+    file names -- the denominator `planner.py`'s `finalize()`/
+    `finalize_multi_planner()` write once and `resume` never regenerates.
+
+    Reuses `planner.py`'s own `STEP_FILENAME_RE` rather than redefining an
+    equivalent pattern, so the two stay in lock-step by construction (Issue
+    #3953). Never reads `lanes/*/step-*.{findings,status}.json` -- a step a
+    lane never touched must still count against the denominator, which an
+    artifact-derived set can never do because it only sees files that exist.
+    """
+    plan_dir = os.path.join(sweep_dir, "plan")
+    if not os.path.isdir(plan_dir):
+        return []
+    return sorted(
+        filename[: -len(".json")]
+        for filename in os.listdir(plan_dir)
+        if planner.STEP_FILENAME_RE.match(filename)
+    )
+
+
+def _plan_failed(sweep_dir: str, step_ids: list[str]) -> bool:
+    """True when the frozen plan cannot serve as a coverage denominator:
+    `finalize()`'s `plan/PLANNING_FAILED` marker is present, or zero
+    `step-*.json` files survived under `plan/` (the condition `finalize()`
+    guarantees always accompanies that marker, checked independently here in
+    case the marker itself is somehow absent)."""
+    marker_path = os.path.join(sweep_dir, "plan", planner.FAILURE_MARKER_FILENAME)
+    return os.path.isfile(marker_path) or not step_ids
 
 
 def load_sweep(sweep_dir: str):
-    """Read every lane's step files under `sweep_dir`.
+    """Read the frozen plan and every lane's step files under `sweep_dir`.
 
-    Returns `(lanes, step_ids, lane_step_state, findings)`:
+    Returns `(lanes, step_ids, lane_step_state, findings, plan_failed)`:
     - `lanes`: sorted lane directory names discovered under `lanes/`.
-    - `step_ids`: sorted union of every step id seen across all lanes.
+    - `step_ids`: sorted step ids read from `plan/step-*.json` -- the frozen
+      plan, never a union of lane-produced artifact files. Empty when the
+      plan failed.
     - `lane_step_state`: `{lane: {step_id: state}}`, `state` one of
       `STEP_STATES`. A `(lane, step_id)` pair with no file at all is simply
-      absent -- it contributes to no coverage bucket, per SEC3900 B7 (a step
-      never run is neither a "reported" nor a "did not find it" signal).
+      absent here -- `build_coverage_table()` turns that absence into an
+      explicit `not_started` count rather than dropping it from every bucket
+      (SEC3900 B7's "neither reported nor did-not-find" signal still holds
+      for agreement math; it is `not_started` for coverage math).
     - `findings`: `[(lane, step_id, finding_dict), ...]` for every finding in
       a schema-valid `state == "complete"` envelope.
+    - `plan_failed`: True when `plan/PLANNING_FAILED` is present or `plan/`
+      contains zero step files -- coverage cannot be computed for this sweep.
     """
     lanes = _discover_lanes(sweep_dir)
-    step_ids = _discover_step_ids(sweep_dir, lanes)
+    step_ids = _discover_plan_step_ids(sweep_dir)
+    plan_failed = _plan_failed(sweep_dir, step_ids)
     lane_step_state: dict[str, dict[str, str]] = {lane: {} for lane in lanes}
     findings: list[tuple[str, str, dict]] = []
 
@@ -163,10 +194,11 @@ def load_sweep(sweep_dir: str):
                 lane_step_state[lane][step_id] = envelope["state"]
                 continue
 
-            # Neither file exists: this lane never ran this step. Not counted
-            # in any coverage bucket -- see SEC3900 B7 in the module docstring.
+            # Neither file exists: this lane never ran this step. Left absent
+            # from lane_step_state -- build_coverage_table() counts it as
+            # not_started rather than dropping it from every bucket.
 
-    return lanes, step_ids, lane_step_state, findings
+    return lanes, step_ids, lane_step_state, findings, plan_failed
 
 
 def _tree_files(repo_root: str, commit_sha: str, cache: dict[str, frozenset]) -> frozenset:
@@ -285,16 +317,26 @@ def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]])
 def build_coverage_table(
     lanes: list[str], step_ids: list[str], lane_step_state: dict[str, dict[str, str]]
 ) -> list[dict]:
+    """One row per lane. The four `STEP_STATES` buckets plus `not_started`
+    always sum to `total_steps` exactly: a `(lane, step_id)` pair with
+    neither a `.findings.json` nor a `.status.json` file is counted as
+    `not_started` rather than contributing to no bucket at all (Issue
+    #3953) -- a step nobody touched must remain visible as an explicit gap,
+    never simply absent from the sum."""
     total = len(step_ids)
     rows = []
     for lane in lanes:
         counts = {state: 0 for state in STEP_STATES}
+        not_started = 0
         for step_id in step_ids:
             state = lane_step_state.get(lane, {}).get(step_id)
             if state in counts:
                 counts[state] += 1
+            else:
+                not_started += 1
         row = {"lane": lane, "total_steps": total}
         row.update(counts)
+        row[NOT_STARTED] = not_started
         rows.append(row)
     return rows
 
@@ -302,7 +344,7 @@ def build_coverage_table(
 def consolidate(sweep_dir: str, repo_root: str) -> dict:
     """Read `sweep_dir` and return the full consolidated report as a dict --
     the exact shape written to `report/consolidated.json`."""
-    lanes, step_ids, lane_step_state, findings = load_sweep(sweep_dir)
+    lanes, step_ids, lane_step_state, findings, plan_failed = load_sweep(sweep_dir)
     groups = _group_findings(findings, repo_root)
     consolidated_findings = _finalize_findings(groups, lane_step_state)
     coverage = build_coverage_table(lanes, step_ids, lane_step_state)
@@ -310,6 +352,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "sweep_id": os.path.basename(os.path.normpath(sweep_dir)),
         "lanes": lanes,
         "steps_discovered": step_ids,
+        "plan_failed": plan_failed,
         "coverage": coverage,
         "findings": consolidated_findings,
     }
@@ -333,26 +376,37 @@ def render_markdown(report: dict) -> str:
 
     lines.append("## Coverage")
     lines.append("")
-    lines.append(f"Steps discovered across the sweep: {len(report['steps_discovered'])}")
-    lines.append("")
-    lines.append("| Lane | Complete | Parked | Refused | Failed |")
-    lines.append("|---|---|---|---|---|")
-    if report["coverage"]:
-        for row in report["coverage"]:
-            total = row["total_steps"]
-            lines.append(
-                "| {lane} | {c}/{t} | {p}/{t} | {r}/{t} | {f}/{t} |".format(
-                    lane=_md_escape_inline(row["lane"]),
-                    c=row["complete"],
-                    p=row["parked"],
-                    r=row["refused"],
-                    f=row["failed"],
-                    t=total,
-                )
-            )
+    if report.get("plan_failed"):
+        lines.append(
+            "**Coverage cannot be computed for this sweep.** No plan survived "
+            "planning: either `plan/PLANNING_FAILED` is present or `plan/` "
+            "contains zero `step-*.json` files, so there is no frozen set of "
+            "steps to measure any lane's output against. This is a planning "
+            "failure, not an empty sweep with nothing to review."
+        )
+        lines.append("")
     else:
-        lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 |")
-    lines.append("")
+        lines.append(f"Steps discovered across the sweep: {len(report['steps_discovered'])}")
+        lines.append("")
+        lines.append("| Lane | Complete | Parked | Refused | Failed | Not started |")
+        lines.append("|---|---|---|---|---|---|")
+        if report["coverage"]:
+            for row in report["coverage"]:
+                total = row["total_steps"]
+                lines.append(
+                    "| {lane} | {c}/{t} | {p}/{t} | {r}/{t} | {f}/{t} | {n}/{t} |".format(
+                        lane=_md_escape_inline(row["lane"]),
+                        c=row["complete"],
+                        p=row["parked"],
+                        r=row["refused"],
+                        f=row["failed"],
+                        n=row["not_started"],
+                        t=total,
+                    )
+                )
+        else:
+            lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 |")
+        lines.append("")
 
     lines.append("## Findings")
     lines.append("")
