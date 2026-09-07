@@ -102,6 +102,23 @@ CONTEXT_FILENAME = ".plan-context.json"
 FAILURE_MARKER_FILENAME = "PLANNING_FAILED"
 STEP_FILENAME_RE = re.compile(r"^step-(\d{3,})\.json$")
 
+# The plan-mode container's own resolved-model report (Issue #3954), written
+# by investigator-entrypoint.sh via `claude --output-format json` into its
+# `/workspace-out/` mount -- i.e. `<sweep_dir>/planners/<lane_dir_name>/plan/`
+# for a multi-planner lane. Only ever present when that lane was launched
+# with CFGMS_SECURITY_REVIEW_MODEL set (the roster path); the legacy
+# single-hardcoded-planner call never writes one.
+PLAN_RESULT_FILENAME = ".investigator-plan-result.json"
+
+# Sidecar `finalize_multi_planner()` writes at the sweep root recording, per
+# configured planner (`lane_dir_name`), the model id `_extract_resolved_model`
+# was able to read back from that planner's own PLAN_RESULT_FILENAME -- or
+# "unknown" when there was nothing to read. `security-review.sh` reads this
+# back to fill `resolved_model` on the "planners" entries of
+# `<sweep_dir>/dispatch_report.json` (epic #3950's D3): the requested and
+# resolved identities must stay distinguishable, never collapsed into one.
+RESOLVED_MODELS_FILENAME = ".plan-resolved-models.json"
+
 # Sub-sweep-dirs for multi-planner dispatch (C6) live under this directory,
 # one per roster entry, named for that entry's own `lane_dir_name` -- see
 # `launch()`'s multi-planner path and `finalize_multi_planner()`.
@@ -753,6 +770,35 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     return True, errors
 
 
+def _extract_resolved_model(result_path: str) -> str:
+    """Best-effort read of the model that actually executed a plan-mode
+    investigator run, from `claude --output-format json`'s result envelope
+    at `result_path` (investigator-entrypoint.sh's PLAN_RESULT_FILENAME).
+
+    Confirmed against the installed CLI: the envelope's top-level
+    `modelUsage` object is keyed by the canonical model id that served the
+    request -- independent of whatever alias `--model` was given. Returns
+    "unknown" whenever the file is absent, unparseable, or does not carry
+    that field: a data-availability signal for the dispatch report, never a
+    guess. This function must never fall back to the lane's own requested
+    model on a read failure -- doing so is exactly the "copy the requested id
+    into an effective-model field" fabrication epic #3950's D3 forbids.
+    """
+    try:
+        with open(result_path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    model_usage = data.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        first_key = next(iter(model_usage))
+        if isinstance(first_key, str) and first_key:
+            return first_key
+    return "unknown"
+
+
 def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tuple[bool, list[str]]:
     """`finalize()` for more than one configured planner (C6, Issue #3937,
     epic #3927). Never called by the legacy single-planner path -- that
@@ -780,9 +826,28 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     steps survive validation across every configured planner: an empty
     merged plan must never look like "nothing to review" any more than an
     empty single-planner plan does.
+
+    Also writes `<sweep_dir>/RESOLVED_MODELS_FILENAME` (Issue #3954),
+    recording each `planners` entry's own `_extract_resolved_model()` result
+    keyed by `lane_dir_name` -- unconditionally, before the context check
+    below, since that record describes what each container reported about
+    itself and is independent of whether the plan it produced ends up
+    validating. `security-review.sh` reads this sidecar back to fill
+    `resolved_model` on `dispatch_report.json`'s "planners" entries, never
+    overwriting the `lane.harness`/`lane.model` it already records for the
+    requested identity (D3: requested and resolved must stay distinguishable).
     """
     plan_dir = os.path.join(sweep_dir, "plan")
     os.makedirs(plan_dir, exist_ok=True)
+
+    resolved_models = {
+        lane.lane_dir_name: _extract_resolved_model(
+            os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan", PLAN_RESULT_FILENAME)
+        )
+        for lane in planners
+    }
+    atomic_write.write_json_atomic(os.path.join(sweep_dir, RESOLVED_MODELS_FILENAME), resolved_models)
+
     context = _read_sweep_context(sweep_dir)
 
     errors: list[str] = []

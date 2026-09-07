@@ -108,8 +108,33 @@ case "$MODE" in
     # --disallowedTools above still runs on top of it, per the comment on
     # inv_disallowed in agent-dispatch.sh.
     echo "Starting investigator (mode=plan)..."
-    exec claude --dangerously-skip-permissions --agent investigator -p "$(cat "$PROMPT_FILE")" \
-      --disallowedTools "$DISALLOWED_TOOLS"
+
+    # CFGMS_SECURITY_REVIEW_MODEL (Issue #3954) is non-empty exactly when the
+    # launcher was called with --harness/--model -- multi-planner dispatch
+    # (planner.py's roster path, Issue #3937), never the legacy single-
+    # hardcoded-planner call, which sets neither var. Before this fix, that
+    # value reached this container (agent-dispatch.sh's inv_harness_env) and
+    # was then silently dropped: `claude` ran with no --model at all and used
+    # whatever its own default resolved to, regardless of what the roster
+    # entry configured. Honor it or fail explicitly -- never substitute a
+    # different model without saying so.
+    #
+    # --output-format json (confirmed against the installed CLI) captures the
+    # CLI's own resolved-model report: the result envelope's top-level
+    # `modelUsage` object is keyed by the canonical model id that actually
+    # served the request, independent of whatever alias --model was given.
+    # Written to a fixed path under /workspace-out/ -- the only writable
+    # mount in plan mode -- instead of only stdout, so
+    # finalize_multi_planner() can read it back after the container exits.
+    if [ -n "${CFGMS_SECURITY_REVIEW_MODEL:-}" ]; then
+      exec claude --dangerously-skip-permissions --agent investigator -p "$(cat "$PROMPT_FILE")" \
+        --disallowedTools "$DISALLOWED_TOOLS" \
+        --model "$CFGMS_SECURITY_REVIEW_MODEL" \
+        --output-format json > /workspace-out/.investigator-plan-result.json
+    else
+      exec claude --dangerously-skip-permissions --agent investigator -p "$(cat "$PROMPT_FILE")" \
+        --disallowedTools "$DISALLOWED_TOOLS"
+    fi
     ;;
   *)
     LANE_SCRIPT="/usr/local/bin/investigator-lane-entrypoint.py"

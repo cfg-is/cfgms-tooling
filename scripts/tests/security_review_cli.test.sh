@@ -826,6 +826,35 @@ fi
   && ok "the consolidator still ran despite the codex lane's credential-unavailable skip" \
   || bad "the consolidator still ran despite the codex lane's credential-unavailable skip" "not found"
 
+echo ""
+echo "== REQUIRED TEST — dispatch_report.json records the codex lane's"
+echo "   credential_unavailable outcome, never omitting it, and launch's own"
+echo "   exit code stays 0 for an intentional skip (Issue #3954) =="
+DISPATCH_REPORT_PARTIAL_CRED="${SWEEP_DIR_PARTIAL_CRED}/dispatch_report.json"
+[[ -f "$DISPATCH_REPORT_PARTIAL_CRED" ]] \
+  && ok "dispatch_report.json was written for this sweep" \
+  || bad "dispatch_report.json was written for this sweep" "not found at ${DISPATCH_REPORT_PARTIAL_CRED}"
+dispatch_report_partial_cred_src="$(cat "$DISPATCH_REPORT_PARTIAL_CRED" 2>/dev/null || true)"
+codex_lane_entry="$(python3 -c "
+import json, sys
+report = json.load(open(sys.argv[1]))
+for lane in report.get('lanes', []):
+    if lane.get('requested_harness') == 'codex' and lane.get('requested_model') == 'model-z':
+        print(json.dumps(lane))
+        break
+" "$DISPATCH_REPORT_PARTIAL_CRED" 2>/dev/null || true)"
+check_contains "the codex lane's dispatch_report.json entry records outcome credential_unavailable" "$codex_lane_entry" '"outcome": "credential_unavailable"'
+claude_lane_entry="$(python3 -c "
+import json, sys
+report = json.load(open(sys.argv[1]))
+for lane in report.get('lanes', []):
+    if lane.get('requested_harness') == 'claude' and lane.get('requested_model') == 'model-a':
+        print(json.dumps(lane))
+        break
+" "$DISPATCH_REPORT_PARTIAL_CRED" 2>/dev/null || true)"
+check_contains "the claude lane's dispatch_report.json entry records outcome dispatched" "$claude_lane_entry" '"outcome": "dispatched"'
+check_eq "launch's own exit code is still 0 despite the codex lane's credential-unavailable skip" "$partial_cred_rc" "0"
+
 # ----------------------------------------------------------------------------
 # REQUIRED TEST (Issue #3936) -- the SAME harness configured TWICE with
 # different models. Epic #3927's C5 roster example is exactly this shape
@@ -1365,6 +1394,165 @@ SWEEP_DIR_CONTENT="$(dirname "$(dirname "$content_launch_out")")"
 
 rm -rf "$CONTENT_FIXTURE_REPO" "$CONTENT_TEST_CLAUDE_BIN"
 rm -f "$CONTENT_PROMPT_LOG"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TEST (Issue #3954) -- dispatch_planner() must wait on EVERY
+# container it launched before finalize_multi_planner() runs, not only the
+# last one. Self-contained: its own sandbox and its own dedicated docker
+# stub, since proving this needs real asynchrony (a container that is still
+# running when `docker wait` is called on it) that the shared docker stub
+# elsewhere in this file deliberately does not have -- that stub does plan
+# mode's "container job" synchronously, before `docker run` even returns, so
+# `docker wait` is always a no-op there and could never distinguish "waited
+# correctly" from "the old tail -n1 bug".
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "== REQUIRED TEST — dispatch_planner waits for EVERY launched planner"
+echo "   container, not only the last one (Issue #3954): two roster planners,"
+echo "   the SECOND-launched one exits immediately and the FIRST-launched one"
+echo "   is deliberately held open -- the merged plan/step-*.json must appear"
+echo "   only once BOTH have exited, never right after only the second one has =="
+MP_DIR="$(mktemp -d)"
+MP_SANDBOX="${MP_DIR}/sandbox"
+MP_FAKEBIN="${MP_DIR}/bin"
+mkdir -p "${MP_SANDBOX}/HOME/.claude" "$MP_FAKEBIN"
+echo '{}' > "${MP_SANDBOX}/HOME/.claude/.credentials.json"
+: > "${MP_SANDBOX}/docker_calls.log"
+
+# Docker stub dedicated to this test: `run -d --mode plan ...` for the
+# claude-model-a/claude-model-b planner sub-sweep-dirs backgrounds the
+# simulated container's job and returns immediately (real `docker run -d`
+# semantics); `wait <cid>` blocks on that job's own completion marker,
+# exactly like the real daemon would. claude-model-a (launched FIRST) blocks
+# until this test explicitly releases it via MP_SANDBOX/release-model-a;
+# claude-model-b (launched SECOND) has no such gate and finishes immediately
+# -- the reverse of launch order the required test asks for. Every other
+# `docker run` (the roster's one finder lane) finishes immediately too: this
+# test only cares about planner ordering.
+cat > "${MP_FAKEBIN}/docker" <<STUB
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  ps) echo ""; exit 0 ;;
+  wait)
+    cid="\$2"
+    while [ ! -f "${MP_SANDBOX}/exited-\${cid}" ]; do sleep 0.02; done
+    exit 0
+    ;;
+esac
+if [ "\${1:-}" != "run" ]; then exit 0; fi
+shift
+args=("\$@")
+out_dir=""
+for a in "\${args[@]}"; do
+  case "\$a" in
+    *:/workspace-out:rw) out_dir="\${a%:/workspace-out:rw}" ;;
+  esac
+done
+lane_dir_name="\$(basename "\$(dirname "\$out_dir")")"
+cid="cid-\${lane_dir_name}-\$RANDOM"
+echo "\$*" >> "${MP_SANDBOX}/docker_calls.log"
+echo "\${lane_dir_name}\t\${cid}" >> "${MP_SANDBOX}/dispatched.log"
+if [ "\$lane_dir_name" = "claude-model-a" ]; then
+  # Redirected away from the inherited stdout/stderr pipe (never left
+  # attached): agent-dispatch.sh's own subprocess call
+  # (planner.py::launch()'s subprocess.run(capture_output=True)) reads that
+  # pipe until EOF, which only arrives once EVERY process holding the write
+  # end closes it -- an un-redirected background child here would keep it
+  # open for as long as this job is deliberately held, blocking the caller
+  # for that whole time even though this "docker run -d" itself returns
+  # immediately, exactly like a real detached container does.
+  (
+    while [ ! -f "${MP_SANDBOX}/release-model-a" ]; do sleep 0.02; done
+    printf '{"step_id":"step-001","scope":["pkg/example/file.go"],"description":"stub-a","files":["pkg/example/file.go"]}' > "\${out_dir}/step-001.json"
+    touch "${MP_SANDBOX}/exited-\${cid}"
+  ) >/dev/null 2>&1 &
+  disown
+elif [ "\$lane_dir_name" = "claude-model-b" ]; then
+  printf '{"step_id":"step-001","scope":["pkg/other/file.go"],"description":"stub-b","files":["pkg/other/file.go"]}' > "\${out_dir}/step-001.json"
+  touch "${MP_SANDBOX}/exited-\${cid}"
+else
+  touch "${MP_SANDBOX}/exited-\${cid}"
+fi
+echo "\$cid"
+STUB
+chmod +x "${MP_FAKEBIN}/docker"
+
+set +e
+PATH="${MP_FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${MP_SANDBOX}/ledger" \
+  HOME="${MP_SANDBOX}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${MP_SANDBOX}/base" \
+  CFGMS_SECURITY_REVIEW_LANES="claude:stub-model" \
+  CFGMS_SECURITY_REVIEW_PLANNERS="claude:model-a,claude:model-b" \
+  "$CLI" launch HEAD >"${MP_SANDBOX}/launch.out" 2>"${MP_SANDBOX}/launch.err" &
+MP_LAUNCH_PID=$!
+set -e
+
+# Wait until both planner containers have actually been dispatched (their
+# `docker run` calls have returned -- real fire-and-forget semantics) before
+# asserting anything about what has or hasn't exited yet.
+mp_dispatched_count() { [[ -f "${MP_SANDBOX}/dispatched.log" ]] && wc -l < "${MP_SANDBOX}/dispatched.log" || echo 0; }
+mp_deadline=$((SECONDS + 20))
+while [[ "$(mp_dispatched_count)" -lt 2 ]] && [[ $SECONDS -lt $mp_deadline ]]; do
+  sleep 0.05
+done
+check_contains "both planner containers were dispatched (claude-model-a)" "$(cat "${MP_SANDBOX}/dispatched.log" 2>/dev/null || true)" "claude-model-a"
+check_contains "both planner containers were dispatched (claude-model-b)" "$(cat "${MP_SANDBOX}/dispatched.log" 2>/dev/null || true)" "claude-model-b"
+
+# claude-model-b (launched second) is free to exit immediately; give it a
+# moment, then confirm it really has while claude-model-a (launched first)
+# is still held open by this test.
+mp_deadline=$((SECONDS + 20))
+while [[ ! -f "${MP_SANDBOX}"/exited-cid-claude-model-b-* ]] && [[ $SECONDS -lt $mp_deadline ]]; do
+  sleep 0.05
+done
+mp_model_b_exited=0; [[ -n "$(compgen -G "${MP_SANDBOX}/exited-cid-claude-model-b-*")" ]] && mp_model_b_exited=1
+check_eq "the second-launched planner (claude-model-b) has already exited" "$mp_model_b_exited" "1"
+mp_model_a_exited=0; [[ -n "$(compgen -G "${MP_SANDBOX}/exited-cid-claude-model-a-*" 2>/dev/null)" ]] && mp_model_a_exited=1
+check_eq "the first-launched planner (claude-model-a) has NOT exited yet" "$mp_model_a_exited" "0"
+
+MP_SWEEP_DIR="$(find "${MP_SANDBOX}/base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+mp_premature_plan=0
+[[ -n "$MP_SWEEP_DIR" ]] && compgen -G "${MP_SWEEP_DIR}/plan/step-*.json" >/dev/null 2>&1 && mp_premature_plan=1
+check_eq "the merged plan/step-*.json does NOT exist yet while claude-model-a is still held open" "$mp_premature_plan" "0"
+check_eq "the launch subprocess is still running (blocked in docker wait on claude-model-a)" "$(kill -0 "$MP_LAUNCH_PID" 2>/dev/null; echo $?)" "0"
+
+# Release claude-model-a and let the launch complete.
+touch "${MP_SANDBOX}/release-model-a"
+set +e
+wait "$MP_LAUNCH_PID"
+mp_launch_rc=$?
+set -e
+check_eq "launch exits 0 once both planners have exited" "$mp_launch_rc" "0"
+
+check_contains "the merged plan/step-*.json now exists after BOTH planners exited" \
+  "$(compgen -G "${MP_SWEEP_DIR}/plan/step-*.json" 2>/dev/null || true)" "step-"
+mp_merged_files="$(cat "${MP_SWEEP_DIR}"/plan/step-*.json 2>/dev/null)"
+check_contains "the merged plan includes claude-model-a's contribution" "$mp_merged_files" "pkg/example/file.go"
+check_contains "the merged plan includes claude-model-b's contribution" "$mp_merged_files" "pkg/other/file.go"
+
+MP_DISPATCH_REPORT="${MP_SWEEP_DIR}/dispatch_report.json"
+[[ -f "$MP_DISPATCH_REPORT" ]] \
+  && ok "dispatch_report.json was written for the multi-planner sweep" \
+  || bad "dispatch_report.json was written for the multi-planner sweep" "not found"
+mp_report_planners="$(python3 -c "
+import json, sys
+report = json.load(open(sys.argv[1]))
+print(json.dumps(report.get('planners', [])))
+" "$MP_DISPATCH_REPORT" 2>/dev/null || true)"
+check_contains "dispatch_report.json's planners entries name model-a" "$mp_report_planners" '"requested_model": "model-a"'
+check_contains "dispatch_report.json's planners entries name model-b" "$mp_report_planners" '"requested_model": "model-b"'
+check_contains "dispatch_report.json's planner entries record outcome dispatched" "$mp_report_planners" '"outcome": "dispatched"'
+
+# snapshot.create_snapshot() strips write bits from every extracted file and
+# directory (its own defense-in-depth, matching cleanup_fixtures's own note
+# above) -- restore them before rm -rf can unlink anything under here.
+chmod -R u+w "$MP_DIR" 2>/dev/null || true
+rm -rf "$MP_DIR"
 
 echo ""
 echo "== REQUIRED TEST evidence — this file's own docker stub replaces ONLY the"

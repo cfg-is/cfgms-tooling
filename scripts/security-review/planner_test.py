@@ -1274,6 +1274,116 @@ def test_finalize_multi_planner_single_configured_planner_matches_a_plain_merge(
         check(merged["planners"] == ["claude-fable-5-1"], "finalize_multi_planner: planners names the one configured entry", merged["planners"])
 
 
+# --- resolved-model read-back (Issue #3954) ----------------------------------
+
+def _write_plan_result(sweep_dir: str, lane_dir_name: str, data: object) -> str:
+    lane_plan_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, lane_dir_name, "plan")
+    os.makedirs(lane_plan_dir, exist_ok=True)
+    result_path = os.path.join(lane_plan_dir, planner.PLAN_RESULT_FILENAME)
+    with open(result_path, "w") as f:
+        if isinstance(data, str):
+            f.write(data)
+        else:
+            json.dump(data, f)
+    return result_path
+
+
+def test_extract_resolved_model_reads_the_sole_modelusage_key():
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            json.dump({"modelUsage": {"claude-sonnet-5": {"inputTokens": 2}}}, f)
+        check(
+            planner._extract_resolved_model(result_path) == "claude-sonnet-5",
+            "_extract_resolved_model: reads the canonical model id out of modelUsage's key",
+        )
+
+
+def test_extract_resolved_model_unknown_when_file_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        check(
+            planner._extract_resolved_model(os.path.join(tmp, "does-not-exist.json")) == "unknown",
+            "_extract_resolved_model: unknown when the result file was never written",
+        )
+
+
+def test_extract_resolved_model_unknown_on_malformed_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            f.write("not json{{{")
+        check(
+            planner._extract_resolved_model(result_path) == "unknown",
+            "_extract_resolved_model: unknown on unparseable JSON, never a fabricated value",
+        )
+
+
+def test_extract_resolved_model_unknown_when_modelusage_absent():
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            json.dump({"result": "no model usage field here"}, f)
+        check(
+            planner._extract_resolved_model(result_path) == "unknown",
+            "_extract_resolved_model: unknown when the envelope has no modelUsage field",
+        )
+
+
+def test_finalize_multi_planner_writes_resolved_models_sidecar_for_every_planner():
+    # REQUIRED: finalize_multi_planner() must record a resolved-model entry
+    # for every configured planner, whether or not that planner's container
+    # left behind a PLAN_RESULT_FILENAME -- so security-review.sh's later
+    # read-back never silently omits a configured planner.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"]),
+        )
+        _write_plan_result(sweep_dir, "claude-fable-5-1", {"modelUsage": {"claude-sonnet-5": {}}})
+        # codex-gpt-terra deliberately gets no PLAN_RESULT_FILENAME at all --
+        # it still contributes a step, but never asked the CLI for a
+        # resolved identity.
+        _write_planner_step(
+            sweep_dir, "codex-gpt-terra", "step-001.json",
+            valid_step("step-001", scope=["pkg/b/b.go"]),
+        )
+
+        ok, _errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: still succeeds while writing the resolved-models sidecar")
+
+        sidecar_path = os.path.join(sweep_dir, planner.RESOLVED_MODELS_FILENAME)
+        check(os.path.isfile(sidecar_path), "finalize_multi_planner: writes the resolved-models sidecar")
+        with open(sidecar_path) as f:
+            resolved = json.load(f)
+        check(
+            resolved == {"claude-fable-5-1": "claude-sonnet-5", "codex-gpt-terra": "unknown"},
+            "finalize_multi_planner: sidecar has one entry per configured planner, unknown where nothing was reported",
+            str(resolved),
+        )
+
+
+def test_finalize_multi_planner_writes_resolved_models_sidecar_even_on_planning_failure():
+    # The sidecar describes what each container reported about itself,
+    # independent of whether the plan it produced ends up validating -- it
+    # must still exist when finalize_multi_planner() fails closed.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        lanes = roster.parse_roster("claude:fable-5-1")
+        # No .plan-context.json -- finalize_multi_planner() fails closed.
+        ok, _errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is False, "finalize_multi_planner: still fails closed on missing sweep context")
+        sidecar_path = os.path.join(sweep_dir, planner.RESOLVED_MODELS_FILENAME)
+        check(
+            os.path.isfile(sidecar_path),
+            "finalize_multi_planner: writes the resolved-models sidecar even when planning fails closed",
+        )
+        with open(sidecar_path) as f:
+            resolved = json.load(f)
+        check(resolved == {"claude-fable-5-1": "unknown"}, "finalize_multi_planner: unknown recorded for the one configured planner", str(resolved))
+
+
 # --- CLI env-var wiring (CFGMS_SECURITY_REVIEW_PLANNERS) ---------------------
 
 def _with_env(name: str, value: str | None, fn):

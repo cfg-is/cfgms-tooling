@@ -226,6 +226,132 @@ verify_snapshot() {
   return 0
 }
 
+# record_planner_dispatch_outcome <sweep_dir> <outcome> [<roster-line> ...]
+# Writes/merges the "planners" array of <sweep_dir>/dispatch_report.json
+# (Issue #3954, epic #3950's D3): one entry per configured planner --
+# resolved separately from planner.py's own CFGMS_SECURITY_REVIEW_PLANNERS
+# parse purely so this record exists even when nothing was actually
+# launched -- or, when no roster is configured at all, a single legacy entry
+# describing the one hardcoded planner (harness "claude", no configured
+# model -- that call never passes --harness/--model to begin with).
+#
+# <outcome> is dispatched / credential_unavailable / launch_failed, applied
+# to every entry in this call: a multi-planner `planner.py launch` reports
+# one aggregated success/failure for the whole roster (see launch()'s own
+# docstring), not a per-entry result, so this is the finest granularity
+# available without changing that contract. Every configured planner still
+# gets a record -- never omitted -- even though a real per-entry outcome
+# is future work.
+#
+# Each <roster-line> is one "harness<TAB>model<TAB>lane_dir_name" line as
+# roster.py prints it. resolved_model is read back from planner.py's own
+# <sweep_dir>/.plan-resolved-models.json sidecar (finalize_multi_planner()'s
+# output, keyed by lane_dir_name) -- "unknown" wherever that sidecar has
+# nothing for a given entry, including always on the legacy path, which
+# never asks the CLI to report a resolved identity in the first place.
+# passed_harness/passed_model equal requested_harness/requested_model: there
+# is no transformation between "configured" and "passed to the executable"
+# anywhere in this script.
+record_planner_dispatch_outcome() {
+  local sweep_dir="$1" outcome="$2"; shift 2
+  python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" "$outcome" "$@" <<'PYEOF'
+import json
+import os
+import sys
+
+sec_dir, sweep_dir, outcome = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, sec_dir)
+import atomic_write  # noqa: E402
+
+resolved_path = os.path.join(sweep_dir, ".plan-resolved-models.json")
+try:
+    with open(resolved_path) as f:
+        resolved = json.load(f)
+    if not isinstance(resolved, dict):
+        resolved = {}
+except (OSError, ValueError):
+    resolved = {}
+
+roster_lines = [line for line in sys.argv[4:] if line]
+entries = []
+if roster_lines:
+    for raw in roster_lines:
+        harness, model, lane_dir_name = raw.split("\t")
+        entries.append({
+            "requested_harness": harness,
+            "requested_model": model,
+            "passed_harness": harness,
+            "passed_model": model,
+            "resolved_model": resolved.get(lane_dir_name, "unknown"),
+            "outcome": outcome,
+        })
+else:
+    entries.append({
+        "requested_harness": "claude",
+        "requested_model": "",
+        "passed_harness": "claude",
+        "passed_model": "",
+        "resolved_model": "unknown",
+        "outcome": outcome,
+    })
+
+report_path = os.path.join(sweep_dir, "dispatch_report.json")
+try:
+    with open(report_path) as f:
+        report = json.load(f)
+    if not isinstance(report, dict):
+        report = {}
+except (OSError, ValueError):
+    report = {}
+report.setdefault("lanes", [])
+report["planners"] = entries
+atomic_write.write_json_atomic(report_path, report)
+PYEOF
+}
+
+# record_lane_dispatch_outcomes <sweep_dir> [<harness>TAB<model>TAB<outcome> ...]
+# Writes/merges the "lanes" array of <sweep_dir>/dispatch_report.json (Issue
+# #3954): one entry per configured finder lane, whatever its outcome -- a
+# credential-unavailable skip is recorded here exactly like a dispatched
+# lane is, never silently omitted. passed_harness/passed_model equal
+# requested_harness/requested_model, matching record_planner_dispatch_outcome
+# above for the same reason.
+record_lane_dispatch_outcomes() {
+  local sweep_dir="$1"; shift
+  python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" "$@" <<'PYEOF'
+import json
+import os
+import sys
+
+sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, sec_dir)
+import atomic_write  # noqa: E402
+
+entries = []
+for raw in sys.argv[3:]:
+    harness, model, outcome = raw.split("\t")
+    entries.append({
+        "requested_harness": harness,
+        "requested_model": model,
+        "passed_harness": harness,
+        "passed_model": model,
+        "outcome": outcome,
+    })
+
+report_path = os.path.join(sweep_dir, "dispatch_report.json")
+try:
+    with open(report_path) as f:
+        report = json.load(f)
+    if not isinstance(report, dict):
+        report = {}
+except (OSError, ValueError):
+    report = {}
+report.setdefault("planners", [])
+report["lanes"] = entries
+atomic_write.write_json_atomic(report_path, report)
+PYEOF
+}
+
 # dispatch_planner <sweep_dir> <commit_sha>
 # prepare() -> launch() -> wait for the container to exit -> finalize().
 # A `prepare` or `finalize` failure is logged and treated as non-fatal to the
@@ -250,20 +376,58 @@ dispatch_planner() {
     return 0
   fi
 
-  local launch_output
-  if ! launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --snapshot-dir "${sweep_dir}/snapshot" --repo-root "$REPO_ROOT" 2>&1); then
-    if _is_intentional_dispatch_skip "$launch_output"; then
-      echo "WARNING: planner launch skipped (credentials unavailable): ${launch_output}" >&2
-      return 0
+  # Resolved purely for the dispatch-outcome record below (Issue #3954) --
+  # planner.py's own launch()/finalize_multi_planner() resolve
+  # CFGMS_SECURITY_REVIEW_PLANNERS themselves via _planners_from_env(); this
+  # is a second, read-only parse of the same env var, never a second source
+  # of truth for which planners actually run.
+  local planner_roster_lines=()
+  if [[ -n "${CFGMS_SECURITY_REVIEW_PLANNERS:-}" ]]; then
+    local planner_roster_output
+    if ! planner_roster_output=$(python3 "${SECURITY_REVIEW_DIR}/roster.py" "$CFGMS_SECURITY_REVIEW_PLANNERS" 2>&1); then
+      echo "ERROR: could not parse CFGMS_SECURITY_REVIEW_PLANNERS: ${planner_roster_output}" >&2
+      return 1
     fi
-    echo "ERROR: planner launch failed: ${launch_output}" >&2
-    return 1
+    local roster_line
+    while IFS= read -r roster_line; do
+      [[ -n "$roster_line" ]] && planner_roster_lines+=("$roster_line")
+    done <<<"$planner_roster_output"
   fi
 
+  local launch_output launch_rc=0
+  launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --snapshot-dir "${sweep_dir}/snapshot" --repo-root "$REPO_ROOT" 2>&1) || launch_rc=$?
+
+  local outcome="dispatched"
+  if [[ $launch_rc -ne 0 ]]; then
+    if _is_intentional_dispatch_skip "$launch_output"; then
+      outcome="credential_unavailable"
+    else
+      outcome="launch_failed"
+    fi
+  fi
+
+  # Wait for EVERY container this launch call started, not only the last one
+  # (Issue #3954): a multi-planner dispatch calls agent-dispatch.sh once per
+  # roster entry, and launch_output concatenates one
+  # LAUNCHED_INVESTIGATOR:plan:<id> line per entry that actually started --
+  # the old `tail -n1` here waited on only the last of those, letting
+  # finalize() run while an earlier planner's container might still be
+  # writing into its own plan/ directory.
   local container_id
-  container_id="$(printf '%s\n' "$launch_output" | sed -n 's/^LAUNCHED_INVESTIGATOR:plan://p' | tail -n1)"
-  if [[ -n "$container_id" ]]; then
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
     docker wait "$container_id" >/dev/null 2>&1 || true
+  done < <(printf '%s\n' "$launch_output" | sed -n 's/^LAUNCHED_INVESTIGATOR:plan://p')
+
+  record_planner_dispatch_outcome "$sweep_dir" "$outcome" "${planner_roster_lines[@]:-}"
+
+  if [[ "$outcome" == "credential_unavailable" ]]; then
+    echo "WARNING: planner launch skipped (credentials unavailable): ${launch_output}" >&2
+    return 0
+  fi
+  if [[ "$outcome" == "launch_failed" ]]; then
+    echo "ERROR: planner launch failed: ${launch_output}" >&2
+    return 1
   fi
 
   local finalize_output
@@ -291,6 +455,7 @@ dispatch_planner() {
 dispatch_roster_lanes() {
   local sweep_dir="$1" roster_value="$2"
   local container_ids=()
+  local lane_entries=()
   local had_failure=0
 
   local roster_output
@@ -318,9 +483,11 @@ dispatch_roster_lanes() {
     if [[ $rc -ne 0 ]]; then
       if _is_intentional_dispatch_skip "$output"; then
         echo "WARNING: lane ${lane_dir_name} dispatch skipped (exit ${rc}): ${output}" >&2
+        lane_entries+=("${harness}"$'\t'"${model}"$'\t'"credential_unavailable")
       else
         echo "ERROR: lane ${lane_dir_name} dispatch failed (exit ${rc}): ${output}" >&2
         had_failure=1
+        lane_entries+=("${harness}"$'\t'"${model}"$'\t'"launch_failed")
       fi
       continue
     fi
@@ -329,15 +496,19 @@ dispatch_roster_lanes() {
     if [[ -z "$cid" ]]; then
       echo "ERROR: lane ${lane_dir_name} dispatched but no container id was parsed from: ${output}" >&2
       had_failure=1
+      lane_entries+=("${harness}"$'\t'"${model}"$'\t'"launch_failed")
       continue
     fi
     container_ids+=("$cid")
+    lane_entries+=("${harness}"$'\t'"${model}"$'\t'"dispatched")
   done <<<"$roster_output"
 
   for cid in "${container_ids[@]:-}"; do
     [[ -n "$cid" ]] || continue
     docker wait "$cid" >/dev/null 2>&1 || true
   done
+
+  record_lane_dispatch_outcomes "$sweep_dir" "${lane_entries[@]:-}"
 
   return "$had_failure"
 }

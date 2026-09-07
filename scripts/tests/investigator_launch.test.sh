@@ -928,6 +928,90 @@ last_hid_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "the container env carries CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY" "$last_hid_run_call" "CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY=${hash_sibling_after}"
 
 echo ""
+echo "== REQUIRED TEST — plan-mode investigator-entrypoint.sh passes --model to"
+echo "   claude when CFGMS_SECURITY_REVIEW_MODEL is set (Issue #3954). Before this"
+echo "   fix, --harness/--model reached the container as env vars (this file's"
+echo "   own docker-run-rendering checks above already prove that) and were"
+echo "   silently dropped inside the entrypoint: claude ran with no --model at"
+echo "   all, regardless of what the roster entry configured =="
+# No docker daemon here (this file's own header), so the container never
+# actually runs -- but the case-arm ITSELF is ordinary bash with no
+# docker/firewall dependency of its own except one hardcoded path,
+# /workspace-out (the container's real bind mount; investigator-entrypoint.sh
+# never writes outside it, by design). Extract the REAL, unmodified text of
+# the plan-mode arm and substitute /workspace-out for a throwaway sandbox
+# directory -- a rewrite that happens only in this test's own copy of the
+# text, never touching the committed script -- so the conditional/flag logic
+# actually under test is exactly what production runs, with a stubbed
+# `claude` on PATH standing in for the real CLI.
+PLAN_BODY="$(sed -n '/^  plan)/,/^    ;;$/p' "$ENTRYPOINT" | sed '1d;$d')"
+check_contains "extracted the plan-mode case arm (sanity check on the sed range)" "$PLAN_BODY" 'claude --dangerously-skip-permissions --agent investigator'
+
+MODEL_TEST_DIR="$(mktemp -d)"
+MODEL_TEST_HOME="${MODEL_TEST_DIR}/HOME"
+MODEL_TEST_OUT="${MODEL_TEST_DIR}/workspace-out"
+MODEL_TEST_BIN="${MODEL_TEST_DIR}/bin"
+mkdir -p "${MODEL_TEST_HOME}/.claude" "$MODEL_TEST_OUT" "$MODEL_TEST_BIN"
+echo '{}' > "${MODEL_TEST_HOME}/.claude/.credentials.json"
+echo 'plan prompt text' > "${MODEL_TEST_OUT}/.investigator-plan-prompt.md"
+
+CLAUDE_ARGV_LOG="${MODEL_TEST_DIR}/claude_argv.log"
+cat > "${MODEL_TEST_BIN}/claude" <<'CLAUDE_STUB'
+#!/usr/bin/env bash
+echo "$@" > "${CLAUDE_ARGV_LOG:?}"
+CLAUDE_STUB
+chmod +x "${MODEL_TEST_BIN}/claude"
+
+PLAN_SCRIPT="${MODEL_TEST_DIR}/plan-arm.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  printf '%s\n' "${PLAN_BODY//\/workspace-out/$MODEL_TEST_OUT}"
+} > "$PLAN_SCRIPT"
+chmod +x "$PLAN_SCRIPT"
+
+set +e
+CLAUDE_ARGV_LOG="$CLAUDE_ARGV_LOG" \
+  CFGMS_INVESTIGATOR_DISALLOWED_TOOLS="Edit,Write" \
+  CFGMS_SECURITY_REVIEW_MODEL="glm-4.6" \
+  HOME="$MODEL_TEST_HOME" \
+  PATH="${MODEL_TEST_BIN}:${PATH}" \
+  bash "$PLAN_SCRIPT" >/dev/null 2>&1
+plan_script_rc=$?
+set -e
+if [[ "$plan_script_rc" -eq 0 ]]; then
+  ok "plan-mode arm (with CFGMS_SECURITY_REVIEW_MODEL set) runs to completion"
+else
+  bad "plan-mode arm (with CFGMS_SECURITY_REVIEW_MODEL set) runs to completion" "exit ${plan_script_rc}"
+fi
+claude_argv_with_model="$(cat "$CLAUDE_ARGV_LOG" 2>/dev/null || true)"
+check_contains "plan-mode passes --model <value> to claude when --harness/--model were supplied" "$claude_argv_with_model" "--model glm-4.6"
+check_contains "plan-mode also requests --output-format json alongside --model" "$claude_argv_with_model" "--output-format json"
+
+echo ""
+echo "== plan-mode WITHOUT CFGMS_SECURITY_REVIEW_MODEL (legacy, no --harness) never"
+echo "   passes --model -- the original single-hardcoded-planner call is unchanged =="
+: > "$CLAUDE_ARGV_LOG"
+set +e
+CLAUDE_ARGV_LOG="$CLAUDE_ARGV_LOG" \
+  CFGMS_INVESTIGATOR_DISALLOWED_TOOLS="Edit,Write" \
+  HOME="$MODEL_TEST_HOME" \
+  PATH="${MODEL_TEST_BIN}:${PATH}" \
+  bash "$PLAN_SCRIPT" >/dev/null 2>&1
+plan_script_legacy_rc=$?
+set -e
+if [[ "$plan_script_legacy_rc" -eq 0 ]]; then
+  ok "plan-mode arm (legacy, no CFGMS_SECURITY_REVIEW_MODEL) runs to completion"
+else
+  bad "plan-mode arm (legacy, no CFGMS_SECURITY_REVIEW_MODEL) runs to completion" "exit ${plan_script_legacy_rc}"
+fi
+claude_argv_legacy="$(cat "$CLAUDE_ARGV_LOG" 2>/dev/null || true)"
+check_not_contains "legacy plan-mode call (no --harness/--model) never passes --model" "$claude_argv_legacy" "--model"
+check_not_contains "legacy plan-mode call never requests --output-format json" "$claude_argv_legacy" "--output-format"
+
+rm -rf "$MODEL_TEST_DIR"
+
+echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"
 if [[ $fail -gt 0 ]]; then
