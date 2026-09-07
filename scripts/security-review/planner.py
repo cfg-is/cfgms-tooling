@@ -124,6 +124,15 @@ RESOLVED_MODELS_FILENAME = ".plan-resolved-models.json"
 # `launch()`'s multi-planner path and `finalize_multi_planner()`.
 PLANNERS_SUBDIR = "planners"
 
+# Written under `<sweep_dir>/plan/` by `finalize()`/`finalize_multi_planner()`
+# (Issue #3956) whenever at least one step-file proposal is excluded during
+# validation -- the `errors` list those functions already compute, persisted
+# as one entry per excluded filename so `consolidate.py` can surface a
+# validation-rejected proposal in `report/consolidated.md` instead of it
+# being visible only via `schema.log_event("invalid_plan_step", ...)`.
+# Absent whenever nothing was rejected -- never written as an empty list.
+REJECTED_PROPOSALS_FILENAME = "rejected_proposals.json"
+
 # The identifier the single, hardcoded planner records in every step's
 # `planners` field when `CFGMS_SECURITY_REVIEW_PLANNERS` (C6, epic #3927's
 # contract C5) is unset -- the legacy path this story must not regress.
@@ -642,6 +651,21 @@ def _write_failure_marker(plan_dir: str, errors: list[str]) -> None:
     atomic_write.write_text_atomic(marker_path, body)
 
 
+def _write_rejected_proposals(plan_dir: str, rejected: list[dict]) -> None:
+    """Persist `rejected` -- `{"filename": ..., "error": ...}` per excluded
+    step-file proposal -- to `<plan_dir>/REJECTED_PROPOSALS_FILENAME`.
+
+    A no-op when `rejected` is empty: absence of the file means "nothing was
+    rejected", never an empty list written for its own sake. Called
+    regardless of whether the overall sweep succeeds -- a rejection is worth
+    surfacing even when enough other steps survived to keep the sweep alive
+    (Issue #3956).
+    """
+    if not rejected:
+        return
+    atomic_write.write_json_atomic(os.path.join(plan_dir, REJECTED_PROPOSALS_FILENAME), rejected)
+
+
 def _read_sweep_context(sweep_dir: str) -> dict[str, str] | None:
     """Read the `sweep_id`/`commit_sha` `prepare()` recorded in
     `<sweep_dir>/.plan-context.json`, or `None` if it is absent or malformed.
@@ -703,6 +727,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     errors: list[str] = []
     excluded: list[str] = []
     valid: list[str] = []
+    rejected: list[dict] = []
 
     if not filenames:
         errors.append("no step-NNN.json files were produced")
@@ -720,12 +745,14 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
         )
         schema.log_event("missing_plan_context", sweep_dir=sweep_dir, errors=[reason])
         errors.extend(f"{filename}: {reason}" for filename in filenames)
+        rejected.extend({"filename": filename, "error": reason} for filename in filenames)
         for filename in filenames:
             try:
                 os.remove(os.path.join(plan_dir, filename))
             except OSError:
                 pass
         _write_failure_marker(plan_dir, errors)
+        _write_rejected_proposals(plan_dir, rejected)
         return False, errors
 
     for filename in filenames:
@@ -736,6 +763,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
         except (OSError, ValueError) as exc:
             schema.log_event("invalid_plan_step", filename=filename, errors=[str(exc)])
             errors.append(f"{filename}: could not parse as JSON: {exc}")
+            rejected.append({"filename": filename, "error": f"could not parse as JSON: {exc}"})
             excluded.append(filename)
             continue
 
@@ -751,6 +779,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
         if step_errors:
             schema.log_event("invalid_plan_step", filename=filename, errors=step_errors)
             errors.extend(step_errors)
+            rejected.append({"filename": filename, "error": "; ".join(step_errors)})
             excluded.append(filename)
             continue
 
@@ -762,6 +791,8 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
             os.remove(os.path.join(plan_dir, filename))
         except OSError:
             pass
+
+    _write_rejected_proposals(plan_dir, rejected)
 
     if not valid:
         _write_failure_marker(plan_dir, errors)
@@ -863,17 +894,19 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
         return False, errors
 
     candidates: list[dict] = []
+    rejected: list[dict] = []
     for lane in planners:
         lane_plan_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan")
         for filename in _discover_step_files(lane_plan_dir):
             path = os.path.join(lane_plan_dir, filename)
+            label = f"{lane.lane_dir_name}/{filename}"
             try:
                 with open(path, "r") as f:
                     data = json.load(f)
             except (OSError, ValueError) as exc:
-                label = f"{lane.lane_dir_name}/{filename}"
                 schema.log_event("invalid_plan_step", filename=label, errors=[str(exc)])
                 errors.append(f"{label}: could not parse as JSON: {exc}")
+                rejected.append({"filename": label, "error": f"could not parse as JSON: {exc}"})
                 continue
 
             if isinstance(data, dict):
@@ -883,9 +916,9 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
 
             step_errors = validate_step(data, filename)
             if step_errors:
-                label = f"{lane.lane_dir_name}/{filename}"
                 schema.log_event("invalid_plan_step", filename=label, errors=step_errors)
                 errors.extend(f"{lane.lane_dir_name}/{e}" for e in step_errors)
+                rejected.append({"filename": label, "error": "; ".join(step_errors)})
                 continue
 
             candidates.append(data)
@@ -893,6 +926,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     if not candidates:
         errors.append("no step-NNN.json files survived validation across any configured planner")
         _write_failure_marker(plan_dir, errors)
+        _write_rejected_proposals(plan_dir, rejected)
         return False, errors
 
     merged = merge_steps_by_scope(candidates)
@@ -914,6 +948,8 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
             errors.extend(step_errors)
             continue
         atomic_write.write_json_atomic(os.path.join(plan_dir, step_filename), step)
+
+    _write_rejected_proposals(plan_dir, rejected)
 
     if not _discover_step_files(plan_dir):
         _write_failure_marker(plan_dir, errors)

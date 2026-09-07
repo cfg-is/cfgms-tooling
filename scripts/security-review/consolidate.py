@@ -428,6 +428,8 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "steps_discovered": step_ids,
         "plan_failed": plan_failed,
         "coverage": coverage,
+        "dispatch": _load_dispatch_report(sweep_dir),
+        "rejected_proposals": _load_rejected_proposals(sweep_dir),
         "findings": consolidated_findings,
     }
 
@@ -443,6 +445,22 @@ def _md_escape_inline(text: object) -> str:
     value = value.replace("|", "\\|")
     value = value.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
     return value
+
+
+def _dispatch_identity(entry: dict) -> str:
+    """Derive a human-readable identity for a `dispatch_report.json`
+    planner/lane entry. Neither the "planners" nor the "lanes" array carries
+    a name field of its own (`security-review.sh`'s
+    `record_planner_dispatch_outcome`/`record_lane_dispatch_outcomes` record
+    only `requested_harness`/`requested_model`/...), so this reconstructs the
+    same `<harness>-<model>` shape `roster.Lane.lane_dir_name` uses, falling
+    back to the harness alone for the legacy single-planner entry, whose
+    `requested_model` is always empty."""
+    harness = entry.get("requested_harness") or ""
+    model = entry.get("requested_model") or ""
+    if model:
+        return f"{harness}-{model}" if harness else model
+    return harness or "unknown"
 
 
 def render_markdown(report: dict) -> str:
@@ -483,6 +501,34 @@ def render_markdown(report: dict) -> str:
             lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0 |")
         lines.append("")
 
+    lines.append("## Dispatch")
+    lines.append("")
+    dispatch = report.get("dispatch") or {}
+    unavailable = [
+        ("planner", entry) for entry in dispatch.get("planners", []) if entry.get("outcome") != "dispatched"
+    ] + [
+        ("lane", entry) for entry in dispatch.get("lanes", []) if entry.get("outcome") != "dispatched"
+    ]
+    rejected_proposals = report.get("rejected_proposals") or []
+    if not unavailable and not rejected_proposals:
+        lines.append("_(no dispatch or proposal issues recorded)_")
+        lines.append("")
+    else:
+        for kind, entry in unavailable:
+            identity = _dispatch_identity(entry)
+            outcome = entry.get("outcome", "unknown")
+            lines.append(
+                f"- **UNAVAILABLE** — {kind} `{_md_escape_inline(identity)}`: "
+                f"{_md_escape_inline(outcome)}"
+            )
+        for item in rejected_proposals:
+            filename = item.get("filename", "unknown") if isinstance(item, dict) else "unknown"
+            error = item.get("error", "") if isinstance(item, dict) else ""
+            lines.append(
+                f"- **REJECTED** — `{_md_escape_inline(filename)}`: {_md_escape_inline(error)}"
+            )
+        lines.append("")
+
     lines.append("## Findings")
     lines.append("")
     if not report["findings"]:
@@ -513,6 +559,33 @@ def render_markdown(report: dict) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _load_dispatch_report(sweep_dir: str) -> dict:
+    """Read `<sweep_dir>/dispatch_report.json` (Issue #3954) -- the
+    per-planner and per-lane requested/passed/resolved identity and dispatch
+    `outcome` `security-review.sh` records. Absent or malformed is not an
+    error here: it means nothing to report, matching every other optional
+    artifact this module reads (SEC3900's "excluded, never crashed on"
+    discipline)."""
+    data = _load_json(os.path.join(sweep_dir, "dispatch_report.json"))
+    if not isinstance(data, dict):
+        return {"planners": [], "lanes": []}
+    planners = data.get("planners")
+    lanes = data.get("lanes")
+    return {
+        "planners": planners if isinstance(planners, list) else [],
+        "lanes": lanes if isinstance(lanes, list) else [],
+    }
+
+
+def _load_rejected_proposals(sweep_dir: str) -> list[dict]:
+    """Read `<sweep_dir>/plan/rejected_proposals.json` (Issue #3956) --
+    `planner.py`'s `finalize()`/`finalize_multi_planner()` record of every
+    step-file proposal excluded during validation. Absent or malformed
+    renders as "nothing to report", never an error."""
+    data = _load_json(os.path.join(sweep_dir, "plan", planner.REJECTED_PROPOSALS_FILENAME))
+    return data if isinstance(data, list) else []
 
 
 def _detect_repo_root() -> str | None:

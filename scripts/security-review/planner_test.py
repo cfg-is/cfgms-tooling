@@ -528,6 +528,66 @@ def test_finalize_still_fails_closed_when_every_step_is_invalid():
         check(os.path.isfile(os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)), "finalize: writes the PLANNING_FAILED marker")
 
 
+def test_finalize_writes_rejected_proposals_for_excluded_step():
+    # Issue #3956: finalize() must persist the excluded step's filename and
+    # validation error text to plan/rejected_proposals.json, even though the
+    # sweep overall succeeds (one valid step survives).
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go"]))
+        write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/foo/bar.go", "features/x/y.go"]))  # invalid
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: still succeeds with one valid step", str(errors))
+
+        rejected_path = os.path.join(plan_dir, planner.REJECTED_PROPOSALS_FILENAME)
+        check(os.path.isfile(rejected_path), "finalize: writes plan/rejected_proposals.json when a step is excluded")
+        with open(rejected_path) as f:
+            rejected = json.load(f)
+        check(len(rejected) == 1, "finalize: one rejected entry for the one excluded step", str(rejected))
+        check(rejected[0]["filename"] == "step-002.json", "finalize: rejected entry names the excluded filename", str(rejected))
+        check(len(rejected[0]["error"]) > 0, "finalize: rejected entry carries non-empty validation error text", str(rejected))
+
+
+def test_finalize_does_not_write_rejected_proposals_when_nothing_excluded():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go"]))
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: succeeds with a fully valid plan", str(errors))
+        check(
+            not os.path.exists(os.path.join(plan_dir, planner.REJECTED_PROPOSALS_FILENAME)),
+            "finalize: no rejected_proposals.json is written when nothing was excluded",
+        )
+
+
+def test_finalize_writes_rejected_proposals_even_when_every_step_is_invalid():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        write_step(plan_dir, "step-001.json", valid_step("step-001", ["pkg/foo/bar.go", "features/x/y.go"]))
+        write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/foo/bar.go", "cmd/steward/main.go"]))
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is False, "finalize: still fails closed when every step is invalid", str(errors))
+
+        rejected_path = os.path.join(plan_dir, planner.REJECTED_PROPOSALS_FILENAME)
+        check(os.path.isfile(rejected_path), "finalize: writes rejected_proposals.json even on total failure")
+        with open(rejected_path) as f:
+            rejected = json.load(f)
+        check(
+            {r["filename"] for r in rejected} == {"step-001.json", "step-002.json"},
+            "finalize: both excluded filenames are recorded",
+            str(rejected),
+        )
+
+
 def test_finalize_accepts_plan_scoped_to_internal_package_end_to_end():
     with tempfile.TemporaryDirectory() as sweep_dir:
         plan_dir = os.path.join(sweep_dir, "plan")
@@ -1249,6 +1309,56 @@ def test_finalize_multi_planner_excludes_only_the_invalid_step():
 
         step_files = [f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f)]
         check(len(step_files) == 1, "finalize_multi_planner: only the valid proposal survives into the merged plan", str(step_files))
+
+
+def test_finalize_multi_planner_writes_rejected_proposals_for_excluded_candidate():
+    # Issue #3956: finalize_multi_planner() must persist every excluded
+    # candidate across any configured planner, labelled with its own
+    # lane_dir_name so a same-named step-NNN.json from two different
+    # planners stays distinguishable.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"]),
+        )
+        # Invalid: spans two top-level subtrees.
+        _write_planner_step(
+            sweep_dir, "codex-gpt-terra", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go", "features/x/y.go"]),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds with one valid proposal", str(errors))
+
+        rejected_path = os.path.join(sweep_dir, "plan", planner.REJECTED_PROPOSALS_FILENAME)
+        check(os.path.isfile(rejected_path), "finalize_multi_planner: writes plan/rejected_proposals.json when a candidate is excluded")
+        with open(rejected_path) as f:
+            rejected = json.load(f)
+        check(len(rejected) == 1, "finalize_multi_planner: one rejected entry for the one excluded candidate", str(rejected))
+        check(
+            rejected[0]["filename"] == "codex-gpt-terra/step-001.json",
+            "finalize_multi_planner: rejected entry names the filename qualified by lane_dir_name",
+            str(rejected),
+        )
+
+
+def test_finalize_multi_planner_does_not_write_rejected_proposals_when_nothing_excluded():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1")
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"]),
+        )
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds with a fully valid plan", str(errors))
+        check(
+            not os.path.exists(os.path.join(sweep_dir, "plan", planner.REJECTED_PROPOSALS_FILENAME)),
+            "finalize_multi_planner: no rejected_proposals.json is written when nothing was excluded",
+        )
 
 
 def test_finalize_multi_planner_single_configured_planner_matches_a_plain_merge():

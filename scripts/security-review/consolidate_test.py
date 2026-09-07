@@ -371,6 +371,148 @@ def test_empty_lane_dirs_show_not_started_against_frozen_plan():
         check("0/2" in md, "consolidate.md: shows 0/2 for the untouched state buckets", md)
 
 
+def write_dispatch_report(sweep: str, planners: list[dict] | None = None, lanes: list[dict] | None = None) -> None:
+    write(
+        os.path.join(sweep, "dispatch_report.json"),
+        {"planners": planners or [], "lanes": lanes or []},
+    )
+
+
+def write_rejected_proposals(sweep: str, entries: list[dict]) -> None:
+    write(os.path.join(sweep, "plan", "rejected_proposals.json"), entries)
+
+
+def test_dispatch_section_empty_when_nothing_recorded():
+    # No dispatch_report.json and no plan/rejected_proposals.json at all --
+    # the Dispatch section must state the empty case explicitly, matching
+    # the discipline the Coverage/Findings sections already apply, not just
+    # omit the section.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        report = consolidate.consolidate(sweep, repo)
+        check(report["dispatch"] == {"planners": [], "lanes": []}, "consolidate: empty dispatch report when dispatch_report.json is absent", str(report["dispatch"]))
+        check(report["rejected_proposals"] == [], "consolidate: empty rejected_proposals when the file is absent", str(report["rejected_proposals"]))
+        md = consolidate.render_markdown(report)
+        check("## Dispatch" in md, "consolidate.md: renders a Dispatch section heading", md)
+        check(
+            "_(no dispatch or proposal issues recorded)_" in md,
+            "consolidate.md: states the empty case explicitly when nothing was rejected or unavailable",
+            md,
+        )
+
+
+def test_dispatch_section_lists_credential_unavailable_lane():
+    # REQUIRED TEST: a dispatch_report.json "lanes" entry with outcome
+    # "credential_unavailable" for lane opencode-glm-4.6 must be named as
+    # unavailable in the rendered Dispatch section.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write_dispatch_report(
+            sweep,
+            lanes=[
+                {
+                    "requested_harness": "opencode",
+                    "requested_model": "glm-4.6",
+                    "passed_harness": "opencode",
+                    "passed_model": "glm-4.6",
+                    "outcome": "credential_unavailable",
+                }
+            ],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check("opencode-glm-4.6" in md, "consolidate.md: names the credential-unavailable lane", md)
+        check("UNAVAILABLE" in md, "consolidate.md: labels the entry UNAVAILABLE", md)
+        check(
+            "_(no dispatch or proposal issues recorded)_" not in md,
+            "consolidate.md: does not render the empty-case line once a dispatch issue exists",
+            md,
+        )
+
+
+def test_dispatch_section_lists_unavailable_planner():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write_dispatch_report(
+            sweep,
+            planners=[
+                {
+                    "requested_harness": "claude",
+                    "requested_model": "",
+                    "passed_harness": "claude",
+                    "passed_model": "",
+                    "resolved_model": "unknown",
+                    "outcome": "launch_failed",
+                }
+            ],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check("claude" in md and "UNAVAILABLE" in md, "consolidate.md: names the launch-failed planner as unavailable", md)
+
+
+def test_dispatch_section_omits_dispatched_entries():
+    # A "dispatched" outcome is the success case -- it must never render as
+    # UNAVAILABLE, and with nothing else to report the empty-case line must
+    # still show.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write_dispatch_report(
+            sweep,
+            planners=[{"requested_harness": "claude", "requested_model": "", "outcome": "dispatched"}],
+            lanes=[{"requested_harness": "claude", "requested_model": "fable-5-1", "outcome": "dispatched"}],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check("UNAVAILABLE" not in md, "consolidate.md: a dispatched entry is never labelled UNAVAILABLE", md)
+        check(
+            "_(no dispatch or proposal issues recorded)_" in md,
+            "consolidate.md: renders the empty-case line when every entry dispatched cleanly",
+            md,
+        )
+
+
+def test_dispatch_section_lists_rejected_proposal_exactly_once():
+    # REQUIRED TEST: a plan/rejected_proposals.json entry appears in the
+    # Dispatch section, and the rejected filename appears exactly once in
+    # the rendered markdown -- not merely present via a count that would
+    # also match an unrelated mention.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write_rejected_proposals(
+            sweep,
+            [{"filename": "step-002.json", "error": "scope spans two top-level subtrees"}],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(report["rejected_proposals"] == [{"filename": "step-002.json", "error": "scope spans two top-level subtrees"}], "consolidate: reads plan/rejected_proposals.json verbatim", str(report["rejected_proposals"]))
+        md = consolidate.render_markdown(report)
+        check("REJECTED" in md, "consolidate.md: labels the rejected proposal REJECTED", md)
+        check(md.count("step-002.json") == 1, "consolidate.md: the rejected filename appears exactly once", md)
+        check("scope spans two top-level subtrees" in md, "consolidate.md: the validation error text is rendered", md)
+
+
+def test_dispatch_section_malformed_dispatch_report_does_not_crash():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        os.makedirs(sweep, exist_ok=True)
+        with open(os.path.join(sweep, "dispatch_report.json"), "w") as f:
+            f.write("not valid json {{{")
+        report = consolidate.consolidate(sweep, repo)
+        check(report["dispatch"] == {"planners": [], "lanes": []}, "consolidate: malformed dispatch_report.json is treated as nothing to report", str(report["dispatch"]))
+        md = consolidate.render_markdown(report)
+        check(
+            "_(no dispatch or proposal issues recorded)_" in md,
+            "consolidate.md: malformed dispatch_report.json does not crash render_markdown()",
+            md,
+        )
+
+
 def test_partial_sweep_coverage_shows_incompleteness():
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
         sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
