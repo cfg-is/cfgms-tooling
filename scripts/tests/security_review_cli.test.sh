@@ -308,7 +308,15 @@ rm -rf "$AC3_LANE_DIR" "$AC3_PLAN_DIR" "$AC3_OUT_DIR" "$AC3_CLAUDE_BIN"
 FAKEBIN="$(mktemp -d)"
 SANDBOX="$(mktemp -d)"
 STUB_CLAUDE_BIN_DIR="$(mktemp -d)"
-cleanup_fixtures() { rm -rf "$FAKEBIN" "$SANDBOX" "$STUB_CLAUDE_BIN_DIR"; }
+# Every real `launch` call below now materializes a real snapshot.py
+# extraction under $SANDBOX (Issue #3952), and snapshot.create_snapshot()
+# deliberately strips owner/group/other write bits from every extracted file
+# AND directory on the host (its own defense-in-depth, documented in
+# snapshot.py). `rm -rf` cannot unlink a directory entry without write
+# permission on the parent directory, so cleanup must restore it first --
+# this is not a mistaken permission, it is the read-only-on-purpose property
+# under test elsewhere in this file, just also visible to this trap.
+cleanup_fixtures() { chmod -R u+w "$FAKEBIN" "$SANDBOX" "$STUB_CLAUDE_BIN_DIR" 2>/dev/null || true; rm -rf "$FAKEBIN" "$SANDBOX" "$STUB_CLAUDE_BIN_DIR"; }
 trap cleanup_fixtures EXIT
 
 # Stub harness CLI binary (Issue #3934) -- the ONLY thing lane mode stubs.
@@ -1199,6 +1207,164 @@ fi
 check_contains "the failure is reported for the affected roster lane" "$roster_fail_out" "claude-stubmodel"
 check_not_contains "roster failure is never misclassified as a credential skip" "$roster_fail_out" "credential_unavailable"
 check_not_contains "roster launch does not print the report path as if the sweep completed cleanly" "$roster_fail_out" "report/consolidated.md"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TESTS (Issue #3952, epic #3950's D1) -- the snapshot-mount cutover
+# itself: a tampered snapshot blocks resume before any dispatch, and a real
+# lane's content genuinely comes from the snapshot, not from REPO_ROOT's live
+# working tree.
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "== REQUIRED TEST — tampering with a tracked file's bytes inside"
+echo "   <sweep_dir>/snapshot/ between launch and resume makes resume fail"
+echo "   closed: exits non-zero, prints the tampered path, and dispatches no"
+echo "   lane or planner container at all (Issue #3952, epic #3950's D1) =="
+SUB_TAMPER="${SANDBOX}/case-tamper"
+setup_sub_sandbox "$SUB_TAMPER"
+tamper_launch_out=$(run_cli "$SUB_TAMPER" launch HEAD 2>"${SUB_TAMPER}/stderr.log")
+tamper_launch_rc=$?
+check_eq "launch exits 0 before any tampering" "$tamper_launch_rc" "0"
+SWEEP_DIR_TAMPER="$(dirname "$(dirname "$tamper_launch_out")")"
+
+TAMPER_TARGET="${SWEEP_DIR_TAMPER}/snapshot/CLAUDE.md"
+[[ -f "$TAMPER_TARGET" ]] && ok "the file this test will tamper with exists in the snapshot" \
+  || bad "the file this test will tamper with exists in the snapshot" "not found: ${TAMPER_TARGET}"
+# create_snapshot() strips write bits from every extracted file -- this is
+# the tamper simulation itself (there is no real host checkout mutation
+# available in this stubbed-docker test, per the acceptance criterion), so
+# the file's own write bit is restored just long enough to corrupt it.
+chmod u+w "$TAMPER_TARGET"
+printf '\nTAMPERED BY security_review_cli.test.sh\n' >> "$TAMPER_TARGET"
+chmod u-w "$TAMPER_TARGET"
+
+lane_step_files_before="$(find "${SWEEP_DIR_TAMPER}/lanes" -name 'step-*' | sort)"
+
+: > "${SUB_TAMPER}/docker_calls.log"
+set +e
+tamper_resume_out=$(run_cli "$SUB_TAMPER" resume "$(basename "$SWEEP_DIR_TAMPER")" 2>&1)
+tamper_resume_rc=$?
+set -e
+if [[ "$tamper_resume_rc" -ne 0 ]]; then
+  ok "resume exits non-zero after the snapshot is tampered"
+else
+  bad "resume exits non-zero after the snapshot is tampered" "exited 0"
+fi
+check_contains "resume reports the tampered path" "$tamper_resume_out" "CLAUDE.md"
+check_contains "resume reports it as a snapshot verification failure" "$tamper_resume_out" "snapshot verification failed"
+check_not_contains "resume never prints the report path as if it completed cleanly" "$tamper_resume_out" "report/consolidated.md"
+check_not_contains "no container was dispatched for the tampered resume" "$(cat "${SUB_TAMPER}/docker_calls.log" 2>/dev/null || true)" "run -d"
+
+lane_step_files_after="$(find "${SWEEP_DIR_TAMPER}/lanes" -name 'step-*' | sort)"
+check_eq "no new step files appear under lanes/<lane>/ after the tampered resume" "$lane_step_files_after" "$lane_step_files_before"
+
+echo ""
+echo "== REQUIRED TEST — launch end to end: the real (stubbed-binary) lane's"
+echo "   own content genuinely comes from <sweep_dir>/snapshot/, not from"
+echo "   REPO_ROOT's live working tree -- proven by pointing a fixture repo's"
+echo "   working tree and its own HEAD commit at deliberately different bytes"
+echo "   for one tracked file. git archive HEAD, which create_snapshot() reads,"
+echo "   never sees an uncommitted change; only a REPO_ROOT-mounted live"
+echo "   checkout (the pre-#3952 behavior) would (Issue #3952, epic #3950's"
+echo "   D1) =="
+
+CONTENT_FIXTURE_REPO="$(mktemp -d)"
+git -C "$CONTENT_FIXTURE_REPO" init --quiet
+git -C "$CONTENT_FIXTURE_REPO" config user.email "test@example.com"
+git -C "$CONTENT_FIXTURE_REPO" config user.name "Test"
+# agent-dispatch.sh (invoked by the real dispatch below) and planner.py's
+# default_dispatch_script() both resolve the harness's own files --
+# agent-dispatch.sh itself, investigator-entrypoint.sh -- relative to
+# $REPO_ROOT/CFGMS_TEST_REPO_ROOT, which this test intentionally points at
+# this synthetic fixture instead of the real checkout. Copying (not
+# symlinking) these two directories in, as real tracked files, supplies the
+# harness's own code from the real checkout while leaving the fixture's OWN
+# git history -- the "reviewed content" this test controls -- completely
+# independent of the marker file below.
+#
+# These copies ARE committed, and that is deliberate: claude_lane.py's
+# CFGMS_SECURITY_REVIEW_REPO_ROOT import-bootstrap fallback resolves its
+# sibling modules (schema.py, terminal_state.py, ...) from
+# "<repo_root>/.claude/scripts/security-review", and after this story's
+# cutover, <repo_root> here is <sweep_dir>/snapshot -- git archive HEAD's
+# own output, not this working tree. An untracked file (or a directory
+# symlink, tried and reverted here -- `_walk_relative_files()`'s
+# `os.walk(..., followlinks=False)` never lists a directory-type symlink as
+# a file at all, so `verify_snapshot()` reports it "missing from snapshot"
+# even once `git archive` has faithfully extracted it) is invisible to
+# `git archive`'s tree walk, so `<sweep_dir>/snapshot` ended up without a
+# `.claude` at all; the sibling imports only kept working by accident, via
+# the harness's hardcoded `/workspace` fallback candidate matching this dev
+# sandbox's own checkout path -- a coincidence that does not hold on a CI
+# runner, where the checkout lives elsewhere and the same imports raise
+# ModuleNotFoundError (swallowed by this file's own docker stub's
+# `|| true`, so the lane silently never runs). Committing real copies makes
+# `git archive` include them as ordinary blobs, exactly like a real
+# checkout's own tracked `.claude/` would produce, so the fallback resolves
+# the same way everywhere, not just where the coincidence holds.
+cp -r "${REPO_ROOT}/.claude" "${CONTENT_FIXTURE_REPO}/.claude"
+cp -r "${REPO_ROOT}/.devcontainer" "${CONTENT_FIXTURE_REPO}/.devcontainer"
+mkdir -p "${CONTENT_FIXTURE_REPO}/pkg/example"
+echo "COMMITTED_SNAPSHOT_MARKER_c3a91f" > "${CONTENT_FIXTURE_REPO}/pkg/example/file.go"
+git -C "$CONTENT_FIXTURE_REPO" add pkg .claude .devcontainer
+git -C "$CONTENT_FIXTURE_REPO" commit --quiet -m "init"
+# Dirty the working tree AFTER the commit the sweep will pin to -- exactly
+# what "develop moves several times an hour" looks like between sweep
+# creation and container dispatch (this epic's own motivating scenario).
+echo "DIRTY_WORKING_TREE_MARKER_never_seen" > "${CONTENT_FIXTURE_REPO}/pkg/example/file.go"
+
+# A dedicated claude stub for this test only (never the shared
+# STUB_CLAUDE_BIN_DIR) that logs its own -p prompt argv -- the prompt is
+# exactly where claude_lane.py::build_prompt() embeds every file it read via
+# read_step_files(repo_root, ...), so grepping the logged prompt for either
+# marker proves which repo_root the lane actually read from.
+CONTENT_TEST_CLAUDE_BIN="$(mktemp -d)"
+CONTENT_PROMPT_LOG="$(mktemp)"
+cat > "${CONTENT_TEST_CLAUDE_BIN}/claude" <<'CONTENT_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+output_path="${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
+printf '%s\n' "$*" >> "${CFGMS_TEST_PROMPT_LOG:?}"
+printf '{"findings":[]}' > "$output_path"
+CONTENT_STUB
+chmod +x "${CONTENT_TEST_CLAUDE_BIN}/claude"
+
+SUB_CONTENT="${SANDBOX}/case-content-provenance"
+mkdir -p "${SUB_CONTENT}/HOME/.claude"
+echo '{}' > "${SUB_CONTENT}/HOME/.claude/.credentials.json"
+: > "${SUB_CONTENT}/docker_calls.log"
+: > "${SUB_CONTENT}/lane_run.log"
+
+set +e
+content_launch_out=$(STUB_PLAN_STEP_COUNT=1 \
+  PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$CONTENT_FIXTURE_REPO" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SUB_CONTENT}/ledger" \
+  HOME="${SUB_CONTENT}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${SUB_CONTENT}/base" \
+  DOCKER_CALL_LOG="${SUB_CONTENT}/docker_calls.log" \
+  LANE_RUN_LOG="${SUB_CONTENT}/lane_run.log" \
+  STUB_CLAUDE_BIN_DIR="$CONTENT_TEST_CLAUDE_BIN" \
+  CFGMS_TEST_PROMPT_LOG="$CONTENT_PROMPT_LOG" \
+  CFGMS_SECURITY_REVIEW_LANES="claude:content-check" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
+  "$CLI" launch HEAD 2>"${SUB_CONTENT}/stderr.log")
+content_launch_rc=$?
+set -e
+check_eq "content-provenance launch exits 0" "$content_launch_rc" "0"
+
+prompt_seen="$(cat "$CONTENT_PROMPT_LOG" 2>/dev/null || true)"
+check_contains "the lane's prompt embeds the snapshot's (committed) file content" "$prompt_seen" "COMMITTED_SNAPSHOT_MARKER_c3a91f"
+check_not_contains "the lane's prompt never embeds REPO_ROOT's dirty working-tree content" "$prompt_seen" "DIRTY_WORKING_TREE_MARKER_never_seen"
+
+SWEEP_DIR_CONTENT="$(dirname "$(dirname "$content_launch_out")")"
+[[ -f "${SWEEP_DIR_CONTENT}/lanes/claude-content-check/step-001.findings.json" ]] \
+  && ok "the real lane wrote step-001.findings.json for the content-provenance check" \
+  || bad "the real lane wrote step-001.findings.json for the content-provenance check" "not found"
+
+rm -rf "$CONTENT_FIXTURE_REPO" "$CONTENT_TEST_CLAUDE_BIN"
+rm -f "$CONTENT_PROMPT_LOG"
 
 echo ""
 echo "== REQUIRED TEST evidence — this file's own docker stub replaces ONLY the"

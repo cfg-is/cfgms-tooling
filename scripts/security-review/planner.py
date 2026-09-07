@@ -5,8 +5,9 @@ Given a sweep directory already created by `manifest.py` (#3902), `prepare()`
 collects `metadata.py::collect()`'s metadata-only summary of the sweep's
 pinned commit, assembles the planner prompt around it, and writes that prompt
 to `<sweep_dir>/plan/.investigator-plan-prompt.md`. `launch()` then invokes
-`agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --mode plan`
-(Issue #3903) -- the sole way any model-driven code touches this tree -- which
+`agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --snapshot-dir
+<snapshot_dir> --mode plan` (Issue #3903; `--snapshot-dir` required as of
+Issue #3952) -- the sole way any model-driven code touches this tree -- which
 execs `claude -p` inside a container whose `.claude/agents/investigator.md`
 profile restricts tool access to `Bash, Glob` only. Because `Write` is not in
 that list (nor is it in the container's `--disallowedTools`, since it was
@@ -84,6 +85,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -251,13 +253,38 @@ def default_dispatch_script(repo_root: str | None = None) -> str:
     return os.path.join(root, ".claude", "scripts", "agent-dispatch.sh")
 
 
+def _materialize_lane_snapshot(top_snapshot_dir: str, lane_sweep_dir: str) -> str:
+    """Give a multi-planner lane's own sub-sweep-dir (`<sweep_dir>/planners/
+    <lane_dir_name>/`) a `snapshot/` of its own, hardlinked from the sweep's
+    one real snapshot at `top_snapshot_dir` (`<sweep_dir>/snapshot`).
+
+    `agent-dispatch.sh launch-investigator`'s `--snapshot-dir` escape check
+    (Issue #3952) requires the passed directory to resolve to EXACTLY
+    `<the --sweep-dir passed on that same call>/snapshot` -- and multi-planner
+    dispatch passes a per-lane sub-directory as `--sweep-dir`, not the sweep
+    root, so the root's own snapshot cannot be passed there directly without
+    weakening that check. Hardlinking (never symlinking -- a symlink would
+    itself fail the same escape check, by design) gives each lane a real
+    directory entry satisfying the check while sharing the same inode and
+    disk blocks as the one extraction `snapshot.create_snapshot()` already
+    made read-only on the host -- no second byte-copy, no second `git
+    archive`. Idempotent: a second call against an already-materialized lane
+    snapshot is a no-op.
+    """
+    lane_snapshot_dir = os.path.join(lane_sweep_dir, "snapshot")
+    if not os.path.isdir(lane_snapshot_dir):
+        shutil.copytree(top_snapshot_dir, lane_snapshot_dir, copy_function=os.link)
+    return lane_snapshot_dir
+
+
 def launch(
     sweep_dir: str,
+    snapshot_dir: str | None = None,
     repo_root: str | None = None,
     dispatch_script: str | None = None,
     planners: "list[roster.Lane] | None" = None,
 ) -> str:
-    """Invoke `agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --mode plan`.
+    """Invoke `agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --snapshot-dir <snapshot_dir> --mode plan`.
 
     `planners` is `None` by default, which preserves this function's
     original, single hardcoded call exactly as it has always been -- no
@@ -302,14 +329,27 @@ def launch(
     every entry has been attempted, summarizing every failure.
 
     Raises `PlannerError` if the prompt has not been written yet, if
-    `agent-dispatch.sh` cannot be found, or if any launch command exits
-    non-zero.
+    `snapshot_dir` is not given, if `agent-dispatch.sh` cannot be found, or
+    if any launch command exits non-zero.
+
+    `snapshot_dir` (Issue #3952, epic #3950's D1) is the sweep's own
+    verified snapshot (`<sweep_dir>/snapshot`, `snapshot.create_snapshot()`)
+    -- required, since `launch-investigator` now refuses to run without a
+    `--snapshot-dir`. Passed straight through on the single-planner call
+    below. The multi-planner branch cannot pass it straight through: each
+    entry's `--sweep-dir` is its own `<sweep_dir>/planners/<lane>/`
+    sub-directory, and `launch-investigator`'s escape check requires
+    `--snapshot-dir` to resolve to exactly `<that --sweep-dir>/snapshot` --
+    so `_materialize_lane_snapshot()` gives each lane a hardlinked
+    `snapshot/` of its own inside its sub-directory first.
     """
     prompt_path = os.path.join(sweep_dir, "plan", PROMPT_FILENAME)
     if not os.path.isfile(prompt_path):
         raise PlannerError(
             f"plan prompt not found at {prompt_path}; call prepare() before launch()"
         )
+    if not snapshot_dir:
+        raise PlannerError("snapshot_dir is required -- pass the sweep's verified snapshot directory")
 
     script = dispatch_script or default_dispatch_script(repo_root)
     if not os.path.isfile(script):
@@ -318,7 +358,16 @@ def launch(
     if not planners:
         try:
             result = subprocess.run(
-                [script, "launch-investigator", "--sweep-dir", sweep_dir, "--mode", "plan"],
+                [
+                    script,
+                    "launch-investigator",
+                    "--sweep-dir",
+                    sweep_dir,
+                    "--snapshot-dir",
+                    snapshot_dir,
+                    "--mode",
+                    "plan",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -339,9 +388,11 @@ def launch(
     outputs: list[str] = []
     failures: list[str] = []
     for lane in planners:
-        lane_plan_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan")
+        lane_sweep_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name)
+        lane_plan_dir = os.path.join(lane_sweep_dir, "plan")
         os.makedirs(lane_plan_dir, exist_ok=True)
         atomic_write.write_text_atomic(os.path.join(lane_plan_dir, PROMPT_FILENAME), prompt_text)
+        lane_snapshot_dir = _materialize_lane_snapshot(snapshot_dir, lane_sweep_dir)
 
         try:
             result = subprocess.run(
@@ -349,7 +400,9 @@ def launch(
                     script,
                     "launch-investigator",
                     "--sweep-dir",
-                    os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name),
+                    lane_sweep_dir,
+                    "--snapshot-dir",
+                    lane_snapshot_dir,
                     "--mode",
                     "plan",
                     "--harness",
@@ -835,6 +888,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_launch = sub.add_parser("launch", help="Launch the investigator plan-mode container")
     p_launch.add_argument("sweep_dir")
+    p_launch.add_argument("--snapshot-dir", required=True)
     p_launch.add_argument("--repo-root", default=None)
 
     p_finalize = sub.add_parser(
@@ -860,7 +914,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: could not parse CFGMS_SECURITY_REVIEW_PLANNERS: {exc}", file=sys.stderr)
             return 1
         try:
-            output = launch(args.sweep_dir, repo_root=args.repo_root, planners=planners)
+            output = launch(
+                args.sweep_dir,
+                snapshot_dir=args.snapshot_dir,
+                repo_root=args.repo_root,
+                planners=planners,
+            )
         except PlannerError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

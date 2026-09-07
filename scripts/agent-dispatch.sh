@@ -1103,11 +1103,24 @@ Commands:
                                             Exit 3 on validation failure.
   cleanup-stale-reviews                     Remove exited review containers that did not clean up
                                             their clone directory on exit.
-  launch-investigator --sweep-dir <DIR> --mode <plan|LANE_ID>
+  launch-investigator --sweep-dir <DIR> --snapshot-dir <DIR> --mode <plan|LANE_ID>
                       [--lane-entrypoint <SCRIPT>] [--harness <ID>] [--model <ID>]
                                             Launch a read-only investigator container (Issue #3903)
                                             against an existing security-review sweep directory.
-                                            /workspace is mounted :ro, no GH_TOKEN, no git identity.
+                                            --snapshot-dir is required (Issue #3952): /workspace is
+                                            mounted :ro from it, never from the live, mutable repo
+                                            checkout -- it must already exist and resolve to exactly
+                                            <sweep-dir>/snapshot (the sweep's own verified snapshot,
+                                            snapshot.py/Issue #3951), checked before any mount is
+                                            built. A missing --snapshot-dir, or one that does not
+                                            resolve there, is a hard failure before any docker call.
+                                            No GH_TOKEN, no git identity. This call also hashes
+                                            investigator-entrypoint.sh and --lane-entrypoint's script
+                                            (the only two files individually mounted from the live
+                                            repo) into a trusted-harness identity, written to
+                                            <sweep-dir>/harness_identity.json and injected as
+                                            CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY -- recorded, not
+                                            frozen: it is not verified against a prior value.
                                             mode=plan mounts <sweep>/plan rw as /workspace-out and
                                             execs `claude -p` with --disallowedTools. Any other mode
                                             is a lane id: mounts <sweep>/plan ro, <sweep>/lanes/<id>
@@ -2712,6 +2725,7 @@ PROMPT_EOF
     #     mode, only plan/) — never the whole sweep tree, so a container can
     #     never read or write another lane's findings or manifest.json
     inv_sweep_dir=""
+    inv_snapshot_dir=""
     inv_mode=""
     inv_lane_entrypoint=""
     inv_harness=""
@@ -2719,6 +2733,7 @@ PROMPT_EOF
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --sweep-dir)       inv_sweep_dir="${2:?--sweep-dir requires a value}"; shift 2 ;;
+        --snapshot-dir)    inv_snapshot_dir="${2:?--snapshot-dir requires a value}"; shift 2 ;;
         --mode)            inv_mode="${2:?--mode requires a value}"; shift 2 ;;
         --lane-entrypoint) inv_lane_entrypoint="${2:?--lane-entrypoint requires a value}"; shift 2 ;;
         --harness)         inv_harness="${2:?--harness requires a value}"; shift 2 ;;
@@ -2728,6 +2743,11 @@ PROMPT_EOF
     done
 
     [[ -n "$inv_sweep_dir" ]] || { echo "ERROR: launch-investigator requires --sweep-dir"; exit 1; }
+    # Checked here, before any mkdir, docker call, or mount construction
+    # (Issue #3952): --snapshot-dir is the ONLY thing ever mounted at
+    # /workspace now (see the docker run invocation below) -- a missing value
+    # must never fall through to some other default source for that mount.
+    [[ -n "$inv_snapshot_dir" ]] || { echo "ERROR: launch-investigator requires --snapshot-dir"; exit 1; }
     [[ -n "$inv_mode" ]] || { echo "ERROR: launch-investigator requires --mode (plan|<lane-id>)"; exit 1; }
 
     # SECURITY: --mode is concatenated into the WRITABLE bind-mount path below
@@ -2757,6 +2777,26 @@ PROMPT_EOF
     # responsible for tracking).
     [[ -d "$inv_sweep_dir" ]] || { echo "ERROR: sweep directory not found: ${inv_sweep_dir}"; exit 1; }
     inv_sweep_dir="$(realpath "$inv_sweep_dir")"
+
+    # --snapshot-dir (Issue #3952, epic #3950's D1): mount the tree from a
+    # verified, immutable snapshot instead of the live, mutable repo checkout.
+    # Validated exactly like inv_plan_dir_real/inv_lane_dir_real below: it
+    # must already exist (security-review.sh's create_sweep_tree() creates it
+    # via snapshot.create_snapshot() before ever calling this command --
+    # never mkdir -p'd here) and its realpath must land EXACTLY on
+    # <sweep-dir>/snapshot. The same reasoning as the plan/lane checks
+    # applies: docker resolves the host side of a bind mount at mount time,
+    # so a symlink at the passed path would redirect /workspace to an
+    # arbitrary host directory -- including back to the live checkout this
+    # story exists to stop mounting.
+    [[ -d "$inv_snapshot_dir" ]] || { echo "ERROR: snapshot directory not found: ${inv_snapshot_dir}"; exit 1; }
+    inv_snapshot_dir_real="$(realpath "$inv_snapshot_dir" 2>/dev/null || true)"
+    if [[ "$inv_snapshot_dir_real" != "${inv_sweep_dir}/snapshot" ]]; then
+      echo "INVESTIGATOR_REFUSED:snapshot_dir_escape:snapshot dir does not resolve inside the sweep directory"
+      exit 2
+    fi
+    inv_snapshot_dir="$inv_snapshot_dir_real"
+
     inv_sweep_id="$(basename "$inv_sweep_dir")"
     inv_mode_safe=$(printf '%s' "$inv_mode" | tr -c 'a-zA-Z0-9._-' '-')
     inv_sweep_id_safe=$(printf '%s' "$inv_sweep_id" | tr -c 'a-zA-Z0-9._-' '-')
@@ -2973,6 +3013,66 @@ PROMPT_EOF
       inv_lane_entrypoint_mount=(-v "${inv_lane_entrypoint}:/usr/local/bin/investigator-lane-entrypoint.py:ro")
     fi
 
+    # Trusted-harness identity (Issue #3952, epic #3950's D1 correction on
+    # revision 3): hash exactly the two files this command individually
+    # mounts from the live repo checkout -- investigator-entrypoint.sh
+    # always, and the --lane-entrypoint script when one is passed (plan mode
+    # passes none). Every OTHER file a lane runner imports (schema.py,
+    # harness_runner.py, atomic_write.py, roster.py, terminal_state.py,
+    # resume.py, the other lane files) has no mount of its own: in
+    # production the import bootstrap resolves those from /workspace, which
+    # after this story's own snapshot cutover above is the frozen snapshot,
+    # not the live tree -- their identity is already implied by commit_sha,
+    # so hashing them here would be redundant at best and describe code that
+    # never actually ran at worst (a sweep whose pinned commit differs from
+    # the live checkout). Each file's REPO_ROOT-relative path is fed into
+    # the digest ahead of its bytes, in a fixed order (entrypoint, then lane
+    # entrypoint), so a rename with unchanged content still changes the
+    # recorded identity -- the path is part of what actually got mounted
+    # where. Runs on the host, before the docker run call, using the same
+    # $REPO_ROOT the mount flags above are already built from. This is
+    # recording, not freezing: the value is written fresh on every call and
+    # never compared against a prior one -- binding it into a step envelope
+    # and quarantining a mismatch on resume is STORY-12 (D6), which consumes
+    # this value; it is not produced here.
+    inv_entrypoint_host_path="${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh"
+    inv_harness_identity_hash=$(python3 - "$REPO_ROOT" "$inv_entrypoint_host_path" "$inv_lane_entrypoint" "${inv_sweep_dir}/harness_identity.json" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+repo_root, entrypoint_path, lane_entrypoint_path, dest_path = sys.argv[1:5]
+
+digest = hashlib.sha256()
+files = []
+for path in (entrypoint_path, lane_entrypoint_path):
+    if not path:
+        continue
+    rel = os.path.relpath(path, repo_root)
+    with open(path, "rb") as f:
+        content = f.read()
+    digest.update(rel.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(content)
+    digest.update(b"\0")
+    files.append(rel)
+
+hash_hex = digest.hexdigest()
+data = {
+    "algorithm": "sha256",
+    "hash": hash_hex,
+    "files": files,
+    "computed_at": datetime.now(timezone.utc).isoformat(),
+}
+with open(dest_path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print(hash_hex)
+PY
+)
+
     inv_session_mount=()
     if inv_sessions_dir=$(prepare_session_dir "$container_name" "investigator-${inv_mode_safe}" "" "" ""); then
       inv_session_mount=(-v "${inv_sessions_dir}:${AGENT_SESSIONS_MOUNT}")
@@ -3006,7 +3106,7 @@ PROMPT_EOF
       --memory=2g \
       --cpus=2 \
       --stop-timeout=900 \
-      -v "${REPO_ROOT}:/workspace:ro" \
+      -v "${inv_snapshot_dir}:/workspace:ro" \
       "${claude_creds_mount[@]}" \
       "${inv_plan_mount[@]}" \
       "${inv_out_mount[@]}" \
@@ -3019,6 +3119,7 @@ PROMPT_EOF
       -e "CFGMS_AGENT_MODE=true" \
       -e "CFGMS_INVESTIGATOR_MODE=${inv_mode}" \
       -e "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=${inv_disallowed}" \
+      -e "CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY=${inv_harness_identity_hash}" \
       "${inv_harness_env[@]}" \
       -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
       --entrypoint /usr/local/bin/investigator-entrypoint.sh \

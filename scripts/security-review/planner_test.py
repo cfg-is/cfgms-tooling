@@ -254,6 +254,8 @@ def test_launch_invokes_agent_dispatch_with_plan_mode():
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
             f.write("prompt text\n")
+        snapshot_dir = os.path.join(sweep_dir, "snapshot")
+        os.makedirs(snapshot_dir)
 
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
@@ -262,7 +264,7 @@ def test_launch_invokes_agent_dispatch_with_plan_mode():
         env_backup = os.environ.get("STUB_LOG")
         os.environ["STUB_LOG"] = log_path
         try:
-            output = planner.launch(sweep_dir, dispatch_script=stub_path)
+            output = planner.launch(sweep_dir, snapshot_dir=snapshot_dir, dispatch_script=stub_path)
         finally:
             if env_backup is None:
                 os.environ.pop("STUB_LOG", None)
@@ -273,8 +275,9 @@ def test_launch_invokes_agent_dispatch_with_plan_mode():
         with open(log_path) as f:
             invoked_args = f.read().strip()
         check(
-            invoked_args == f"ARGS:launch-investigator --sweep-dir {sweep_dir} --mode plan",
-            "launch: invokes agent-dispatch.sh launch-investigator with --sweep-dir and --mode plan",
+            invoked_args
+            == f"ARGS:launch-investigator --sweep-dir {sweep_dir} --snapshot-dir {snapshot_dir} --mode plan",
+            "launch: invokes agent-dispatch.sh launch-investigator with --sweep-dir, --snapshot-dir and --mode plan",
             invoked_args,
         )
 
@@ -284,13 +287,15 @@ def test_launch_raises_on_nonzero_exit():
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
             f.write("prompt text\n")
+        snapshot_dir = os.path.join(sweep_dir, "snapshot")
+        os.makedirs(snapshot_dir)
 
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         write_stub_script(stub_path, STUB_DISPATCH_FAILURE)
 
         raised = False
         try:
-            planner.launch(sweep_dir, dispatch_script=stub_path)
+            planner.launch(sweep_dir, snapshot_dir=snapshot_dir, dispatch_script=stub_path)
         except planner.PlannerError:
             raised = True
         check(raised, "launch: raises PlannerError when the launch command exits non-zero")
@@ -299,6 +304,24 @@ def test_launch_raises_on_nonzero_exit():
 def test_launch_refuses_without_prepared_prompt():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
+        snapshot_dir = os.path.join(sweep_dir, "snapshot")
+        os.makedirs(snapshot_dir)
+        stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
+        write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
+
+        raised = False
+        try:
+            planner.launch(sweep_dir, snapshot_dir=snapshot_dir, dispatch_script=stub_path)
+        except planner.PlannerError:
+            raised = True
+        check(raised, "launch: refuses to launch before prepare() has written the prompt")
+
+
+def test_launch_refuses_without_snapshot_dir():
+    with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
+        os.makedirs(os.path.join(sweep_dir, "plan"))
+        with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
+            f.write("prompt text\n")
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
 
@@ -307,7 +330,7 @@ def test_launch_refuses_without_prepared_prompt():
             planner.launch(sweep_dir, dispatch_script=stub_path)
         except planner.PlannerError:
             raised = True
-        check(raised, "launch: refuses to launch before prepare() has written the prompt")
+        check(raised, "launch: refuses to launch without a snapshot_dir")
 
 
 # --- validate_step() / bounded-scope rule ---------------------------------
@@ -973,6 +996,8 @@ def test_launch_single_planner_default_is_unchanged_by_the_planners_parameter():
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
             f.write("prompt text\n")
+        snapshot_dir = os.path.join(sweep_dir, "snapshot")
+        os.makedirs(snapshot_dir)
 
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
@@ -981,7 +1006,7 @@ def test_launch_single_planner_default_is_unchanged_by_the_planners_parameter():
         env_backup = os.environ.get("STUB_LOG")
         os.environ["STUB_LOG"] = log_path
         try:
-            planner.launch(sweep_dir, dispatch_script=stub_path, planners=None)
+            planner.launch(sweep_dir, snapshot_dir=snapshot_dir, dispatch_script=stub_path, planners=None)
         finally:
             if env_backup is None:
                 os.environ.pop("STUB_LOG", None)
@@ -991,7 +1016,8 @@ def test_launch_single_planner_default_is_unchanged_by_the_planners_parameter():
         with open(log_path) as f:
             invoked_args = f.read().strip()
         check(
-            invoked_args == f"ARGS:launch-investigator --sweep-dir {sweep_dir} --mode plan",
+            invoked_args
+            == f"ARGS:launch-investigator --sweep-dir {sweep_dir} --snapshot-dir {snapshot_dir} --mode plan",
             "launch: planners=None still invokes the exact single hardcoded call, no --harness/--model",
             invoked_args,
         )
@@ -1002,6 +1028,10 @@ def test_launch_multi_planner_dispatches_one_container_per_roster_entry():
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
             f.write("prompt text for planners\n")
+        snapshot_dir = os.path.join(sweep_dir, "snapshot")
+        os.makedirs(snapshot_dir)
+        with open(os.path.join(snapshot_dir, "a.txt"), "w") as f:
+            f.write("snapshot content\n")
 
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
@@ -1012,7 +1042,7 @@ def test_launch_multi_planner_dispatches_one_container_per_roster_entry():
         env_backup = os.environ.get("STUB_LOG")
         os.environ["STUB_LOG"] = log_path
         try:
-            output = planner.launch(sweep_dir, dispatch_script=stub_path, planners=lanes)
+            output = planner.launch(sweep_dir, snapshot_dir=snapshot_dir, dispatch_script=stub_path, planners=lanes)
         finally:
             if env_backup is None:
                 os.environ.pop("STUB_LOG", None)
@@ -1026,15 +1056,22 @@ def test_launch_multi_planner_dispatches_one_container_per_roster_entry():
 
         for lane in lanes:
             lane_sweep_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, lane.lane_dir_name)
+            lane_snapshot_dir = os.path.join(lane_sweep_dir, "snapshot")
             expected = (
-                f"ARGS:launch-investigator --sweep-dir {lane_sweep_dir} --mode plan "
-                f"--harness {lane.harness} --model {lane.model}"
+                f"ARGS:launch-investigator --sweep-dir {lane_sweep_dir} --snapshot-dir {lane_snapshot_dir} "
+                f"--mode plan --harness {lane.harness} --model {lane.model}"
             )
-            check(expected in lines, f"launch: {lane.lane_dir_name} dispatched with its own --sweep-dir/--harness/--model", str(lines))
+            check(expected in lines, f"launch: {lane.lane_dir_name} dispatched with its own --sweep-dir/--snapshot-dir/--harness/--model", str(lines))
             prompt_copy = os.path.join(lane_sweep_dir, "plan", planner.PROMPT_FILENAME)
             check(os.path.isfile(prompt_copy), f"launch: {lane.lane_dir_name} got its own copy of the prepared prompt")
             with open(prompt_copy) as f:
                 check(f.read() == "prompt text for planners\n", f"launch: {lane.lane_dir_name}'s prompt copy matches the prepared prompt")
+            lane_snapshot_file = os.path.join(lane_snapshot_dir, "a.txt")
+            check(os.path.isfile(lane_snapshot_file), f"launch: {lane.lane_dir_name} got its own materialized snapshot/")
+            check(
+                os.stat(lane_snapshot_file).st_ino == os.stat(os.path.join(snapshot_dir, "a.txt")).st_ino,
+                f"launch: {lane.lane_dir_name}'s snapshot/ is hardlinked to the sweep's own snapshot, not a byte copy",
+            )
 
 
 def test_launch_multi_planner_attempts_every_entry_even_if_one_fails():
@@ -1044,6 +1081,8 @@ def test_launch_multi_planner_attempts_every_entry_even_if_one_fails():
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
             f.write("prompt\n")
+        snapshot_dir = os.path.join(sweep_dir, "snapshot")
+        os.makedirs(snapshot_dir)
 
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         log_path = os.path.join(bin_dir, "stub.log")
@@ -1066,7 +1105,7 @@ esac
         try:
             raised = False
             try:
-                planner.launch(sweep_dir, dispatch_script=stub_path, planners=lanes)
+                planner.launch(sweep_dir, snapshot_dir=snapshot_dir, dispatch_script=stub_path, planners=lanes)
             except planner.PlannerError as exc:
                 raised = True
                 check("codex-gpt-terra" in str(exc), "launch: the raised error names the failing entry", str(exc))

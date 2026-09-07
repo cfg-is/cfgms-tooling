@@ -37,7 +37,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECURITY_REVIEW_DIR="${SCRIPT_DIR}/security-review"
 AGENT_DISPATCH_SCRIPT="${SCRIPT_DIR}/agent-dispatch.sh"
 
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+# REPO_ROOT: CFGMS_TEST_REPO_ROOT lets hermetic tests point this at a
+# throwaway fixture git repository instead of this checkout -- the same
+# override agent-dispatch.sh has always honored (see its own REPO_ROOT
+# line), needed here so a test can make the snapshot's committed content
+# diverge from a live working tree without ever touching this checkout.
+# Production invocations never set it, so `git rev-parse --show-toplevel`
+# against this script's own location remains the only resolution path that
+# matters outside tests.
+if [[ -n "${CFGMS_TEST_REPO_ROOT:-}" ]]; then
+  REPO_ROOT="$CFGMS_TEST_REPO_ROOT"
+else
+  REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+fi
 if [[ -z "$REPO_ROOT" ]]; then
   echo "ERROR: cannot determine the repository root (\`git rev-parse --show-toplevel\` failed)" >&2
   exit 1
@@ -48,14 +60,15 @@ usage() {
 Usage: security-review.sh <command> [args...]
 
 Commands:
-  launch <ref>        Resolve <ref>, create a new sweep tree, run the metadata-only
-                       planner, dispatch every roster lane (CFGMS_SECURITY_REVIEW_LANES)
-                       independently, run the consolidator, and print the path to
-                       report/consolidated.md.
-  resume <sweep-id>   Re-invoke the planner against an existing sweep (a no-op if
-                       plan/ is already populated) and re-dispatch every roster lane --
-                       each lane's own resume-scanner integration ensures only its
-                       missing steps run again -- then re-run the consolidator.
+  launch <ref>        Resolve <ref>, create a new sweep tree AND its immutable snapshot,
+                       verify the snapshot, run the metadata-only planner, dispatch every
+                       roster lane (CFGMS_SECURITY_REVIEW_LANES) independently, run the
+                       consolidator, and print the path to report/consolidated.md.
+  resume <sweep-id>   Re-verify the sweep's snapshot, re-invoke the planner against an
+                       existing sweep (a no-op if plan/ is already populated) and
+                       re-dispatch every roster lane -- each lane's own resume-scanner
+                       integration ensures only its missing steps run again -- then
+                       re-run the consolidator.
   status <sweep-id>   Print the per-lane x per-step coverage breakdown for an existing
                        sweep. Read-only: never re-runs the planner, a lane, or the
                        consolidator.
@@ -66,10 +79,19 @@ docs/architecture/security-review-harness.md. A lane that parks, refuses, or fai
 on some steps never blocks any other lane's dispatch or progress, and never
 prevents the consolidator from running against whatever the other lanes produced.
 
+Every planner and lane container mounts the sweep's own verified snapshot
+(snapshot.py, Issue #3951) at /workspace, never the live, mutable repository
+checkout -- launch creates that snapshot right after the sweep tree, and both
+launch and resume independently re-verify it against the pinned commit before
+dispatching anything (Issue #3952, epic #3950's D1). A verify_snapshot()
+mismatch is printed to stderr and is fatal: neither the planner nor any lane is
+ever dispatched against a snapshot that does not match its own commit.
+
 Exit status: non-zero if the sweep base directory cannot be resolved, if
-CFGMS_SECURITY_REVIEW_LANES is unset or malformed, or if consolidation could not
-run -- this script never exits 0 having silently written a partial or empty sweep
-tree.
+CFGMS_SECURITY_REVIEW_LANES is unset or malformed, if the sweep's snapshot
+cannot be created or fails verification, or if consolidation could not run --
+this script never exits 0 having silently written a partial or empty sweep
+tree, or having dispatched anything against an unverified snapshot.
 EOF
 }
 
@@ -87,6 +109,18 @@ resolve_base_dir() {
 # A missing or malformed CFGMS_SECURITY_REVIEW_LANES fails closed here too,
 # before any sweep directory exists -- there is no hardcoded lane set to
 # fall back to.
+#
+# Immediately after manifest.create_sweep() succeeds, this also materializes
+# <sweep_dir>/snapshot/ via snapshot.create_snapshot() (Issue #3952, epic
+# #3950's D1) -- every container this script later dispatches mounts that
+# directory, never REPO_ROOT's live working tree. A snapshot-creation
+# failure makes this function return non-zero exactly like a manifest
+# failure does, so cmd_launch's existing hard-exit on a non-zero
+# create_sweep_tree already covers it -- no new branch needed there. Skipped
+# (not re-created) when the snapshot directory already has content, matching
+# manifest.create_sweep()'s own idempotency: a second `launch` call against a
+# sweep id that already exists (same ref, same UTC minute) must not crash on
+# `create_snapshot()`'s "dest_dir already contains files" guard.
 create_sweep_tree() {
   local ref="$1"
 
@@ -111,6 +145,7 @@ import sys
 sec_dir, repo_root, ref, lane_dir_names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sys.path.insert(0, sec_dir)
 import manifest  # noqa: E402
+import snapshot  # noqa: E402
 
 lanes = tuple(lane_dir_names.split(","))
 try:
@@ -121,6 +156,15 @@ except Exception as exc:
 
 with open(os.path.join(sweep_dir, "manifest.json")) as f:
     m = json.load(f)
+
+snapshot_dir = os.path.join(sweep_dir, "snapshot")
+if not (os.path.isdir(snapshot_dir) and os.listdir(snapshot_dir)):
+    try:
+        snapshot.create_snapshot(m["commit_sha"], repo_root, snapshot_dir)
+    except snapshot.SnapshotError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
 print(f"{sweep_dir}\t{m['commit_sha']}")
 PYEOF
 }
@@ -161,6 +205,27 @@ plan_already_populated() {
   compgen -G "${sweep_dir}/plan/step-*.json" >/dev/null 2>&1
 }
 
+# verify_snapshot <sweep_dir> <commit_sha>
+# Re-checks <sweep_dir>/snapshot/ against <commit_sha>'s tree byte-for-byte
+# via snapshot.py's own CLI (snapshot.verify_snapshot(), Issue #3951) --
+# never re-implemented here. Called by both cmd_launch and cmd_resume before
+# any dispatch call on that invocation (Issue #3952, epic #3950's D1: "and
+# again on resume" -- a sweep can sit parked for days, and this re-proves the
+# snapshot on disk still matches the pinned commit every time, not only at
+# creation). Every mismatch line snapshot.py prints is forwarded to stderr
+# verbatim; a non-empty result is the one condition that must stop a launch
+# or resume before dispatching the planner or any lane at all.
+verify_snapshot() {
+  local sweep_dir="$1" commit_sha="$2"
+  local output
+  if ! output=$(python3 "${SECURITY_REVIEW_DIR}/snapshot.py" verify "${sweep_dir}/snapshot" "$commit_sha" "$REPO_ROOT" 2>&1); then
+    echo "ERROR: snapshot verification failed for ${sweep_dir}:" >&2
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+  return 0
+}
+
 # dispatch_planner <sweep_dir> <commit_sha>
 # prepare() -> launch() -> wait for the container to exit -> finalize().
 # A `prepare` or `finalize` failure is logged and treated as non-fatal to the
@@ -186,7 +251,7 @@ dispatch_planner() {
   fi
 
   local launch_output
-  if ! launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --repo-root "$REPO_ROOT" 2>&1); then
+  if ! launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --snapshot-dir "${sweep_dir}/snapshot" --repo-root "$REPO_ROOT" 2>&1); then
     if _is_intentional_dispatch_skip "$launch_output"; then
       echo "WARNING: planner launch skipped (credentials unavailable): ${launch_output}" >&2
       return 0
@@ -244,6 +309,7 @@ dispatch_roster_lanes() {
     rc=0
     output=$("$AGENT_DISPATCH_SCRIPT" launch-investigator \
       --sweep-dir "$sweep_dir" \
+      --snapshot-dir "${sweep_dir}/snapshot" \
       --mode "$lane_dir_name" \
       --harness "$harness" \
       --model "$model" \
@@ -317,6 +383,15 @@ cmd_launch() {
   sweep_dir="$(printf '%s' "$result" | cut -f1)"
   commit_sha="$(printf '%s' "$result" | cut -f2)"
 
+  # Verify before dispatching anything (Issue #3952, epic #3950's D1): a
+  # mismatch here -- however unlikely immediately after create_sweep_tree
+  # just wrote this snapshot -- must stop this launch exactly as loudly as a
+  # mismatch found on a days-later resume does, never dispatch the planner
+  # or a lane against an unverified tree.
+  if ! verify_snapshot "$sweep_dir" "$commit_sha"; then
+    exit 1
+  fi
+
   local dispatch_failed=0
   dispatch_planner "$sweep_dir" "$commit_sha" || dispatch_failed=1
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
@@ -359,6 +434,14 @@ cmd_resume() {
 
   local commit_sha
   commit_sha="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['commit_sha'])" "${sweep_dir}/manifest.json")"
+
+  # Re-verify before dispatching anything on this resume (Issue #3952, epic
+  # #3950's D1: "and again on resume") -- a sweep can sit parked for days,
+  # and this re-proves the on-disk snapshot still matches the pinned commit
+  # every time, not only at creation.
+  if ! verify_snapshot "$sweep_dir" "$commit_sha"; then
+    exit 1
+  fi
 
   local dispatch_failed=0
   if plan_already_populated "$sweep_dir"; then

@@ -88,9 +88,15 @@ check_not_contains "launch-investigator never sets -e GH_TOKEN" "$launch_block_c
 check_not_contains "launch-investigator never calls gh auth token" "$launch_block_code" 'gh auth token'
 
 echo ""
-echo "== REQUIRED TEST evidence — /workspace mounted read-only =="
-check_contains "workspace mount is read-only" "$launch_block" '-v "${REPO_ROOT}:/workspace:ro"'
+echo "== REQUIRED TEST evidence — /workspace mounted read-only from the verified"
+echo "   snapshot, never from REPO_ROOT (Issue #3952, epic #3950's D1) =="
+check_contains "workspace mount is read-only, from the snapshot dir" "$launch_block" '-v "${inv_snapshot_dir}:/workspace:ro"'
 check_not_contains "workspace is never mounted read-write" "$launch_block" ':/workspace" \\'
+check_not_contains "REPO_ROOT is never mounted at /workspace" "$launch_block_code" '-v "${REPO_ROOT}:/workspace:ro"'
+check_contains "launch-investigator requires --snapshot-dir" "$launch_block_code" '--snapshot-dir)'
+check_contains "usage() documents --snapshot-dir" "$dispatch_src" '--snapshot-dir'
+check_contains "a missing --snapshot-dir is a hard failure" "$launch_block_code" 'launch-investigator requires --snapshot-dir'
+check_contains "--snapshot-dir must resolve to exactly <sweep-dir>/snapshot" "$launch_block" '"$inv_snapshot_dir_real" != "${inv_sweep_dir}/snapshot"'
 
 echo ""
 echo "== REQUIRED TEST evidence — writable mount is scoped to one lane or plan/, never the sweep root =="
@@ -218,16 +224,48 @@ echo '{}' > "${SANDBOX}/HOME/.claude/.credentials.json"
 export DOCKER_CALL_LOG="${SANDBOX}/docker_calls.log"
 : > "$DOCKER_CALL_LOG"
 
-plan_out=$(PATH="${FAKEBIN}:${PATH}" \
+# The sweep's own verified snapshot (Issue #3952) -- launch-investigator now
+# requires --snapshot-dir and mounts it at /workspace instead of REPO_ROOT.
+# security-review.sh always creates this via snapshot.py before calling
+# launch-investigator; this fixture stands in for that, real content included
+# so the mount is meaningfully distinct from an empty directory.
+SNAPSHOT_DIR="${SWEEP_DIR}/snapshot"
+mkdir -p "$SNAPSHOT_DIR"
+echo 'snapshot fixture content' > "${SNAPSHOT_DIR}/a.txt"
+
+echo ""
+echo "== REQUIRED TEST — a missing --snapshot-dir is a hard failure before any"
+echo "   mkdir, docker run, or mount construction (Issue #3952) =="
+: > "$DOCKER_CALL_LOG"
+set +e
+no_snapshot_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
+no_snapshot_rc=$?
+set -e
+check_contains "missing --snapshot-dir is reported" "$no_snapshot_out" "requires --snapshot-dir"
+if [[ "$no_snapshot_rc" -ne 0 ]]; then ok "missing --snapshot-dir exits non-zero"; else bad "missing --snapshot-dir exits non-zero" "exited 0"; fi
+check_not_contains "missing --snapshot-dir never reaches docker run" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+
+: > "$DOCKER_CALL_LOG"
+plan_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode plan 2>&1)
 check_contains "plan mode launch reports LAUNCHED_INVESTIGATOR" "$plan_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
 
 run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "rendered docker run mounts /workspace:ro" "$run_call" "/workspace:ro"
+echo ""
+echo "== REQUIRED TEST — PLAN-mode docker run argv mounts --snapshot-dir at"
+echo "   /workspace and never mounts REPO_ROOT there (Issue #3952) =="
+check_contains "plan mode mounts the passed --snapshot-dir at /workspace:ro" "$run_call" "${SNAPSHOT_DIR}:/workspace:ro"
+check_not_contains "plan mode never mounts REPO_ROOT at /workspace" "$run_call" "${REPO_ROOT}:/workspace:ro"
 check_not_contains "rendered docker run has no GH_TOKEN" "$run_call" "GH_TOKEN"
 check_contains "rendered docker run mounts plan/ as /workspace-out:rw" "$run_call" "${SWEEP_DIR}/plan:/workspace-out:rw"
 check_not_contains "rendered docker run does not mount the bare sweep dir" "$run_call" "${SWEEP_DIR}:/workspace"
@@ -249,7 +287,7 @@ lane_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-sonnet5 \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode claude-sonnet5 \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "lane mode launch reports LAUNCHED_INVESTIGATOR" "$lane_out" "LAUNCHED_INVESTIGATOR:claude-sonnet5:fake-container-id"
 
@@ -257,6 +295,16 @@ lane_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "lane mode mounts its own lane dir rw" "$lane_run_call" "${SWEEP_DIR}/lanes/claude-sonnet5:/workspace-out:rw"
 check_contains "lane mode mounts plan/ read-only" "$lane_run_call" "${SWEEP_DIR}/plan:/workspace-plan:ro"
 check_not_contains "lane mode does not mount any other lane" "$lane_run_call" "/lanes/claude-sonnet5:/workspace-plan"
+echo ""
+echo "== REQUIRED TEST — LANE-mode docker run argv mounts --snapshot-dir at"
+echo "   /workspace and never mounts REPO_ROOT there (Issue #3952). Asserted"
+echo "   explicitly and separately from the plan-mode case above -- the mount"
+echo "   line is shared code today, but 'one code path, so testing one mode"
+echo "   proves the other' is exactly the assumption that failed earlier in"
+echo "   this same story's harness-identity design (Tech Lead finding,"
+echo "   revision 4) =="
+check_contains "lane mode mounts the passed --snapshot-dir at /workspace:ro" "$lane_run_call" "${SNAPSHOT_DIR}:/workspace:ro"
+check_not_contains "lane mode never mounts REPO_ROOT at /workspace" "$lane_run_call" "${REPO_ROOT}:/workspace:ro"
 check_not_contains "lane mode has no GH_TOKEN" "$lane_run_call" "GH_TOKEN"
 check_contains "lane mode delivers harness credentials read-only" "$lane_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 # Lane mode reads raw third-party model output, so its egress containment
@@ -282,7 +330,7 @@ harness_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-sonnet5 \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode claude-sonnet5 \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "harness-mode launch reports LAUNCHED_INVESTIGATOR" "$harness_out" "LAUNCHED_INVESTIGATOR:claude-sonnet5:fake-container-id"
 
@@ -298,7 +346,7 @@ unwired_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode stub-lane \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode stub-lane \
     --harness stub --model stubmodel --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "an unwired --harness still dispatches (env vars set, no error)" "$unwired_out" "LAUNCHED_INVESTIGATOR:stub-lane:fake-container-id"
 unwired_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
@@ -324,7 +372,7 @@ plan_harness_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode plan \
     --harness claude --model sonnet-5 2>&1)
 check_contains "plan mode with --harness claude launches" "$plan_harness_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
 plan_harness_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
@@ -339,7 +387,7 @@ plan_foreign_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode plan \
     --harness stub --model stubmodel 2>&1)
 check_contains "plan mode with a non-claude --harness launches" "$plan_foreign_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
 plan_foreign_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
@@ -359,7 +407,7 @@ codex_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode codex-gpt5codex \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode codex-gpt5codex \
     --harness codex --model gpt-5-codex --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "--harness codex launch reports LAUNCHED_INVESTIGATOR" "$codex_out" "LAUNCHED_INVESTIGATOR:codex-gpt5codex:fake-container-id"
 
@@ -384,7 +432,7 @@ codex_missing_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="$NO_CODEX_HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode codex-missing-creds \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode codex-missing-creds \
     --harness codex --model gpt-5-codex --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 codex_missing_rc=$?
 set -e
@@ -406,7 +454,7 @@ claude_still_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="$NO_CODEX_HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-still-fine \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode claude-still-fine \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "a claude lane on the same (codex-credential-less) host still dispatches" "$claude_still_out" "LAUNCHED_INVESTIGATOR:claude-still-fine:fake-container-id"
 claude_still_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
@@ -425,7 +473,7 @@ opencode_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode opencode-bigpickle \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode opencode-bigpickle \
     --harness opencode --model big-pickle --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "--harness opencode launch reports LAUNCHED_INVESTIGATOR" "$opencode_out" "LAUNCHED_INVESTIGATOR:opencode-bigpickle:fake-container-id"
 
@@ -452,7 +500,7 @@ opencode_missing_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="$NO_OPENCODE_HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode opencode-missing-creds \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode opencode-missing-creds \
     --harness opencode --model big-pickle --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 opencode_missing_rc=$?
 set -e
@@ -473,7 +521,7 @@ claude_still_out2=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="$NO_OPENCODE_HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode claude-still-fine-2 \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode claude-still-fine-2 \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "a claude lane on the same (opencode-credential-less) host still dispatches" "$claude_still_out2" "LAUNCHED_INVESTIGATOR:claude-still-fine-2:fake-container-id"
 claude_still_run_call2="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
@@ -505,7 +553,7 @@ for bad_mode in ".." "." "../.." "lanes/../../.." "a/b" "/etc" "$rel_escape" ".h
     CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
     CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
     HOME="${SANDBOX}/HOME" \
-    bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode "$bad_mode" 2>&1)
+    bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode "$bad_mode" 2>&1)
   trav_rc=$?
   set -e
   check_contains "refuses --mode '${bad_mode}'" "$trav_out" "INVESTIGATOR_REFUSED:invalid_mode"
@@ -546,6 +594,8 @@ mkdir -p "$PLAN_ESCAPE_TARGET"
 SWEEP_PLANLINK="${SANDBOX}/sweep-planlink/2026-09-05T0000Z-planlink"
 mkdir -p "${SWEEP_PLANLINK}/lanes"
 ln -s "$PLAN_ESCAPE_TARGET" "${SWEEP_PLANLINK}/plan"
+SWEEP_PLANLINK_SNAPSHOT="${SWEEP_PLANLINK}/snapshot"
+mkdir -p "$SWEEP_PLANLINK_SNAPSHOT"
 
 for escape_mode in plan escapelane; do
   : > "$DOCKER_CALL_LOG"
@@ -555,7 +605,7 @@ for escape_mode in plan escapelane; do
     CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
     CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
     HOME="${SANDBOX}/HOME" \
-    bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_PLANLINK" --mode "$escape_mode" 2>&1)
+    bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_PLANLINK" --snapshot-dir "$SWEEP_PLANLINK_SNAPSHOT" --mode "$escape_mode" 2>&1)
   plan_escape_rc=$?
   set -e
   check_contains "--mode '${escape_mode}' refuses a symlinked plan/" "$plan_escape_out" "INVESTIGATOR_REFUSED:plan_dir_escape"
@@ -580,6 +630,83 @@ else
 fi
 
 echo ""
+echo "== REQUIRED TEST evidence — a symlinked --snapshot-dir cannot redirect the"
+echo "   /workspace bind mount (Issue #3952) =="
+# Same class of attack as the plan/ escape immediately above, against the
+# --snapshot-dir guard added at agent-dispatch.sh:2792-2798: mkdir -p is never
+# called on this path (create_sweep_tree() creates it via
+# snapshot.create_snapshot() before launch-investigator ever runs), but
+# `realpath` on an attacker-planted symlink still resolves off-tree, and
+# docker still resolves the host side of a bind mount at mount time -- a
+# symlinked --snapshot-dir would redirect /workspace to an arbitrary host
+# path, including back to the live, mutable checkout this story exists to
+# stop mounting.
+check_contains "launch asserts --snapshot-dir resolves inside the sweep dir before mounting" "$launch_block" 'inv_snapshot_dir_real'
+check_contains "snapshot dir escape is refused explicitly" "$launch_block" 'INVESTIGATOR_REFUSED:snapshot_dir_escape'
+
+SNAPSHOT_ESCAPE_TARGET="${SANDBOX}/snapshot-escape-target"
+mkdir -p "$SNAPSHOT_ESCAPE_TARGET"
+SWEEP_SNAPLINK="${SANDBOX}/sweep-snaplink/2026-09-05T0000Z-snaplink"
+mkdir -p "${SWEEP_SNAPLINK}/lanes" "${SWEEP_SNAPLINK}/plan"
+ln -s "$SNAPSHOT_ESCAPE_TARGET" "${SWEEP_SNAPLINK}/snapshot"
+
+for escape_mode in plan escapelane; do
+  : > "$DOCKER_CALL_LOG"
+  set +e
+  snapshot_escape_out=$(PATH="${FAKEBIN}:${PATH}" \
+    CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+    CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+    HOME="${SANDBOX}/HOME" \
+    bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_SNAPLINK" --snapshot-dir "${SWEEP_SNAPLINK}/snapshot" --mode "$escape_mode" 2>&1)
+  snapshot_escape_rc=$?
+  set -e
+  check_contains "--mode '${escape_mode}' refuses a symlinked --snapshot-dir" "$snapshot_escape_out" "INVESTIGATOR_REFUSED:snapshot_dir_escape"
+  if [[ "$snapshot_escape_rc" -eq 2 ]]; then
+    ok "--mode '${escape_mode}' snapshot dir escape exits 2"
+  else
+    bad "--mode '${escape_mode}' snapshot dir escape exits 2" "actual rc: ${snapshot_escape_rc}"
+  fi
+  if grep -q '^run -d' "$DOCKER_CALL_LOG"; then
+    bad "--mode '${escape_mode}' never reaches docker run with a symlinked --snapshot-dir" "a container was launched"
+  else
+    ok "--mode '${escape_mode}' never reaches docker run with a symlinked --snapshot-dir"
+  fi
+  check_not_contains "--mode '${escape_mode}' never renders a mount of the snapshot symlink target" \
+    "$(cat "$DOCKER_CALL_LOG")" "$SNAPSHOT_ESCAPE_TARGET"
+done
+
+if find "$SNAPSHOT_ESCAPE_TARGET" -mindepth 1 2>/dev/null | grep -q .; then
+  bad "snapshot symlink target directory is untouched" "something was created under it"
+else
+  ok "snapshot symlink target directory is untouched"
+fi
+
+echo ""
+echo "== REQUIRED TEST evidence — a --snapshot-dir pointed entirely outside the"
+echo "   sweep tree (no symlink involved) is refused the same way =="
+OUTSIDE_SNAPSHOT_DIR="${SANDBOX}/outside-snapshot-dir"
+mkdir -p "$OUTSIDE_SNAPSHOT_DIR"
+: > "$DOCKER_CALL_LOG"
+set +e
+outside_snapshot_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$OUTSIDE_SNAPSHOT_DIR" --mode plan 2>&1)
+outside_snapshot_rc=$?
+set -e
+check_contains "a --snapshot-dir outside the sweep tree is refused" "$outside_snapshot_out" "INVESTIGATOR_REFUSED:snapshot_dir_escape"
+if [[ "$outside_snapshot_rc" -eq 2 ]]; then
+  ok "--snapshot-dir outside the sweep tree exits 2"
+else
+  bad "--snapshot-dir outside the sweep tree exits 2" "actual rc: ${outside_snapshot_rc}"
+fi
+check_not_contains "--snapshot-dir outside the sweep tree never reaches docker run" \
+  "$(cat "$DOCKER_CALL_LOG")" "run -d"
+
+echo ""
 echo "== REQUIRED TEST evidence — the API-key credential mechanism is retired in"
 echo "   full (Issue #3933): --cred-name no longer exists anywhere in launch-investigator =="
 check_not_contains "no --cred-name flag parsing remains" "$launch_block_code" '--cred-name'
@@ -601,7 +728,7 @@ set +e
 dup_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode plan 2>&1)
 dup_rc=$?
 set -e
 check_contains "refuses when a container by that name already exists" "$dup_out" "INVESTIGATOR_REFUSED:plan:container_exists"
@@ -634,7 +761,7 @@ reap_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode plan 2>&1)
 reap_rc=$?
 set -e
 check_contains "an exited container is reaped, then a new one is launched" "$reap_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id-reaped"
@@ -662,7 +789,7 @@ running_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --mode plan 2>&1)
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode plan 2>&1)
 running_rc=$?
 set -e
 check_contains "a still-running container is refused" "$running_out" "INVESTIGATOR_REFUSED:plan:container_exists"
@@ -674,11 +801,131 @@ echo ""
 echo "== functional: missing sweep directory is a hard failure =="
 set +e
 missing_out=$(PATH="${FAKEBIN}:${PATH}" CFGMS_TEST_REPO_ROOT="$REPO_ROOT" HOME="${SANDBOX}/HOME" \
-  bash "$DISPATCH" launch-investigator --sweep-dir "${SANDBOX}/does-not-exist" --mode plan 2>&1)
+  bash "$DISPATCH" launch-investigator --sweep-dir "${SANDBOX}/does-not-exist" --snapshot-dir "$SNAPSHOT_DIR" --mode plan 2>&1)
 missing_rc=$?
 set -e
 check_contains "reports sweep directory not found" "$missing_out" "sweep directory not found"
 if [[ "$missing_rc" -ne 0 ]]; then ok "missing sweep dir exits non-zero"; else bad "missing sweep dir exits non-zero" "exited 0"; fi
+
+echo ""
+echo "== REQUIRED TEST evidence — trusted-harness identity (Issue #3952, epic"
+echo "   #3950's D1 correction on revision 3): launch-investigator hashes"
+echo "   exactly investigator-entrypoint.sh and --lane-entrypoint's script into"
+echo "   <sweep-dir>/harness_identity.json, sensitive to both real mounted"
+echo "   inputs and insensitive to everything else =="
+
+HARNESS_ID_REPO="${SANDBOX}/harness-id-repo"
+mkdir -p "${HARNESS_ID_REPO}/.devcontainer/scripts" "${HARNESS_ID_REPO}/.claude/scripts/security-review"
+ENTRYPOINT_FIXTURE="${HARNESS_ID_REPO}/.devcontainer/scripts/investigator-entrypoint.sh"
+SIBLING_FIXTURE="${HARNESS_ID_REPO}/.claude/scripts/security-review/schema.py"
+LANE_ENTRYPOINT_A="${SANDBOX}/lane-entrypoint-a.py"
+LANE_ENTRYPOINT_B="${SANDBOX}/lane-entrypoint-b.py"
+printf 'lane entrypoint content A\n' > "$LANE_ENTRYPOINT_A"
+printf 'lane entrypoint content B\n' > "$LANE_ENTRYPOINT_B"
+
+cat > "${FAKEBIN}/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "${DOCKER_CALL_LOG:?}"
+case "$1" in
+  ps)  echo "" ;;
+  run) echo "fake-container-id" ;;
+  wait) exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "${FAKEBIN}/docker"
+
+HID_SWEEP_DIR="${SANDBOX}/sweep-hid/2026-09-05T0000Z-hid"
+mkdir -p "${HID_SWEEP_DIR}/plan" "${HID_SWEEP_DIR}/lanes"
+HID_SNAPSHOT_DIR="${HID_SWEEP_DIR}/snapshot"
+mkdir -p "$HID_SNAPSHOT_DIR"
+
+# run_hid_launch <mode> <lane-entrypoint-or-empty> -- launches (stubbed
+# docker, no real container) and prints the recorded harness_identity.json's
+# "hash" field. Reused across the four tests below; each fresh call
+# overwrites harness_identity.json, matching the real "recorded, never
+# frozen" contract.
+run_hid_launch() {
+  local mode="$1" lane_entrypoint="$2"
+  local extra=()
+  [[ -n "$lane_entrypoint" ]] && extra=(--lane-entrypoint "$lane_entrypoint" --harness stub --model stubmodel)
+  : > "$DOCKER_CALL_LOG"
+  PATH="${FAKEBIN}:${PATH}" \
+    CFGMS_TEST_REPO_ROOT="$HARNESS_ID_REPO" \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+    CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+    HOME="${SANDBOX}/HOME" \
+    bash "$DISPATCH" launch-investigator --sweep-dir "$HID_SWEEP_DIR" --snapshot-dir "$HID_SNAPSHOT_DIR" \
+      --mode "$mode" "${extra[@]}" >/dev/null 2>&1
+  python3 -c "import json; print(json.load(open('${HID_SWEEP_DIR}/harness_identity.json'))['hash'])"
+}
+
+echo ""
+echo "== REQUIRED TEST — two launches with unchanged harness files record the"
+echo "   identical hash (deterministic, not time- or PID-seeded) =="
+printf '#!/usr/bin/env bash\necho entrypoint-v1\n' > "$ENTRYPOINT_FIXTURE"
+printf 'sibling module v1\n' > "$SIBLING_FIXTURE"
+hash_det_1="$(run_hid_launch plan "")"
+hash_det_2="$(run_hid_launch plan "")"
+if [[ -n "$hash_det_1" && "$hash_det_1" == "$hash_det_2" ]]; then
+  ok "unchanged harness files record an identical hash across two calls"
+else
+  bad "unchanged harness files record an identical hash across two calls" "first=${hash_det_1} second=${hash_det_2}"
+fi
+
+echo ""
+echo "== REQUIRED TEST — changing investigator-entrypoint.sh's content between"
+echo "   two calls changes the recorded hash =="
+printf '#!/usr/bin/env bash\necho entrypoint-v1\n' > "$ENTRYPOINT_FIXTURE"
+hash_entry_before="$(run_hid_launch plan "")"
+printf '#!/usr/bin/env bash\necho entrypoint-v2-CHANGED\n' > "$ENTRYPOINT_FIXTURE"
+hash_entry_after="$(run_hid_launch plan "")"
+if [[ -n "$hash_entry_before" && -n "$hash_entry_after" && "$hash_entry_before" != "$hash_entry_after" ]]; then
+  ok "changing investigator-entrypoint.sh's content changes the recorded hash"
+else
+  bad "changing investigator-entrypoint.sh's content changes the recorded hash" "before=${hash_entry_before} after=${hash_entry_after}"
+fi
+
+echo ""
+echo "== REQUIRED TEST — passing a different --lane-entrypoint VALUE (different"
+echo "   content, same investigator-entrypoint.sh) between two lane-mode calls"
+echo "   changes the recorded hash (Tech Lead finding, revision 3: without this,"
+echo "   a hardcoded lane-entrypoint path in the hash computation would pass"
+echo "   every other test here while recording a wrong identity for any lane"
+echo "   other than the hardcoded one) =="
+printf '#!/usr/bin/env bash\necho entrypoint-v1\n' > "$ENTRYPOINT_FIXTURE"
+hash_lane_a="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
+hash_lane_b="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_B")"
+if [[ -n "$hash_lane_a" && -n "$hash_lane_b" && "$hash_lane_a" != "$hash_lane_b" ]]; then
+  ok "a different --lane-entrypoint VALUE changes the recorded hash"
+else
+  bad "a different --lane-entrypoint VALUE changes the recorded hash" "a=${hash_lane_a} b=${hash_lane_b}"
+fi
+
+echo ""
+echo "== REQUIRED TEST — changing a sibling .py module under"
+echo "   .claude/scripts/security-review/ (never individually mounted) between"
+echo "   two calls does NOT change the recorded hash -- proves the hash does"
+echo "   not, and must not, cover that file (the test the revision-2 draft's"
+echo "   over-broad scope would have failed) =="
+printf '#!/usr/bin/env bash\necho entrypoint-v1\n' > "$ENTRYPOINT_FIXTURE"
+printf 'sibling module v1\n' > "$SIBLING_FIXTURE"
+hash_sibling_before="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
+printf 'sibling module v2 CHANGED\n' > "$SIBLING_FIXTURE"
+hash_sibling_after="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
+if [[ -n "$hash_sibling_before" && "$hash_sibling_before" == "$hash_sibling_after" ]]; then
+  ok "changing a never-mounted sibling module does NOT change the recorded hash"
+else
+  bad "changing a never-mounted sibling module does NOT change the recorded hash" "before=${hash_sibling_before} after=${hash_sibling_after}"
+fi
+
+echo ""
+echo "== functional — harness_identity.json shape and the env var injection =="
+last_hid_json="${HID_SWEEP_DIR}/harness_identity.json"
+check_contains "harness_identity.json records the sha256 algorithm" "$(cat "$last_hid_json")" '"algorithm": "sha256"'
+check_contains "harness_identity.json lists investigator-entrypoint.sh" "$(cat "$last_hid_json")" 'investigator-entrypoint.sh'
+last_hid_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "the container env carries CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY" "$last_hid_run_call" "CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY=${hash_sibling_after}"
 
 echo ""
 echo "-----------------------------------------"
