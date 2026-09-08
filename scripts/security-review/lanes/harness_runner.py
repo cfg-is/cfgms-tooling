@@ -67,6 +67,7 @@ three future lane runners:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -138,6 +139,34 @@ OUTPUT_SCHEMA_DESCRIPTION = (
 )
 
 
+def compute_plan_hash(plan_dir: str, step_id: str) -> str:
+    """SHA-256 hex digest of `<plan_dir>/<step_id>.json`'s own raw bytes on
+    disk (Issue #3962) -- one of the two identity bindings a step's envelope
+    carries alongside `harness_identity`, recomputed by
+    `resume.missing_steps()` on a later invocation to detect a plan step
+    whose content changed since a lane last wrote a `complete` envelope for
+    it. Hashed over the file's own bytes, not a re-serialization of the
+    parsed JSON, so the recorded hash is sensitive to any byte-level change
+    to the file on disk, never only to the fields this module's own parser
+    happens to read.
+    """
+    path = os.path.join(plan_dir, f"{step_id}.json")
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def compute_prompt_version() -> str:
+    """SHA-256 hex digest of `SYSTEM_PROMPT`'s own UTF-8 bytes (Issue #3962)
+    -- recorded on every envelope so a changed system prompt is visible
+    directly on the envelope, without a human needing to diff two envelopes'
+    worth of embedded prompt text. Unlike `plan_hash`/`harness_identity`,
+    `resume.missing_steps()` does not check this value against a current
+    one -- it is provenance recorded on the envelope, not a third
+    resume-time binding.
+    """
+    return hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+
+
 def refusal_decision(refusal_attempts: int) -> str:
     """Pure refusal-retry-once decision: `RETRY` if `refusal_attempts` (the
     count already recorded for this step, before this refusal) is `0`,
@@ -186,13 +215,25 @@ def build_envelope(
 ) -> dict:
     """Build a step envelope carrying `refusal_attempts` alongside the fields
     `schema.py::validate_step_envelope` requires. `context` supplies
-    `sweep_id`/`commit_sha`/`lane`/`step_id`, matching every existing lane's
-    own envelope-building convention.
+    `sweep_id`/`commit_sha`/`lane`/`step_id`/`plan_hash`/`prompt_version`/
+    `harness_identity`, matching every existing lane's own envelope-building
+    convention.
 
     `refusal_attempts` is always present, regardless of `state` -- it is not
     a refusal-only field, so a step's full history (including "this step
     once refused, then went on to complete") stays visible in its final
     envelope rather than being dropped once a retry succeeds.
+
+    `plan_hash`/`prompt_version`/`harness_identity` (Issue #3962) are also
+    always present, regardless of `state`, for the same reason: a step that
+    refused or failed still ran against a specific frozen plan step, system
+    prompt, and harness code, and that binding is exactly what a later
+    `resume` needs to decide whether re-running this step (rather than
+    trusting whatever is already on disk) is required, including for the
+    non-`complete` states `resume.missing_steps` already always retries.
+    Sourced from `context` rather than being separate parameters -- like
+    `sweep_id`/`commit_sha`/`lane`/`step_id`, they are identity the caller
+    already owns for this step, never invented here.
 
     `files_intended`/`files_read` (Issue #3957) and `dispositions` (Issue
     #3959) are attached only when `state == COMPLETE`, matching `findings`'s
@@ -223,6 +264,9 @@ def build_envelope(
         "state": state,
         "model_id": model_id,
         "refusal_attempts": refusal_attempts,
+        "plan_hash": context["plan_hash"],
+        "prompt_version": context["prompt_version"],
+        "harness_identity": context["harness_identity"],
     }
     if state == terminal_state.COMPLETE:
         envelope["findings"] = findings if findings is not None else []
@@ -472,10 +516,12 @@ def write_step_failure_envelope(
     Deliberately minimal: no `plan_step` is passed to `write_envelope`, and no
     `findings`/`dispositions`/`files_*` are attached (a non-`complete`
     envelope carries none of them anyway), so this envelope's validity depends
-    only on the four identity strings in `context` plus `model_id` -- never on
-    whatever was malformed about the step. `refusal_attempts` still carries
-    over from whatever is on disk, so a step that refused once and then hit an
-    unhandled error keeps its history.
+    only on the identity strings already in `context`
+    (`sweep_id`/`commit_sha`/`lane`/`step_id`/`plan_hash`/`prompt_version`/
+    `harness_identity`) plus `model_id` -- never on whatever was malformed
+    about the step. `refusal_attempts` still carries over from whatever is on
+    disk, so a step that refused once and then hit an unhandled error keeps
+    its history.
 
     Never raises: a failure to write the fallback is logged and reported as
     `None`, because the caller's whole reason for calling it is to keep the

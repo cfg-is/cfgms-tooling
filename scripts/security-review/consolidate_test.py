@@ -124,6 +124,9 @@ def complete_envelope(
         "step_id": step_id,
         "state": "complete",
         "model_id": "claude-opus-5",
+        "plan_hash": "a" * 64,
+        "prompt_version": "b" * 64,
+        "harness_identity": "c" * 64,
         "findings": findings,
         "dispositions": dispositions,
     }
@@ -142,6 +145,9 @@ def status_envelope(commit_sha: str, lane: str, step_id: str, state: str) -> dic
         "step_id": step_id,
         "state": state,
         "model_id": "claude-opus-5",
+        "plan_hash": "a" * 64,
+        "prompt_version": "b" * 64,
+        "harness_identity": "c" * 64,
         "stop_reason_raw": "rate_limited" if state == "parked" else "policy_declined" if state == "refused" else "auth_error",
     }
 

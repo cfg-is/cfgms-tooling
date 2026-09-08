@@ -5,6 +5,7 @@ Run: python3 .claude/scripts/security-review/resume_test.py
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -40,6 +41,9 @@ def complete_envelope(step_id: str, **overrides) -> dict:
         "step_id": step_id,
         "state": "complete",
         "model_id": "claude-opus-5",
+        "plan_hash": "a" * 64,
+        "prompt_version": "b" * 64,
+        "harness_identity": "c" * 64,
         "findings": [],
         "dispositions": [],
     }
@@ -55,10 +59,30 @@ def status_envelope(step_id: str, state: str, **overrides) -> dict:
         "step_id": step_id,
         "state": state,
         "model_id": "claude-opus-5",
+        "plan_hash": "a" * 64,
+        "prompt_version": "b" * 64,
+        "harness_identity": "c" * 64,
         "stop_reason_raw": "rate_limited",
     }
     envelope.update(overrides)
     return envelope
+
+
+def write_plan_step(plan_dir: str, step_id: str, hypotheses: list | None = None) -> None:
+    if hypotheses is None:
+        hypotheses = ["h1"]
+    write(
+        os.path.join(plan_dir, f"{step_id}.json"),
+        {
+            "step_id": step_id,
+            "sweep_id": "s1",
+            "commit_sha": "abc123",
+            "scope": "pkg/example",
+            "hypotheses": hypotheses,
+            "files": [],
+            "planners": ["metadata-only-planner"],
+        },
+    )
 
 
 def test_complete_step_not_missing():
@@ -188,6 +212,115 @@ def test_invalid_findings_file_logs_single_safe_record():
                 "missing_steps: the forged title survives intact inside the record's field",
                 repr(output),
             )
+
+
+def _plan_hash_of(plan_dir: str, step_id: str) -> str:
+    with open(os.path.join(plan_dir, f"{step_id}.json"), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+# --- Binding checks on resume (Issue #3962) ---------------------------------
+
+
+def test_plan_hash_mismatch_quarantines_and_returns_outstanding():
+    # REQUIRED TEST: a complete envelope's plan_hash was computed from one
+    # version of step-001.json; the plan file's hypotheses then changes on
+    # disk (simulating a plan edit between sweep runs). Calling
+    # missing_steps() with the new plan_dir must treat the step as
+    # outstanding and quarantine (rename aside) the stale envelope rather
+    # than leaving it in place under its original name.
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        write_plan_step(plan_dir, "step-001", hypotheses=["h1"])
+        original_hash = _plan_hash_of(plan_dir, "step-001")
+        findings_path = os.path.join(lane_dir, "step-001.findings.json")
+        write(findings_path, complete_envelope("step-001", plan_hash=original_hash))
+
+        # The plan step's content changes after the envelope was written.
+        write_plan_step(plan_dir, "step-001", hypotheses=["h1", "h2"])
+
+        missing = resume.missing_steps(lane_dir, ["step-001"], plan_dir=plan_dir)
+        check(
+            missing == ["step-001"],
+            "missing_steps: a plan_hash mismatch is returned as outstanding",
+            str(missing),
+        )
+        check(
+            not os.path.isfile(findings_path),
+            "missing_steps: the mismatched findings.json no longer exists at its original path",
+            str(os.listdir(lane_dir)),
+        )
+        quarantined = [n for n in os.listdir(lane_dir) if n.startswith("step-001.findings.json.quarantined-")]
+        check(
+            len(quarantined) == 1,
+            "missing_steps: the mismatched envelope was renamed aside, not deleted",
+            str(os.listdir(lane_dir)),
+        )
+
+
+def test_harness_identity_mismatch_quarantines_independently_of_plan_hash():
+    # REQUIRED TEST: plan_dir/the plan file are unchanged (plan_hash matches),
+    # but current_harness_identity differs from the envelope's recorded
+    # value -- proving the two bindings are checked independently, not only
+    # the plan half actually being wired.
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        write_plan_step(plan_dir, "step-001", hypotheses=["h1"])
+        matching_hash = _plan_hash_of(plan_dir, "step-001")
+        findings_path = os.path.join(lane_dir, "step-001.findings.json")
+        write(
+            findings_path,
+            complete_envelope("step-001", plan_hash=matching_hash, harness_identity="abc123"),
+        )
+
+        missing = resume.missing_steps(
+            lane_dir, ["step-001"], plan_dir=plan_dir, current_harness_identity="def456"
+        )
+        check(
+            missing == ["step-001"],
+            "missing_steps: a harness_identity mismatch alone is returned as outstanding",
+            str(missing),
+        )
+        check(
+            not os.path.isfile(findings_path),
+            "missing_steps: the harness_identity-mismatched findings.json is quarantined, not left in place",
+            str(os.listdir(lane_dir)),
+        )
+
+
+def test_matching_bindings_are_not_quarantined():
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        write_plan_step(plan_dir, "step-001", hypotheses=["h1"])
+        matching_hash = _plan_hash_of(plan_dir, "step-001")
+        findings_path = os.path.join(lane_dir, "step-001.findings.json")
+        write(
+            findings_path,
+            complete_envelope("step-001", plan_hash=matching_hash, harness_identity="abc123"),
+        )
+
+        missing = resume.missing_steps(
+            lane_dir, ["step-001"], plan_dir=plan_dir, current_harness_identity="abc123"
+        )
+        check(missing == [], "missing_steps: matching plan_hash and harness_identity is not quarantined", str(missing))
+        check(
+            os.path.isfile(findings_path),
+            "missing_steps: a matching envelope is left in place under its original name",
+        )
+
+
+def test_binding_checks_are_skipped_when_both_params_are_none():
+    # Behavior-preserving default: no plan_dir, no current_harness_identity
+    # given -- a caller not yet updated for #3962 sees no change at all,
+    # even though the envelope's recorded bindings would not match anything.
+    with tempfile.TemporaryDirectory() as lane_dir:
+        write(
+            os.path.join(lane_dir, "step-001.findings.json"),
+            complete_envelope("step-001", plan_hash="stale", harness_identity="stale"),
+        )
+        missing = resume.missing_steps(lane_dir, ["step-001"])
+        check(
+            missing == [],
+            "missing_steps: plan_dir=None, current_harness_identity=None performs no binding check",
+            str(missing),
+        )
 
 
 def main() -> int:

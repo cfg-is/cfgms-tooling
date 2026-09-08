@@ -15,6 +15,7 @@ Run: python3 .claude/scripts/security-review/lanes/harness_runner_test.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -48,6 +49,9 @@ def make_context(**overrides) -> dict:
         "commit_sha": "abc1234",
         "lane": "claude-sonnet5",
         "step_id": "step-001",
+        "plan_hash": "a" * 64,
+        "prompt_version": "b" * 64,
+        "harness_identity": "c" * 64,
     }
     context.update(overrides)
     return context
@@ -236,6 +240,62 @@ def test_build_envelope_carries_refusal_attempts_even_when_complete():
         envelope.get("refusal_attempts") == 1 and envelope.get("findings") == [],
         "build_envelope: refusal_attempts survives onto an eventually-complete envelope",
         str(envelope),
+    )
+
+
+# --- plan_hash/prompt_version/harness_identity bindings (Issue #3962) ------
+
+
+def test_build_envelope_carries_binding_fields_unconditionally():
+    for state, extra in (
+        (terminal_state.COMPLETE, {"findings": []}),
+        (terminal_state.REFUSED, {"stop_reason_raw": "policy_decline"}),
+        (terminal_state.FAILED, {"stop_reason_raw": "harness_exit_1"}),
+        (terminal_state.PARKED, {"stop_reason_raw": "rate_limited"}),
+    ):
+        context = make_context(plan_hash="planhash1", prompt_version="promptver1", harness_identity="harnessid1")
+        envelope = harness_runner.build_envelope(context, "claude-sonnet-5", state, 0, **extra)
+        check(
+            envelope.get("plan_hash") == "planhash1"
+            and envelope.get("prompt_version") == "promptver1"
+            and envelope.get("harness_identity") == "harnessid1",
+            f"build_envelope: state={state} carries plan_hash/prompt_version/harness_identity from context",
+            str(envelope),
+        )
+
+
+def test_compute_plan_hash_matches_sha256_of_file_bytes():
+    with tempfile.TemporaryDirectory() as plan_dir:
+        content = b'{"step_id": "step-001"}'
+        with open(os.path.join(plan_dir, "step-001.json"), "wb") as f:
+            f.write(content)
+        expected = hashlib.sha256(content).hexdigest()
+        actual = harness_runner.compute_plan_hash(plan_dir, "step-001")
+        check(actual == expected, "compute_plan_hash: matches sha256 of the plan step file's own bytes", actual)
+
+
+def test_compute_plan_hash_changes_when_file_content_changes():
+    with tempfile.TemporaryDirectory() as plan_dir:
+        path = os.path.join(plan_dir, "step-001.json")
+        with open(path, "w") as f:
+            f.write('{"hypotheses": ["h1"]}')
+        first = harness_runner.compute_plan_hash(plan_dir, "step-001")
+        with open(path, "w") as f:
+            f.write('{"hypotheses": ["h1", "h2"]}')
+        second = harness_runner.compute_plan_hash(plan_dir, "step-001")
+        check(first != second, "compute_plan_hash: changes when the plan step file's content changes", f"{first} {second}")
+
+
+def test_compute_prompt_version_matches_sha256_of_system_prompt():
+    expected = hashlib.sha256(harness_runner.SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    actual = harness_runner.compute_prompt_version()
+    check(actual == expected, "compute_prompt_version: matches sha256 of SYSTEM_PROMPT's own bytes", actual)
+
+
+def test_compute_prompt_version_is_stable_across_calls():
+    check(
+        harness_runner.compute_prompt_version() == harness_runner.compute_prompt_version(),
+        "compute_prompt_version: deterministic across repeated calls",
     )
 
 

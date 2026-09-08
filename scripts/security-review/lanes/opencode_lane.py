@@ -565,7 +565,20 @@ def run_lane(
     for the rationale behind each step."""
     os.makedirs(out_dir, exist_ok=True)
     step_ids = discover_step_ids(plan_dir)
-    outstanding = resume.missing_steps(out_dir, step_ids)
+
+    # Issue #3962: the two resume-time binding checks. `harness_identity`
+    # comes straight from the env var #3952's `launch-investigator` injects
+    # (falling back to "unknown" for a standalone invocation outside the
+    # container, e.g. these tests) -- the same value this lane records on
+    # every envelope it writes below, so a later invocation launched under
+    # different harness code sees a mismatch against envelopes this run
+    # writes. `prompt_version` is recorded on every envelope but is not
+    # itself a resume-time check (see `harness_runner.compute_prompt_version`).
+    harness_identity = os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY", "unknown")
+    prompt_version = harness_runner.compute_prompt_version()
+    outstanding = resume.missing_steps(
+        out_dir, step_ids, plan_dir=plan_dir, current_harness_identity=harness_identity
+    )
 
     written: list = []
     for step_id in outstanding:
@@ -577,7 +590,16 @@ def run_lane(
         commit_sha = step["commit_sha"]
         files = step.get("files") or []
 
-        context = {"sweep_id": sweep_id, "commit_sha": commit_sha, "lane": lane_id, "step_id": step_id}
+        plan_hash = harness_runner.compute_plan_hash(plan_dir, step_id)
+        context = {
+            "sweep_id": sweep_id,
+            "commit_sha": commit_sha,
+            "lane": lane_id,
+            "step_id": step_id,
+            "plan_hash": plan_hash,
+            "prompt_version": prompt_version,
+            "harness_identity": harness_identity,
+        }
         envelope_path = harness_runner.status_envelope_path(out_dir, step_id)
 
         # Issue #3959: every step's body runs inside its own guard, so one

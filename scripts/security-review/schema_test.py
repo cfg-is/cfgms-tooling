@@ -138,6 +138,9 @@ def valid_step_envelope(**overrides) -> dict:
         "step_id": "step-007",
         "state": "complete",
         "model_id": "claude-opus-5",
+        "plan_hash": "a" * 64,
+        "prompt_version": "b" * 64,
+        "harness_identity": "c" * 64,
         "findings": [],
         "dispositions": [valid_disposition()],
     }
@@ -280,6 +283,59 @@ def test_validate_step_envelope_missing_fields_distinct_errors():
         "validate_step_envelope: missing base fields produce distinct errors",
         str(errors),
     )
+
+
+# --- Binding fields: plan_hash/prompt_version/harness_identity (Issue #3962) --
+
+
+def test_validate_step_envelope_requires_plan_hash():
+    envelope = valid_step_envelope()
+    del envelope["plan_hash"]
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("plan_hash" in e for e in errors),
+        "validate_step_envelope: missing plan_hash is rejected",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_requires_prompt_version():
+    envelope = valid_step_envelope()
+    del envelope["prompt_version"]
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("prompt_version" in e for e in errors),
+        "validate_step_envelope: missing prompt_version is rejected",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_requires_harness_identity():
+    envelope = valid_step_envelope()
+    del envelope["harness_identity"]
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("harness_identity" in e for e in errors),
+        "validate_step_envelope: missing harness_identity is rejected",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_requires_binding_fields_on_non_complete_states_too():
+    # Issue #3962: plan_hash/prompt_version/harness_identity are unconditional,
+    # exactly like refusal_attempts -- a refused/failed/parked envelope still
+    # ran against a specific plan step, prompt, and harness code.
+    for state in ("parked", "refused", "failed"):
+        envelope = valid_step_envelope(state=state, stop_reason_raw="rate_limited")
+        del envelope["findings"]
+        del envelope["dispositions"]
+        del envelope["harness_identity"]
+        errors = schema.validate_step_envelope(envelope)
+        check(
+            any("harness_identity" in e for e in errors),
+            f"validate_step_envelope: state={state} still requires harness_identity",
+            str(errors),
+        )
 
 
 # --- Disposition validation (Issue #3959) -----------------------------------

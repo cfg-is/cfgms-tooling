@@ -18,6 +18,8 @@ Run: python3 .claude/scripts/security-review/lanes/opencode_lane_test.py
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import subprocess
@@ -26,6 +28,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness_runner  # noqa: E402
 import opencode_lane  # noqa: E402
 import terminal_state  # noqa: E402
 
@@ -105,6 +108,24 @@ def make_harness_stub(exit_code: int = 0, raw_body=None, rate_limited: bool = Fa
     return _stub
 
 
+@contextlib.contextmanager
+def harness_identity_env(value: str):
+    """Sets `CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY` -- the env var #3952's
+    `launch-investigator` injects and `run_lane` reads -- for the duration of
+    the block, restoring whatever the ambient environment had (including
+    "unset") afterwards, so these tests neither depend on nor leak a harness
+    identity."""
+    original = os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY")
+    os.environ["CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY"] = value
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY", None)
+        else:
+            os.environ["CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY"] = original
+
+
 def test_complete_clean_sweep() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")
@@ -117,6 +138,112 @@ def test_complete_clean_sweep() -> None:
         check(written[0]["findings"] == [], "clean sweep: findings is an empty list", repr(written))
         path = os.path.join(out_dir, "step-001.findings.json")
         check(os.path.isfile(path), "clean sweep: findings.json written to disk")
+
+
+def test_run_lane_writes_matching_plan_hash_and_harness_identity() -> None:
+    """[REQUIRED TEST] (Issue #3962) This lane's own copy of the binding-field
+    wiring, checked by value rather than by presence: `plan_hash` must equal a
+    fresh hash of the same `step-001.json` this lane read (hashing a different
+    file, or the prompt instead of the plan, fails here), `harness_identity`
+    must equal what `CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY` held (reading a
+    different env var fails here), and `prompt_version` must equal the digest
+    of `harness_runner.SYSTEM_PROMPT`. `schema.py` requiring these fields only
+    proves *some* value was supplied -- it cannot prove the right one."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        with open(os.path.join(plan_dir, "step-001.json"), "rb") as f:
+            expected_plan_hash = hashlib.sha256(f.read()).hexdigest()
+        expected_prompt_version = harness_runner.compute_prompt_version()
+
+        with harness_identity_env("test-harness-identity-hash"):
+            written = opencode_lane.run_lane(
+                plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+                call_harness_fn=make_harness_stub(exit_code=0, raw_body={"findings": []}),
+            )
+
+        check(
+            written[0]["plan_hash"] == expected_plan_hash,
+            "run_lane: plan_hash equals a fresh sha256 of the same step-001.json read",
+            repr(written),
+        )
+        check(
+            written[0]["harness_identity"] == "test-harness-identity-hash",
+            "run_lane: harness_identity equals CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY",
+            repr(written),
+        )
+        check(
+            written[0]["prompt_version"] == expected_prompt_version,
+            "run_lane: prompt_version equals sha256 of harness_runner.SYSTEM_PROMPT",
+            repr(written),
+        )
+
+
+def test_changed_binding_quarantines_and_reruns_the_step() -> None:
+    """[REQUIRED TEST] (Issue #3962) Proves this lane actually passes
+    `plan_dir` and `current_harness_identity` into `resume.missing_steps()`,
+    which no value check on a single envelope can show: dropping either
+    argument leaves the pre-#3962 default (`None`, check skipped) in place, so
+    the stale `complete` envelope would be accepted and the step never re-run.
+    Four invocations against one lane dir -- unchanged bindings skip the step,
+    a changed harness identity quarantines and re-runs it, a changed plan step
+    does the same -- and the harness call count is the evidence."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        calls = {"n": 0}
+
+        def stub(model, prompt, output_path):
+            calls["n"] += 1
+            with open(output_path, "w") as f:
+                json.dump({"findings": []}, f)
+            return 0, False
+
+        def run(identity):
+            with harness_identity_env(identity):
+                return opencode_lane.run_lane(
+                    plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=stub
+                )
+
+        def quarantined_files():
+            return sorted(n for n in os.listdir(out_dir) if ".quarantined-" in n)
+
+        first = run("identity-A")
+        check(first[0]["state"] == "complete", "binding resume: first run completes the step", repr(first))
+        check(calls["n"] == 1, "binding resume: the harness ran once", str(calls))
+
+        second = run("identity-A")
+        check(second == [], "binding resume: unchanged bindings skip the completed step", repr(second))
+        check(calls["n"] == 1, "binding resume: unchanged bindings do not re-invoke the harness", str(calls))
+        check(quarantined_files() == [], "binding resume: nothing quarantined while bindings match", repr(quarantined_files()))
+
+        third = run("identity-B")
+        check(calls["n"] == 2, "binding resume: a changed harness_identity re-invokes the harness", str(calls))
+        check(
+            third and third[0]["harness_identity"] == "identity-B",
+            "binding resume: the re-run envelope records the current harness identity",
+            repr(third),
+        )
+        check(
+            len(quarantined_files()) == 1,
+            "binding resume: the stale envelope is quarantined, not deleted or left in place",
+            repr(sorted(os.listdir(out_dir))),
+        )
+
+        write_plan_step(plan_dir, "step-001", description="a changed scope description")
+        with open(os.path.join(plan_dir, "step-001.json"), "rb") as f:
+            changed_plan_hash = hashlib.sha256(f.read()).hexdigest()
+
+        fourth = run("identity-B")
+        check(calls["n"] == 3, "binding resume: a changed plan step re-invokes the harness", str(calls))
+        check(
+            fourth and fourth[0]["plan_hash"] == changed_plan_hash,
+            "binding resume: the re-run envelope records the changed plan's hash",
+            repr(fourth),
+        )
+        check(
+            len(quarantined_files()) == 2,
+            "binding resume: the plan-mismatched envelope is quarantined too",
+            repr(sorted(os.listdir(out_dir))),
+        )
 
 
 def test_complete_with_findings_enriched() -> None:

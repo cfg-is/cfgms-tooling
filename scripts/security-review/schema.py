@@ -26,7 +26,16 @@ Three shapes are validated here:
   rather than only `files_read`, is what lets a report distinguish "reviewed
   everything declared and found nothing" from "skipped every declared file
   and still returned an empty findings array" — the two are otherwise
-  indistinguishable from `findings: []` alone.
+  indistinguishable from `findings: []` alone. `plan_hash`/`prompt_version`/
+  `harness_identity` (Issue #3962) are required on every envelope regardless
+  of `state`, exactly like `sweep_id`/`commit_sha`/`lane`/`step_id`/`model_id`
+  — the identity of the frozen plan step, system prompt, and harness code a
+  step ran against, so `resume.missing_steps()` can bind a `complete`
+  envelope to the sweep that is actually resuming rather than trusting one
+  written under a since-changed plan or harness. This module only validates
+  that the three fields are present and non-empty strings; recomputing and
+  comparing them against the current sweep's values is `resume.py`'s job,
+  not this module's.
 
 - A **plan step** (`validate_plan_step`): the one shape the planner writes and
   every lane reads (epic #3927's contract C1). Before this story, the planner
@@ -111,6 +120,9 @@ REQUIRED_STEP_ENVELOPE_FIELDS = (
     "step_id",
     "state",
     "model_id",
+    "plan_hash",
+    "prompt_version",
+    "harness_identity",
 )
 
 STEP_STATES = frozenset({"complete", "parked", "refused", "failed"})
