@@ -1153,6 +1153,266 @@ def test_plan_step_id_regex_matches_planner_module():
     )
 
 
+def _section(md: str, heading: str) -> str:
+    """Return the body of the named `## heading` section, up to the next
+    `## ` heading -- so an assertion about "does the Incomplete section
+    mention X" cannot be satisfied by X appearing in some other section
+    (e.g. the report's opening sentence, which references `` `## Incomplete` ``
+    by name as a pointer)."""
+    marker = f"\n{heading}\n"
+    padded = f"\n{md}"
+    if marker not in padded:
+        return ""
+    after = padded.split(marker, 1)[1]
+    return after.split("\n## ", 1)[0]
+
+
+def test_incomplete_sweep_uses_no_candidates_wording_not_clean_framing():
+    # [REQUIRED TEST] (Issue #3961): one lane, one plan step, that lane's
+    # directory exists but never produced any step file -- not_started=1,
+    # zero findings. The old unconditional "clean" framing must never render
+    # for a sweep in this state.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        os.makedirs(os.path.join(sweep, "lanes", "laneA"))
+        report = consolidate.consolidate(sweep, repo)
+        row = report["coverage"][0]
+        check(row["not_started"] == 1 and row["lane"] == "laneA", "setup sanity: laneA has one not_started step", str(row))
+        check(report["findings"] == [], "setup sanity: zero findings", str(report["findings"]))
+
+        md = consolidate.render_markdown(report)
+        check(
+            "No candidates reported in the tasks that completed." in md,
+            "consolidate.md: an incomplete sweep with zero findings states 'no candidates reported', not 'clean'",
+            md,
+        )
+        check(
+            "_No findings after de-duplication and validation._" not in md,
+            "consolidate.md: the old unconditional 'clean' framing never renders for an incomplete sweep",
+            md,
+        )
+
+
+def test_incomplete_section_names_the_lane_with_not_started_gap():
+    # [REQUIRED TEST] (Issue #3961): same incomplete fixture as above --
+    # the ## Incomplete section text must name laneA specifically, not just
+    # gesture at "something is incomplete".
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        os.makedirs(os.path.join(sweep, "lanes", "laneA"))
+        report = consolidate.consolidate(sweep, repo)
+
+        md = consolidate.render_markdown(report)
+        check("## Incomplete" in md, "consolidate.md: renders an Incomplete section heading for an incomplete sweep", md)
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "laneA" in incomplete_section and "not started" in incomplete_section,
+            "consolidate.md: the Incomplete section names laneA's not_started gap specifically",
+            incomplete_section,
+        )
+
+
+def test_complete_sweep_omits_incomplete_section_and_clean_wording():
+    # [REQUIRED TEST] (Issue #3961): every lane's not_started/files_short are
+    # 0, no dispatch/rejection entries, no incomplete hypothesis bundles.
+    # Added by Tech Lead/PO ruling on revision 2 -- without this test, an
+    # implementation that hardcodes sweep_complete = False unconditionally
+    # would satisfy every other AC in this story while defeating its purpose.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        row = report["coverage"][0]
+        check(
+            row["complete"] == 1 and row["not_started"] == 0 and row["failed"] == 0 and row["files_short"] == 0,
+            "setup sanity: laneA completed its one step cleanly with no gaps",
+            str(row),
+        )
+        check(report["dispatch"] == {"planners": [], "lanes": []}, "setup sanity: no dispatch entries", str(report["dispatch"]))
+        check(report["rejected_proposals"] == [], "setup sanity: no rejected proposals", str(report["rejected_proposals"]))
+        check(report["findings"] == [], "setup sanity: zero findings", str(report["findings"]))
+
+        md = consolidate.render_markdown(report)
+        check(
+            "no candidates reported in the tasks that completed" not in md.lower(),
+            "consolidate.md: a fully-complete sweep never uses the incomplete-sweep wording",
+            md,
+        )
+        check(
+            "## Incomplete" not in md,
+            "consolidate.md: a fully-complete sweep omits the Incomplete section entirely",
+            md,
+        )
+        check(
+            "_No findings after de-duplication and validation._" in md,
+            "consolidate.md: a fully-complete sweep with zero findings still uses the original clean-sweep wording",
+            md,
+        )
+
+
+def test_incomplete_sweep_due_to_failed_step_names_lane_in_incomplete_section():
+    # A schema-invalid (or #3959 incomplete-hypothesis-bundle) step is
+    # counted `failed` in the coverage table. That must also drive
+    # sweep_complete to False and be named in ## Incomplete, not just
+    # not_started/files_short gaps.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        bad_envelope = complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001")])
+        del bad_envelope["findings"]
+        assert schema.validate_step_envelope(bad_envelope) != [], "test fixture must actually be schema-invalid"
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), bad_envelope)
+
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(
+            "No candidates reported in the tasks that completed." in md,
+            "consolidate.md: a sweep with a failed step is not rendered as clean",
+            md,
+        )
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "laneA" in incomplete_section and "failed" in incomplete_section,
+            "consolidate.md: the Incomplete section names laneA's failed-step gap",
+            incomplete_section,
+        )
+
+
+def test_incomplete_sweep_due_to_parked_step_names_lane_in_incomplete_section():
+    # A `parked` step (rate limit, context exhaustion) never got far enough to
+    # have read anything meaningful -- exactly like a `failed` one. A sweep
+    # whose only step is parked has reviewed no code at all, so it must never
+    # render as a clean full sweep.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        parked = status_envelope(sha, "laneA", "step-001", "parked")
+        assert schema.validate_step_envelope(parked) == [], "test fixture must be schema-valid"
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.status.json"), parked)
+
+        report = consolidate.consolidate(sweep, repo)
+        row = report["coverage"][0]
+        check(
+            row["parked"] == 1 and row["failed"] == 0 and row["not_started"] == 0 and row["files_short"] == 0,
+            "setup sanity: laneA's only step lands in the parked bucket with no other gap counter set",
+            str(row),
+        )
+
+        md = consolidate.render_markdown(report)
+        check(
+            "No candidates reported in the tasks that completed." in md,
+            "consolidate.md: a sweep whose only step is parked is not rendered as clean",
+            md,
+        )
+        check(
+            "Every planned step across every lane finished cleanly" not in md,
+            "consolidate.md: a parked-only sweep never uses the clean-sweep opening sentence",
+            md,
+        )
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "laneA" in incomplete_section and "parked" in incomplete_section,
+            "consolidate.md: the Incomplete section names laneA's parked-step gap",
+            incomplete_section,
+        )
+
+
+def test_incomplete_sweep_due_to_refused_step_names_lane_in_incomplete_section():
+    # Same for `refused`: the model declined the task, so zero code was read.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        refused = status_envelope(sha, "laneA", "step-001", "refused")
+        assert schema.validate_step_envelope(refused) == [], "test fixture must be schema-valid"
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.status.json"), refused)
+
+        report = consolidate.consolidate(sweep, repo)
+        row = report["coverage"][0]
+        check(
+            row["refused"] == 1 and row["failed"] == 0 and row["not_started"] == 0 and row["files_short"] == 0,
+            "setup sanity: laneA's only step lands in the refused bucket with no other gap counter set",
+            str(row),
+        )
+
+        md = consolidate.render_markdown(report)
+        check(
+            "No candidates reported in the tasks that completed." in md,
+            "consolidate.md: a sweep whose only step is refused is not rendered as clean",
+            md,
+        )
+        check(
+            "_No findings after de-duplication and validation._" not in md,
+            "consolidate.md: a refused-only sweep never uses the clean zero-findings wording",
+            md,
+        )
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "laneA" in incomplete_section and "refused" in incomplete_section,
+            "consolidate.md: the Incomplete section names laneA's refused-step gap",
+            incomplete_section,
+        )
+
+
+def test_zero_lanes_dispatched_is_incomplete_not_clean():
+    # A valid, non-empty plan with zero lanes dispatched has reviewed
+    # nothing -- the exact "unreviewed package looks clean" failure mode
+    # SKILL.md warns about. It must render as incomplete, not as a clean
+    # zero-findings sweep.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        report = consolidate.consolidate(sweep, repo)
+        check(report["lanes"] == [], "setup sanity: zero lanes discovered", str(report["lanes"]))
+        check(report["findings"] == [], "setup sanity: zero findings", str(report["findings"]))
+
+        md = consolidate.render_markdown(report)
+        check(
+            "No candidates reported in the tasks that completed." in md,
+            "consolidate.md: a zero-lane sweep is not rendered as a clean zero-findings report",
+            md,
+        )
+        check("## Incomplete" in md, "consolidate.md: a zero-lane sweep renders the Incomplete section", md)
+
+
+def test_incomplete_sweep_due_to_dispatch_issue_does_not_duplicate_rejected_filename():
+    # A dispatch/rejection gap must show up in ## Incomplete too, but the
+    # existing "exactly once" guarantee on a rejected proposal's filename
+    # (test_dispatch_section_lists_rejected_proposal_exactly_once) must keep
+    # holding -- ## Incomplete summarizes the count and points at ##
+    # Dispatch rather than re-printing the identity/filename a second time.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        write_rejected_proposals(
+            sweep,
+            [{"filename": "step-002.json", "error": "scope spans two top-level subtrees"}],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check("## Incomplete" in md, "consolidate.md: a rejected proposal alone still triggers the Incomplete section", md)
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "rejected proposal" in incomplete_section.lower(),
+            "consolidate.md: the Incomplete section mentions the rejected proposal gap",
+            incomplete_section,
+        )
+        check(
+            md.count("step-002.json") == 1,
+            "consolidate.md: the rejected filename still appears exactly once (## Dispatch owns the identity detail)",
+            md,
+        )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

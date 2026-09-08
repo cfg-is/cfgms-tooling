@@ -126,6 +126,16 @@ sorted by multi-lane agreement first, then severity, then confidence. A single-l
 noise by default — the whole reason for running multiple labs is that the unique findings are
 often the valuable ones.
 
+**An empty findings array means "no candidates reported in the tasks that completed," never
+"clean."** Those two only read the same when the sweep is actually complete — every lane finished
+every planned step `complete`, with nothing left `not_started`, `parked`, `refused`, or `failed`,
+no `files_short` gap, no dispatch or rejected-proposal issue, and no hypothesis bundle left
+incomplete (Issue #3961). A parked or refused step read no more code than a failed one, so it
+counts as a gap too. Whenever any of that is
+true, `render_markdown()` says so up front and adds a `## Incomplete` section naming every gap
+before the findings list; treat that section, not a bare empty `## Findings`, as the answer to
+"did this sweep actually cover the code."
+
 ## Hand off, do not auto-file
 
 Summarize for the user: coverage, headline findings, what looks real.

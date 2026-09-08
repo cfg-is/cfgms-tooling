@@ -53,6 +53,18 @@ were somehow bypassed.
 **Log injection (SEC3900 A2):** every diagnostic this module logs about a
 malformed file goes through `schema.log_event`/`safe_log_event`, never a raw
 f-string interpolation of tainted content -- matching `resume.py`.
+
+**Honest incompleteness (Issue #3961):** an empty `findings` array means "no
+candidates reported in the tasks that completed," never "clean" -- the two
+read identically only when every lane finished every planned step. Whenever
+`_sweep_complete()` is `False` (any `not_started`, `files_short`, `failed`,
+`parked`, or `refused` count on any lane's coverage row -- a parked or refused
+step read no more code than a failed one; any `dispatch_report.json`/
+`rejected_proposals.json` entry; or the plan itself failed), `render_markdown()`
+says so in its opening sentence, in a dedicated `## Incomplete` section naming
+every gap, and in the `## Findings` section's empty-case text -- it never
+falls back to the unconditional "no findings" framing that reads as a clean
+sweep regardless of how much of the sweep actually ran.
 """
 from __future__ import annotations
 
@@ -490,8 +502,135 @@ def _dispatch_identity(entry: dict) -> str:
     return harness or "unknown"
 
 
+def _sweep_complete(report: dict) -> bool:
+    """Whether every lane finished every planned step cleanly enough that an
+    empty findings list can be trusted to mean "nothing found" rather than
+    "nothing looked" (Issue #3961). Never the default in the absence of
+    evidence: a sweep with no frozen plan at all reads as incomplete, not
+    complete-by-omission.
+
+    False whenever:
+    - the frozen plan itself failed (`plan_failed`) or discovered zero steps
+      -- the two cases #3953 already special-cases in the Coverage section,
+      routed through this same flag rather than special-cased again here.
+    - any lane's coverage row shows `not_started > 0` or `files_short > 0`
+      (#3953, #3957).
+    - any lane's coverage row shows `failed > 0` -- `load_sweep()` counts a
+      step `failed` both for a schema-invalid envelope and for the #3959
+      incomplete-hypothesis-bundle exclusion (a `complete` envelope with any
+      `not_attempted` disposition); either way the step never became usable
+      coverage, so both fold into this one check.
+    - any lane's coverage row shows `parked > 0` or `refused > 0` -- a
+      rate-limited or model-refused step "never got far enough to have read
+      anything meaningful" (docs/architecture/security-review-harness.md),
+      exactly like `failed`. Without these two, a sweep in which every step
+      was parked or refused -- zero code actually read -- would render as a
+      clean full sweep, which is the fail-open framing this check exists to
+      remove.
+    - a `dispatch_report.json` planner or lane entry recorded an outcome
+      other than `dispatched` (#3956).
+    - `plan/rejected_proposals.json` recorded any entry (#3956).
+    - no lane has produced any output at all -- a valid plan with zero
+      dispatched lanes has reviewed nothing, which is exactly the "clean
+      because unreviewed" failure mode this story exists to stop describing
+      as clean.
+    """
+    if report.get("plan_failed") or not report.get("steps_discovered"):
+        return False
+    if not report.get("lanes"):
+        return False
+    for row in report.get("coverage") or []:
+        if (
+            row.get("not_started", 0) > 0
+            or row.get("files_short", 0) > 0
+            or row.get("failed", 0) > 0
+            or row.get("parked", 0) > 0
+            or row.get("refused", 0) > 0
+        ):
+            return False
+    dispatch = report.get("dispatch") or {}
+    if any(entry.get("outcome") != "dispatched" for entry in dispatch.get("planners", [])):
+        return False
+    if any(entry.get("outcome") != "dispatched" for entry in dispatch.get("lanes", [])):
+        return False
+    if report.get("rejected_proposals"):
+        return False
+    return True
+
+
+def _incomplete_lines(report: dict) -> list[str]:
+    """One bullet per concrete gap behind a `False` `_sweep_complete()`,
+    named by lane where a lane is the relevant unit -- never a bare "this
+    sweep is incomplete" with no way to tell which task did not finish."""
+    if report.get("plan_failed") or not report.get("steps_discovered"):
+        return [
+            "- **Planning did not produce a usable frozen plan** for this "
+            "sweep; see `## Coverage` above."
+        ]
+    if not report.get("lanes"):
+        return [
+            "- **No lane has produced any output for this sweep yet**; see "
+            "`## Coverage` above."
+        ]
+
+    lines = []
+    for row in report.get("coverage") or []:
+        lane = _md_escape_inline(row["lane"])
+        total = row["total_steps"]
+        if row.get("not_started", 0) > 0:
+            lines.append(f"- Lane `{lane}`: {row['not_started']}/{total} step(s) not started.")
+        if row.get("failed", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['failed']}/{total} step(s) failed "
+                "(schema-invalid, or a bundle left incomplete with an "
+                "unattempted hypothesis)."
+            )
+        if row.get("parked", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['parked']}/{total} step(s) parked "
+                "(stopped before reading anything meaningful; resumable)."
+            )
+        if row.get("refused", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['refused']}/{total} step(s) refused "
+                "(the model declined; nothing was reviewed)."
+            )
+        if row.get("files_short", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['files_short']} step(s) read fewer "
+                "files than declared (`files_short`)."
+            )
+
+    dispatch = report.get("dispatch") or {}
+    dispatch_issues = sum(
+        1 for entry in dispatch.get("planners", []) if entry.get("outcome") != "dispatched"
+    ) + sum(1 for entry in dispatch.get("lanes", []) if entry.get("outcome") != "dispatched")
+    if dispatch_issues:
+        lines.append(f"- {dispatch_issues} dispatch issue(s) recorded; see `## Dispatch` below.")
+
+    rejected_count = len(report.get("rejected_proposals") or [])
+    if rejected_count:
+        lines.append(f"- {rejected_count} rejected proposal(s) recorded; see `## Dispatch` below.")
+
+    return lines
+
+
 def render_markdown(report: dict) -> str:
+    sweep_complete = _sweep_complete(report)
+
     lines = [f"# Security Review Consolidated Report — `{report['sweep_id']}`", ""]
+    if sweep_complete:
+        lines.append(
+            "Every planned step across every lane finished cleanly; the "
+            "findings below reflect the full sweep."
+        )
+    else:
+        lines.append(
+            "**This sweep is incomplete.** See `## Incomplete` below — the "
+            "findings in this report reflect only the tasks that completed, "
+            "not the full sweep."
+        )
+    lines.append("")
 
     lines.append("## Coverage")
     lines.append("")
@@ -528,6 +667,12 @@ def render_markdown(report: dict) -> str:
             lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0 |")
         lines.append("")
 
+    if not sweep_complete:
+        lines.append("## Incomplete")
+        lines.append("")
+        lines.extend(_incomplete_lines(report))
+        lines.append("")
+
     lines.append("## Dispatch")
     lines.append("")
     dispatch = report.get("dispatch") or {}
@@ -559,7 +704,10 @@ def render_markdown(report: dict) -> str:
     lines.append("## Findings")
     lines.append("")
     if not report["findings"]:
-        lines.append("_No findings after de-duplication and validation._")
+        if sweep_complete:
+            lines.append("_No findings after de-duplication and validation._")
+        else:
+            lines.append("No candidates reported in the tasks that completed.")
         lines.append("")
 
     for finding in report["findings"]:
