@@ -89,6 +89,7 @@ with open(output_path, "w") as f:
     json.dump({
         "findings": [
             {
+                "hypothesis_id": "h1",
                 "file": "pkg/example/thing.go",
                 "symbol": "DoSomething",
                 "vuln_class": "hardcoded-secret",
@@ -98,7 +99,14 @@ with open(output_path, "w") as f:
                 "evidence": "Planted by claude_lane_integration_test.py's stub claude binary.",
                 "suggested_fix": "N/A -- test fixture.",
             }
-        ]
+        ],
+        "dispositions": [
+            {
+                "hypothesis_id": "h1",
+                "disposition": "candidate_found",
+                "summary": "Planted by claude_lane_integration_test.py's stub claude binary.",
+            }
+        ],
     }, f)
 sys.exit(0)
 """

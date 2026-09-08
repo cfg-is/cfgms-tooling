@@ -272,7 +272,7 @@ AC3_CLAUDE_BIN="$(mktemp -d)"
 cat > "${AC3_CLAUDE_BIN}/claude" <<'AC3_CLAUDE_STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '{"findings":[]}' > "${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
+printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
 AC3_CLAUDE_STUB
 chmod +x "${AC3_CLAUDE_BIN}/claude"
 cat > "${AC3_PLAN_DIR}/step-001.json" <<JSON
@@ -406,7 +406,7 @@ output_path="${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
 outcome="${STUB_CLAUDE_OUTCOME:-complete}"
 case "$outcome" in
   complete)
-    printf '{"findings":[]}' > "$output_path"
+    printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
     exit 0
     ;;
   parked)
@@ -805,7 +805,7 @@ done
 : "${output_path:?no --output-last-message found in argv}"
 case "$outcome" in
   complete)
-    printf '{"findings":[]}' > "$output_path"
+    printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
     exit 0
     ;;
   parked)
@@ -971,7 +971,7 @@ output_path="${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
 outcome="${STUB_OPENCODE_OUTCOME:-complete}"
 case "$outcome" in
   complete)
-    printf '{"findings":[]}' > "$output_path"
+    printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
     exit 0
     ;;
   parked)
@@ -1398,7 +1398,7 @@ cat > "${CONTENT_TEST_CLAUDE_BIN}/claude" <<'CONTENT_STUB'
 set -euo pipefail
 output_path="${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
 printf '%s\n' "$*" >> "${CFGMS_TEST_PROMPT_LOG:?}"
-printf '{"findings":[]}' > "$output_path"
+printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
 CONTENT_STUB
 chmod +x "${CONTENT_TEST_CLAUDE_BIN}/claude"
 

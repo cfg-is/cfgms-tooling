@@ -89,29 +89,45 @@ SURFACE = "surface"
 SYSTEM_PROMPT = (
     "You are a security researcher performing manual code review for the CFGMS "
     "configuration management system, a zero-trust multi-tenant fleet management "
-    "product. Review the source you are given for genuine security vulnerabilities: "
-    "authorization and tenant-scoping defects, injection, unsafe deserialization, "
-    "missing input validation at trust boundaries, secret handling, and other logic "
-    "bugs that are syntactically valid code doing semantically wrong things -- "
-    "exactly the class static analyzers cannot see. Report every security concern "
-    "you are reasonably confident is grounded in the code you read, including "
-    "low-confidence and low-severity candidates, each carrying its own confidence, "
-    "severity, and a note of what evidence would raise or lower that confidence. "
-    "Do not filter for importance before reporting. Do not report style issues, "
-    "hypothetical concerns, or invent findings to avoid returning an empty list -- "
-    "a genuinely clean review returns an empty findings array. Write your findings to the output file named "
-    "in your instructions, in exactly the shape described below, and nothing else -- "
-    "no prose before or after it."
+    "product. You are given a numbered list of hypotheses to investigate, each "
+    "naming a security property and the evidence that would confirm or refute it. "
+    "Investigate every hypothesis you are given, by its id, and address it in your "
+    "output -- authorization and tenant-scoping defects, injection, unsafe "
+    "deserialization, missing input validation at trust boundaries, secret "
+    "handling, and other logic bugs that are syntactically valid code doing "
+    "semantically wrong things -- exactly the class static analyzers cannot see. "
+    "Report every security concern you are reasonably confident is grounded in the "
+    "code you read, including low-confidence and low-severity candidates, each "
+    "carrying its own confidence, severity, and a note of what evidence would "
+    "raise or lower that confidence. Do not filter for importance before "
+    "reporting. Do not report style issues, hypothetical concerns, or invent "
+    "findings to avoid returning an empty list -- a genuinely clean review "
+    "returns an empty findings array. A hypothesis you investigated and found "
+    "nothing for is not a hypothesis you skipped: mark it 'investigated', never "
+    "'not_attempted'. Write your findings to the output file named in your "
+    "instructions, in exactly the shape described below, and nothing else -- no "
+    "prose before or after it."
 )
 
 # The single output-schema description every harness's lane runner sends,
 # describing the exact shape `schema.py::validate_finding` requires --
 # never a second, differently-worded restatement of that shape.
 OUTPUT_SCHEMA_DESCRIPTION = (
-    'Write a single JSON object of the exact shape {"findings": [...]} to the '
-    'output file. "findings" is a JSON array, empty if you found nothing -- a '
+    'Write a single JSON object of the exact shape {"findings": [...], '
+    '"dispositions": [...]} to the output file. '
+    '"dispositions" is a JSON array with exactly one entry per hypothesis you '
+    "were given -- every hypothesis id must appear exactly once. Each entry is a "
+    'JSON object with exactly these string fields: "hypothesis_id" (the id of '
+    'the hypothesis this entry resolves), "disposition" (one of '
+    '"investigated"/"candidate_found"/"inconclusive"/"not_attempted"), and '
+    '"summary" (what you found, or why you could not investigate it). Use '
+    '"not_attempted" only for a hypothesis you genuinely could not get to -- '
+    "never fabricate a summary for one you skipped, and never invent a "
+    "hypothesis id that was not given to you. "
+    '"findings" is a JSON array, empty if you found nothing -- a '
     "genuinely clean review is a valid, expected result. Each element is a JSON "
-    'object with exactly these string fields: "file" (repo-relative path), '
+    'object with exactly these string fields: "hypothesis_id" (the id of the '
+    'hypothesis this finding resulted from), "file" (repo-relative path), '
     '"symbol" (function/method/type name), "vuln_class" (a short vulnerability-'
     'class label), "severity" (one of "low"/"medium"/"high"/"critical"), '
     '"confidence" (one of "low"/"medium"/"high"), "title", "evidence" (why this '
@@ -166,6 +182,7 @@ def build_envelope(
     findings: list[dict] | None = None,
     files_intended: list[str] | None = None,
     files_read: list[str] | None = None,
+    dispositions: list[dict] | None = None,
 ) -> dict:
     """Build a step envelope carrying `refusal_attempts` alongside the fields
     `schema.py::validate_step_envelope` requires. `context` supplies
@@ -177,13 +194,26 @@ def build_envelope(
     once refused, then went on to complete") stays visible in its final
     envelope rather than being dropped once a retry succeeds.
 
-    `files_intended`/`files_read` (Issue #3957) are attached only when
-    `state == COMPLETE`, matching `findings`'s own conditional -- a
-    `refused`/`failed`/`parked` step never got far enough to have read
-    anything meaningful, so the fields are omitted rather than written as an
-    empty pair that could be misread as "declared and read nothing". Each
-    defaults to an empty list when the caller completed a step that declared
-    (or read) no files at all -- distinct from the fields being absent.
+    `files_intended`/`files_read` (Issue #3957) and `dispositions` (Issue
+    #3959) are attached only when `state == COMPLETE`, matching `findings`'s
+    own conditional -- a `refused`/`failed`/`parked` step never got far
+    enough to have read anything meaningful or to have addressed any
+    hypothesis, so the fields are omitted rather than written as an empty
+    list that could be misread as "declared and read nothing" or "addressed
+    zero hypotheses". Each defaults to an empty list when the caller
+    completed a step that declared (or read) no files, or resolved no
+    hypotheses, at all -- distinct from the fields being absent. A caller
+    completing a step is expected to have already synthesized a
+    `not_attempted` disposition for every hypothesis its harness's raw
+    output did not address (see each lane's `run_lane`) -- this function
+    does not itself guarantee full coverage of a step's hypotheses; that
+    guarantee lives in the caller and is independently checked by
+    `write_envelope` below via `schema.validate_step_envelope`.
+
+    `dispositions` is passed through `dedupe_dispositions()` before being
+    attached, so no caller can build an envelope carrying two entries for one
+    `hypothesis_id` -- see that function for why a duplicate is a plan-level
+    defect that must not be able to reach `write_envelope`.
     """
     envelope = {
         "sweep_id": context["sweep_id"],
@@ -198,9 +228,107 @@ def build_envelope(
         envelope["findings"] = findings if findings is not None else []
         envelope["files_intended"] = files_intended if files_intended is not None else []
         envelope["files_read"] = files_read if files_read is not None else []
+        envelope["dispositions"] = dedupe_dispositions(dispositions)
     else:
         envelope["stop_reason_raw"] = stop_reason_raw or state
     return envelope
+
+
+def dedupe_dispositions(dispositions: list | None) -> list:
+    """Return `dispositions` with at most one entry per `hypothesis_id`,
+    first-seen winning, order otherwise preserved. `None` and a non-list both
+    become `[]`.
+
+    A step whose plan carries two hypotheses with the same `id` makes every
+    lane emit two dispositions with the same `hypothesis_id` -- one per
+    hypothesis, as required -- which `schema.validate_step_envelope` rejects
+    as a duplicate, which `write_envelope` turns into a `ValueError`. That
+    combination once meant a single malformed plan step (an `id` a model is
+    free to repeat, since `id` is only ever unique within its own step) killed
+    the whole lane process mid-sweep, destroying the envelopes of every step
+    that had not run yet.
+
+    The primary fix is upstream: `schema.validate_plan_step` now rejects a
+    step with duplicate hypothesis ids and `planner._merge_hypotheses`
+    suffixes rather than repeats an id. This function is the independent
+    second control, at the one point every lane's dispositions pass through,
+    so no future path back to a duplicate can reach `write_envelope` -- a
+    collapsed pair is a strictly better outcome than an unwritable envelope,
+    and the plan step that caused it was already rejected before a lane saw
+    it.
+    """
+    if not isinstance(dispositions, list):
+        return []
+    seen: set = set()
+    result: list = []
+    for disposition in dispositions:
+        if isinstance(disposition, dict):
+            hypothesis_id = disposition.get("hypothesis_id")
+            if isinstance(hypothesis_id, str) and hypothesis_id:
+                if hypothesis_id in seen:
+                    schema.log_event(
+                        "duplicate_disposition_collapsed", hypothesis_id=hypothesis_id
+                    )
+                    continue
+                seen.add(hypothesis_id)
+        result.append(disposition)
+    return result
+
+
+# Execution-task budget (Issue #3959). A step's `file_contents` dict -- the
+# same dict every lane's own `read_step_files()` builds -- above this total
+# UTF-8 byte length is split across multiple sequential harness invocations
+# for the same step, each addressing a subset of the step's hypotheses,
+# rather than asking one harness turn to hold every file and every
+# hypothesis in its own context/investigation budget at once. A simple,
+# testable proxy for "this step is too large for one harness turn" -- not a
+# token-accurate estimate, which would require a per-harness tokenizer this
+# module has no way to share across three different CLIs (`claude`, `codex`,
+# `opencode`).
+MAX_BUNDLE_BYTES = 200_000
+
+
+def bundle_byte_length(file_contents: dict) -> int:
+    """Total UTF-8 byte length of every file body in `file_contents`."""
+    return sum(len(content.encode("utf-8")) for content in file_contents.values())
+
+
+def split_hypotheses_for_budget(
+    hypotheses: list, file_contents: dict, max_bundle_bytes: int = MAX_BUNDLE_BYTES
+) -> list:
+    """Split a plan step's `hypotheses` list into one or more execution
+    tasks, based purely on `bundle_byte_length(file_contents)` against
+    `max_bundle_bytes`.
+
+    Returns `[hypotheses]` (a single task, `hypotheses` unchanged) when the
+    bundle is within budget, or when there is at most one hypothesis to
+    split -- the common case every existing lane test exercises without ever
+    touching the multi-task path below.
+
+    When over budget, `hypotheses` is divided as evenly as possible across
+    `ceil(bundle_byte_length(file_contents) / max_bundle_bytes)` tasks
+    (capped at one hypothesis per task, never more tasks than hypotheses).
+    Each task still needs the step's full `file_contents` when it is
+    actually run -- the files a step declares do not shrink because fewer
+    hypotheses are being investigated in one call, only the number of
+    hypotheses a single harness turn must hold in its own
+    context/investigation budget does. Every split task retains the
+    original step's identity (its caller passes the same `step_id`,
+    `sweep_id`, `commit_sha` to every task); merging their results back into
+    one envelope for that `step_id` is the caller's job (`run_lane`), never
+    this function's -- `consolidate.py` must never see more than one
+    envelope per step, split or not.
+    """
+    hypotheses = list(hypotheses)
+    if len(hypotheses) <= 1 or bundle_byte_length(file_contents) <= max_bundle_bytes:
+        return [hypotheses]
+
+    total_bytes = bundle_byte_length(file_contents)
+    num_tasks = min(len(hypotheses), -(-total_bytes // max_bundle_bytes))
+    tasks: list = [[] for _ in range(num_tasks)]
+    for index, hypothesis in enumerate(hypotheses):
+        tasks[index % num_tasks].append(hypothesis)
+    return [task for task in tasks if task]
 
 
 def status_envelope_path(lane_dir: str, step_id: str) -> str:
@@ -218,6 +346,7 @@ def apply_refusal_policy(
     findings: list[dict] | None = None,
     files_intended: list[str] | None = None,
     files_read: list[str] | None = None,
+    dispositions: list[dict] | None = None,
 ) -> dict:
     """Apply the refusal-retry-once policy on top of one `terminal_state.classify()`
     result and return the envelope to write.
@@ -262,10 +391,11 @@ def apply_refusal_policy(
         findings=findings,
         files_intended=files_intended,
         files_read=files_read,
+        dispositions=dispositions,
     )
 
 
-def write_envelope(lane_dir: str, step_id: str, envelope: dict) -> str:
+def write_envelope(lane_dir: str, step_id: str, envelope: dict, plan_step: dict | None = None) -> str:
     """Atomically write `envelope` to `<lane_dir>/<step_id>.findings.json`
     (state `complete`) or `.status.json` (every other state), matching every
     existing lane's suffix convention, and return the path written.
@@ -273,12 +403,97 @@ def write_envelope(lane_dir: str, step_id: str, envelope: dict) -> str:
     Refuses to write an envelope `schema.py::validate_step_envelope` would
     itself reject -- mirrors every existing lane's own defensive check
     (e.g. `anthropic.py::process_step`) rather than trusting this module's
-    own construction unconditionally.
+    own construction unconditionally. `plan_step`, when given, is forwarded
+    to `schema.validate_step_envelope` so a complete envelope's
+    `dispositions` array is checked against the step's actual hypotheses --
+    belt-and-braces on top of each lane's own synthesis of `not_attempted`
+    entries for any hypothesis its harness's raw output did not address, so a
+    bug in that synthesis fails loudly here rather than writing a silently
+    short envelope.
     """
-    errors = schema.validate_step_envelope(envelope)
+    errors = schema.validate_step_envelope(envelope, plan_step)
     if errors:
         raise ValueError(f"refusing to write a schema-invalid envelope: {errors}")
     suffix = "findings" if envelope.get("state") == terminal_state.COMPLETE else "status"
     path = os.path.join(lane_dir, f"{step_id}.{suffix}.json")
     atomic_write.write_json_atomic(path, envelope)
     return path
+
+
+# Cap on the raw reason text carried into a fallback failure envelope. The
+# text is an exception string, so it can quote model-supplied content of any
+# length (a `write_envelope` rejection quotes the offending hypothesis ids);
+# the envelope records why a step failed, not an unbounded transcript.
+MAX_STOP_REASON_CHARS = 500
+
+
+def remove_step_temp_artifacts(lane_dir: str, step_id: str) -> None:
+    """Best-effort removal of every intermediate dotfile a step left in
+    `lane_dir`.
+
+    Each lane writes its per-step scratch files (the harness's raw output, the
+    enriched candidate, and their `.taskN.` variants when a step is split)
+    as dotfiles prefixed `.<step_id>`, and removes them itself on every path
+    it completes normally. This is the same cleanup for the path where a step
+    raised part-way through, so the "no temp artifacts left behind"
+    invariant holds on the failure path too. Never raises: a directory that
+    has vanished, or an entry that cannot be removed, is skipped.
+    """
+    try:
+        names = os.listdir(lane_dir)
+    except OSError:
+        return
+    prefix = f".{step_id}"
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        try:
+            os.remove(os.path.join(lane_dir, name))
+        except OSError:
+            pass
+
+
+def write_step_failure_envelope(
+    lane_dir: str, context: dict, model_id: str, stop_reason_raw: str
+) -> dict | None:
+    """Write a minimal `failed` envelope for a step whose normal envelope
+    could not be produced, and return it -- or `None` if even this could not
+    be written.
+
+    This is the fallback each lane's `run_lane` uses when anything in a step's
+    body raises: the step is recorded `failed` (a state `resume.missing_steps`
+    never retries, so a deterministically-unwritable step cannot loop forever)
+    and the sweep goes on to the next step. Before this existed, one raising
+    step -- e.g. `write_envelope` refusing a schema-invalid envelope --
+    propagated out of `run_lane` and out of `main()`, killing the lane process
+    mid-sweep: every step after it produced no envelope at all, so a defect in
+    one step's plan silently cost the coverage of every step behind it.
+
+    Deliberately minimal: no `plan_step` is passed to `write_envelope`, and no
+    `findings`/`dispositions`/`files_*` are attached (a non-`complete`
+    envelope carries none of them anyway), so this envelope's validity depends
+    only on the four identity strings in `context` plus `model_id` -- never on
+    whatever was malformed about the step. `refusal_attempts` still carries
+    over from whatever is on disk, so a step that refused once and then hit an
+    unhandled error keeps its history.
+
+    Never raises: a failure to write the fallback is logged and reported as
+    `None`, because the caller's whole reason for calling it is to keep the
+    loop alive.
+    """
+    step_id = context.get("step_id")
+    try:
+        envelope = build_envelope(
+            context,
+            model_id,
+            terminal_state.FAILED,
+            read_refusal_attempts(status_envelope_path(lane_dir, str(step_id))),
+            stop_reason_raw=str(stop_reason_raw)[:MAX_STOP_REASON_CHARS] or terminal_state.FAILED,
+        )
+        write_envelope(lane_dir, str(step_id), envelope)
+        return envelope
+    except Exception as exc:  # noqa: BLE001 -- the fallback itself must never kill the lane
+        schema.log_event(
+            "step_failure_envelope_unwritable", step_id=step_id, error=str(exc)
+        )
+        return None

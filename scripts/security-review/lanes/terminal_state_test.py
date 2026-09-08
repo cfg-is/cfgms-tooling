@@ -51,6 +51,7 @@ def valid_finding(**overrides) -> dict:
         "commit_sha": "0541b9c8",
         "lane": "claude-sonnet5",
         "step_id": "step-007",
+        "hypothesis_id": "h1",
         "file": "pkg/example/thing.go",
         "symbol": "Thing.DoSomething",
         "vuln_class": "tenant-scoping",

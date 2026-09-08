@@ -307,12 +307,32 @@ def read_step_files(repo_root: str, files: list, step_id: str) -> dict:
     return contents
 
 
+def _render_hypotheses(hypotheses: list) -> str:
+    """Render a plan step's `hypotheses` array as an explicit, numbered list
+    naming each hypothesis's `id`/`objective`/`required_evidence` -- never
+    just the old single free-text `description` -- so the harness has every
+    hypothesis id it must address in its `dispositions` output (Issue
+    #3959). Malformed entries (not a dict, or missing a field) are rendered
+    with whatever they have rather than dropped -- the harness still needs
+    to see every declared id even if a field is missing."""
+    lines = []
+    for index, hypothesis in enumerate(hypotheses, start=1):
+        if not isinstance(hypothesis, dict):
+            continue
+        lines.append(
+            f"{index}. id: {hypothesis.get('id', '')}\n"
+            f"   objective: {hypothesis.get('objective', '')}\n"
+            f"   required_evidence: {hypothesis.get('required_evidence', '')}"
+        )
+    return "\n".join(lines)
+
+
 def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     """Assemble the full prompt handed to the `claude` harness for one step:
     the shared system prompt and output-schema description (C4, never a
-    second copy), the step's own scope/description, every readable file's
-    content, and an explicit, unambiguous instruction naming the one file
-    this harness must write its findings to."""
+    second copy), the step's own scope and hypotheses list, every readable
+    file's content, and an explicit, unambiguous instruction naming the one
+    file this harness must write its findings to."""
     scope = step.get("scope")
     if isinstance(scope, list):
         scope_text = ", ".join(scope)
@@ -321,6 +341,7 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     else:
         scope_text = ""
     description = step.get("description", "")
+    hypotheses_text = _render_hypotheses(step.get("hypotheses") or [])
     sections = [f"## {path}\n```\n{content}\n```" for path, content in file_contents.items()]
     body = "\n\n".join(sections)
     return (
@@ -330,6 +351,8 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
         f"and no other: {output_path}\n\n"
         f"Scope: {scope_text}\n"
         f"Description: {description}\n\n"
+        f"Hypotheses to investigate (address every one by id in your dispositions array):\n"
+        f"{hypotheses_text}\n\n"
         f"{body}"
     )
 
@@ -425,6 +448,76 @@ def _build_candidate(
     return enriched
 
 
+def _parse_raw_dispositions(raw_path: str) -> list:
+    """Return the `dispositions` array the harness wrote at `raw_path`
+    alongside its findings, or `[]` if the file is absent, unparseable, or
+    carries no `dispositions` list at all. Unlike `_parse_raw_findings`, a
+    missing/malformed `dispositions` is never treated as "no valid findings
+    file" -- `_build_dispositions` below is what turns an empty result here
+    into synthesized `not_attempted` entries, one per hypothesis, rather than
+    failing the whole step."""
+    try:
+        with open(raw_path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if isinstance(data, dict):
+        dispositions = data.get("dispositions")
+        if isinstance(dispositions, list):
+            return dispositions
+    return []
+
+
+def _build_dispositions(raw_path: str, hypotheses: list, step_id: str) -> list:
+    """Return exactly one disposition entry per hypothesis in `hypotheses`,
+    drawn from whatever the harness's raw output addressed, with a
+    `not_attempted` entry synthesized for any hypothesis id the raw output
+    did not address (Issue #3959's acceptance criteria: the lane -- never the
+    planner -- is the only place permitted to mark an actually-missing
+    disposition `not_attempted`).
+
+    A raw entry is used only when it independently validates via
+    `schema.validate_disposition` and its `hypothesis_id` matches a
+    hypothesis this step actually proposed -- a malformed entry (missing
+    `summary`, an out-of-enum `disposition` value) is treated exactly like a
+    missing one, never passed through to let a bundle complete on a
+    technicality.
+    """
+    raw_by_id: dict = {}
+    for raw in _parse_raw_dispositions(raw_path):
+        if not isinstance(raw, dict):
+            continue
+        hypothesis_id = raw.get("hypothesis_id")
+        if not isinstance(hypothesis_id, str) or not hypothesis_id:
+            continue
+        if not schema.validate_disposition(raw):
+            raw_by_id[hypothesis_id] = raw
+
+    result = []
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict):
+            continue
+        hypothesis_id = hypothesis.get("id")
+        if not isinstance(hypothesis_id, str) or not hypothesis_id:
+            continue
+        if hypothesis_id in raw_by_id:
+            result.append(raw_by_id[hypothesis_id])
+        else:
+            schema.log_event(
+                "disposition_missing_synthesized_not_attempted",
+                step_id=step_id,
+                hypothesis_id=hypothesis_id,
+            )
+            result.append(
+                {
+                    "hypothesis_id": hypothesis_id,
+                    "disposition": "not_attempted",
+                    "summary": "the harness's raw output did not address this hypothesis",
+                }
+            )
+    return result
+
+
 def discover_step_ids(plan_dir: str) -> list:
     if not os.path.isdir(plan_dir):
         return []
@@ -460,7 +553,10 @@ def run_lane(
     call_harness_fn=call_claude_harness,
 ) -> list:
     """Iterate every step this lane has not yet resolved and write one
-    envelope per step. Returns the list of envelopes written, mainly for
+    envelope per step. Every step's body is independently guarded (Issue
+    #3959): a step that raises is recorded `failed` and the loop moves on, so
+    one malformed step can never cost the coverage of the steps behind it.
+    Returns the list of envelopes written, mainly for
     tests -- the on-disk files are the actual contract."""
     os.makedirs(out_dir, exist_ok=True)
     step_ids = discover_step_ids(plan_dir)
@@ -475,75 +571,135 @@ def run_lane(
         sweep_id = step["sweep_id"]
         commit_sha = step["commit_sha"]
         files = step.get("files") or []
-        file_contents = read_step_files(repo_root, files, step_id)
 
-        raw_path = _raw_output_path(out_dir, step_id)
-        candidate_path = _candidate_path(out_dir, step_id)
-        for stale in (raw_path, candidate_path):
-            try:
-                os.remove(stale)
-            except OSError:
-                pass
-
-        prompt = build_prompt(step, file_contents, raw_path)
         context = {"sweep_id": sweep_id, "commit_sha": commit_sha, "lane": lane_id, "step_id": step_id}
         envelope_path = harness_runner.status_envelope_path(out_dir, step_id)
+
+        # Issue #3959: every step's body runs inside its own guard, so one
+        # step that raises costs one step. The concrete case is a plan step
+        # carrying two hypotheses with the same `id`: the dispositions built
+        # from it collide, `harness_runner.write_envelope` refuses the
+        # envelope, and before this guard existed that `ValueError` unwound
+        # out of `run_lane` and out of `main()` -- killing the lane process
+        # mid-sweep, so every step after it produced no envelope at all. The
+        # step is recorded `failed` (never retried by `resume.missing_steps`,
+        # so a deterministically-broken step cannot loop) and the sweep
+        # continues.
         try:
-            exit_code, rate_limited = call_harness_fn(model, prompt, raw_path)
-        except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
-            schema.log_event("step_launch_failed", step_id=step_id, error=str(exc))
+            file_contents = read_step_files(repo_root, files, step_id)
+            hypotheses = step.get("hypotheses") or []
+
+            # Issue #3959: a step whose combined file_contents exceeds the shared
+            # budget is split into multiple sequential execution tasks, each
+            # addressing a subset of the step's hypotheses -- see
+            # `harness_runner.split_hypotheses_for_budget`'s own docstring. The
+            # common case (within budget, or at most one hypothesis) returns a
+            # single task unchanged, so every existing single-call step below
+            # behaves exactly as before the split existed.
+            tasks = harness_runner.split_hypotheses_for_budget(
+                hypotheses, file_contents, harness_runner.MAX_BUNDLE_BYTES
+            )
+            multi_task = len(tasks) > 1
+
+            task_findings: list = []
+            task_dispositions: list = []
+            task_states: list = []
+            stop_reason_raw = None
+            launch_exc = None
+
+            for task_index, task_hypotheses in enumerate(tasks):
+                task_step = dict(step, hypotheses=task_hypotheses)
+                raw_id = f"{step_id}.task{task_index}" if multi_task else step_id
+                raw_path = _raw_output_path(out_dir, raw_id)
+                candidate_path = _candidate_path(out_dir, raw_id)
+                for stale in (raw_path, candidate_path):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+
+                prompt = build_prompt(task_step, file_contents, raw_path)
+                try:
+                    exit_code, rate_limited = call_harness_fn(model, prompt, raw_path)
+                except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
+                    launch_exc = exc
+                    break
+
+                enriched = _build_candidate(raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id)
+                findings_path = candidate_path if enriched is not None else None
+                task_state = terminal_state.classify(exit_code, findings_path, rate_limited=rate_limited)
+                task_states.append(task_state)
+
+                if task_state == terminal_state.COMPLETE:
+                    task_findings.extend(enriched or [])
+                    task_dispositions.extend(_build_dispositions(raw_path, task_hypotheses, step_id))
+                elif task_state == terminal_state.PARKED:
+                    stop_reason_raw = stop_reason_raw or "rate_limited"
+                elif task_state == terminal_state.REFUSED:
+                    stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
+                elif task_state == terminal_state.FAILED and exit_code != 0:
+                    stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
+                else:
+                    stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
+
+                for stale in (raw_path, candidate_path):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+
+            if launch_exc is not None:
+                schema.log_event("step_launch_failed", step_id=step_id, error=str(launch_exc))
+                envelope = harness_runner.apply_refusal_policy(
+                    terminal_state.FAILED,
+                    envelope_path,
+                    context,
+                    model,
+                    stop_reason_raw=f"launch_exception:{launch_exc}",
+                    files_intended=files,
+                    files_read=list(file_contents.keys()),
+                )
+                harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)
+                written.append(envelope)
+                continue
+
+            if task_states and all(s == terminal_state.COMPLETE for s in task_states):
+                state = terminal_state.COMPLETE
+            elif terminal_state.PARKED in task_states:
+                state = terminal_state.PARKED
+            elif terminal_state.REFUSED in task_states:
+                state = terminal_state.REFUSED
+            else:
+                state = terminal_state.FAILED
+
             envelope = harness_runner.apply_refusal_policy(
-                terminal_state.FAILED,
+                state,
                 envelope_path,
                 context,
                 model,
-                stop_reason_raw=f"launch_exception:{exc}",
+                stop_reason_raw=stop_reason_raw if state != terminal_state.COMPLETE else None,
+                findings=task_findings if state == terminal_state.COMPLETE else None,
                 files_intended=files,
                 files_read=list(file_contents.keys()),
+                dispositions=task_dispositions if state == terminal_state.COMPLETE else None,
             )
-            harness_runner.write_envelope(out_dir, step_id, envelope)
+            harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)
+            schema.log_event(
+                "step_written",
+                step_id=step_id,
+                state=envelope["state"],
+                stop_reason_raw=envelope.get("stop_reason_raw"),
+            )
             written.append(envelope)
+        except Exception as exc:  # noqa: BLE001 -- one bad step is a failed step, never a crashed lane
+            schema.log_event("step_unhandled_error", step_id=step_id, error=str(exc))
+            harness_runner.remove_step_temp_artifacts(out_dir, step_id)
+            envelope = harness_runner.write_step_failure_envelope(
+                out_dir, context, model, f"unhandled_step_error:{exc}"
+            )
+            if envelope is not None:
+                written.append(envelope)
             continue
-
-        enriched = _build_candidate(raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id)
-        findings_path = candidate_path if enriched is not None else None
-        state = terminal_state.classify(exit_code, findings_path, rate_limited=rate_limited)
-
-        if state == terminal_state.PARKED:
-            stop_reason_raw = "rate_limited"
-        elif state == terminal_state.REFUSED:
-            stop_reason_raw = "no_valid_findings_file"
-        elif state == terminal_state.FAILED and exit_code != 0:
-            stop_reason_raw = f"harness_exit_{exit_code}"
-        elif state == terminal_state.FAILED:
-            stop_reason_raw = "invalid_findings_schema"
-        else:
-            stop_reason_raw = None
-
-        envelope = harness_runner.apply_refusal_policy(
-            state,
-            envelope_path,
-            context,
-            model,
-            stop_reason_raw=stop_reason_raw,
-            findings=enriched if state == terminal_state.COMPLETE else None,
-            files_intended=files,
-            files_read=list(file_contents.keys()),
-        )
-        harness_runner.write_envelope(out_dir, step_id, envelope)
-        schema.log_event(
-            "step_written",
-            step_id=step_id,
-            state=envelope["state"],
-            stop_reason_raw=envelope.get("stop_reason_raw"),
-        )
-        written.append(envelope)
-
-        for stale in (raw_path, candidate_path):
-            try:
-                os.remove(stale)
-            except OSError:
-                pass
 
     return written
 

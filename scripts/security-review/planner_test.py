@@ -35,6 +35,7 @@ import basedir  # noqa: E402
 import metadata  # noqa: E402
 import planner  # noqa: E402
 import roster  # noqa: E402
+import schema  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -1351,6 +1352,70 @@ def test_merge_steps_by_scope_keeps_two_distinct_hypotheses_from_one_planner_sha
             == {"tenant scoping on the read path", "input validation on the write path"},
             "merge_steps_by_scope: two distinct same-planner hypotheses sharing an id are both kept",
             str(merged[0]["hypotheses"]),
+        )
+        # ...but kept under DISTINCT ids. Two hypotheses sharing an id inside
+        # one merged step make every finder lane emit two dispositions with
+        # the same hypothesis_id, which schema.validate_step_envelope rejects
+        # and harness_runner.write_envelope raises on -- that ValueError used
+        # to kill the entire lane process mid-sweep.
+        ids = [h["id"] for h in merged[0]["hypotheses"]]
+        check(
+            ids == ["h1", "h1#2"],
+            "merge_steps_by_scope: the reused id is suffixed so the merged step's ids stay unique",
+            str(merged[0]["hypotheses"]),
+        )
+        original_ids = {h["original_id"] for h in merged[0]["hypotheses"]}
+        check(
+            original_ids == {"h1"},
+            "merge_steps_by_scope: the planner-issued id is still preserved under original_id",
+            str(merged[0]["hypotheses"]),
+        )
+        check(
+            schema.validate_plan_step(merged[0]) == [],
+            "merge_steps_by_scope: the merged step passes validate_plan_step's id-uniqueness rule",
+            str(schema.validate_plan_step(merged[0])),
+        )
+        check(
+            planner.merge_steps_by_scope(merged) == merged,
+            "merge_steps_by_scope: re-merging a suffixed hypothesis list changes nothing",
+            str(planner.merge_steps_by_scope(merged)),
+        )
+
+
+def test_merge_steps_by_scope_suffix_never_collides_with_a_planner_minted_id():
+    # Pathological but reachable: a planner reuses `h1` for two distinct
+    # proposals AND separately mints the literal id the suffixing scheme
+    # would produce. The merged step's ids must still all be distinct.
+    step = valid_step(
+        "step-001",
+        scope=["pkg/example/thing.go"],
+        planners=["claude-fable-5-1"],
+        hypotheses=[
+            {"id": "h1", "objective": "obj-a", "required_evidence": "ev-a", "planner": "claude-fable-5-1"},
+            {"id": "h1", "objective": "obj-b", "required_evidence": "ev-b", "planner": "claude-fable-5-1"},
+            {"id": "h1#2", "objective": "obj-c", "required_evidence": "ev-c", "planner": "claude-fable-5-1"},
+        ],
+    )
+
+    merged = planner.merge_steps_by_scope([step])
+    check(len(merged) == 1, "merge_steps_by_scope: one merged step", str(merged))
+    if merged:
+        hypotheses = merged[0]["hypotheses"]
+        ids = [h["id"] for h in hypotheses]
+        check(
+            len(hypotheses) == 3 and len(set(ids)) == 3,
+            "merge_steps_by_scope: all three proposals survive under three distinct ids",
+            str(hypotheses),
+        )
+        check(
+            schema.validate_plan_step(merged[0]) == [],
+            "merge_steps_by_scope: the collision-resolved step passes validate_plan_step",
+            str(schema.validate_plan_step(merged[0])),
+        )
+        check(
+            planner.merge_steps_by_scope(merged) == merged,
+            "merge_steps_by_scope: collision resolution is idempotent",
+            str(planner.merge_steps_by_scope(merged)),
         )
 
 

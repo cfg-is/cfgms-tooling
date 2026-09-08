@@ -86,6 +86,7 @@ def finding(commit_sha: str, lane: str, step_id: str, **overrides) -> dict:
         "commit_sha": commit_sha,
         "lane": lane,
         "step_id": step_id,
+        "hypothesis_id": "h1",
         "file": "pkg/example/thing.go",
         "symbol": "Thing.DoSomething",
         "vuln_class": "tenant-scoping",
@@ -106,7 +107,16 @@ def complete_envelope(
     findings: list[dict],
     files_intended: list[str] | None = None,
     files_read: list[str] | None = None,
+    dispositions: list[dict] | None = None,
 ) -> dict:
+    if dispositions is None:
+        dispositions = [
+            {
+                "hypothesis_id": "h1",
+                "disposition": "candidate_found" if findings else "investigated",
+                "summary": "test fixture disposition",
+            }
+        ]
     envelope = {
         "sweep_id": "2026-09-05T0214Z-0541b9c8",
         "commit_sha": commit_sha,
@@ -115,6 +125,7 @@ def complete_envelope(
         "state": "complete",
         "model_id": "claude-opus-5",
         "findings": findings,
+        "dispositions": dispositions,
     }
     if files_intended is not None:
         envelope["files_intended"] = files_intended
@@ -918,6 +929,42 @@ def test_schema_invalid_findings_file_excluded_and_marked_failed():
         check(report["findings"] == [], "consolidate: a schema-invalid findings.json contributes no findings", str(report["findings"]))
         row = next(r for r in report["coverage"] if r["lane"] == "laneA")
         check(row["failed"] == 1, "consolidate: the schema-invalid step is counted as failed in the coverage table", str(row))
+
+
+def test_not_attempted_disposition_counts_step_as_failed_not_complete():
+    # REQUIRED TEST (Issue #3959): a schema-valid complete envelope whose
+    # dispositions array contains one not_attempted entry among otherwise
+    # candidate_found ones must be counted failed in the coverage table for
+    # that lane, never complete -- a bundle that completed silently short of
+    # its hypotheses must never read as full coverage.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        envelope = complete_envelope(
+            sha,
+            "laneA",
+            "step-001",
+            [finding(sha, "laneA", "step-001", hypothesis_id="h1")],
+            dispositions=[
+                {"hypothesis_id": "h1", "disposition": "candidate_found", "summary": "found it"},
+                {"hypothesis_id": "h2", "disposition": "not_attempted", "summary": "budget exceeded"},
+            ],
+        )
+        assert schema.validate_step_envelope(envelope) == [], "test fixture must itself be schema-valid"
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), envelope)
+
+        report = consolidate.consolidate(sweep, repo)
+        row = next(r for r in report["coverage"] if r["lane"] == "laneA")
+        check(
+            row["failed"] == 1 and row["complete"] == 0,
+            "consolidate: a step with any not_attempted disposition is counted failed, never complete",
+            str(row),
+        )
+        check(
+            report["findings"] == [],
+            "consolidate: a not_attempted step's findings do not appear in the consolidated output",
+            str(report["findings"]),
+        )
 
 
 def test_schema_invalid_findings_file_does_not_crash():

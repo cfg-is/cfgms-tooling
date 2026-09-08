@@ -637,15 +637,25 @@ def _merge_hypotheses(hypotheses: "list[dict]") -> "list[dict]":
     and required_evidence is the same hypothesis seen again (what merging an
     already-merged list produces), and is dropped; one carrying DIFFERENT
     content is a second, distinct proposal that happens to reuse an id its
-    planner is free to reuse -- `validate_hypothesis()` requires ids to be
-    unique only within the step that proposed them -- and is kept, because
-    nothing here may silently drop a proposal.
+    planner already used, and is kept, because nothing here may silently drop
+    a proposal -- but it is kept under a DISTINCT id (`<id>#2`, `<id>#3`, ...
+    in first-seen order), never under the colliding one. Two hypotheses
+    sharing an `id` inside one merged step are not merely untidy: a finder
+    lane emits exactly one disposition per hypothesis, so a duplicate id
+    produces a duplicate `hypothesis_id` that `schema.validate_step_envelope`
+    rejects, and `schema.validate_plan_step` now rejects the merged step
+    outright rather than letting it reach a lane. Suffixing is what keeps
+    "never drop a proposal" and "a step's ids are unique" both true.
 
     When two or more different planners share the same `id` string, this
     function disambiguates the merged output's `id` field by namespacing it
     with the planner (`<planner>:<id>`) -- the original planner-issued `id`
     is preserved intact under `original_id` regardless, for traceability.
-    Ids that never collide are left exactly as their planner wrote them.
+    Ids that never collide are left exactly as their planner wrote them. A
+    final pass guarantees the returned ids are distinct even in the
+    pathological case where a planner itself mints an id that collides with a
+    suffixed one (a literal `h1#2` alongside two `h1`s): the later entry gets
+    a further suffix rather than the collision surviving.
 
     An entry with no usable provenance at all is passed through untouched:
     never keyed, never namespaced, never given an `original_id` this module
@@ -655,11 +665,15 @@ def _merge_hypotheses(hypotheses: "list[dict]") -> "list[dict]":
 
     Idempotent: an entry already carrying `original_id` (from a previous
     merge) is deduplicated and re-disambiguated on that same original value,
-    so merging an already-merged list reproduces the identical result.
+    so merging an already-merged list reproduces the identical result --
+    including the `#N` suffixes, which are derived from first-seen order over
+    the preserved `original_id`, never from the possibly-suffixed `id` a
+    previous merge wrote.
     """
     seen: dict[tuple[str, str], list[dict]] = {}
     collected: list[dict] = []
     provenances: list["tuple[str, str] | None"] = []
+    ordinals: list[int] = []
     for hypothesis in hypotheses:
         if not isinstance(hypothesis, dict):
             continue
@@ -669,6 +683,7 @@ def _merge_hypotheses(hypotheses: "list[dict]") -> "list[dict]":
             merged_hypothesis.pop("original_id", None)
             collected.append(merged_hypothesis)
             provenances.append(None)
+            ordinals.append(0)
             continue
         payload = {
             key: value
@@ -682,20 +697,29 @@ def _merge_hypotheses(hypotheses: "list[dict]") -> "list[dict]":
         merged_hypothesis["original_id"] = provenance[1]
         collected.append(merged_hypothesis)
         provenances.append(provenance)
+        ordinals.append(len(already_seen))
 
     planners_by_original_id: dict[str, set] = {}
     for provenance in provenances:
         if provenance is not None:
             planners_by_original_id.setdefault(provenance[1], set()).add(provenance[0])
 
-    for hypothesis, provenance in zip(collected, provenances):
+    assigned_ids: set[str] = set()
+    for hypothesis, provenance, ordinal in zip(collected, provenances, ordinals):
         if provenance is None:
             continue
         planner_id, original_id = provenance
         if len(planners_by_original_id[original_id]) > 1:
-            hypothesis["id"] = f"{planner_id}:{original_id}"
+            base_id = f"{planner_id}:{original_id}"
         else:
-            hypothesis["id"] = original_id
+            base_id = original_id
+        candidate_id = base_id if ordinal <= 1 else f"{base_id}#{ordinal}"
+        suffix = ordinal if ordinal > 1 else 1
+        while candidate_id in assigned_ids:
+            suffix += 1
+            candidate_id = f"{base_id}#{suffix}"
+        assigned_ids.add(candidate_id)
+        hypothesis["id"] = candidate_id
 
     return collected
 

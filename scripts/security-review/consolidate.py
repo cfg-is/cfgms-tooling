@@ -29,6 +29,16 @@ check. A file that fails validation is excluded from both output files, never
 crashes the consolidator, and is counted as `failed` in the coverage table --
 exactly as visible to a human reader as a normal `failed` step.
 
+**Per-hypothesis dispositions (Issue #3959):** a schema-valid `complete`
+envelope whose `dispositions` array contains any `not_attempted` entry is
+treated exactly like a schema-invalid envelope -- excluded from findings,
+logged via `schema.log_event`, and counted `failed` in the coverage table,
+never `complete`. A bundle that completed silently short of the hypotheses
+it was handed must never read as full coverage. A duplicate `hypothesis_id`
+within `dispositions` is caught earlier, by `schema.validate_step_envelope`
+itself (structural, no plan step needed), so it already falls into the
+ordinary schema-invalid path above.
+
 **Path-traversal validation (SEC3900 A1):** a finding's `file` field is
 model-generated text. Before it is rendered anywhere, it is checked for
 membership in the real repository tree at the finding's own `commit_sha`
@@ -180,8 +190,23 @@ def load_sweep(sweep_dir: str):
                     continue
 
                 state = envelope["state"]
-                lane_step_state[lane][step_id] = state
                 if state == "complete":
+                    dispositions = envelope.get("dispositions") or []
+                    has_not_attempted = any(
+                        isinstance(d, dict) and d.get("disposition") == "not_attempted"
+                        for d in dispositions
+                    )
+                    if has_not_attempted:
+                        schema.log_event(
+                            "step_incomplete_not_attempted",
+                            lane=lane,
+                            step_id=step_id,
+                            path=findings_path,
+                        )
+                        lane_step_state[lane][step_id] = "failed"
+                        continue
+
+                    lane_step_state[lane][step_id] = state
                     for finding in envelope["findings"]:
                         findings.append((lane, step_id, finding))
                     files_intended = envelope.get("files_intended")
@@ -191,6 +216,8 @@ def load_sweep(sweep_dir: str):
                             "files_intended": files_intended,
                             "files_read": files_read,
                         }
+                else:
+                    lane_step_state[lane][step_id] = state
                 continue
 
             if os.path.isfile(status_path):

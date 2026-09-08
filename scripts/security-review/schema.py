@@ -44,13 +44,33 @@ Three shapes are validated here:
 - A **hypothesis** (`validate_hypothesis`): one structured, planner-originated
   claim a later review pass should investigate, carried in a plan step's
   `hypotheses` array (Issue #3958, epic #3950). Requires `id` (unique within
-  the step that proposed it, not globally — two different planners are
-  expected to independently mint the same `id` string, e.g. both calling
-  their first hypothesis `h1`), `objective` (what security property is being
+  the step that proposed it — enforced by `validate_plan_step`, which is the
+  only validator that sees the whole array — but not globally: two different
+  planners are expected to independently mint the same `id` string, e.g. both
+  calling their first hypothesis `h1`), `objective` (what security property is being
   investigated), `required_evidence` (what would confirm or refute it), and
   `planner` (which planner proposed it — injected from the sweep's own
   authoritative context by `planner.finalize()`/`finalize_multi_planner()`,
   never trusted from the model, exactly like a step's own `planners` field).
+
+- A **disposition** (`validate_disposition`): the record a finder lane writes
+  per hypothesis it was handed, carried in a `complete` step envelope's
+  `dispositions` array (Issue #3959, epic #3950). Requires `hypothesis_id`
+  (matching the `id` of the hypothesis this disposition resolves),
+  `disposition` (one of `investigated`/`candidate_found`/`inconclusive`/
+  `not_attempted`), and `summary` (what the lane found, or why it could not
+  investigate). A `complete` envelope must carry exactly one disposition per
+  hypothesis in the step it resolves — never zero, never two sharing a
+  `hypothesis_id` — so a bundle can never complete silently short of the
+  hypotheses it was asked to address. `not_attempted` is a legitimate value
+  structurally (a lane genuinely could not get to a hypothesis, e.g. a
+  budget-driven split — see `harness_runner.py`), but `consolidate.py` treats
+  any envelope containing one as an incomplete step, never `complete`, for
+  coverage purposes — that policy line lives in `consolidate.py`, not here,
+  since this module only validates shape. A `candidate_found` finding
+  references the hypothesis it resulted from via `hypothesis_id`, now a
+  `REQUIRED_FINDING_FIELDS` entry on every finding, not only ones carrying a
+  `candidate_found` disposition.
 
 Also provides `safe_log_event`/`log_event`: this module and its siblings
 (resume.py, basedir.py) log diagnostic text that can carry model-generated or
@@ -70,6 +90,7 @@ REQUIRED_FINDING_FIELDS = (
     "commit_sha",
     "lane",
     "step_id",
+    "hypothesis_id",
     "file",
     "symbol",
     "vuln_class",
@@ -111,6 +132,16 @@ REQUIRED_HYPOTHESIS_FIELDS = (
     "planner",
 )
 
+REQUIRED_DISPOSITION_FIELDS = (
+    "hypothesis_id",
+    "disposition",
+    "summary",
+)
+
+DISPOSITION_VALUES = frozenset(
+    {"investigated", "candidate_found", "inconclusive", "not_attempted"}
+)
+
 
 def validate_finding(finding: object) -> list[str]:
     """Return a list of validation errors; empty list means valid.
@@ -142,10 +173,18 @@ def validate_finding(finding: object) -> list[str]:
     return errors
 
 
-def validate_step_envelope(envelope: object) -> list[str]:
+def validate_step_envelope(envelope: object, plan_step: object = None) -> list[str]:
     """Return a list of validation errors; empty list means valid.
 
     Never raises on malformed input -- a caller checks `errors == []`.
+
+    `plan_step`, if given, is the frozen plan step this envelope resolves --
+    when it carries a `hypotheses` list, every hypothesis `id` in it must
+    have a matching entry in the envelope's `dispositions` array on a
+    `complete` envelope, or an error is raised naming the missing id. This is
+    an optional, additive check: every existing caller that validates shape
+    alone (never having seen the originating plan step) keeps working
+    unchanged by passing nothing.
     """
     if not isinstance(envelope, dict):
         return ["step envelope must be a JSON object"]
@@ -177,6 +216,43 @@ def validate_step_envelope(envelope: object) -> list[str]:
                 for finding_error in validate_finding(finding):
                     errors.append(f"findings[{index}]: {finding_error}")
 
+        dispositions = envelope.get("dispositions")
+        if not isinstance(dispositions, list):
+            errors.append(
+                "dispositions must be a list (one entry per hypothesis) when state is "
+                f"complete, got {dispositions!r}"
+            )
+        else:
+            seen_hypothesis_ids: set = set()
+            for index, disposition in enumerate(dispositions):
+                for disposition_error in validate_disposition(disposition):
+                    errors.append(f"dispositions[{index}]: {disposition_error}")
+                if isinstance(disposition, dict):
+                    hypothesis_id = disposition.get("hypothesis_id")
+                    if isinstance(hypothesis_id, str) and hypothesis_id:
+                        if hypothesis_id in seen_hypothesis_ids:
+                            errors.append(
+                                f"dispositions[{index}]: duplicate hypothesis_id {hypothesis_id!r}"
+                            )
+                        else:
+                            seen_hypothesis_ids.add(hypothesis_id)
+
+            if isinstance(plan_step, dict):
+                plan_hypotheses = plan_step.get("hypotheses")
+                if isinstance(plan_hypotheses, list):
+                    for hypothesis in plan_hypotheses:
+                        if not isinstance(hypothesis, dict):
+                            continue
+                        hypothesis_id = hypothesis.get("id")
+                        if (
+                            isinstance(hypothesis_id, str)
+                            and hypothesis_id
+                            and hypothesis_id not in seen_hypothesis_ids
+                        ):
+                            errors.append(
+                                f"dispositions: missing entry for hypothesis_id {hypothesis_id!r}"
+                            )
+
         for field in ("files_intended", "files_read"):
             if field not in envelope:
                 continue
@@ -207,10 +283,12 @@ def validate_hypothesis(hypothesis: object) -> list[str]:
 
     All four required fields (`id`, `objective`, `required_evidence`,
     `planner`) must be non-empty strings. `id` is unique only within the
-    step that proposed the hypothesis, not globally -- this function does
-    not, and cannot, check cross-step or cross-planner uniqueness; that is
-    `planner.merge_steps_by_scope()`'s job when two planners' proposals for
-    the same scope are unioned.
+    step that proposed the hypothesis, not globally -- this function
+    validates one hypothesis in isolation and so checks no uniqueness at all:
+    within-step uniqueness is `validate_plan_step()`'s job (it is the only
+    caller that sees the whole array), and cross-planner disambiguation is
+    `planner.merge_steps_by_scope()`'s when two planners' proposals for the
+    same scope are unioned.
     """
     if not isinstance(hypothesis, dict):
         return ["hypothesis must be a JSON object"]
@@ -222,6 +300,41 @@ def validate_hypothesis(hypothesis: object) -> list[str]:
             continue
         value = hypothesis[field]
         if not isinstance(value, str) or value == "":
+            errors.append(f"field {field} must be a non-empty string, got {value!r}")
+
+    return errors
+
+
+def validate_disposition(disposition: object) -> list[str]:
+    """Return a list of validation errors; empty list means valid.
+
+    Never raises on malformed input -- a caller checks `errors == []`, same
+    shape as `validate_finding`/`validate_hypothesis`/`validate_step_envelope`.
+
+    All three required fields (`hypothesis_id`, `disposition`, `summary`)
+    must be non-empty strings, and `disposition` must additionally be one of
+    `DISPOSITION_VALUES`. This function validates one disposition entry in
+    isolation -- it does not, and cannot, check for a duplicate
+    `hypothesis_id` across a `dispositions` array, or for missing coverage of
+    a plan step's hypotheses; both are `validate_step_envelope`'s job, since
+    both require seeing the whole array (and, for the coverage check, the
+    originating plan step).
+    """
+    if not isinstance(disposition, dict):
+        return ["disposition must be a JSON object"]
+
+    errors: list[str] = []
+    for field in REQUIRED_DISPOSITION_FIELDS:
+        if field not in disposition:
+            errors.append(f"missing required field: {field}")
+            continue
+        value = disposition[field]
+        if field == "disposition":
+            if value not in DISPOSITION_VALUES:
+                errors.append(
+                    f"disposition must be one of {sorted(DISPOSITION_VALUES)}, got {value!r}"
+                )
+        elif not isinstance(value, str) or value == "":
             errors.append(f"field {field} must be a non-empty string, got {value!r}")
 
     return errors
@@ -239,9 +352,16 @@ def validate_plan_step(step: object) -> list[str]:
     legitimately name zero concrete files while still describing a scope).
     `planners` must be a non-empty list of non-empty strings: a step always
     has at least one planner that proposed it. `hypotheses` must be a
-    non-empty list, each entry validated via `validate_hypothesis` -- a plan
+    non-empty list, each entry validated via `validate_hypothesis`, with every
+    entry's `id` distinct within the step -- a plan
     step's defining content since Issue #3958 is what it proposes to
-    investigate, not a single free-text sentence. `description`, if present,
+    investigate, not a single free-text sentence. Within-step `id` uniqueness
+    is enforced here, at the contract boundary, because it is not a cosmetic
+    property: a finder lane emits exactly one disposition per hypothesis it is
+    handed, so two hypotheses sharing an `id` produce two dispositions sharing
+    a `hypothesis_id`, which `validate_step_envelope` rejects -- a step that
+    cannot produce a writable envelope is malformed, and the only place that
+    can be caught before a lane runs it is here. `description`, if present,
     is not validated: it is optional, backward-readable human context only,
     never load-bearing for anything downstream.
 
@@ -288,9 +408,21 @@ def validate_plan_step(step: object) -> list[str]:
                     f"field hypotheses must be a non-empty list, got {value!r}"
                 )
             else:
+                seen_ids: set = set()
                 for index, hypothesis in enumerate(value):
                     for hyp_error in validate_hypothesis(hypothesis):
                         errors.append(f"hypotheses[{index}]: {hyp_error}")
+                    if not isinstance(hypothesis, dict):
+                        continue
+                    hypothesis_id = hypothesis.get("id")
+                    if not (isinstance(hypothesis_id, str) and hypothesis_id):
+                        continue
+                    if hypothesis_id in seen_ids:
+                        errors.append(
+                            f"hypotheses[{index}]: duplicate hypothesis id {hypothesis_id!r}"
+                        )
+                    else:
+                        seen_ids.add(hypothesis_id)
 
     return errors
 

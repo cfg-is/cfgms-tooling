@@ -41,6 +41,7 @@ def complete_envelope(step_id: str, **overrides) -> dict:
         "state": "complete",
         "model_id": "claude-opus-5",
         "findings": [],
+        "dispositions": [],
     }
     envelope.update(overrides)
     return envelope
