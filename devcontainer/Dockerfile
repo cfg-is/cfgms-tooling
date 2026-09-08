@@ -55,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     dnsutils \
     dnsmasq \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js — major version tracks web/.nvmrc, the same file frontend-ci.yml reads
@@ -183,13 +184,56 @@ RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 ARG OPENCODE_CLI_VERSION=1.18.29
 RUN npm install -g "opencode-ai@${OPENCODE_CLI_VERSION}"
 
+# Ollama CLI — pinned, never @latest (same supply-chain rule as Claude Code,
+# Codex and OpenCode above). This pin is intentionally NOT tracked by
+# dependency-pin-check.yml -- that workflow's freshness checks are
+# hand-written per tool and adding one is out of scope for the story that
+# introduced this pin (Issue #3976). This is the fourth subscription agent
+# harness the security review harness dispatches (Issue #3976, epic
+# #3975) — `ollama_lane.py` invokes this binary as a subprocess,
+# authenticated by the operator's own `~/.ollama/id_ed25519` `ollama
+# signin` session keypair (`agent-dispatch.sh launch-investigator --harness
+# ollama`), never an API key.
+#
+# Unlike the three npm-installed harnesses above, there is no client-only
+# release asset: the Linux release tarballs (`ollama-linux-<arch>.tar.zst`)
+# bundle the CLI/daemon binary (`bin/ollama`, ~38MB) together with a GPU
+# runner directory (CUDA/ggml inference libraries, ~4.5GB) in one archive.
+# This story is Cloud-only (see the issue's "Out of Scope: Local
+# (non-`:cloud`) Ollama models") and needs only the CLI/daemon binary, so
+# this step downloads the full archive, verifies its SHA-256 against a
+# pinned value (the checksum source is `sha256sum.txt`, the direct analogue
+# of Trivy's `trivy_<ver>_checksums.txt` above), and extracts ONLY
+# `bin/ollama` — the GPU runner directory is never extracted, never
+# copied, never referenced. Everything happens in one RUN so the ~1.4GB
+# archive never becomes its own image layer; the final image gains only the
+# ~38MB client binary.
+#
+# Per-architecture checksums from the `sha256sum.txt` release asset at
+# https://github.com/ollama/ollama/releases/download/v<ver>/sha256sum.txt
+ARG OLLAMA_CLI_VERSION=0.33.3
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) OLLAMA_ARCH='amd64'; OLLAMA_SHA256='c13cea8f3389db4145f8a6cb88d1747242a48639d7c13e3bda7c1ebdc6eebb2f' ;; \
+      arm64) OLLAMA_ARCH='arm64'; OLLAMA_SHA256='4425a112af999ae6572c1ce211fbabeaca7bab23ed5860972acdfc0cc2358420' ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ARCHIVE="ollama-linux-${OLLAMA_ARCH}.tar.zst"; \
+    curl -sSfL -o "/tmp/${ARCHIVE}" \
+      "https://github.com/ollama/ollama/releases/download/v${OLLAMA_CLI_VERSION}/${ARCHIVE}"; \
+    printf '%s  /tmp/%s\n' "${OLLAMA_SHA256}" "${ARCHIVE}" | sha256sum -c -; \
+    zstd -dc "/tmp/${ARCHIVE}" | tar -xf - -C /tmp bin/ollama; \
+    install -m 0755 /tmp/bin/ollama /usr/local/bin/ollama; \
+    rm -rf "/tmp/${ARCHIVE}" /tmp/bin
+
 # Non-root agent user with sudo for iptables only
 RUN useradd -m -s /bin/bash agent \
     && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
     && mkdir -p /persist && chown agent:agent /persist \
     && mkdir -p /home/agent/.cache/go-build /home/agent/go/pkg/mod \
     && chown -R agent:agent /home/agent/.cache /home/agent/go \
-    && mkdir -p /home/agent/.claude && chown agent:agent /home/agent/.claude
+    && mkdir -p /home/agent/.claude && chown agent:agent /home/agent/.claude \
+    && mkdir -p /home/agent/.ollama && chown agent:agent /home/agent/.ollama
 
 # Pre-download Trivy vulnerability DB (avoids runtime download behind firewall)
 RUN trivy fs --download-db-only --cache-dir /home/agent/.cache/trivy 2>/dev/null || true

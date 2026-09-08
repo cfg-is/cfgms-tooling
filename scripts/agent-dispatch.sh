@@ -2996,6 +2996,39 @@ PROMPT_EOF
           fi
           inv_harness_creds_mount=(-v "${HOME}/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro")
           ;;
+        ollama)
+          # Ollama's own session credential (Issue #3976): the `ollama
+          # signin` keypair, `~/.ollama/id_ed25519{,.pub}` -- confirmed
+          # against the installed CLI (`ollama signin`, host verification
+          # while writing this story: `~/.ollama/config.json` holds no
+          # token; the local daemon signs Cloud requests with this keypair
+          # instead). Same existence-gated fail-closed shape as codex and
+          # opencode above: a host that has never run `ollama signin` fails
+          # the launch closed with credential_unavailable, which
+          # security-review.sh's _is_intentional_dispatch_skip already
+          # recognizes.
+          #
+          # The two key files are mounted individually, never the
+          # ~/.ollama directory itself: `ollama serve` (started by
+          # investigator-entrypoint.sh once inside the container) writes
+          # other daemon state (models dir, config.json, history) into that
+          # same directory, and a directory bind mount from the host would
+          # either leak that host-side state into the container or make the
+          # daemon try to write through a read-only host mount.
+          # Both files are gated here, not just the private key: `docker run
+          # -v` creates a missing host path as an empty directory rather than
+          # failing, so an absent id_ed25519.pub alone would silently mount a
+          # directory at the path the daemon expects a file, rather than
+          # failing closed the same way a missing private key does.
+          if [[ ! -f "${HOME}/.ollama/id_ed25519" || ! -f "${HOME}/.ollama/id_ed25519.pub" ]]; then
+            echo "LAUNCH_FAILED:${container_name}:credential_unavailable:no ollama session found at ${HOME}/.ollama/id_ed25519{,.pub} -- run 'ollama signin' on the host"
+            exit 1
+          fi
+          inv_harness_creds_mount=(
+            -v "${HOME}/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+            -v "${HOME}/.ollama/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro"
+          )
+          ;;
       esac
       inv_harness_env=(
         -e "CFGMS_SECURITY_REVIEW_HARNESS=${inv_harness}"

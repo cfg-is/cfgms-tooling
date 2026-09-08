@@ -76,14 +76,45 @@ def test_rejects_missing_separator() -> None:
         check(True, "rejects entry missing ':' separator")
 
 
-def test_rejects_extra_separator() -> None:
-    # A colon inside the model half would otherwise silently truncate the
-    # model to its first segment -- this must fail loudly instead.
+def test_accepts_one_extra_colon_in_model_tag() -> None:
+    # Ollama model ids carry a mandatory tag (`glm-5.3-flash:cloud`) -- the
+    # harness:model split is on the FIRST colon only, so a single extra
+    # colon in the model half is a legitimate tagged model id, not a typo.
+    lanes = roster.parse_roster("ollama:glm-5.3-flash:cloud")
+    check(len(lanes) == 1, "tagged model: exactly one lane", repr(lanes))
+    check(lanes[0].harness == "ollama", "tagged model: harness parsed", repr(lanes))
+    check(
+        lanes[0].model == "glm-5.3-flash:cloud",
+        "tagged model: model keeps its tag intact",
+        repr(lanes),
+    )
+    check(
+        lanes[0].lane_dir_name == "ollama-glm-5.3-flash-cloud",
+        "tagged model: lane_dir_name sanitizes ':' to '-'",
+        repr(lanes),
+    )
+
+
+def test_rejects_two_extra_colons_in_model() -> None:
+    # The relaxation that allows one tag colon is bounded, not removed: two
+    # extra colons is still rejected rather than silently truncated or
+    # accepted as some longer model id.
     try:
-        roster.parse_roster("claude:sonnet:5")
-        check(False, "rejects entry with more than one ':' separator", "did not raise")
+        roster.parse_roster("claude:sonnet:5:extra")
+        check(False, "rejects entry with two extra ':' in the model half", "did not raise")
     except roster.RosterError:
-        check(True, "rejects entry with more than one ':' separator")
+        check(True, "rejects entry with two extra ':' in the model half")
+
+
+def test_rejects_duplicate_lane_dir_name() -> None:
+    # Two entries whose harness:model pairs sanitize to the same
+    # lane_dir_name would silently overwrite each other's findings on disk.
+    for bad in ("ollama:foo:bar,ollama:foo-bar", "claude:sonnet-5,claude:sonnet-5"):
+        try:
+            roster.parse_roster(bad)
+            check(False, f"rejects duplicate lane_dir_name {bad!r}", "did not raise")
+        except roster.RosterError:
+            check(True, f"rejects duplicate lane_dir_name {bad!r}")
 
 
 def test_rejects_empty_harness_or_model() -> None:

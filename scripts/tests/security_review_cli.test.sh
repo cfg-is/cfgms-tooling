@@ -66,8 +66,9 @@ SECURITY_REVIEW_DIR="${REPO_ROOT}/.claude/scripts/security-review"
 CLAUDE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/claude_lane.py"
 CODEX_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/codex_lane.py"
 OPENCODE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/opencode_lane.py"
+OLLAMA_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/ollama_lane.py"
 
-for f in "$CLI" "$DISPATCH" "$CLAUDE_LANE_SCRIPT" "$CODEX_LANE_SCRIPT" "$OPENCODE_LANE_SCRIPT"; do
+for f in "$CLI" "$DISPATCH" "$CLAUDE_LANE_SCRIPT" "$CODEX_LANE_SCRIPT" "$OPENCODE_LANE_SCRIPT" "$OLLAMA_LANE_SCRIPT"; do
   [[ -f "$f" ]] || { printf 'FAIL: expected file not found: %s\n' "$f" >&2; exit 1; }
 done
 [[ -x "$CLI" ]] || { printf 'FAIL: %s is not executable\n' "$CLI" >&2; exit 1; }
@@ -1026,6 +1027,90 @@ check_not_contains "security-review.sh needed no opencode-specific source change
 report_twomodel="$(cat "${SWEEP_DIR_TWOMODEL}/report/consolidated.md" 2>/dev/null || true)"
 check_contains "consolidated report picked up the opencode-model-qwen lane" "$report_twomodel" "opencode-model-qwen"
 check_contains "consolidated report picked up the opencode-model-glm lane" "$report_twomodel" "opencode-model-glm"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TEST (Issue #3976) -- the fourth harness lane, `ollama`. Unlike
+# `claude`/`codex`/`opencode`, `ollama run <model>` has no tool loop and no
+# argv-named/env-named output file: `ollama_lane.py::call_ollama_harness`
+# pipes the prompt on STDIN and reads the findings JSON back from STDOUT.
+# The stub binary below matches that exact contract -- it never reads
+# CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE or an --output-last-message argv
+# value, only stdin/stdout -- proving `dispatch_roster_lanes` needed no
+# per-harness change to add this fourth harness either (same structural
+# check the codex/opencode blocks above already established).
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "== REQUIRED TEST — CFGMS_SECURITY_REVIEW_LANES=claude:<model>,ollama:<model>:cloud"
+echo "   drives the full launch path against a stub ollama harness binary and"
+echo "   produces the ollama lane's own row in the coverage table (Issue #3976) =="
+SUB_OLLAMA="${SANDBOX}/case-ollama"
+setup_sub_sandbox "$SUB_OLLAMA"
+mkdir -p "${SUB_OLLAMA}/HOME/.ollama"
+echo 'fake-ed25519-private-key' > "${SUB_OLLAMA}/HOME/.ollama/id_ed25519"
+echo 'fake-ed25519-public-key' > "${SUB_OLLAMA}/HOME/.ollama/id_ed25519.pub"
+
+OLLAMA_ENTRYPOINT_DIR="${SANDBOX}/ollama-lane-entrypoints"
+mkdir -p "$OLLAMA_ENTRYPOINT_DIR"
+cp "$CLAUDE_LANE_SCRIPT" "${OLLAMA_ENTRYPOINT_DIR}/claude_lane.py"
+cp "$OLLAMA_LANE_SCRIPT" "${OLLAMA_ENTRYPOINT_DIR}/ollama_lane.py"
+
+# Stub `ollama` binary (Issue #3976): reads the prompt on stdin (discarded --
+# this stub's answer does not depend on it) and prints the findings JSON
+# object to stdout, exactly the contract `call_ollama_harness` expects back.
+OLLAMA_BIN_DIR="${SANDBOX}/ollama-harness-bins"
+mkdir -p "$OLLAMA_BIN_DIR"
+cp "${STUB_CLAUDE_BIN_DIR}/claude" "${OLLAMA_BIN_DIR}/claude"
+cat > "${OLLAMA_BIN_DIR}/ollama" <<'OLLAMA_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+outcome="${STUB_OLLAMA_OUTCOME:-complete}"
+case "$outcome" in
+  complete)
+    printf 'Sure, here is my review:\n\n{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}\n\nLet me know if you need more detail.'
+    exit 0
+    ;;
+  unauthenticated)
+    printf 'You need to be signed in to Ollama to run Cloud models.'
+    exit 0
+    ;;
+  *)
+    echo "stub ollama: unrecognized STUB_OLLAMA_OUTCOME=${outcome}" >&2
+    exit 1
+    ;;
+esac
+OLLAMA_STUB
+chmod +x "${OLLAMA_BIN_DIR}/claude" "${OLLAMA_BIN_DIR}/ollama"
+
+ollama_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x,ollama:model-y:cloud" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$OLLAMA_ENTRYPOINT_DIR" \
+  STUB_CLAUDE_BIN_DIR="$OLLAMA_BIN_DIR" \
+  STUB_PLAN_STEP_COUNT=2 \
+  run_cli "$SUB_OLLAMA" launch HEAD 2>"${SUB_OLLAMA}/stderr.log")
+ollama_rc=$?
+check_eq "ollama roster launch exits 0" "$ollama_rc" "0"
+SWEEP_DIR_OLLAMA="$(dirname "$(dirname "$ollama_out")")"
+
+for step in step-001 step-002; do
+  [[ -f "${SWEEP_DIR_OLLAMA}/lanes/claude-model-x/${step}.findings.json" ]] \
+    && ok "claude-model-x lane produced ${step} findings" \
+    || bad "claude-model-x lane produced ${step} findings" "not found"
+  [[ -f "${SWEEP_DIR_OLLAMA}/lanes/ollama-model-y-cloud/${step}.findings.json" ]] \
+    && ok "ollama-model-y-cloud lane produced ${step} findings (real ollama_lane.py run, stdin/stdout stub)" \
+    || bad "ollama-model-y-cloud lane produced ${step} findings (real ollama_lane.py run, stdin/stdout stub)" "not found"
+done
+
+ollama_call_log="$(cat "${SUB_OLLAMA}/docker_calls.log")"
+ollama_lane_call="$(grep ' ollama-model-y-cloud$' "${SUB_OLLAMA}/docker_calls.log" || true)"
+check_contains "ollama lane dispatched via launch-investigator --harness ollama" "$ollama_lane_call" "CFGMS_SECURITY_REVIEW_HARNESS=ollama"
+check_contains "ollama lane's container carries CFGMS_SECURITY_REVIEW_MODEL=model-y:cloud" "$ollama_lane_call" "CFGMS_SECURITY_REVIEW_MODEL=model-y:cloud"
+check_contains "ollama lane mounted ~/.ollama/id_ed25519 read-only, never the Claude credential" "$ollama_lane_call" "${SUB_OLLAMA}/HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+check_not_contains "security-review.sh needed no ollama-specific source change to dispatch this roster" "$cli_src" "ollama"
+
+report_ollama="$(cat "${SWEEP_DIR_OLLAMA}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "consolidated report picked up the claude lane alongside ollama" "$report_ollama" "claude-model-x"
+check_contains "consolidated report picked up the ollama lane's own coverage row" "$report_ollama" "ollama-model-y-cloud"
 
 echo ""
 echo "== REQUIRED TEST — roster.py rejects a malformed CFGMS_SECURITY_REVIEW_LANES"

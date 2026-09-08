@@ -88,6 +88,7 @@ assert_eq() {
 [[ -f "${FRAGMENT_DIR}/claude.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/claude.conf" >&2; exit 1; }
 [[ -f "${FRAGMENT_DIR}/codex.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/codex.conf" >&2; exit 1; }
 [[ -f "${FRAGMENT_DIR}/opencode.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/opencode.conf" >&2; exit 1; }
+[[ -f "${FRAGMENT_DIR}/ollama.conf" ]] || { echo "FAIL: expected file not found: ${FRAGMENT_DIR}/ollama.conf" >&2; exit 1; }
 [[ ! -f "${FRAGMENT_DIR}/legacy.conf" ]] || { echo "FAIL: legacy.conf should have been retired (Issue #3933): ${FRAGMENT_DIR}/legacy.conf still exists" >&2; exit 1; }
 
 echo "=== init-firewall.sh: per-harness egress fragment selection (Issue #3932) ==="
@@ -98,6 +99,8 @@ base_src="$(cat "$BASE_CONF")"
 assert_not_contains "$base_src" "openai.com" "base conf carries no openai.com entry (Codex's domains live only in codex.conf)"
 assert_not_contains "$base_src" "chatgpt.com" "base conf carries no chatgpt.com entry (Codex's domains live only in codex.conf)"
 assert_not_contains "$base_src" "opencode.ai" "base conf carries no opencode.ai entry (OpenCode's domain lives only in opencode.conf)"
+assert_not_contains "$base_src" "ollama.com" "base conf carries no ollama.com entry (Ollama's domains live only in ollama.conf)"
+assert_not_contains "$base_src" "registry.ollama.ai" "base conf carries no registry.ollama.ai entry (Ollama's domains live only in ollama.conf)"
 
 # ----------------------------------------------------------------------------
 # Strategy 1: stubbed sudo/iptables/dnsmasq/etc — real init-firewall.sh logic
@@ -202,6 +205,23 @@ assert_not_contains "$call_line" "claude.conf" "--harness opencode launch does n
 assert_not_contains "$call_line" "codex.conf" "--harness opencode launch does not also load the codex fragment"
 frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_line" | wc -l)
 assert_eq "$frag_count" "1" "--harness opencode launch loads at most one fragment"
+
+echo ""
+echo "--- --harness ollama (CFGMS_SECURITY_REVIEW_HARNESS=ollama): loads base + ollama.conf ---"
+: > "$CALL_LOG"
+set +e
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=ollama CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "--harness ollama launch exits 0"
+call_line="$(cat "$CALL_LOG")"
+assert_contains "$call_line" "--conf-file=${BASE_CONF}" "--harness ollama launch loads the base conf"
+assert_contains "$call_line" "--conf-file=${FRAGMENT_DIR}/ollama.conf" "--harness ollama launch loads the ollama fragment"
+assert_not_contains "$call_line" "claude.conf" "--harness ollama launch does not also load the claude fragment"
+assert_not_contains "$call_line" "codex.conf" "--harness ollama launch does not also load the codex fragment"
+assert_not_contains "$call_line" "opencode.conf" "--harness ollama launch does not also load the opencode fragment"
+frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_line" | wc -l)
+assert_eq "$frag_count" "1" "--harness ollama launch loads at most one fragment"
 
 echo ""
 echo "--- REQUIRED TEST: an unrecognized harness value fails to start ---"
@@ -472,6 +492,89 @@ assert_blocked_dns3 "api.openai.com" "base+opencode: api.openai.com is NOT reach
 assert_blocked_dns3 "ollama.com" "base+opencode: ollama.com is NOT reachable (Issue #3933)"
 assert_blocked_dns3 "openrouter.ai" "base+opencode: openrouter.ai is NOT reachable (a third-party-API-key provider OpenCode can proxy to, never this harness's own account flow)"
 assert_blocked_dns3 "example.com" "base+opencode: domain absent from allowlist still blocked"
+
+kill "$DNSMASQ_PID" 2>/dev/null || true
+wait "$DNSMASQ_PID" 2>/dev/null || true
+DNSMASQ_PID=""
+
+echo ""
+echo "--- REQUIRED TEST: a --harness ollama launch resolves exactly the Ollama"
+echo "    Cloud domains (ollama.com + registry.ollama.ai) and does NOT resolve"
+echo "    anthropic.com/claude.ai/claude.com or any other harness's fragment"
+echo "    domains (Issue #3976) -- the same single-image-safety proof the Codex"
+echo "    and OpenCode blocks above establish, extended to a fourth harness ---"
+PORT4=15357
+LOG_FILE4="$(mktemp -t init-firewall-test-ollama.XXXXXX.log)"
+DNSMASQ_PID=""
+cleanup_dnsmasq4() {
+    if [[ -n "$DNSMASQ_PID" ]] && kill -0 "$DNSMASQ_PID" 2>/dev/null; then
+        kill "$DNSMASQ_PID" 2>/dev/null || true
+        wait "$DNSMASQ_PID" 2>/dev/null || true
+    fi
+    rm -f "$LOG_FILE4"
+}
+trap 'cleanup_stubs; cleanup_dnsmasq4' EXIT
+
+dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/ollama.conf" \
+    --listen-address=127.0.0.1 --port="$PORT4" --no-daemon --log-facility=- >"$LOG_FILE4" 2>&1 &
+DNSMASQ_PID=$!
+
+ready=0
+for _ in $(seq 1 20); do
+    if dig +short +time=1 +tries=1 @127.0.0.1 -p "$PORT4" github.com >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+if [[ "$ready" -ne 1 ]]; then
+    echo "ERROR: dnsmasq did not become ready on port $PORT4" >&2
+    cat "$LOG_FILE4" >&2 || true
+    exit 1
+fi
+
+dns_status4() {
+    local domain="$1"
+    dig +time=3 +tries=1 @127.0.0.1 -p "$PORT4" "$domain" A +noall +comment 2>/dev/null \
+        | grep -oP '(?<=status: )[A-Z]+' || echo "QUERY_FAILED"
+}
+assert_resolves4() {
+    local domain="$1" msg="$2"
+    local status
+    status=$(dns_status4 "$domain")
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$status" == "NOERROR" ]]; then
+        echo "    ✓ $msg ($domain -> $status)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        _fail "$msg — expected NOERROR for $domain, got $status"
+    fi
+}
+assert_blocked_dns4() {
+    local domain="$1" msg="$2"
+    local status
+    status=$(dns_status4 "$domain")
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$status" == "REFUSED" ]]; then
+        echo "    ✓ $msg ($domain -> $status)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        _fail "$msg — expected REFUSED for $domain, got $status"
+    fi
+}
+
+assert_resolves4 "github.com" "base+ollama: pre-existing GitHub entry still resolves"
+assert_resolves4 "ollama.com" "base+ollama: ollama.com resolves"
+assert_resolves4 "registry.ollama.ai" "base+ollama: registry.ollama.ai resolves"
+assert_blocked_dns4 "anthropic.com" "base+ollama: anthropic.com is NOT reachable (no cross-harness bleed)"
+assert_blocked_dns4 "claude.ai" "base+ollama: claude.ai is NOT reachable (no cross-harness bleed)"
+assert_blocked_dns4 "claude.com" "base+ollama: claude.com is NOT reachable (no cross-harness bleed)"
+assert_blocked_dns4 "auth.openai.com" "base+ollama: auth.openai.com is NOT reachable (Codex fragment's domain, no cross-harness bleed)"
+assert_blocked_dns4 "chatgpt.com" "base+ollama: chatgpt.com is NOT reachable (Codex fragment's domain, no cross-harness bleed)"
+assert_blocked_dns4 "api.openai.com" "base+ollama: api.openai.com is NOT reachable"
+assert_blocked_dns4 "opencode.ai" "base+ollama: opencode.ai is NOT reachable (OpenCode fragment's domain, no cross-harness bleed)"
+assert_blocked_dns4 "ollama.ai" "base+ollama: the bare ollama.ai apex is NOT reachable (only the registry.ollama.ai subdomain is allowlisted, never the whole apex)"
+assert_blocked_dns4 "example.com" "base+ollama: domain absent from allowlist still blocked"
 
 kill "$DNSMASQ_PID" 2>/dev/null || true
 wait "$DNSMASQ_PID" 2>/dev/null || true

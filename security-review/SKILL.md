@@ -61,16 +61,18 @@ Which lanes run, and against which models, is controlled entirely by one environ
 `.env.local.example`:
 
 ```bash
-CFGMS_SECURITY_REVIEW_LANES=claude:sonnet-5,codex:gpt-5-codex,opencode:qwen3-coder,opencode:glm-4.6
+CFGMS_SECURITY_REVIEW_LANES=claude:sonnet-5,codex:gpt-5-codex,opencode:qwen3-coder,opencode:glm-4.6,ollama:glm-5.3-flash:cloud
 ```
 
 A comma-separated list of `harness:model` pairs. Every entry runs at every step (fan-out, not a
 fallback chain), and adding a lane — a new model on an existing harness, or an entirely new
 harness — is a one-line edit to this variable; no dispatch code changes to pick up either case.
 `security-review.sh` fails closed, before creating or dispatching anything, if this is unset or
-malformed — there is no hardcoded lane set to fall back to.
+malformed — there is no hardcoded lane set to fall back to. An `ollama` model id always carries a
+mandatory tag (`<name>:cloud`); the roster parser allows at most one extra `:` in the model half
+for exactly this shape.
 
-Three harnesses are landed, each authenticating as that harness's own subscription session (a
+Four harnesses are landed, each authenticating as that harness's own subscription session (a
 read-only credential mount, never an OS-keychain API key):
 
 | Harness | Model examples | Landed by |
@@ -78,6 +80,12 @@ read-only credential mount, never an OS-keychain API key):
 | `claude` | `sonnet-5` | switchover cutover (#3933/#3934) |
 | `codex` | `gpt-5-codex` | Codex lane runner (#3935) |
 | `opencode` | `qwen3-coder`, `glm-4.6` (OpenCode Zen catalog) | OpenCode lane runner (#3936) |
+| `ollama` | `glm-5.3-flash:cloud` (Ollama Cloud only — never a local/GPU model) | Ollama Cloud lane runner (#3976) |
+
+**`ollama` needs an `ollama signin` session on the host** before it can be used — the operator's
+own Cloud subscription keypair (`~/.ollama/id_ed25519`), the same "subscription session, never an
+API key" contract every other harness follows. Without it, `--harness ollama` fails closed as a
+recorded, skippable `credential_unavailable` dispatch outcome; every other roster lane still runs.
 
 Every roster entry dispatches through `.claude/scripts/agent-dispatch.sh launch-investigator`
 (Issue #3903): one short-lived, read-only container per lane per invocation — `/workspace`

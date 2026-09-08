@@ -30,6 +30,13 @@ from dataclasses import dataclass
 
 _VALID_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# A model half may carry at most one extra `:` -- Ollama's tagged model ids
+# are mandatorily `<name>:<tag>` (e.g. `glm-5.3-flash:cloud`). Each segment
+# is validated against the same charset `_VALID_TOKEN` enforces, so this is
+# strictly tighter than an unbounded `split(":", 1)`: `claude:sonnet:5:extra`
+# (two extra colons) is still rejected, only one typo-guard boundary moved.
+_VALID_MODEL_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(:[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+
 
 class RosterError(ValueError):
     """Raised when a `CFGMS_SECURITY_REVIEW_LANES` entry is malformed."""
@@ -46,38 +53,54 @@ def parse_roster(value: str) -> list[Lane]:
     """Parses a comma-separated `harness:model` roster string into `Lane`
     tuples.
 
+    The `harness:model` split is on the FIRST `:` only, since a model half
+    may itself carry one mandatory tag colon (Ollama's `glm-5.3-flash:cloud`
+    shape) -- but that relaxation is bounded, not removed: the model half
+    is validated against `_VALID_MODEL_TOKEN`, which allows at most one
+    extra `:`, so `claude:sonnet:5:extra` (two extra colons) still raises
+    rather than silently truncating to model `sonnet:5`.
+
     Raises `RosterError` -- and produces no partial result -- on the first
-    malformed entry: one missing the `:` separator, one with more than one
-    `:` (a colon inside a model id would otherwise silently truncate the
-    model to its first segment), an empty harness or model half, or either
-    half failing the same strict token shape `--mode` enforces at launch.
-    An empty overall roster (`""` or all-whitespace) is also rejected --
-    the caller only enters the roster path when the env var is set, so an
-    empty value is a configuration mistake, not "zero lanes."
+    malformed entry: one missing the `:` separator, one whose model half
+    carries more than one extra `:`, an empty harness or model half, either
+    half failing its token shape, or a roster whose entries produce two
+    identical `lane_dir_name` values (two lanes sharing one output directory
+    would silently overwrite each other's findings). An empty overall
+    roster (`""` or all-whitespace) is also rejected -- the caller only
+    enters the roster path when the env var is set, so an empty value is a
+    configuration mistake, not "zero lanes."
     """
     if not value or not value.strip():
         raise RosterError("roster value is empty")
 
     lanes: list[Lane] = []
+    seen_lane_dir_names: set[str] = set()
     for raw_entry in value.split(","):
         entry = raw_entry.strip()
         if not entry:
             raise RosterError(f"empty lane entry in roster: {value!r}")
 
-        parts = entry.split(":")
+        parts = entry.split(":", 1)
         if len(parts) != 2:
             raise RosterError(
-                f"malformed lane entry (want exactly one harness:model separator): {entry!r}"
+                f"malformed lane entry (want a harness:model separator): {entry!r}"
             )
         harness, model = parts[0].strip(), parts[1].strip()
         if not harness or not model:
             raise RosterError(f"malformed lane entry (empty harness or model): {entry!r}")
         if not _VALID_TOKEN.match(harness) or ".." in harness:
             raise RosterError(f"invalid harness id: {harness!r}")
-        if not _VALID_TOKEN.match(model) or ".." in model:
+        if not _VALID_MODEL_TOKEN.match(model) or ".." in model:
             raise RosterError(f"invalid model id: {model!r}")
 
-        lanes.append(Lane(harness=harness, model=model, lane_dir_name=f"{harness}-{model}"))
+        lane_dir_name = f"{harness}-{model}".replace(":", "-")
+        if lane_dir_name in seen_lane_dir_names:
+            raise RosterError(
+                f"duplicate lane_dir_name {lane_dir_name!r} in roster: {value!r}"
+            )
+        seen_lane_dir_names.add(lane_dir_name)
+
+        lanes.append(Lane(harness=harness, model=model, lane_dir_name=lane_dir_name))
 
     return lanes
 

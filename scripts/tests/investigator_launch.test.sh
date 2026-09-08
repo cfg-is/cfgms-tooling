@@ -528,6 +528,104 @@ claude_still_run_call2="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call2" "${NO_OPENCODE_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 
 echo ""
+echo "== REQUIRED TEST — --harness ollama mounts ~/.ollama/id_ed25519 and"
+echo "   id_ed25519.pub read-only as two individual files (never the directory),"
+echo "   sets CFGMS_SECURITY_REVIEW_HARNESS=ollama/_MODEL, and never mounts any"
+echo "   other harness's credential (Issue #3976) =="
+mkdir -p "${SANDBOX}/HOME/.ollama"
+echo 'fake-ed25519-private-key' > "${SANDBOX}/HOME/.ollama/id_ed25519"
+echo 'fake-ed25519-public-key' > "${SANDBOX}/HOME/.ollama/id_ed25519.pub"
+
+: > "$DOCKER_CALL_LOG"
+ollama_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode ollama-glm-5.3-flash-cloud \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "--harness ollama launch reports LAUNCHED_INVESTIGATOR" "$ollama_out" "LAUNCHED_INVESTIGATOR:ollama-glm-5.3-flash-cloud:fake-container-id"
+
+ollama_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "--harness ollama mounts id_ed25519 read-only at /home/agent/.ollama/" "$ollama_run_call" "${SANDBOX}/HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+check_contains "--harness ollama mounts id_ed25519.pub read-only at /home/agent/.ollama/" "$ollama_run_call" "${SANDBOX}/HOME/.ollama/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro"
+check_not_contains "--harness ollama never mounts the ~/.ollama directory itself" "$ollama_run_call" "${SANDBOX}/HOME/.ollama:/home/agent/.ollama:ro"
+check_contains "--harness ollama sets CFGMS_SECURITY_REVIEW_HARNESS=ollama" "$ollama_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=ollama"
+check_contains "--model glm-5.3-flash:cloud sets CFGMS_SECURITY_REVIEW_MODEL" "$ollama_run_call" "CFGMS_SECURITY_REVIEW_MODEL=glm-5.3-flash:cloud"
+check_contains "--mode ollama-glm-5.3-flash-cloud sets CFGMS_SECURITY_REVIEW_LANE_ID=ollama-glm-5.3-flash-cloud" "$ollama_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=ollama-glm-5.3-flash-cloud"
+check_not_contains "--harness ollama never mounts the Claude credential file" "$ollama_run_call" ".claude/.credentials.json"
+check_not_contains "--harness ollama never mounts the Codex credential file" "$ollama_run_call" ".codex/auth.json"
+check_not_contains "--harness ollama never mounts the OpenCode credential file" "$ollama_run_call" "opencode/auth.json"
+check_not_contains "--harness ollama launch has no GH_TOKEN" "$ollama_run_call" "GH_TOKEN"
+
+echo ""
+echo "== REQUIRED TEST — an ollama lane with no ~/.ollama/id_ed25519 on the host"
+echo "   fails closed as a recorded, skippable credential_unavailable, and never"
+echo "   mounts a broken/nonexistent path (Issue #3976) =="
+NO_OLLAMA_HOME="${SANDBOX}/HOME-no-ollama"
+mkdir -p "${NO_OLLAMA_HOME}/.claude"
+echo '{}' > "${NO_OLLAMA_HOME}/.claude/.credentials.json"
+: > "$DOCKER_CALL_LOG"
+set +e
+ollama_missing_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="$NO_OLLAMA_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode ollama-missing-creds \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+ollama_missing_rc=$?
+set -e
+if [[ "$ollama_missing_rc" -ne 0 ]]; then
+  ok "an ollama lane with no host credential exits non-zero"
+else
+  bad "an ollama lane with no host credential exits non-zero" "exited 0"
+fi
+check_contains "the failure is reported as credential_unavailable (matches security-review.sh's intentional-skip pattern)" "$ollama_missing_out" "credential_unavailable"
+check_not_contains "no container is ever dispatched for the missing-credential ollama lane" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+
+echo ""
+echo "== REQUIRED TEST — an ollama lane with id_ed25519 present but"
+echo "   id_ed25519.pub absent also fails closed as credential_unavailable"
+echo "   (jrdnr's PR review, finding 3 -- 'docker run -v' would otherwise"
+echo "   create an empty directory at the missing host path rather than"
+echo "   failing) (Issue #3976) =="
+NO_OLLAMA_PUB_HOME="${SANDBOX}/HOME-no-ollama-pub"
+mkdir -p "${NO_OLLAMA_PUB_HOME}/.claude" "${NO_OLLAMA_PUB_HOME}/.ollama"
+echo '{}' > "${NO_OLLAMA_PUB_HOME}/.claude/.credentials.json"
+echo 'fake-ed25519-private-key' > "${NO_OLLAMA_PUB_HOME}/.ollama/id_ed25519"
+: > "$DOCKER_CALL_LOG"
+set +e
+ollama_missing_pub_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="$NO_OLLAMA_PUB_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode ollama-missing-pub-creds \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+ollama_missing_pub_rc=$?
+set -e
+if [[ "$ollama_missing_pub_rc" -ne 0 ]]; then
+  ok "an ollama lane with id_ed25519.pub missing exits non-zero"
+else
+  bad "an ollama lane with id_ed25519.pub missing exits non-zero" "exited 0"
+fi
+check_contains "the pub-key-missing failure is reported as credential_unavailable" "$ollama_missing_pub_out" "credential_unavailable"
+check_not_contains "no container is ever dispatched when only id_ed25519.pub is missing" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+
+echo ""
+echo "== REQUIRED TEST — a claude lane still dispatches normally even though this"
+echo "   file's ollama harness has no credential on the host (C5's 'never"
+echo "   silently substituted' property, extended to a fourth harness) =="
+: > "$DOCKER_CALL_LOG"
+claude_still_out3=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="$NO_OLLAMA_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --mode claude-still-fine-3 \
+    --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "a claude lane on the same (ollama-credential-less) host still dispatches" "$claude_still_out3" "LAUNCHED_INVESTIGATOR:claude-still-fine-3:fake-container-id"
+claude_still_run_call3="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call3" "${NO_OLLAMA_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+
+echo ""
 echo "== REQUIRED TEST evidence — --mode path traversal cannot widen the writable mount =="
 # The writable mount path is built from the RAW --mode value, so --mode is
 # validated as a lane id. The `tr`-sanitized $inv_mode_safe is for the

@@ -58,7 +58,14 @@ if ! sudo iptables -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
     echo "ERROR: egress firewall not active (OUTPUT policy is not DROP); refusing to start"
     exit 1
 fi
-if ! grep -q '^nameserver 127\.0\.0\.1$' /etc/resolv.conf; then
+# CFGMS_TEST_RESOLV_CONF_PATH lets investigator-entrypoint_test.sh point this
+# post-condition at a fixture file it controls -- /etc/resolv.conf is read by
+# absolute path below and cannot be intercepted via a PATH-prepended stub the
+# way sudo/iptables/pgrep are. Unset in every real container, where the
+# default applies. Same override-for-testability convention init-firewall.sh's
+# CFGMS_TEST_DNSMASQ_* vars already use.
+resolv_conf_path="${CFGMS_TEST_RESOLV_CONF_PATH:-/etc/resolv.conf}"
+if ! grep -q '^nameserver 127\.0\.0\.1$' "$resolv_conf_path"; then
     echo "ERROR: resolv.conf is not pinned to the filtered resolver; refusing to start"
     exit 1
 fi
@@ -137,11 +144,68 @@ case "$MODE" in
     fi
     ;;
   *)
-    LANE_SCRIPT="/usr/local/bin/investigator-lane-entrypoint.py"
+    # CFGMS_TEST_LANE_SCRIPT_PATH lets investigator-entrypoint_test.sh point
+    # this at a stub lane script it controls, since the real path is a
+    # container-internal mount destination this process's own user cannot
+    # write to directly. Unset in every real container, where the launcher's
+    # --lane-entrypoint bind mount always lands at the default path below.
+    LANE_SCRIPT="${CFGMS_TEST_LANE_SCRIPT_PATH:-/usr/local/bin/investigator-lane-entrypoint.py}"
     if [ ! -f "$LANE_SCRIPT" ]; then
         echo "ERROR: no lane entrypoint mounted for lane '${MODE}'"
         echo "launch-investigator must be called with --lane-entrypoint <script> for lane mode."
         exit 1
+    fi
+
+    # Ollama lane (Issue #3976): `ollama run <model>` is a client to a LOCAL
+    # daemon, not a direct-to-cloud call -- confirmed while writing this
+    # story: `OLLAMA_HOST=https://ollama.com ollama run <model>` returns
+    # `401 Unauthorized`/"You need to be signed in" and exits 0 regardless of
+    # what OLLAMA_HOST points at, because it is the local daemon that signs a
+    # Cloud request with the `ollama signin` keypair mounted at
+    # ~/.ollama/id_ed25519. Every other harness's behavior below is
+    # unchanged -- this block runs only for CFGMS_SECURITY_REVIEW_HARNESS=ollama
+    # and falls straight through to the same `exec python3 "$LANE_SCRIPT"
+    # "$MODE"` every other lane already uses.
+    #
+    # Fails closed: if the daemon never reports ready, this script exits
+    # non-zero and never execs the lane script -- the alternative (falling
+    # through to a lane run against an absent daemon) is exactly the
+    # zero-work-silent-pass failure class this harness exists to prevent,
+    # just moved one layer earlier than `ollama_lane.py`'s own exit-0
+    # detection handles for an authentication failure.
+    if [ "${CFGMS_SECURITY_REVIEW_HARNESS:-}" = "ollama" ]; then
+        echo "Starting ollama daemon..."
+        ollama serve >/tmp/ollama-serve.log 2>&1 &
+        OLLAMA_SERVE_PID=$!
+
+        # CFGMS_TEST_OLLAMA_READY_* let investigator-entrypoint_test.sh drive
+        # this poll loop to completion in well under a second instead of the
+        # real ~30s worst case -- unset in every real container, where the
+        # defaults below apply. Same override-for-testability convention
+        # init-firewall.sh's CFGMS_TEST_DNSMASQ_* vars already use.
+        ollama_ready_max_attempts="${CFGMS_TEST_OLLAMA_READY_MAX_ATTEMPTS:-30}"
+        ollama_ready_sleep_seconds="${CFGMS_TEST_OLLAMA_READY_SLEEP_SECONDS:-1}"
+
+        ollama_ready=0
+        for _ in $(seq 1 "$ollama_ready_max_attempts"); do
+            if ollama list >/dev/null 2>&1; then
+                ollama_ready=1
+                break
+            fi
+            if ! kill -0 "$OLLAMA_SERVE_PID" 2>/dev/null; then
+                # The daemon process itself has already exited -- no point
+                # polling further.
+                break
+            fi
+            sleep "$ollama_ready_sleep_seconds"
+        done
+
+        if [ "$ollama_ready" -ne 1 ]; then
+            echo "ERROR: ollama daemon did not become ready; refusing to start the ollama lane" >&2
+            cat /tmp/ollama-serve.log >&2 || true
+            exit 1
+        fi
+        echo "ollama daemon ready"
     fi
 
     echo "Starting investigator (mode=lane, lane=${MODE})..."
