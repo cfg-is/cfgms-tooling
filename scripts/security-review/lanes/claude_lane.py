@@ -116,6 +116,20 @@ def _bootstrap_harness_imports() -> None:
 
     lane_candidates = [Path(__file__).resolve().parent]
     harness_candidates = [Path(__file__).resolve().parent.parent]
+    # Issue #3982: inside the investigator container the harness modules --
+    # `harness_runner`, `scan_profiles` (the scanner allowlist), `schema`,
+    # `resume`, ... -- must come from the TRUSTED harness mount
+    # (`agent-dispatch.sh launch-investigator` bind-mounts the host's own
+    # `.claude/scripts/security-review` read-only at
+    # `/opt/cfgms-harness/security-review` and exports its path in
+    # `CFGMS_SECURITY_REVIEW_HARNESS_DIR`), never from the audited snapshot at
+    # `/workspace`: the snapshot is the code under review, and a reviewed commit
+    # must not be able to replace the registry or run code on import beside the
+    # lane credential. The `/workspace` fallbacks below stay only for the
+    # pre-#3982 single-file layout when no harness mount is present.
+    trusted_harness = os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_DIR") or "/opt/cfgms-harness/security-review"
+    lane_candidates.append(Path(trusted_harness) / "lanes")
+    harness_candidates.append(Path(trusted_harness))
     if env_repo_root:
         lane_candidates.append(Path(env_repo_root) / ".claude/scripts/security-review/lanes")
         harness_candidates.append(Path(env_repo_root) / ".claude/scripts/security-review")
@@ -354,7 +368,8 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
         f"Description: {description}\n\n"
         f"Hypotheses to investigate (address every one by id in your dispositions array):\n"
         f"{hypotheses_text}\n\n"
-        f"{body}"
+        f"{body}\n\n"
+        f"{harness_runner.render_scan_evidence(step.get('scan_evidence'))}"
     )
 
 
@@ -610,6 +625,9 @@ def run_lane(
         # continues.
         try:
             file_contents = read_step_files(repo_root, files, step_id)
+            # Issue #3982: fixed scanner profiles over the step's files; every
+            # tool problem is a recorded gap, never a failed step.
+            scan_evidence = harness_runner.collect_scan_evidence(step, repo_root, out_dir)
             hypotheses = step.get("hypotheses") or []
 
             # Issue #3959: a step whose combined file_contents exceeds the shared
@@ -631,7 +649,7 @@ def run_lane(
             launch_exc = None
 
             for task_index, task_hypotheses in enumerate(tasks):
-                task_step = dict(step, hypotheses=task_hypotheses)
+                task_step = dict(step, hypotheses=task_hypotheses, scan_evidence=scan_evidence)
                 raw_id = f"{step_id}.task{task_index}" if multi_task else step_id
                 raw_path = _raw_output_path(out_dir, raw_id)
                 candidate_path = _candidate_path(out_dir, raw_id)
@@ -681,6 +699,7 @@ def run_lane(
                     stop_reason_raw=f"launch_exception:{launch_exc}",
                     files_intended=files,
                     files_read=list(file_contents.keys()),
+                    scans=harness_runner.scan_summary(scan_evidence),
                 )
                 harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)
                 written.append(envelope)
@@ -704,6 +723,7 @@ def run_lane(
                 findings=task_findings if state == terminal_state.COMPLETE else None,
                 files_intended=files,
                 files_read=list(file_contents.keys()),
+                scans=harness_runner.scan_summary(scan_evidence),
                 dispositions=task_dispositions if state == terminal_state.COMPLETE else None,
             )
             harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)

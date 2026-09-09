@@ -1,0 +1,27 @@
+# CFGMS project rule (Issue #3982). Mirrors the architecture checker's
+# raw-leader-primitive rule (pkg/ha/architecture_test.go): outside pkg/ha,
+# `IsRaftLeader()` / `IsLeader()` is the raw Raft protocol primitive and lags
+# reality during a partition; authority decisions must use HasLeadership()
+# (ADR-029). A legitimate status/diagnostic use carries a same-line
+# `//architecture:allow-raw-leader -- <reason>` annotation. Text-level rule
+# so the annotation comment is visible to the match.
+rules:
+  - id: cfgms-raw-leader-primitive-unannotated
+    languages: [generic]
+    severity: WARNING
+    message: >-
+      Raw Raft leader primitive (IsRaftLeader/IsLeader) used outside pkg/ha
+      without an //architecture:allow-raw-leader annotation. Use
+      HasLeadership() for any authority decision; annotate status-only uses.
+    metadata:
+      category: correctness
+      confidence: MEDIUM
+      source: cfgms
+    paths:
+      include:
+        - "*.go"
+      exclude:
+        - "pkg/ha/*"
+        - "*_test.go"
+    patterns:
+      - pattern-regex: '\.(?:IsRaftLeader|IsLeader)\(\)(?![^\n]*architecture:allow-raw-leader)'

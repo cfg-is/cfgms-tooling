@@ -454,6 +454,72 @@ def build_coverage_table(
     return rows
 
 
+SCAN_STATUSES = ("ok", "partial", "empty", "failed", "timeout", "rejected", "unavailable", "skipped")
+
+
+def load_scan_summaries(sweep_dir: str, lanes: list[str], step_ids: list[str]) -> dict[str, dict[str, list]]:
+    """`{lane: {step_id: scans}}` from every lane envelope that carries a
+    `scans` list (Issue #3982) -- findings and status envelopes alike, since
+    scanner coverage is recorded regardless of the step's terminal state. A
+    lane written before scans existed simply has no entry."""
+    out: dict[str, dict[str, list]] = {}
+    for lane in lanes:
+        lane_dir = os.path.join(sweep_dir, "lanes", lane)
+        for step_id in step_ids:
+            for suffix in ("findings", "status"):
+                path = os.path.join(lane_dir, f"{step_id}.{suffix}.json")
+                if not os.path.isfile(path):
+                    continue
+                envelope = _load_json(path)
+                scans = envelope.get("scans") if isinstance(envelope, dict) else None
+                if isinstance(scans, list):
+                    out.setdefault(lane, {})[step_id] = scans
+                break
+    return out
+
+
+def build_scanner_coverage(lanes: list[str], step_ids: list[str], lane_step_scans: dict[str, dict[str, list]]) -> list[dict]:
+    """One row per lane: how many scanner checks ran per status, how many
+    were truncated or served from cache, how many steps recorded no scans at
+    all, and the concrete gaps (every non-`ok` check and every non-check gap)
+    named by step. This is report data, never adjudication: a scanner gap
+    does not change `_sweep_complete()` -- the model still reviewed the
+    source -- it changes what a reader knows the tools did not cover."""
+    rows = []
+    for lane in lanes:
+        counts = {status: 0 for status in SCAN_STATUSES}
+        truncated = cached = 0
+        steps_without = 0
+        gaps: list[dict] = []
+        for step_id in step_ids:
+            scans = lane_step_scans.get(lane, {}).get(step_id)
+            if scans is None:
+                steps_without += 1
+                continue
+            for entry in scans:
+                if not isinstance(entry, dict):
+                    continue
+                if "gap" in entry:
+                    gaps.append({"step_id": step_id, "kind": str(entry.get("gap")), "detail": {k: v for k, v in entry.items() if k != "gap"}})
+                    continue
+                status = str(entry.get("status", "failed"))
+                counts[status if status in counts else "failed"] += 1
+                if entry.get("truncated"):
+                    truncated += 1
+                if entry.get("cached"):
+                    cached += 1
+                if status != "ok" or entry.get("truncated"):
+                    gaps.append({
+                        "step_id": step_id,
+                        "kind": f"scan_{status}" + ("_truncated" if entry.get("truncated") else ""),
+                        "detail": {"tool": entry.get("tool"), "scope": entry.get("scope"), "reason": entry.get("reason", "")},
+                    })
+        row = {"lane": lane, "checks": sum(counts.values()), "truncated": truncated, "cached": cached, "steps_without_scans": steps_without, "gaps": gaps}
+        row.update(counts)
+        rows.append(row)
+    return rows
+
+
 def consolidate(sweep_dir: str, repo_root: str) -> dict:
     """Read `sweep_dir` and return the full consolidated report as a dict --
     the exact shape written to `report/consolidated.json`."""
@@ -461,12 +527,14 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     groups = _group_findings(findings, repo_root)
     consolidated_findings = _finalize_findings(groups, lane_step_state)
     coverage = build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
+    scanner_coverage = build_scanner_coverage(lanes, step_ids, load_scan_summaries(sweep_dir, lanes, step_ids))
     return {
         "sweep_id": os.path.basename(os.path.normpath(sweep_dir)),
         "lanes": lanes,
         "steps_discovered": step_ids,
         "plan_failed": plan_failed,
         "coverage": coverage,
+        "scanner_coverage": scanner_coverage,
         "dispatch": _load_dispatch_report(sweep_dir),
         "rejected_proposals": _load_rejected_proposals(sweep_dir),
         "findings": consolidated_findings,
@@ -672,6 +740,47 @@ def render_markdown(report: dict) -> str:
         lines.append("")
         lines.extend(_incomplete_lines(report))
         lines.append("")
+
+    lines.append("## Scanner coverage")
+    lines.append("")
+    scanner_rows = report.get("scanner_coverage") or []
+    if not scanner_rows or all(r["checks"] == 0 and r["steps_without_scans"] == len(report.get("steps_discovered", [])) for r in scanner_rows):
+        lines.append(
+            "_(no scanner evidence recorded -- every lane envelope predates scanner "
+            "profiles, or no step declared a file any profile covers)_"
+        )
+        lines.append("")
+    else:
+        lines.append(
+            "Fixed, harness-owned tool profiles (Issue #3982) ran over each step's files; "
+            "a non-`ok` check or a step without scans is code the tools did not cover, "
+            "listed below. These gaps do not make the sweep incomplete -- the model still "
+            "reviewed the source -- but a bare empty tool result is never treated as clean. "
+            "Known suppression gap: staticcheck honours `//lint:ignore` directives in the audited "
+            "code (it has no switch to ignore them); semgrep `nosemgrep` and gosec `#nosec` "
+            "suppressions are disabled, and eslint inline config is disabled."
+        )
+        lines.append("")
+        lines.append("| Lane | Checks | Ok | Partial | Empty | Failed | Timeout | Rejected | Unavailable | Skipped | Truncated | Cached | Steps without scans |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for row in scanner_rows:
+            lines.append(
+                "| {lane} | {checks} | {ok} | {partial} | {empty} | {failed} | {timeout} | {rejected} | {unavailable} | {skipped} | {truncated} | {cached} | {sw} |".format(
+                    lane=_md_escape_inline(row["lane"]), sw=row["steps_without_scans"],
+                    **{k: row.get(k, 0) for k in ("checks", "ok", "partial", "empty", "failed", "timeout", "rejected", "unavailable", "skipped", "truncated", "cached")},
+                )
+            )
+        lines.append("")
+        all_gaps = [(row["lane"], g) for row in scanner_rows for g in row["gaps"]]
+        if all_gaps:
+            lines.append(f"Scanner gaps ({len(all_gaps)}):")
+            lines.append("")
+            for lane, gap in all_gaps[:200]:
+                detail = " ".join(f"{k}={_md_escape_inline(str(v))}" for k, v in gap["detail"].items() if v not in (None, ""))
+                lines.append(f"- Lane `{_md_escape_inline(lane)}` step `{_md_escape_inline(gap['step_id'])}`: **{_md_escape_inline(gap['kind'])}** {detail}".rstrip())
+            if len(all_gaps) > 200:
+                lines.append(f"- _(... {len(all_gaps) - 200} more scanner gap(s) in `consolidated.json`)_")
+            lines.append("")
 
     lines.append("## Dispatch")
     lines.append("")

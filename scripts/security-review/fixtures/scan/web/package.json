@@ -1,0 +1,9 @@
+{
+  "name": "cfgms-scan-fixture-decoy",
+  "private": true,
+  "description": "DECOY (Issue #3982). A snapshot package.json the scanner must never install from or run scripts of. If any script below executes, the snapshot's code ran next to the lane credential.",
+  "scripts": {
+    "lint": "node -e \"throw new Error('SNAPSHOT_NPM_SCRIPT_WAS_RUN')\"",
+    "preinstall": "node -e \"throw new Error('SNAPSHOT_NPM_SCRIPT_WAS_RUN')\""
+  }
+}

@@ -1,0 +1,70 @@
+# Vendored from https://github.com/semgrep/semgrep-rules at commit 40b8c63f75dc7c22c8a77482d73bfb864b146f7e
+# (develop, committed 2026-07-30). Curated subset: go/lang/security/**,
+# typescript/react/security/**, typescript/lang/security/**. Each line is
+# sha256 of the vendored file. Refresh only by re-vendoring at a new pinned
+# commit and regenerating this file; never edit a vendored rule in place --
+# project rules live in ../cfgms/.
+
+d4c626d204271f4d79772645261a82cfc628d8397c89919dffdd0de7bd6a3e9f  go/lang/security/audit/crypto/bad_imports.yaml
+fb1a787ba8f3865141eac49ac8a311f0558275a9479f3cd84ae5102efd2d4a58  go/lang/security/audit/crypto/insecure_ssh.yaml
+897361e03410697e14c410bec02f3947a9e8dc3b8cac73aacb260e0a3e0249c7  go/lang/security/audit/crypto/math_random.yaml
+65f6bb9d61851d8e9cb402b7d8566a2e350322092a9511dbc0a1f6ca0bc2be40  go/lang/security/audit/crypto/missing-ssl-minversion.yaml
+1521c278aaefd70bd6f8c7c8e2dcc4af1f919e16cdf2062354897727bafefa95  go/lang/security/audit/crypto/sha224-hash.yaml
+b873dfa99d77b1d788082debfe3a4f8d614043269d77564908934d504eccb664  go/lang/security/audit/crypto/ssl.yaml
+473804728d7b03c5011c1535ec42b1c879931b5de4b3b168d37074d5c83199e0  go/lang/security/audit/crypto/tls.yaml
+cc86af55aa9354cf08c8acadb9b09ebd6f2c3f30ce2c20f1423b1641999752e8  go/lang/security/audit/crypto/use_of_weak_crypto.yaml
+f106708de5a938ed5ac541fec0b440d6622433bd27821fe52640fe72b2b34669  go/lang/security/audit/crypto/use_of_weak_rsa_key.yaml
+367e9cbee481219dc860cfb5520354a21019afb64d774291bc4937cd14e51d51  go/lang/security/audit/dangerous-command-write.yaml
+30e0551e87654d5365e6f886d69f866bf526b1b018e509e1c4bfde8802c71bfb  go/lang/security/audit/dangerous-exec-cmd.yaml
+b6a8f7e4c80d8565e01bfe9566bcf0a611008075fbdbd965933bd657c5a65fb9  go/lang/security/audit/dangerous-exec-command.yaml
+917ad53b3f09d314f489d5efd8c3c7ca3af75f53c235c742e2fa0bbea6e069d4  go/lang/security/audit/dangerous-syscall-exec.yaml
+d631e16ff17e9900bcdc18f3176b17e8a9cda415f9674b875b5739c5df12bb5f  go/lang/security/audit/database/string-formatted-query.yaml
+0429f6df72c5aca2ccf6996d1276b35924a57035be04757abc79bc9760327961  go/lang/security/audit/md5-used-as-password.yaml
+da11467b6bb3a8886c4b42f6f14c2d636d328f0ef9eea8fdc7f486088d3f2e53  go/lang/security/audit/net/bind_all.yaml
+21b1062cdedd555693d70998ba896220e1416b33398ead4ea2768025c2335a30  go/lang/security/audit/net/cookie-missing-httponly.yaml
+1b94d28f69c35ef81b92b0a8a845dbb8c26cd1174ab627d8abcd7e292a5d4d0e  go/lang/security/audit/net/cookie-missing-secure.yaml
+9ce5ef514a958df6c6cc088f1c4b3c7500228dd19bfbd4aa026a126fb1e408bb  go/lang/security/audit/net/dynamic-httptrace-clienttrace.yaml
+6565614e63f830159c3bdd858e17778389dbdf6724b7efc394d2fe9859dcbb74  go/lang/security/audit/net/formatted-template-string.yaml
+f494c53a44a82aa8b33d469602f512b39643f345c38b6aa12e7b7e823d9ae355  go/lang/security/audit/net/fs-directory-listing.yaml
+5c908a2b0c1ff0a730f41eb4ec815273632f22c9a4910ae9108da3c597097fd8  go/lang/security/audit/net/pprof.yaml
+1d7d891688fdc72975680494109f2d7e508202e61d1e29113d98e4707620f4a2  go/lang/security/audit/net/unescaped-data-in-htmlattr.yaml
+f0d181e34301450f9b55bb4dfc9a46358d83bad9f645c4691e4f3d1937e23aa8  go/lang/security/audit/net/unescaped-data-in-js.yaml
+446470c0994b2d5db01fdf55111f3acba7f6c0e16ca8ff9d3b4904c7031cab2b  go/lang/security/audit/net/unescaped-data-in-url.yaml
+b808cb196205d28f146cb6892fb2b287534097b89bf7d58a55ed3004f4dee14f  go/lang/security/audit/net/use-tls.yaml
+dec2a99394f906676e93f192f1b1e0d5840b8929677ffd8e106cec25c0ee1407  go/lang/security/audit/net/wip-xss-using-responsewriter-and-printf.yaml
+123707c7409a66e06a0a96533075c66da481bb625ce8ecfc37ba22d29fc6db4f  go/lang/security/audit/reflect-makefunc.yaml
+349a10ac8c44a85d7684c7c70e787898874c77f2c353f74784348459c87c9822  go/lang/security/audit/sqli/gosql-sqli.yaml
+6cd6aa898557b7040e59c08f25b6ca99b44044a2101ef54e91ae494fdd51d9d9  go/lang/security/audit/sqli/pg-orm-sqli.yaml
+7b27bcabf89f1bcede2ec5fe8fcb295251845a92e90b6b7e4bf83f19b309e7c7  go/lang/security/audit/sqli/pg-sqli.yaml
+8101fdc66fd53af2e66d53ec049eeb8007d57864ffefb28aa34fec3d51c72897  go/lang/security/audit/sqli/pgx-sqli.yaml
+48718c15ee9085eede289e5a328936dc565db68f51844111254a589eab83e290  go/lang/security/audit/unsafe-reflect-by-name.yaml
+016d45988f01916f75e11c1f2dcde886b8b7fcba5c39f4ba88b18d78a86c59a0  go/lang/security/audit/unsafe.yaml
+c433e1327c02d25defac5d13f5a8bfe878dffe80e7fc150d1d6bae3b82f3075d  go/lang/security/audit/xss/import-text-template.yaml
+ab01f9b4f527d78198a1d1e117cf1b0f77a15a3fb20b33e584396075bc8aa2a2  go/lang/security/audit/xss/no-direct-write-to-responsewriter.yaml
+8d8e095d1d25bfcb9d44daba3d36afc17b489d43cbb55ae73fd3dc2e624b141c  go/lang/security/audit/xss/no-fprintf-to-responsewriter.yaml
+a7ab0c327052ff363646d82f6a91410c77e1eddd6c809328223604e4227e5a49  go/lang/security/audit/xss/no-interpolation-in-tag.yaml
+6b0849988358cef2961e1366f9b7b0bc22a0902b353c4791b6f5aa4cafcda2e4  go/lang/security/audit/xss/no-interpolation-js-template-string.yaml
+cbaaacf04c72b967f665c7daac9080301633b0d5eb72f0febc9fe9ab9274ba41  go/lang/security/audit/xss/no-io-writestring-to-responsewriter.yaml
+4fef7bed12202e7d3bf398dd08fd558514362430ac5e7356bddce074ee7fc573  go/lang/security/audit/xss/no-printf-in-responsewriter.yaml
+76ecd1a306e5c73690ea95b8910a0e5f3f27a7a5c81e208b0284b6624e531496  go/lang/security/audit/xss/template-html-does-not-escape.yaml
+ef9816819a3dc9efcf4bb5d55a1c175c46a8edc91cebe9d62ffe8cd023259a79  go/lang/security/audit/xxe/parsing-external-entities-enabled.yaml
+a8d998c73e097b39d2424ae68df16690643c53d13ea37472c25659ef1ad35d31  go/lang/security/bad_tmp.yaml
+9c45d9ca144aca25aeba1fd41d23cee10cdc79f455fe7ce5f96dc5c3f5a6a5ef  go/lang/security/decompression_bomb.yaml
+a3483810485a7046b401bacc90149773d2ab6a91ce7da771f63cdd44b48ac136  go/lang/security/deserialization/unsafe-deserialization-interface.yaml
+465d65cd5aee62fd226c005485f7de8ae85349fc45ef5ef397b1769e3a1ee5a7  go/lang/security/filepath-clean-misuse.yaml
+ba7e36674682ebba3e085557280c7204f01ae55971f512aed0171bb6c0b89a2e  go/lang/security/injection/open-redirect.yaml
+6e6654e0885aa2296f2d33ce5bc895ca947af75a999204f7d3333f4ffe22a9fb  go/lang/security/injection/raw-html-format.yaml
+20c16479184a078e4208c20cee27b364e34cd0949e85d9dfd63e0732f0934053  go/lang/security/injection/tainted-sql-string.yaml
+481f38df51f4ad8f2438aa47f502572cf933cc54ce28a34ae56f539c27a80774  go/lang/security/injection/tainted-url-host.yaml
+29612864d63d06dd79122cf3637c602a843f70616f97a0940ffc21664d1f949f  go/lang/security/reverseproxy-director.yaml
+77f74f11a30cd26932c61f28dad51eafdc495c6cd2f1c50b328a68820025396c  go/lang/security/shared-url-struct-mutation.yaml
+f8778412982aafc14e97599a77c341e6931c6b995e604b0fa19db45f95045f46  go/lang/security/zip.yaml
+fc271110d672f2093bf1e949ab413e6117f7483ad6e285ef093096d77fb33821  typescript/lang/security/audit/cors-regex-wildcard.yaml
+794094512be7f7dcaa49a4b1edf621dbdf1f984b4f29ab09a23538c0e59c2136  typescript/react/security/audit/react-dangerouslysetinnerhtml.yaml
+aa8ade23b4a351f93be2bcd47ecc694b6b3d2a861a65fc8d345a6cb87f9253f2  typescript/react/security/audit/react-href-var.yaml
+5e4ca6b6fa672c29cfbf78993f8b3b5724d77fd99da251de7b108835705fec15  typescript/react/security/audit/react-jwt-decoded-property.yaml
+8850734261ecbb6eee29707a683acc5d177b2d785cec00ef4788eb6193b5ba05  typescript/react/security/audit/react-jwt-in-localstorage.yaml
+c774bae09d1b0d8c4c12c32436f4dad6d93a590f9cfbd159bc2ab2416054d273  typescript/react/security/audit/react-unsanitized-method.yaml
+0dc00b10abae599731f0c4f56c9efc64cf2469dfa4cc0d562ca6a3a0581be59d  typescript/react/security/audit/react-unsanitized-property.yaml
+4869905cc60559b8ca0ed0ac62c5abe9a26b2ee0e3bbdc0d1baf47271ee70376  typescript/react/security/react-insecure-request.yaml
+e464c0f72c8a89ae325524b738c7c2024be1258e7a060a6365b487a0aa284434  typescript/react/security/react-markdown-insecure-html.yaml

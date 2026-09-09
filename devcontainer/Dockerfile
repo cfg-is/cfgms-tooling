@@ -365,6 +365,65 @@ RUN install -d -o agent -g agent /home/agent/.cache/uv /home/agent/.local \
 # Defense-in-depth: keep any stray uv invocation offline behind the firewall.
 ENV UV_OFFLINE=1
 
+# === Security-review scanner toolchain (Issue #3982, epic #3975) ===
+# Image-OWNED tools, configs and rules the finder lanes run over an UNTRUSTED
+# snapshot mounted read-only at /workspace, next to a live subscription
+# credential. Nothing under /workspace is ever loaded as code: eslint runs
+# with `--no-config-lookup --config /opt/cfgms-scanner/eslint.config.js`
+# against these node_modules (never the audited project's), semgrep reads
+# only the rule files installed here, and every argv is a constant from
+# .claude/scripts/security-review/lanes/scan_profiles.py. rg, gosec and
+# staticcheck are already installed above and are NOT reinstalled.
+#
+# All three pins below are intentionally NOT tracked by
+# dependency-pin-check.yml (same status as the Ollama CLI pin above): its
+# freshness checks are hand-written per tool and adding them is outside
+# this story. Refresh: bump the versions in .devcontainer/scanner/, regenerate
+# the lockfile / hashed requirements as their headers describe, rebuild.
+#
+# ESLint + plugins: exact versions from .devcontainer/scanner/package.json,
+# integrity-pinned by its package-lock.json (`npm ci` refuses a mismatch);
+# `--ignore-scripts` so no dependency lifecycle script runs at build.
+COPY .devcontainer/scanner/package.json .devcontainer/scanner/package-lock.json /opt/cfgms-scanner/
+WORKDIR /opt/cfgms-scanner
+RUN npm ci --ignore-scripts --no-audit --no-fund \
+    && test -f /opt/cfgms-scanner/node_modules/eslint/bin/eslint.js
+WORKDIR /
+COPY .devcontainer/scanner/eslint.config.js /opt/cfgms-scanner/eslint.config.js
+
+# semgrep: hash-pinned wheel closure (.devcontainer/scanner/semgrep-requirements.txt,
+# `--require-hashes` rejects any artifact whose sha256 is not listed) into a
+# private virtualenv on the system Python. Network is needed only here, at
+# build time; the runner sets SEMGREP_SEND_METRICS=off and every profile
+# passes --metrics=off --disable-version-check, so nothing phones home later.
+ARG SEMGREP_VERSION=1.176.1
+COPY .devcontainer/scanner/semgrep-requirements.txt /opt/cfgms-scanner/semgrep-requirements.txt
+RUN grep -q "^semgrep==${SEMGREP_VERSION} " /opt/cfgms-scanner/semgrep-requirements.txt \
+    && UV_OFFLINE=0 uv venv --python /usr/bin/python3 /opt/cfgms-scanner/venv \
+    && UV_OFFLINE=0 uv pip install --python /opt/cfgms-scanner/venv/bin/python \
+         --require-hashes --no-cache -r /opt/cfgms-scanner/semgrep-requirements.txt \
+    && /opt/cfgms-scanner/venv/bin/semgrep --version
+
+# semgrep rules: the curated upstream Go + TS/React security rules are fetched
+# at the commit pinned in semgrep/upstream/SOURCE and verified file-by-file
+# against the sha256 recorded there (fetch-semgrep-rules.sh fails the build on
+# any mismatch); the CFGMS project rules are copied from the repository.
+COPY .devcontainer/scanner/semgrep/upstream/SOURCE /tmp/semgrep-upstream-SOURCE
+COPY .devcontainer/scanner/fetch-semgrep-rules.sh /usr/local/bin/fetch-semgrep-rules.sh
+RUN chmod 0755 /usr/local/bin/fetch-semgrep-rules.sh \
+    && /usr/local/bin/fetch-semgrep-rules.sh /tmp/semgrep-upstream-SOURCE /opt/cfgms-scanner/semgrep/upstream \
+    && rm -f /tmp/semgrep-upstream-SOURCE
+COPY .devcontainer/scanner/semgrep/cfgms/ /opt/cfgms-scanner/semgrep/cfgms/
+# Validate every rule file parses at build time, offline, so a broken rule
+# fails the build rather than silently producing an empty scan later.
+RUN SEMGREP_SEND_METRICS=off /opt/cfgms-scanner/venv/bin/semgrep --validate --metrics=off --disable-version-check \
+      --config /opt/cfgms-scanner/semgrep/upstream/go \
+      --config /opt/cfgms-scanner/semgrep/upstream/typescript \
+      --config /opt/cfgms-scanner/semgrep/cfgms/go \
+      --config /opt/cfgms-scanner/semgrep/cfgms/typescript
+# Read-only for the agent user; the runner never writes here.
+RUN chmod -R a+rX /opt/cfgms-scanner
+
 # Not a long-running service; health checks are not applicable for on-demand
 # agent containers. HEALTHCHECK NONE suppresses the Trivy DS-0026 advisory.
 HEALTHCHECK NONE

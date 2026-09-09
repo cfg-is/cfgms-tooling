@@ -909,13 +909,16 @@ echo ""
 echo "== REQUIRED TEST evidence — trusted-harness identity (Issue #3952, epic"
 echo "   #3950's D1 correction on revision 3): launch-investigator hashes"
 echo "   exactly investigator-entrypoint.sh and --lane-entrypoint's script into"
-echo "   <sweep-dir>/harness_identity.json, sensitive to both real mounted"
-echo "   inputs and insensitive to everything else =="
+echo "   <sweep-dir>/harness_identity.json (plus, since Issue #3982, every"
+echo "   non-test .py under the mounted trusted harness tree), sensitive to"
+echo "   the mounted inputs and insensitive to everything else =="
 
 HARNESS_ID_REPO="${SANDBOX}/harness-id-repo"
 mkdir -p "${HARNESS_ID_REPO}/.devcontainer/scripts" "${HARNESS_ID_REPO}/.claude/scripts/security-review"
 ENTRYPOINT_FIXTURE="${HARNESS_ID_REPO}/.devcontainer/scripts/investigator-entrypoint.sh"
 SIBLING_FIXTURE="${HARNESS_ID_REPO}/.claude/scripts/security-review/schema.py"
+mkdir -p "${HARNESS_ID_REPO}/docs/security-review"
+printf 'methodology v1\n' > "${HARNESS_ID_REPO}/docs/security-review/methodology.md"
 LANE_ENTRYPOINT_A="${SANDBOX}/lane-entrypoint-a.py"
 LANE_ENTRYPOINT_B="${SANDBOX}/lane-entrypoint-b.py"
 printf 'lane entrypoint content A\n' > "$LANE_ENTRYPOINT_A"
@@ -1001,21 +1004,53 @@ else
 fi
 
 echo ""
-echo "== REQUIRED TEST — changing a sibling .py module under"
-echo "   .claude/scripts/security-review/ (never individually mounted) between"
-echo "   two calls does NOT change the recorded hash -- proves the hash does"
-echo "   not, and must not, cover that file (the test the revision-2 draft's"
-echo "   over-broad scope would have failed) =="
+echo "== REQUIRED TEST (Issue #3982) — the whole trusted harness tree"
+echo "   .claude/scripts/security-review/ is now bind-mounted read-only at"
+echo "   /opt/cfgms-harness/security-review for a lane, so changing a sibling"
+echo "   .py module between two calls MUST change the recorded hash (it is"
+echo "   mounted, executed code), while a *_test.py sibling (never executed by a"
+echo "   lane) must NOT =="
 printf '#!/usr/bin/env bash\necho entrypoint-v1\n' > "$ENTRYPOINT_FIXTURE"
 printf 'sibling module v1\n' > "$SIBLING_FIXTURE"
 hash_sibling_before="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
 printf 'sibling module v2 CHANGED\n' > "$SIBLING_FIXTURE"
 hash_sibling_after="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
-if [[ -n "$hash_sibling_before" && "$hash_sibling_before" == "$hash_sibling_after" ]]; then
-  ok "changing a never-mounted sibling module does NOT change the recorded hash"
+if [[ -n "$hash_sibling_before" && -n "$hash_sibling_after" && "$hash_sibling_before" != "$hash_sibling_after" ]]; then
+  ok "changing a mounted sibling harness module changes the recorded hash"
 else
-  bad "changing a never-mounted sibling module does NOT change the recorded hash" "before=${hash_sibling_before} after=${hash_sibling_after}"
+  bad "changing a mounted sibling harness module changes the recorded hash" "before=${hash_sibling_before} after=${hash_sibling_after}"
 fi
+SIBLING_TEST_FIXTURE="${HARNESS_ID_REPO}/.claude/scripts/security-review/schema_test.py"
+printf 'test v1\n' > "$SIBLING_TEST_FIXTURE"
+hash_testfile_before="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
+printf 'test v2 CHANGED\n' > "$SIBLING_TEST_FIXTURE"
+hash_testfile_after="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
+if [[ -n "$hash_testfile_before" && "$hash_testfile_before" == "$hash_testfile_after" ]]; then
+  ok "changing a *_test.py sibling does NOT change the recorded hash"
+else
+  bad "changing a *_test.py sibling does NOT change the recorded hash" "before=${hash_testfile_before} after=${hash_testfile_after}"
+fi
+check_contains "lane launch bind-mounts the trusted harness tree read-only at /opt/cfgms-harness/security-review" \
+  "$(cat "$DOCKER_CALL_LOG")" "${HARNESS_ID_REPO}/.claude/scripts/security-review:/opt/cfgms-harness/security-review:ro"
+check_contains "lane launch exports CFGMS_SECURITY_REVIEW_HARNESS_DIR" \
+  "$(cat "$DOCKER_CALL_LOG")" "CFGMS_SECURITY_REVIEW_HARNESS_DIR=/opt/cfgms-harness/security-review"
+check_contains "lane launch bind-mounts the trusted methodology beside the harness" \
+  "$(cat "$DOCKER_CALL_LOG")" "${HARNESS_ID_REPO}/docs/security-review:/opt/cfgms-harness/docs/security-review:ro"
+printf 'methodology v2 CHANGED\n' > "${HARNESS_ID_REPO}/docs/security-review/methodology.md"
+hash_method_after="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
+if [[ -n "$hash_sibling_after" && -n "$hash_method_after" && "$hash_sibling_after" != "$hash_method_after" ]]; then
+  ok "changing the mounted methodology changes the recorded hash"
+else
+  bad "changing the mounted methodology changes the recorded hash" "before=${hash_sibling_after} after=${hash_method_after}"
+fi
+hash_plan="$(run_hid_launch plan "")"
+if grep -q "/opt/cfgms-harness/security-review" "$DOCKER_CALL_LOG"; then
+  bad "plan-mode launch does not mount the harness tree" "$(grep -o '/opt/cfgms-harness[^ ]*' "$DOCKER_CALL_LOG" | head -1)"
+else
+  ok "plan-mode launch does not mount the harness tree"
+fi
+# Restore the lane-mode call log the checks below read.
+hash_sibling_after="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
 
 echo ""
 echo "== functional — harness_identity.json shape and the env var injection =="

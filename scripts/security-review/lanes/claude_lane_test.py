@@ -840,6 +840,38 @@ def test_build_prompt_starts_with_the_shared_methodology_preamble():
     )
 
 
+def test_run_lane_folds_scanner_evidence_into_prompt_and_envelope() -> None:
+    """Issue #3982: the lane collects scanner evidence through the shared
+    runner, renders it into the prompt (after the shared preamble) and records
+    the summary on the envelope. Exercised against a real repo_root whose only
+    declared file has no scanner profile, so the evidence is a concrete,
+    named coverage gap rather than a tool run."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as repo:
+        os.makedirs(os.path.join(repo, "docs"))
+        with open(os.path.join(repo, "docs", "notes.md"), "w") as f:
+            f.write("# notes\n")
+        write_plan_step(plan_dir, "step-001")
+        step_path = os.path.join(plan_dir, "step-001.json")
+        step = json.load(open(step_path))
+        step["files"] = ["docs/notes.md"]
+        json.dump(step, open(step_path, "w"))
+        prompts: list[str] = []
+
+        def stub(model, prompt, output_path):
+            prompts.append(prompt)
+            with open(output_path, "w") as f:
+                json.dump({"findings": []}, f)
+            return 0, False
+
+        with harness_identity_env("h"):
+            written = claude_lane.run_lane(plan_dir, out_dir, repo, LANE_ID, MODEL, call_harness_fn=stub)
+        check(len(prompts) == 1 and "## Scanner evidence for this step" in prompts[0], "prompt carries the scanner-evidence section")
+        check("unsupported_language" in prompts[0] and "docs/notes.md" in prompts[0], "the unsupported file is a named gap in the prompt", prompts[0][-600:] if prompts else "")
+        check(prompts and prompts[0].index(harness_runner.SYSTEM_PROMPT[:40]) < prompts[0].index("## Scanner evidence"), "scanner evidence comes after the shared preamble")
+        scans = written[0].get("scans")
+        check(isinstance(scans, list) and any(e.get("gap") == "unsupported_language" for e in scans), "envelope records the scan summary with the gap", repr(scans))
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

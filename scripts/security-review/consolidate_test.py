@@ -1419,6 +1419,54 @@ def test_incomplete_sweep_due_to_dispatch_issue_does_not_duplicate_rejected_file
         )
 
 
+def test_scanner_coverage_is_reported_from_envelope_scans() -> None:
+    """Issue #3982: `scans` on a lane envelope (complete or not) is surfaced in
+    the report as a per-lane table and a named gap list; a scanner gap never
+    flips the sweep to incomplete."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = os.path.join(tmp, "repo")
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        sweep = os.path.join(tmp, "sweep")
+        write_plan_step(sweep, "step-001", sha)
+        write_plan_step(sweep, "step-002", sha)
+        env1 = complete_envelope(sha, "lane-a", "step-001", [], files_intended=["pkg/example/thing.go"], files_read=["pkg/example/thing.go"])
+        env1["scans"] = [
+            {"tool": "gosec", "tool_version": "v", "language": "go", "scope": "pkg/example", "status": "ok", "exit_code": 0, "output_bytes": 10, "truncated": False, "cached": False, "reason": ""},
+            {"tool": "staticcheck", "tool_version": "v", "language": "go", "scope": "pkg/example", "status": "empty", "exit_code": 0, "output_bytes": 0, "truncated": False, "cached": False, "reason": "exit 0 with no output"},
+            {"tool": "semgrep", "tool_version": None, "language": "go", "scope": "pkg/example", "status": "unavailable", "exit_code": None, "output_bytes": 0, "truncated": False, "cached": False, "reason": "tool not present"},
+            {"gap": "unsupported_language", "files": ["docs/x.md"], "reason": "no profile"},
+        ]
+        write(os.path.join(sweep, "lanes", "lane-a", "step-001.findings.json"), env1)
+        env2 = complete_envelope(sha, "lane-a", "step-002", [], files_intended=["pkg/example/thing.go"], files_read=["pkg/example/thing.go"])
+        write(os.path.join(sweep, "lanes", "lane-a", "step-002.findings.json"), env2)  # no scans field
+        report = consolidate.consolidate(sweep, repo)
+        rows = report["scanner_coverage"]
+        check(len(rows) == 1 and rows[0]["lane"] == "lane-a", "one scanner-coverage row per lane", str(rows))
+        row = rows[0]
+        check(row["checks"] == 3 and row["ok"] == 1 and row["empty"] == 1 and row["unavailable"] == 1, "check statuses are counted", str(row))
+        check(row["steps_without_scans"] == 1, "a step whose envelope carries no scans is counted", str(row))
+        kinds = sorted(g["kind"] for g in row["gaps"])
+        check(kinds == ["scan_empty", "scan_unavailable", "unsupported_language"], "every non-ok check and non-check gap is a named gap", str(kinds))
+        check(consolidate._sweep_complete(report), "scanner gaps do not make the sweep incomplete")
+        md = consolidate.render_markdown(report)
+        section = _section(md, "## Scanner coverage")
+        check("| lane-a | 3 | 1 | 0 | 1 |" in section, "markdown carries the per-lane scanner table", section)
+        check("scan_unavailable" in section and "tool=semgrep" in section and "step-001" in section, "markdown names each gap by step, tool and kind", section)
+        check("unsupported_language" in section, "non-check gaps appear in the markdown")
+
+
+def test_scanner_coverage_absent_is_stated_not_blank() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = os.path.join(tmp, "repo")
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        sweep = os.path.join(tmp, "sweep")
+        write_plan_step(sweep, "step-001", sha)
+        write(os.path.join(sweep, "lanes", "lane-a", "step-001.findings.json"), complete_envelope(sha, "lane-a", "step-001", []))
+        md = consolidate.render_markdown(consolidate.consolidate(sweep, repo))
+        section = _section(md, "## Scanner coverage")
+        check("no scanner evidence recorded" in section, "a sweep with no scans says so explicitly", section)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -1,0 +1,17 @@
+{
+  "name": "cfgms-scanner",
+  "private": true,
+  "description": "Image-owned ESLint toolchain for the security-review finder lanes (Issue #3982). Scanner dependencies only -- never the audited project's node_modules. Versions track web/package-lock.json.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "eslint": "9.39.5",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-security": "4.0.1",
+    "globals": "17.11.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.67.0"
+  }
+}

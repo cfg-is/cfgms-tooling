@@ -1,0 +1,54 @@
+# CFGMS project rule (Issue #3982). The same HTML-injection sink bans
+# web/eslint.config.js enforces in CI (Story #2488), expressed for semgrep so
+# the TS/TSX profile carries them even where eslint cannot parse a file.
+rules:
+  - id: cfgms-html-injection-sink
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      HTML-injection sink ($SINK). React escapes rendered values by default;
+      this construct bypasses that protection (CWE-79). Render through React.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      category: security
+      confidence: HIGH
+      source: cfgms
+    patterns:
+      - pattern-either:
+          - pattern: $EL.$SINK = $VALUE
+          - pattern: $EL.$SINK(...)
+          - pattern: document.$SINK(...)
+      - metavariable-regex:
+          metavariable: $SINK
+          regex: ^(?:innerHTML|outerHTML|insertAdjacentHTML|write|writeln)$
+  - id: cfgms-react-dangerously-set-inner-html
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      dangerouslySetInnerHTML is banned repo-wide (HTML-injection sink,
+      CWE-79). Render the content through React.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      category: security
+      confidence: HIGH
+      source: cfgms
+    pattern-either:
+      - pattern: '<$TAG dangerouslySetInnerHTML={...} />'
+      - pattern: '<$TAG dangerouslySetInnerHTML={...}>...</$TAG>'
+      - pattern: '$X.createElement($TAG, {dangerouslySetInnerHTML: $V, ...}, ...)'
+  - id: cfgms-runtime-code-composition
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      Runtime code composition (eval / new Function / string-timer) is banned
+      repo-wide (CLAUDE.md banned patterns, CWE-95).
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      category: security
+      confidence: HIGH
+      source: cfgms
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: setTimeout("...", ...)
+      - pattern: setInterval("...", ...)

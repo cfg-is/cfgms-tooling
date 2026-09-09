@@ -1,0 +1,31 @@
+# CFGMS project rule (Issue #3982). Mirrors CLAUDE.md's log-injection rule:
+# an error value returned from a gRPC, store or decode call carries the
+# caller's tainted input back out inside its message text, so a bare `err`
+# beside a sanitized ID in one log call is still a `go/log-injection`
+# finding. `make lint-log-injection` enforces this under features/; this rule
+# gives the reviewing model the same signal for every Go file in a step.
+rules:
+  - id: cfgms-raw-error-in-structured-log
+    languages: [go]
+    severity: WARNING
+    message: >-
+      Structured log call passes a raw error value under the "error" key.
+      Wrap it: "error", logging.SanitizeLogValue($ERR.Error()). A raw error
+      can carry attacker-controlled text from the failing call back into the
+      log stream (CWE-117).
+    metadata:
+      cwe: "CWE-117: Improper Output Neutralization for Logs"
+      category: security
+      confidence: MEDIUM
+      source: cfgms
+    patterns:
+      - pattern-either:
+          - pattern: $LOGGER.$METHOD(..., "error", $ERR, ...)
+          - pattern: slog.$METHOD(..., "error", $ERR, ...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(Error|Warn|Info|Debug|ErrorContext|WarnContext|InfoContext|DebugContext|Log|LogAttrs)$
+      - pattern-not: $LOGGER.$METHOD(..., "error", logging.SanitizeLogValue(...), ...)
+      - pattern-not: slog.$METHOD(..., "error", logging.SanitizeLogValue(...), ...)
+      - pattern-not: $LOGGER.$METHOD(..., "error", "...", ...)
+      - pattern-not: slog.$METHOD(..., "error", "...", ...)

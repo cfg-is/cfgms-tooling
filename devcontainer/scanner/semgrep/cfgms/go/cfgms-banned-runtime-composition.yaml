@@ -1,0 +1,50 @@
+# CFGMS project rule (Issue #3982). CLAUDE.md bans runtime code composition
+# in anything that runs on an endpoint: `sh -c`/`bash -c "<string>"`,
+# `powershell -Command`/`-EncodedCommand`/`-ExecutionPolicy Bypass`,
+# `python -c`, `Invoke-Expression`. Scripts run as `<interpreter> -File <path>`
+# against an on-disk, hash-recorded file, never as a composed string.
+rules:
+  - id: cfgms-banned-runtime-composition
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Runtime command composition through a shell or interpreter string
+      (CLAUDE.md banned pattern). Invoke the target binary directly with an
+      argv, or run a staged on-disk script file.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      category: security
+      confidence: HIGH
+      source: cfgms
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: exec.Command("$SHELL", "-c", ...)
+              - pattern: exec.CommandContext($CTX, "$SHELL", "-c", ...)
+          - metavariable-regex:
+              metavariable: $SHELL
+              regex: ^(?:/bin/|/usr/bin/)?(?:sh|bash|dash|zsh)$
+      - patterns:
+          - pattern-either:
+              - pattern: exec.Command("$CMD", "/c", ...)
+              - pattern: exec.CommandContext($CTX, "$CMD", "/c", ...)
+          - metavariable-regex:
+              metavariable: $CMD
+              regex: ^(?i)cmd(?:\.exe)?$
+      - patterns:
+          - pattern-either:
+              - pattern: exec.Command("$PS", ..., "$FLAG", ...)
+              - pattern: exec.CommandContext($CTX, "$PS", ..., "$FLAG", ...)
+          - metavariable-regex:
+              metavariable: $PS
+              regex: ^(?i)(?:powershell|pwsh)(?:\.exe)?$
+          - metavariable-regex:
+              metavariable: $FLAG
+              regex: ^(?i)(?:-Command|-c|-EncodedCommand|-e|-ec|-enc|-ExecutionPolicy)$
+      - patterns:
+          - pattern-either:
+              - pattern: exec.Command("$PY", "-c", ...)
+              - pattern: exec.CommandContext($CTX, "$PY", "-c", ...)
+          - metavariable-regex:
+              metavariable: $PY
+              regex: ^(?:python|python3|python2)(?:\.exe)?$

@@ -130,6 +130,28 @@ severity definitions and the worked examples every lane receives in its prompt. 
 triaging a report: a `high` in the report means what that document says it means, for the attacker
 it names.
 
+## Scanner evidence in every step
+
+Each finder lane runs fixed, harness-owned security-tool profiles over a step's files before it
+prompts the model (Issue #3982): gosec, staticcheck and semgrep for Go; eslint (image-owned
+config, never the repo's) and semgrep for TS/TSX; ripgrep for the CLAUDE.md banned patterns in
+shell/PowerShell/Python. The tool output is folded into the prompt after the shared preamble,
+labelled as untrusted evidence. No model chooses these commands — the registry is
+`.claude/scripts/security-review/lanes/scan_profiles.py`, every argv runs with no shell, every
+path is confined to the snapshot, and no scanner has network access.
+
+A scan that did not happen is never silent. Each step envelope carries a `scans` list: one entry
+per check with its `status` (`ok`, `partial`, `empty`, `failed`, `timeout`, `rejected`,
+`unavailable`, `skipped`), `findings` count and `truncated` flag, plus one entry per non-check gap
+(`unsupported_language`, `path_rejected`, `no_go_module`, `go_module_unscannable`,
+`runner_error`, `prompt_budget_omitted`). `partial` means the tool reported findings AND analysis
+errors (a package that failed to compile or import), so its coverage is incomplete.
+`go_module_unscannable` means the Go module tree held a symlink, a `vendor/` directory or a
+`replace` that is not a plain module-plus-version, so no Go tool was allowed to open it.
+`prompt_budget_omitted` means the model did not receive every scanner record in full. `empty` means the tool completed and printed
+nothing — that is "no evidence", not "clean". A `rejected` check means a registry entry failed
+its shape check at runtime; that is a code defect to fix, not a finding to triage.
+
 ## Reading the report
 
 `report/consolidated.md` opens with a per-lane × per-step coverage table — counts of `complete` /
@@ -149,6 +171,11 @@ counts as a gap too. Whenever any of that is
 true, `render_markdown()` says so up front and adds a `## Incomplete` section naming every gap
 before the findings list; treat that section, not a bare empty `## Findings`, as the answer to
 "did this sweep actually cover the code."
+
+`## Scanner coverage` follows: a per-lane table of scanner checks by status and a gap list naming
+each non-`ok` check by step, tool and scope, plus every step whose envelope recorded no scans.
+Scanner gaps do not make the sweep incomplete (the model still reviewed the source), but they
+tell you which code no tool looked at — read them before trusting a quiet step.
 
 ## Hand off, do not auto-file
 
