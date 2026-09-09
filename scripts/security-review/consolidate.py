@@ -20,7 +20,43 @@ or partially parked -- and produces two files under `<sweep_dir>/report/`:
 
 This module never calls a provider API and never dispatches a container --
 it is a pure read-existing-files-and-render step, safe to run against fixture
-data before any lane (S6/S7/S8) exists.
+data before any lane (S6/S7/S8) exists. That stays true after Issue #3984:
+the model-backed **adjudication stage** lives in `adjudicate.py` (host side,
+prepare/launch) and `lanes/adjudicator.py` (in-container), and this
+module only *reads* the envelope that stage leaves at
+`adjudication/lanes/adjudicator/adjudication.json` -- exactly as it reads a
+finder lane's envelopes. `consolidate_test.py` enforces the claim: every
+subprocess this module spawns is `git`, and it imports no network module.
+
+**Severity disagreement and adjudication (Issue #3984):** every consolidated
+finding carries a deterministic `severity_range` -- the lowest and highest
+severity any lane reported for it, per-lane values, and a `disagreement`
+flag -- so two lanes calling the same defect `low` and `critical` is
+rendered as an explicit disagreement, never silently collapsed. When the
+adjudication stage ran, its per-finding verdict is merged ONTO the
+deterministic set by de-duplication key as a second layer (`adjudication`
+on each finding, with the adjudicating harness/model and its rationale);
+`occurrences` and `severity_range` are never rewritten, so what the lanes
+actually said is always recoverable. The adjudication layer can annotate
+and can never delete: a finding the adjudicator omitted is still rendered,
+marked as not adjudicated, and counted in `## Incomplete`; an adjudication
+naming a key that matches no finding is dropped and counted (`unmatched`)
+-- a model cannot add findings either. An adjudication envelope that is
+missing after a recorded dispatch, schema-invalid, non-`complete`, from a
+different sweep, or computed over a different deterministic input than the
+current one (`input_hash` mismatch, e.g. lanes re-ran on resume) is treated
+like a failed lane: raw severities render, and the failure is named in
+`## Incomplete`, so a report never *looks* adjudicated when it is not.
+
+**Cross-step re-aggregation (Issue #3984):** the planner partitions blind, so
+one defect's evidence can land in two steps. `build_cross_step_groups()`
+mechanically groups consolidated findings that share a defect class (`cwe`
+when a finding carries one -- #3983 -- else `vuln_class`) across two or more
+distinct plan steps, renders them in a `## Cross-step groups` section, and
+hands them to the adjudicator for a `same_defect`/`distinct`/`unsure`
+assessment. Grouping is over-inclusive by design: a false group costs a
+reader a glance, a missed cross-step defect is the failure this exists to
+catch.
 
 Every file this module reads is validated through #3901's actual
 `schema.validate_step_envelope` (which recursively validates nested findings
@@ -69,6 +105,7 @@ sweep regardless of how much of the sweep actually ran.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -90,6 +127,31 @@ NOT_STARTED = "not_started"
 # SEVERITY_VALUES/CONFIDENCE_VALUES exactly.
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+_SEVERITY_BY_RANK = {rank: name for name, rank in _SEVERITY_RANK.items()}
+
+# Adjudication stage layout (Issue #3984). The stage runs as a lane-mode
+# investigator container against its own sub-sweep directory,
+# `<sweep_dir>/adjudication/`, whose `snapshot/` is deliberately EMPTY (the
+# adjudicator sees findings, never source), whose `plan/` carries the
+# deterministic input this module builds, and whose
+# `lanes/adjudicator/` is the container's only writable mount.
+ADJUDICATION_SUBDIR = "adjudication"
+ADJUDICATOR_LANE_ID = "adjudicator"
+ADJUDICATION_INPUT_FILENAME = "adjudication-input.json"
+ADJUDICATION_OUTPUT_FILENAME = "adjudication.json"
+
+# Adjudication statuses a report can carry. The first two are the only ones
+# `_sweep_complete()` accepts; every other status names a gap in
+# `## Incomplete`.
+ADJUDICATION_NOT_CONFIGURED = "not_configured"
+ADJUDICATION_SKIPPED_NO_FINDINGS = "skipped_no_findings"
+ADJUDICATION_COMPLETE = "complete"
+ADJUDICATION_MISSING = "missing"
+ADJUDICATION_INVALID = "invalid"
+ADJUDICATION_STALE = "stale"
+ADJUDICATION_OK_STATUSES = frozenset(
+    {ADJUDICATION_NOT_CONFIGURED, ADJUDICATION_SKIPPED_NO_FINDINGS, ADJUDICATION_COMPLETE}
+)
 
 
 def _load_json(path: str):
@@ -321,17 +383,23 @@ def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> di
         group = groups.setdefault(key, {"lanes": set(), "step_ids": set(), "occurrences": []})
         group["lanes"].add(lane)
         group["step_ids"].add(step_id)
-        group["occurrences"].append(
-            {
-                "lane": lane,
-                "step_id": step_id,
-                "severity": finding["severity"],
-                "confidence": finding["confidence"],
-                "title": finding["title"],
-                "evidence": finding["evidence"],
-                "suggested_fix": finding["suggested_fix"],
-            }
-        )
+        occurrence = {
+            "lane": lane,
+            "step_id": step_id,
+            "severity": finding["severity"],
+            "confidence": finding["confidence"],
+            "title": finding["title"],
+            "evidence": finding["evidence"],
+            "suggested_fix": finding["suggested_fix"],
+        }
+        # Issue #3983's normalised defect identifier, when a finding carries
+        # one -- consumed by cross-step grouping (Issue #3984). Optional
+        # until #3983 lands, so an occurrence without it has no key at all
+        # rather than a null placeholder.
+        cwe = finding.get("cwe")
+        if isinstance(cwe, str) and cwe:
+            occurrence["cwe"] = cwe
+        group["occurrences"].append(occurrence)
 
     return groups
 
@@ -363,6 +431,12 @@ def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
     as critical.
     """
     severity_rank = max(_SEVERITY_RANK[occ["severity"]] for occ in finding["occurrences"])
+    adjudication = finding.get("adjudication")
+    if isinstance(adjudication, dict) and adjudication.get("severity") in _SEVERITY_RANK:
+        # Issue #3984: once a finding carries an adjudicated severity, that
+        # is the severity a reader is meant to act on, so it is what the
+        # report sorts by. The raw range still renders beside it.
+        severity_rank = _SEVERITY_RANK[adjudication["severity"]]
     confidence_rank = max(_CONFIDENCE_RANK[occ["confidence"]] for occ in finding["occurrences"])
     return (
         -finding["agreement"]["reported"],
@@ -394,10 +468,372 @@ def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]])
                 "occurrences": sorted(
                     group["occurrences"], key=lambda o: (o["lane"], o["step_id"])
                 ),
+                "severity_range": _severity_range(group["occurrences"]),
+                "adjudication": None,
             }
         )
     consolidated.sort(key=_group_rank_key)
     return consolidated
+
+
+def _severity_range(occurrences: list[dict]) -> dict:
+    """The deterministic severity record for one consolidated finding (Issue
+    #3984): the lowest and highest severity any occurrence carries, the
+    highest severity each lane reported (a lane can report the same key from
+    two steps), and whether the lanes disagree at all. Computed from the
+    occurrences alone, never from an adjudication, so it always says what the
+    lanes actually reported."""
+    by_lane: dict[str, int] = {}
+    for occ in occurrences:
+        rank = _SEVERITY_RANK[occ["severity"]]
+        if rank > by_lane.get(occ["lane"], -1):
+            by_lane[occ["lane"]] = rank
+    ranks = [_SEVERITY_RANK[occ["severity"]] for occ in occurrences]
+    lowest, highest = min(ranks), max(ranks)
+    return {
+        "lowest": _SEVERITY_BY_RANK[lowest],
+        "highest": _SEVERITY_BY_RANK[highest],
+        "disagreement": lowest != highest,
+        "by_lane": {lane: _SEVERITY_BY_RANK[rank] for lane, rank in sorted(by_lane.items())},
+    }
+
+
+def _finding_key(finding: dict) -> tuple[str, str, str]:
+    return (finding["file"], finding["symbol"], finding["vuln_class"])
+
+
+def _defect_class(finding: dict) -> str:
+    """The class a finding is grouped on for cross-step re-aggregation: the
+    first non-empty `cwe` any occurrence carries (Issue #3983's normalised
+    identifier, when present), else the de-duplication key's own
+    `vuln_class`."""
+    for occ in finding["occurrences"]:
+        cwe = occ.get("cwe")
+        if isinstance(cwe, str) and cwe:
+            return cwe
+    return finding["vuln_class"]
+
+
+def build_cross_step_groups(findings: list[dict]) -> list[dict]:
+    """Mechanically group consolidated findings whose evidence spans plan
+    steps (Issue #3984): two or more findings sharing a defect class
+    (`_defect_class`) whose combined `step_ids` cover two or more distinct
+    steps. A pair of findings in the same step is not a cross-step group --
+    the planner already put them together -- and a class reported once is
+    not a group at all.
+
+    Deterministic: groups are ordered by defect class, members by
+    de-duplication key, and ids are `group-NNN` in that order, so the id an
+    adjudicator's `group_assessments` refers back to is stable across runs
+    over the same input.
+    """
+    by_class: dict[str, list[dict]] = {}
+    for finding in findings:
+        by_class.setdefault(_defect_class(finding), []).append(finding)
+
+    groups: list[dict] = []
+    for defect_class in sorted(by_class):
+        members = sorted(by_class[defect_class], key=_finding_key)
+        if len(members) < 2:
+            continue
+        step_ids = sorted({step_id for member in members for step_id in member["step_ids"]})
+        if len(step_ids) < 2:
+            continue
+        groups.append(
+            {
+                "group_id": f"group-{len(groups) + 1:03d}",
+                "defect_class": defect_class,
+                "step_ids": step_ids,
+                "members": [
+                    {
+                        "file": member["file"],
+                        "symbol": member["symbol"],
+                        "vuln_class": member["vuln_class"],
+                        "step_ids": member["step_ids"],
+                    }
+                    for member in members
+                ],
+                "assessment": None,
+            }
+        )
+    return groups
+
+
+def build_adjudication_input(sweep_id: str, commit_sha: str, findings: list[dict], groups: list[dict]) -> dict:
+    """The exact object the adjudication stage is handed (Issue #3984):
+    findings only -- each finding's key, the lanes' own severities/
+    confidences/titles/evidence/suggested fixes, and its deterministic
+    severity range -- plus the cross-step groups. No file body, no path
+    beyond the finding's own repo-relative `file`, nothing read from the
+    tree. Built here, in the pure module, so `adjudicate.py` (which writes
+    it for the container) and `consolidate()` (which recomputes it to check
+    an envelope's `input_hash` is over the CURRENT deterministic set) can
+    never disagree about its shape.
+
+    Findings are emitted in de-duplication-key order, not report order: the
+    report re-sorts once an adjudication is merged, and the hash over this
+    object must be identical before and after that merge or every
+    adjudication would read as stale against its own input."""
+    return {
+        "sweep_id": sweep_id,
+        "commit_sha": commit_sha,
+        "findings": [
+            {
+                "file": finding["file"],
+                "symbol": finding["symbol"],
+                "vuln_class": finding["vuln_class"],
+                "step_ids": list(finding["step_ids"]),
+                "severity_range": finding["severity_range"],
+                "reports": [
+                    {
+                        "lane": occ["lane"],
+                        "step_id": occ["step_id"],
+                        "severity": occ["severity"],
+                        "confidence": occ["confidence"],
+                        "title": occ["title"],
+                        "evidence": occ["evidence"],
+                        "suggested_fix": occ["suggested_fix"],
+                    }
+                    for occ in finding["occurrences"]
+                ],
+            }
+            for finding in sorted(findings, key=_finding_key)
+        ],
+        "cross_step_groups": [
+            {
+                "group_id": group["group_id"],
+                "defect_class": group["defect_class"],
+                "step_ids": group["step_ids"],
+                "members": group["members"],
+            }
+            for group in groups
+        ],
+    }
+
+
+def canonical_adjudication_input(adjudication_input: dict) -> str:
+    """The one serialisation of an adjudication input: sorted keys, no
+    whitespace, no trailing newline. `adjudicate.py` writes exactly these
+    bytes for the container, the adjudicator lane hashes exactly the bytes it
+    read, and `adjudication_input_hash()` hashes this same string -- so the
+    three agree by construction."""
+    return json.dumps(adjudication_input, sort_keys=True, separators=(",", ":"))
+
+
+def adjudication_input_hash(adjudication_input: dict) -> str:
+    """SHA-256 over `canonical_adjudication_input()`. The adjudicator lane
+    records the same digest (over the file bytes it read) on its envelope;
+    `consolidate()` recomputes this over the current deterministic set and
+    treats a mismatch as a stale adjudication (the lanes re-ran, or a finding
+    was added or excluded, after the adjudicator saw its input)."""
+    canonical = canonical_adjudication_input(adjudication_input)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def adjudication_output_path(sweep_dir: str) -> str:
+    return os.path.join(
+        sweep_dir, ADJUDICATION_SUBDIR, "lanes", ADJUDICATOR_LANE_ID, ADJUDICATION_OUTPUT_FILENAME
+    )
+
+
+def load_adjudication(
+    sweep_dir: str,
+    dispatch: dict,
+    expected_sweep_id: str,
+    expected_input_hash: str,
+    has_findings: bool,
+) -> tuple[dict, dict | None]:
+    """Read the adjudication stage's envelope and classify it.
+
+    Returns `(status_record, envelope_or_None)`. `status_record` is the
+    `adjudication` block of the report: `status`, the requested harness/model
+    from `dispatch_report.json`'s `adjudicator` entry (when one exists), and
+    `errors` naming exactly why an envelope was not usable. The envelope is
+    returned only when `status == "complete"`, and only then does
+    `_apply_adjudication()` merge anything.
+
+    Classification, in order:
+    - no `adjudicator` dispatch entry and no envelope file: `not_configured`
+      -- the operator did not set `CFGMS_SECURITY_REVIEW_ADJUDICATOR`; raw
+      severities render, plainly labelled as raw.
+    - dispatch outcome `skipped_no_findings`: nothing to adjudicate; fine.
+    - dispatch outcome other than `dispatched`: that outcome verbatim
+      (`credential_unavailable`, `launch_failed`) -- a gap.
+    - dispatched but no envelope file: `missing` -- the container left no
+      parseable output, so it did not run (the lane rule, applied here).
+    - envelope not a JSON object / fails `validate_adjudication_envelope` /
+      names a different `sweep_id`: `invalid`.
+    - envelope `state` is `parked`/`refused`/`failed`: that state.
+    - envelope `input_hash` differs from the hash over the current
+      deterministic input: `stale`.
+    - otherwise `complete`.
+    """
+    entry = dispatch.get("adjudicator") if isinstance(dispatch, dict) else None
+    record: dict = {
+        "status": ADJUDICATION_NOT_CONFIGURED,
+        "harness": entry.get("requested_harness") if isinstance(entry, dict) else None,
+        "model_id": entry.get("requested_model") if isinstance(entry, dict) else None,
+        "dispatch_outcome": entry.get("outcome") if isinstance(entry, dict) else None,
+        "adjudicated": 0,
+        "omitted": 0,
+        "unmatched": 0,
+        "groups_assessed": 0,
+        "groups_omitted": 0,
+        "unsent": 0,
+        "groups_unsent": 0,
+        "unsolicited": 0,
+        "errors": [],
+    }
+    path = adjudication_output_path(sweep_dir)
+    envelope_exists = os.path.isfile(path)
+
+    if not isinstance(entry, dict) and not envelope_exists:
+        return record, None
+    if isinstance(entry, dict):
+        outcome = entry.get("outcome")
+        if outcome == ADJUDICATION_SKIPPED_NO_FINDINGS:
+            if not has_findings:
+                record["status"] = ADJUDICATION_SKIPPED_NO_FINDINGS
+                return record, None
+            # The skip was recorded over an empty set, but findings exist
+            # now (lanes re-ran, or an envelope landed after the skip). A
+            # skip must never be inherited by findings it never saw.
+            record["status"] = ADJUDICATION_STALE
+            record["errors"].append(
+                "adjudicator was skipped for an empty finding set, but findings now exist; "
+                "re-run the adjudication stage"
+            )
+            return record, None
+        if outcome != "dispatched":
+            record["status"] = str(outcome or "unknown")
+            record["errors"].append(f"adjudicator dispatch outcome: {outcome!r}")
+            return record, None
+
+    if not envelope_exists:
+        record["status"] = ADJUDICATION_MISSING
+        record["errors"].append("no adjudication envelope was written")
+        return record, None
+
+    envelope = _load_json(path)
+    errors = (
+        schema.validate_adjudication_envelope(envelope)
+        if isinstance(envelope, dict)
+        else ["adjudication file did not contain a JSON object"]
+    )
+    if not errors and envelope.get("sweep_id") != expected_sweep_id:
+        errors.append(
+            f"envelope sweep_id {envelope.get('sweep_id')!r} does not match this sweep {expected_sweep_id!r}"
+        )
+    if errors:
+        schema.log_event("invalid_adjudication_file", path=path, errors=errors)
+        record["status"] = ADJUDICATION_INVALID
+        record["errors"].extend(errors)
+        return record, None
+
+    record["harness"] = envelope["harness"]
+    record["model_id"] = envelope["model_id"]
+    if envelope["state"] != "complete":
+        record["status"] = envelope["state"]
+        record["errors"].append(
+            f"adjudicator ended {envelope['state']}: {envelope.get('stop_reason_raw', '')}"
+        )
+        return record, None
+    if envelope["input_hash"] != expected_input_hash:
+        record["status"] = ADJUDICATION_STALE
+        record["errors"].append(
+            "adjudication was computed over a different deterministic finding set "
+            "than the current one (input_hash mismatch); re-run the adjudication stage"
+        )
+        return record, None
+
+    record["status"] = ADJUDICATION_COMPLETE
+    return record, envelope
+
+
+def _apply_adjudication(findings: list[dict], groups: list[dict], envelope: dict, record: dict) -> None:
+    """Merge a `complete` adjudication envelope ONTO the deterministic
+    findings and groups, in place, and fill the counts on `record`.
+
+    Iterates the deterministic set and looks each finding up in the
+    envelope -- never the other way round -- which is what makes deletion
+    structurally impossible: a finding the adjudicator omitted keeps
+    `adjudication: None` and is counted `omitted`; an adjudication whose key
+    matches nothing is dropped, logged and counted `unmatched`. `occurrences`
+    and `severity_range` are not touched.
+    """
+    # What the lane itself declined to send (over its prompt-size budget),
+    # so the report can say why a finding or group has no verdict.
+    unsent = envelope.get("unsent_findings")
+    unassessed = envelope.get("unassessed_groups")
+    record["unsent"] = len(unsent) if isinstance(unsent, list) else 0
+    record["groups_unsent"] = len(unassessed) if isinstance(unassessed, list) else 0
+
+    # Defence in depth on the lane's own rule: a verdict for a finding the
+    # lane says it never sent, or a group it says it never assessed, is a
+    # verdict the model was never asked for. It is dropped here too, even if
+    # a lane bug let it onto the envelope, and counted as `unsolicited`.
+    unsent_keys = {tuple(k) for k in unsent if isinstance(k, list) and len(k) == 3} if isinstance(unsent, list) else set()
+    unassessed_ids = set(unassessed) if isinstance(unassessed, list) else set()
+    record["unsolicited"] = 0
+
+    by_key = {}
+    for adjudication in envelope.get("adjudications") or []:
+        key = (adjudication["file"], adjudication["symbol"], adjudication["vuln_class"])
+        if key in unsent_keys:
+            record["unsolicited"] += 1
+            schema.log_event("adjudication_verdict_for_unsent_finding", file=key[0], symbol=key[1], vuln_class=key[2])
+            continue
+        by_key[key] = adjudication
+    matched_keys: set = set()
+    for finding in findings:
+        key = _finding_key(finding)
+        adjudication = by_key.get(key)
+        if adjudication is None:
+            record["omitted"] += 1
+            continue
+        matched_keys.add(key)
+        record["adjudicated"] += 1
+        finding["adjudication"] = {
+            "severity": adjudication["severity"],
+            "rationale": adjudication["rationale"],
+            "harness": envelope["harness"],
+            "model_id": envelope["model_id"],
+            "changed": adjudication["severity"] != finding["severity_range"]["highest"]
+            or finding["severity_range"]["disagreement"],
+        }
+    for key in by_key:
+        if key not in matched_keys:
+            record["unmatched"] += 1
+            schema.log_event(
+                "adjudication_unmatched_key",
+                file=key[0],
+                symbol=key[1],
+                vuln_class=key[2],
+            )
+
+    assessments = {}
+    for assessment in envelope.get("group_assessments") or []:
+        if assessment["group_id"] in unassessed_ids:
+            record["unsolicited"] += 1
+            schema.log_event("adjudication_verdict_for_unassessed_group", group_id=assessment["group_id"])
+            continue
+        assessments[assessment["group_id"]] = assessment
+    for group in groups:
+        assessment = assessments.get(group["group_id"])
+        if assessment is None:
+            # A group the adjudicator was handed and did not assess is a gap
+            # exactly like an omitted finding (Issue #3984 review).
+            record["groups_omitted"] += 1
+            continue
+        record["groups_assessed"] += 1
+        group["assessment"] = {
+            "assessment": assessment["assessment"],
+            "rationale": assessment["rationale"],
+            "harness": envelope["harness"],
+            "model_id": envelope["model_id"],
+        }
+    # The sort key reads the adjudicated severity, so re-sort after merging.
+    findings.sort(key=_group_rank_key)
 
 
 def build_coverage_table(
@@ -528,17 +964,53 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     consolidated_findings = _finalize_findings(groups, lane_step_state)
     coverage = build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
     scanner_coverage = build_scanner_coverage(lanes, step_ids, load_scan_summaries(sweep_dir, lanes, step_ids))
+    sweep_id = os.path.basename(os.path.normpath(sweep_dir))
+    dispatch = _load_dispatch_report(sweep_dir)
+
+    # Issue #3984: deterministic layers first (cross-step groups, the input
+    # hash over exactly what an adjudicator would be handed), then the
+    # adjudication envelope merged ONTO them if -- and only if -- it is
+    # complete, for this sweep, and over this input.
+    cross_step_groups = build_cross_step_groups(consolidated_findings)
+    adjudication_input = build_adjudication_input(
+        sweep_id, _sweep_commit_sha(sweep_dir), consolidated_findings, cross_step_groups
+    )
+    adjudication, envelope = load_adjudication(
+        sweep_dir,
+        dispatch,
+        sweep_id,
+        adjudication_input_hash(adjudication_input),
+        has_findings=bool(consolidated_findings),
+    )
+    if envelope is not None:
+        _apply_adjudication(consolidated_findings, cross_step_groups, envelope, adjudication)
+
     return {
-        "sweep_id": os.path.basename(os.path.normpath(sweep_dir)),
+        "sweep_id": sweep_id,
         "lanes": lanes,
         "steps_discovered": step_ids,
         "plan_failed": plan_failed,
         "coverage": coverage,
         "scanner_coverage": scanner_coverage,
-        "dispatch": _load_dispatch_report(sweep_dir),
+        "dispatch": dispatch,
         "rejected_proposals": _load_rejected_proposals(sweep_dir),
+        "adjudication": adjudication,
+        "cross_step_groups": cross_step_groups,
         "findings": consolidated_findings,
     }
+
+
+def _sweep_commit_sha(sweep_dir: str) -> str:
+    """The commit a sweep reviewed, from the planner's own context sidecar
+    (`.plan-context.json`, written at the sweep root by `planner.prepare()`),
+    falling back to `manifest.json`. Carried into the adjudication input so
+    the adjudicator's envelope is bound to the same commit the findings
+    are."""
+    for filename, key in ((planner.CONTEXT_FILENAME, "commit_sha"), ("manifest.json", "commit_sha")):
+        data = _load_json(os.path.join(sweep_dir, filename))
+        if isinstance(data, dict) and isinstance(data.get(key), str) and data[key]:
+            return data[key]
+    return "unknown"
 
 
 def _md_escape_inline(text: object) -> str:
@@ -623,7 +1095,56 @@ def _sweep_complete(report: dict) -> bool:
         return False
     if report.get("rejected_proposals"):
         return False
+    adjudication = report.get("adjudication") or {}
+    if adjudication:
+        # Issue #3984: an adjudication stage that was configured but did not
+        # produce a usable, current envelope -- or that produced one which
+        # skipped findings -- is a gap exactly like a failed lane. A report
+        # must never look adjudicated when it is not.
+        if adjudication.get("status") not in ADJUDICATION_OK_STATUSES:
+            return False
+        if adjudication.get("omitted", 0) > 0 or adjudication.get("groups_omitted", 0) > 0:
+            return False
     return True
+
+
+def _adjudication_incomplete_lines(adjudication: dict) -> list[str]:
+    status = adjudication.get("status")
+    lines = []
+    if status not in ADJUDICATION_OK_STATUSES:
+        reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
+        lines.append(
+            f"- **Adjudication stage did not complete** (`{_md_escape_inline(status)}`): "
+            f"{reasons or 'no detail recorded'}. Every severity below is a raw lane value, "
+            "not an adjudicated one."
+        )
+    else:
+        if adjudication.get("omitted", 0) > 0:
+            unsent = adjudication.get("unsent", 0)
+            why = (
+                f" ({unsent} of them never sent: over the adjudicator's prompt-size budget)"
+                if unsent
+                else ""
+            )
+            lines.append(
+                f"- **Adjudicator omitted {adjudication['omitted']} finding(s)** it was handed{why}; "
+                "each is still listed under `## Findings`, marked *not adjudicated*, with its raw "
+                "lane severities."
+            )
+        if adjudication.get("groups_omitted", 0) > 0:
+            groups_unsent = adjudication.get("groups_unsent", 0)
+            why = (
+                f" ({groups_unsent} of them never sent: the members could not share one "
+                "prompt, and a group is never assessed on partial evidence)"
+                if groups_unsent
+                else ""
+            )
+            lines.append(
+                f"- **Adjudicator did not assess {adjudication['groups_omitted']} cross-step "
+                f"group(s)** it was handed{why}; each is still listed under `## Cross-step groups` "
+                "with no assessment."
+            )
+    return lines
 
 
 def _incomplete_lines(report: dict) -> list[str]:
@@ -679,6 +1200,8 @@ def _incomplete_lines(report: dict) -> list[str]:
     rejected_count = len(report.get("rejected_proposals") or [])
     if rejected_count:
         lines.append(f"- {rejected_count} rejected proposal(s) recorded; see `## Dispatch` below.")
+
+    lines.extend(_adjudication_incomplete_lines(report.get("adjudication") or {}))
 
     return lines
 
@@ -810,6 +1333,16 @@ def render_markdown(report: dict) -> str:
             )
         lines.append("")
 
+    lines.append("## Adjudication")
+    lines.append("")
+    lines.extend(_adjudication_lines(report.get("adjudication") or {}))
+    lines.append("")
+
+    lines.append("## Cross-step groups")
+    lines.append("")
+    lines.extend(_cross_step_group_lines(report.get("cross_step_groups") or []))
+    lines.append("")
+
     lines.append("## Findings")
     lines.append("")
     if not report["findings"]:
@@ -832,6 +1365,8 @@ def render_markdown(report: dict) -> str:
             f"completed this step: {lanes_text}"
         )
         lines.append("")
+        lines.append(_severity_line(finding, report.get("adjudication") or {}))
+        lines.append("")
         for occ in finding["occurrences"]:
             lines.append(
                 f"- **{_md_escape_inline(occ['lane'])}** "
@@ -843,6 +1378,122 @@ def render_markdown(report: dict) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _adjudication_lines(adjudication: dict) -> list[str]:
+    """The `## Adjudication` section body: one status sentence a reader can
+    act on, never a blank. Says plainly when severities are raw."""
+    status = adjudication.get("status", ADJUDICATION_NOT_CONFIGURED)
+    harness = _md_escape_inline(adjudication.get("harness") or "unknown")
+    model_id = _md_escape_inline(adjudication.get("model_id") or "unknown")
+    if status == ADJUDICATION_NOT_CONFIGURED:
+        return [
+            "_Not run: no adjudicator is configured (`CFGMS_SECURITY_REVIEW_ADJUDICATOR` "
+            "unset). Every severity in this report is a **raw lane value**; where lanes "
+            "disagree, the finding says so and shows the full range._"
+        ]
+    if status == ADJUDICATION_SKIPPED_NO_FINDINGS:
+        return [
+            f"_Skipped: the deterministic set contained no findings for `{harness}`/`{model_id}` "
+            "to adjudicate._"
+        ]
+    if status == ADJUDICATION_COMPLETE:
+        return [
+            f"Adjudicated by `{harness}` / `{model_id}` over findings only (no source). "
+            f"Findings adjudicated: {adjudication.get('adjudicated', 0)}; omitted by the "
+            f"adjudicator: {adjudication.get('omitted', 0)}; adjudications matching no "
+            f"finding (dropped): {adjudication.get('unmatched', 0)}; cross-step groups "
+            f"assessed: {adjudication.get('groups_assessed', 0)}; groups not assessed: "
+            f"{adjudication.get('groups_omitted', 0)}; verdicts for items never sent "
+            f"(dropped): {adjudication.get('unsolicited', 0)}. An adjudicated severity "
+            "is rendered as **Severity (adjudicated)** with the lanes' raw values beside it; "
+            "a finding without one is rendered as **Severity (raw)**."
+        ]
+    reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
+    return [
+        f"**Did not complete** (`{_md_escape_inline(status)}`, `{harness}` / `{model_id}`): "
+        f"{reasons or 'no detail recorded'}. Every severity in this report is a **raw lane "
+        "value**; see `## Incomplete`."
+    ]
+
+
+def _severity_line(finding: dict, adjudication_record: dict) -> str:
+    """One line per finding stating the severity a reader should act on and
+    exactly where it came from. Both original per-lane values are always
+    shown, so an adjudicated severity never hides what the lanes said, and a
+    disagreement without an adjudication is named as a disagreement rather
+    than rendered as one value with the other silently discarded."""
+    severity_range = finding["severity_range"]
+    by_lane = ", ".join(
+        f"{_md_escape_inline(lane)}={_md_escape_inline(sev)}"
+        for lane, sev in severity_range["by_lane"].items()
+    )
+    adjudication = finding.get("adjudication")
+    if isinstance(adjudication, dict):
+        return (
+            f"Severity (adjudicated): **{_md_escape_inline(adjudication['severity'])}** — by "
+            f"`{_md_escape_inline(adjudication['harness'])}` / "
+            f"`{_md_escape_inline(adjudication['model_id'])}`; lanes reported {by_lane}. "
+            f"Rationale: {_md_escape_inline(adjudication['rationale'])}"
+        )
+    status = adjudication_record.get("status", ADJUDICATION_NOT_CONFIGURED)
+    if status == ADJUDICATION_COMPLETE:
+        why = "the adjudicator omitted this finding"
+    elif status == ADJUDICATION_NOT_CONFIGURED:
+        why = "no adjudicator configured"
+    else:
+        why = f"adjudication stage `{_md_escape_inline(status)}`"
+    if severity_range["disagreement"]:
+        return (
+            f"Severity (raw): **DISAGREEMENT** {_md_escape_inline(severity_range['lowest'])} → "
+            f"{_md_escape_inline(severity_range['highest'])} — lanes reported {by_lane}; "
+            f"not adjudicated ({why}). Treat the highest value as the working severity "
+            "until a human resolves it."
+        )
+    return (
+        f"Severity (raw): **{_md_escape_inline(severity_range['highest'])}** — lanes reported "
+        f"{by_lane}; not adjudicated ({why})."
+    )
+
+
+def _cross_step_group_lines(groups: list[dict]) -> list[str]:
+    """The `## Cross-step groups` section body (Issue #3984)."""
+    if not groups:
+        return [
+            "_None: no two findings share a defect class across different plan steps._"
+        ]
+    lines = [
+        f"{len(groups)} group(s) of findings share a defect class across plan-step "
+        "boundaries. Read each as one possible defect whose evidence the planner split "
+        "between steps; an assessment, when present, is the adjudicator's judgement on "
+        "whether the members are the same defect."
+    ]
+    for group in groups:
+        lines.append("")
+        steps = ", ".join(f"`{_md_escape_inline(s)}`" for s in group["step_ids"])
+        lines.append(
+            f"### {_md_escape_inline(group['group_id'])} — "
+            f"{_md_escape_inline(group['defect_class'])} across {steps}"
+        )
+        lines.append("")
+        for member in group["members"]:
+            member_steps = ", ".join(_md_escape_inline(s) for s in member["step_ids"])
+            lines.append(
+                f"- `{_md_escape_inline(member['file'])}` :: "
+                f"{_md_escape_inline(member['symbol'])} ({_md_escape_inline(member['vuln_class'])}; "
+                f"step(s) {member_steps})"
+            )
+        assessment = group.get("assessment")
+        if isinstance(assessment, dict):
+            lines.append(
+                f"- Assessment: **{_md_escape_inline(assessment['assessment'])}** — by "
+                f"`{_md_escape_inline(assessment['harness'])}` / "
+                f"`{_md_escape_inline(assessment['model_id'])}`. "
+                f"{_md_escape_inline(assessment['rationale'])}"
+            )
+        else:
+            lines.append("- Assessment: _none (not adjudicated)_")
+    return lines
 
 
 def _load_dispatch_report(sweep_dir: str) -> dict:
@@ -857,10 +1508,18 @@ def _load_dispatch_report(sweep_dir: str) -> dict:
         return {"planners": [], "lanes": []}
     planners = data.get("planners")
     lanes = data.get("lanes")
-    return {
+    report = {
         "planners": planners if isinstance(planners, list) else [],
         "lanes": lanes if isinstance(lanes, list) else [],
     }
+    # Issue #3984: the adjudicator's single dispatch entry, present only when
+    # CFGMS_SECURITY_REVIEW_ADJUDICATOR was set for the run. Its absence is
+    # itself a signal ("not configured"), so it is not normalised to an
+    # empty placeholder the way the two lists above are.
+    adjudicator = data.get("adjudicator")
+    if isinstance(adjudicator, dict):
+        report["adjudicator"] = adjudicator
+    return report
 
 
 def _load_rejected_proposals(sweep_dir: str) -> list[dict]:

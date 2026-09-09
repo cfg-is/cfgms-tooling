@@ -421,6 +421,20 @@ case "$outcome" in
     printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
     exit 0
     ;;
+  finding_low|finding_critical)
+    # One finding at a fixed key (Issue #3984): two lanes, one on each of
+    # these outcomes, produce the exact low-vs-critical disagreement the
+    # adjudication stage exists to resolve.
+    sev="${outcome#finding_}"
+    printf '{"findings":[{"hypothesis_id":"h1","file":"pkg/example/file.go","symbol":"Do","vuln_class":"tenant-scoping","severity":"%s","confidence":"medium","title":"stub cross-tenant read","evidence":"stub evidence","suggested_fix":"stub fix"}],"dispositions":[{"hypothesis_id":"h1","disposition":"candidate_found","summary":"stub: found one"}]}' "$sev" > "$output_path"
+    exit 0
+    ;;
+  adjudication)
+    # The adjudicator harness's raw output shape (Issue #3984): one verdict
+    # for the key the two finder outcomes above report.
+    printf '{"adjudications":[{"file":"pkg/example/file.go","symbol":"Do","vuln_class":"tenant-scoping","severity":"high","rationale":"stub rubric: high, authenticated cross-tenant read"}],"group_assessments":[]}' > "$output_path"
+    exit 0
+    ;;
   parked)
     echo "stub harness: rate limit exceeded, try again later"
     exit 0
@@ -470,14 +484,25 @@ out_dir=""
 plan_dir=""
 repo_root=""
 entrypoint_path=""
+harness_dir=""
+methodology_dir=""
 model=""
+harness=""
 for a in "${args[@]}"; do
   case "$a" in
     *:/workspace-out:rw) out_dir="${a%:/workspace-out:rw}" ;;
     *:/workspace-plan:ro) plan_dir="${a%:/workspace-plan:ro}" ;;
     *:/workspace:ro) repo_root="${a%:/workspace:ro}" ;;
     *:/usr/local/bin/investigator-lane-entrypoint.py:ro) entrypoint_path="${a%:/usr/local/bin/investigator-lane-entrypoint.py:ro}" ;;
+    # The trusted harness and methodology mounts (Issue #3982) -- forwarded
+    # to the lane process as the same env/path contract the real container
+    # sees, so a lane whose /workspace snapshot is EMPTY (the adjudicator,
+    # Issue #3984) still finds its siblings and the rubric where the real
+    # launcher puts them, not via the snapshot fallback.
+    *:/opt/cfgms-harness/security-review:ro) harness_dir="${a%:/opt/cfgms-harness/security-review:ro}" ;;
+    *:/opt/cfgms-harness/docs/security-review:ro) methodology_dir="${a%:/opt/cfgms-harness/docs/security-review:ro}" ;;
     CFGMS_SECURITY_REVIEW_MODEL=*) model="${a#CFGMS_SECURITY_REVIEW_MODEL=}" ;;
+    CFGMS_SECURITY_REVIEW_HARNESS=*) harness="${a#CFGMS_SECURITY_REVIEW_HARNESS=}" ;;
   esac
 done
 
@@ -513,6 +538,9 @@ else
   CFGMS_SECURITY_REVIEW_OUT_DIR="$out_dir" \
   CFGMS_SECURITY_REVIEW_REPO_ROOT="$repo_root" \
   CFGMS_SECURITY_REVIEW_MODEL="$model" \
+  CFGMS_SECURITY_REVIEW_HARNESS="$harness" \
+  CFGMS_SECURITY_REVIEW_HARNESS_DIR="${harness_dir:-/opt/cfgms-harness/security-review}" \
+  CFGMS_SECURITY_REVIEW_METHODOLOGY="${methodology_dir:+${methodology_dir}/methodology.md}" \
   PATH="${STUB_CLAUDE_BIN_DIR}:${PATH}" \
   python3 "$entrypoint_path" "$mode" >>"${LANE_RUN_LOG:-/dev/null}" 2>&1 || true
 fi
@@ -1729,6 +1757,177 @@ check_contains "dispatch_report.json's planner entries record outcome dispatched
 # above) -- restore them before rm -rf can unlink anything under here.
 chmod -R u+w "$MP_DIR" 2>/dev/null || true
 rm -rf "$MP_DIR"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TESTS (Issue #3984) -- the adjudication stage. Two finder lanes
+# disagree (low vs critical) on one key; CFGMS_SECURITY_REVIEW_ADJUDICATOR
+# dispatches ONE more launch-investigator container, in lane mode, whose
+# /workspace snapshot is EMPTY (findings only, never source), running the
+# real adjudicator.py against the real stub harness; the consolidator
+# then merges its verdict beside the raw values. A failed adjudicator leaves
+# raw severities and an Incomplete entry; an unset variable leaves a report
+# that says so; a malformed one fails closed before dispatching anything.
+# ----------------------------------------------------------------------------
+echo ""
+echo "== REQUIRED TEST — CFGMS_SECURITY_REVIEW_ADJUDICATOR dispatches a source-free"
+echo "   adjudicator container after the lanes, and the report carries the adjudicated"
+echo "   severity with both original lane values beside it (Issue #3984) =="
+SUB_ADJ="${SANDBOX}/case-adjudicate"
+setup_sub_sandbox "$SUB_ADJ"
+adj_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
+  STUB_OUTCOME_CLAUDE_LOW=finding_low \
+  STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
+  CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:judge" \
+  STUB_OUTCOME_ADJUDICATOR=adjudication \
+  STUB_PLAN_STEP_COUNT=1 \
+  run_cli "$SUB_ADJ" launch HEAD 2>"${SUB_ADJ}/stderr.log")
+adj_rc=$?
+check_eq "adjudicated launch exits 0" "$adj_rc" "0"
+SWEEP_DIR_ADJ="$(dirname "$(dirname "$adj_out")")"
+adj_call="$(grep ' adjudicator$' "${SUB_ADJ}/docker_calls.log" || true)"
+adj_call_count="$(grep -c ' adjudicator$' "${SUB_ADJ}/docker_calls.log" || true)"
+check_eq "exactly one adjudicator container was dispatched" "$adj_call_count" "1"
+check_contains "adjudicator container runs lane mode under the adjudicator lane id" "$adj_call" "CFGMS_SECURITY_REVIEW_LANE_ID=adjudicator"
+check_contains "adjudicator container carries the configured harness" "$adj_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
+check_contains "adjudicator container carries the configured model" "$adj_call" "CFGMS_SECURITY_REVIEW_MODEL=judge"
+check_contains "adjudicator container mounts the real adjudicator.py as its lane entrypoint" "$adj_call" "${SECURITY_REVIEW_DIR}/lanes/adjudicator.py:/usr/local/bin/investigator-lane-entrypoint.py:ro"
+check_contains "adjudicator's /workspace mount is the adjudication sub-sweep's own snapshot" "$adj_call" "${SWEEP_DIR_ADJ}/adjudication/snapshot:/workspace:ro"
+if [[ -d "${SWEEP_DIR_ADJ}/adjudication/snapshot" ]] && [[ -z "$(ls -A "${SWEEP_DIR_ADJ}/adjudication/snapshot")" ]]; then
+  ok "the snapshot mounted at the adjudicator's /workspace is EMPTY (findings only, never source)"
+else
+  bad "the snapshot mounted at the adjudicator's /workspace is EMPTY (findings only, never source)" "$(ls -A "${SWEEP_DIR_ADJ}/adjudication/snapshot" 2>&1)"
+fi
+check_contains "adjudicator's /workspace-plan mount is the adjudication input directory" "$adj_call" "${SWEEP_DIR_ADJ}/adjudication/plan:/workspace-plan:ro"
+check_contains "adjudicator's writable mount is its own lane directory only" "$adj_call" "${SWEEP_DIR_ADJ}/adjudication/lanes/adjudicator:/workspace-out:rw"
+adj_input="$(cat "${SWEEP_DIR_ADJ}/adjudication/plan/adjudication-input.json" 2>/dev/null || true)"
+check_contains "the adjudication input carries the disputed finding" "$adj_input" '"symbol":"Do"'
+check_not_contains "the adjudication input carries no file body" "$adj_input" "package example"
+adj_env="$(cat "${SWEEP_DIR_ADJ}/adjudication/lanes/adjudicator/adjudication.json" 2>/dev/null || true)"
+check_contains "the real adjudicator.py wrote a complete envelope" "$adj_env" '"state": "complete"'
+check_contains "the envelope records the harness" "$adj_env" '"harness": "claude"'
+check_contains "the envelope records the model" "$adj_env" '"model_id": "judge"'
+adj_dispatch="$(cat "${SWEEP_DIR_ADJ}/dispatch_report.json" 2>/dev/null || true)"
+check_contains "dispatch_report.json records the adjudicator as dispatched" "$adj_dispatch" '"outcome": "dispatched"'
+adj_report="$(cat "${SWEEP_DIR_ADJ}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "report: the finding is rendered with the adjudicated severity" "$adj_report" "Severity (adjudicated): **high**"
+check_contains "report: the adjudicated line names the adjudicating harness/model" "$adj_report" '`claude` / `judge`'
+check_contains "report: the low lane's original value is still shown" "$adj_report" "claude-low=low"
+check_contains "report: the critical lane's original value is still shown" "$adj_report" "claude-crit=critical"
+check_contains "report: the rationale is rendered" "$adj_report" "stub rubric: high"
+check_contains "report: the Adjudication section says who adjudicated" "$adj_report" "Adjudicated by \`claude\` / \`judge\` over findings only (no source)"
+check_not_contains "report: a fully adjudicated sweep has no Incomplete section" "$adj_report" "## Incomplete"
+adj_json="$(cat "${SWEEP_DIR_ADJ}/report/consolidated.json" 2>/dev/null || true)"
+check_contains "consolidated.json still records the low lane's own severity" "$adj_json" '"lane": "claude-low"'
+check_contains "consolidated.json severity_range records the disagreement" "$adj_json" '"disagreement": true'
+adj_lane_log="$(cat "${SUB_ADJ}/lane_run.log" 2>/dev/null || true)"
+check_not_contains "the real adjudicator lane run produced no import or runtime errors" "$adj_lane_log" "Traceback"
+
+echo ""
+echo "== REQUIRED TEST — an adjudicator that fails leaves the deterministic findings"
+echo "   intact, renders raw severities, and names the failure under Incomplete (Issue #3984) =="
+SUB_ADJF="${SANDBOX}/case-adjudicate-failed"
+setup_sub_sandbox "$SUB_ADJF"
+adjf_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
+  STUB_OUTCOME_CLAUDE_LOW=finding_low \
+  STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
+  CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:judge" \
+  STUB_OUTCOME_ADJUDICATOR=failed \
+  STUB_PLAN_STEP_COUNT=1 \
+  run_cli "$SUB_ADJF" launch HEAD 2>"${SUB_ADJF}/stderr.log")
+adjf_rc=$?
+check_eq "a failed adjudicator is a recorded lane-shaped failure, not a dispatch failure: launch exits 0" "$adjf_rc" "0"
+SWEEP_DIR_ADJF="$(dirname "$(dirname "$adjf_out")")"
+adjf_env="$(cat "${SWEEP_DIR_ADJF}/adjudication/lanes/adjudicator/adjudication.json" 2>/dev/null || true)"
+check_contains "the adjudicator wrote a failed envelope" "$adjf_env" '"state": "failed"'
+adjf_report="$(cat "${SWEEP_DIR_ADJF}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "report: the sweep is marked incomplete" "$adjf_report" "**This sweep is incomplete.**"
+check_contains "report: the adjudication failure is named under Incomplete" "$adjf_report" "Adjudication stage did not complete"
+check_contains "report: the failure state is named" "$adjf_report" '`failed`'
+check_contains "report: the disputed finding still renders, as a raw disagreement" "$adjf_report" "Severity (raw): **DISAGREEMENT** low → critical"
+check_contains "report: both lane values render" "$adjf_report" "claude-crit=critical, claude-low=low"
+check_not_contains "report: nothing renders as adjudicated" "$adjf_report" "Severity (adjudicated)"
+
+echo ""
+echo "== REQUIRED TEST — with CFGMS_SECURITY_REVIEW_ADJUDICATOR unset no adjudicator is"
+echo "   dispatched and the report says severities are raw (Issue #3984) =="
+SUB_ADJN="${SANDBOX}/case-adjudicate-unset"
+setup_sub_sandbox "$SUB_ADJN"
+adjn_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
+  STUB_OUTCOME_CLAUDE_LOW=finding_low \
+  STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
+  STUB_PLAN_STEP_COUNT=1 \
+  run_cli "$SUB_ADJN" launch HEAD 2>"${SUB_ADJN}/stderr.log")
+adjn_rc=$?
+check_eq "launch without an adjudicator exits 0" "$adjn_rc" "0"
+SWEEP_DIR_ADJN="$(dirname "$(dirname "$adjn_out")")"
+adjn_calls="$(grep -c ' adjudicator$' "${SUB_ADJN}/docker_calls.log" || true)"
+check_eq "no adjudicator container is dispatched" "$adjn_calls" "0"
+[[ -e "${SWEEP_DIR_ADJN}/adjudication" ]] && bad "no adjudication/ sub-sweep directory is created" "exists" || ok "no adjudication/ sub-sweep directory is created"
+adjn_report="$(cat "${SWEEP_DIR_ADJN}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "report: says no adjudicator is configured" "$adjn_report" "no adjudicator is configured"
+check_contains "report: the disagreement is surfaced raw" "$adjn_report" "Severity (raw): **DISAGREEMENT** low → critical"
+check_not_contains "report: an unconfigured adjudicator is not an Incomplete gap" "$adjn_report" "## Incomplete"
+adjn_dispatch="$(cat "${SWEEP_DIR_ADJN}/dispatch_report.json" 2>/dev/null || true)"
+check_not_contains "dispatch_report.json has no adjudicator entry" "$adjn_dispatch" '"adjudicator"'
+
+echo ""
+echo "== REQUIRED TEST — a sweep with no findings records the adjudicator as skipped"
+echo "   without dispatching it (Issue #3984) =="
+SUB_ADJZ="${SANDBOX}/case-adjudicate-nothing"
+setup_sub_sandbox "$SUB_ADJZ"
+adjz_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-a" \
+  CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:judge" \
+  STUB_OUTCOME_ADJUDICATOR=adjudication \
+  STUB_PLAN_STEP_COUNT=1 \
+  run_cli "$SUB_ADJZ" launch HEAD 2>"${SUB_ADJZ}/stderr.log")
+adjz_rc=$?
+check_eq "launch with nothing to adjudicate exits 0" "$adjz_rc" "0"
+SWEEP_DIR_ADJZ="$(dirname "$(dirname "$adjz_out")")"
+adjz_calls="$(grep -c ' adjudicator$' "${SUB_ADJZ}/docker_calls.log" || true)"
+check_eq "no adjudicator container is dispatched for an empty finding set" "$adjz_calls" "0"
+adjz_dispatch="$(cat "${SWEEP_DIR_ADJZ}/dispatch_report.json" 2>/dev/null || true)"
+check_contains "dispatch_report.json records skipped_no_findings" "$adjz_dispatch" '"outcome": "skipped_no_findings"'
+adjz_report="$(cat "${SWEEP_DIR_ADJZ}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "report: the skip is stated" "$adjz_report" "Skipped: the deterministic set contained no findings"
+check_not_contains "report: a skip for no findings is not an Incomplete gap" "$adjz_report" "## Incomplete"
+
+echo ""
+echo "== REQUIRED TEST — a malformed CFGMS_SECURITY_REVIEW_ADJUDICATOR (two entries)"
+echo "   fails closed after the lanes and never dispatches an adjudicator (Issue #3984) =="
+SUB_ADJM="${SANDBOX}/case-adjudicate-malformed"
+setup_sub_sandbox "$SUB_ADJM"
+set +e
+adjm_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
+  STUB_OUTCOME_CLAUDE_LOW=finding_low \
+  STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
+  CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:a,claude:b" \
+  STUB_PLAN_STEP_COUNT=1 \
+  run_cli "$SUB_ADJM" launch HEAD 2>&1)
+adjm_rc=$?
+set -e
+if [[ "$adjm_rc" -ne 0 ]]; then ok "launch exits non-zero for a two-entry adjudicator value"; else bad "launch exits non-zero for a two-entry adjudicator value" "exited 0"; fi
+check_contains "the failure names the variable and the one-entry rule" "$adjm_out" "CFGMS_SECURITY_REVIEW_ADJUDICATOR must name exactly one harness:model pair"
+adjm_calls="$(grep -c ' adjudicator$' "${SUB_ADJM}/docker_calls.log" || true)"
+check_eq "no adjudicator container is dispatched on a malformed value" "$adjm_calls" "0"
+check_not_contains "no report path is printed as if the sweep completed cleanly" "$adjm_out" "report/consolidated.md"
+SWEEP_DIR_ADJM="$(find "${SUB_ADJM}/base" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+adjm_dispatch="$(cat "${SWEEP_DIR_ADJM}/dispatch_report.json" 2>/dev/null || true)"
+check_contains "dispatch_report.json records the unusable configuration as a launch_failed adjudicator outcome" "$adjm_dispatch" '"outcome": "launch_failed"'
+check_contains "dispatch_report.json records the raw configuration value that failed to parse" "$adjm_dispatch" 'claude:a,claude:b'
+adjm_report="$(cat "${SWEEP_DIR_ADJM}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "report: a configured-but-unusable adjudicator is an Incomplete gap, never 'not configured'" "$adjm_report" "Adjudication stage did not complete"
+check_not_contains "report: the misconfigured stage is not described as unconfigured" "$adjm_report" "no adjudicator is configured"
+
+echo ""
+echo "== structural — the adjudication stage is wired into both launch and resume,"
+echo "   after the lanes and before consolidation (Issue #3984) =="
+adj_wiring_count="$(grep -c 'dispatch_adjudicator "\$sweep_dir" || dispatch_failed=1' "$CLI" || true)"
+check_eq "dispatch_adjudicator is called from both cmd_launch and cmd_resume" "$adj_wiring_count" "2"
+check_contains "dispatch_adjudicator no-ops when CFGMS_SECURITY_REVIEW_ADJUDICATOR is unset" "$cli_src" 'if [[ -z "${CFGMS_SECURITY_REVIEW_ADJUDICATOR:-}" ]]; then'
+check_contains "dispatch_adjudicator dispatches through adjudicate.py launch" "$cli_src" '"${SECURITY_REVIEW_DIR}/adjudicate.py" launch'
+consolidate_src="$(cat "${SECURITY_REVIEW_DIR}/consolidate.py")"
+check_contains "consolidate.py still states its purity claim" "$consolidate_src" "This module never calls a provider API and never dispatches a container"
+check_not_contains "consolidate.py never invokes the launcher" "$consolidate_src" '"launch-investigator"'
 
 echo ""
 echo "== REQUIRED TEST evidence — this file's own docker stub replaces ONLY the"

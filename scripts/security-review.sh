@@ -12,6 +12,9 @@
 #   - agent-dispatch.sh launch-investigator (#3903) -- dispatches each roster
 #     lane's own subscription-harness container, one per invocation
 #   - consolidate.py (#3904) -- consolidate()/load_sweep()/build_coverage_table()
+#   - adjudicate.py (#3984) -- prepare()/launch(): the optional model-backed
+#     severity-adjudication stage between the lanes and the consolidator,
+#     selected by CFGMS_SECURITY_REVIEW_ADJUDICATOR (one harness:model pair)
 #   - roster.py (#3932) -- parse_roster(), the ONLY lane-dispatch path (epic
 #     #3927's contract C5). `CFGMS_SECURITY_REVIEW_LANES` must be set; there
 #     is no hardcoded fallback lane set (Issue #3933 removed the three REST
@@ -84,6 +87,16 @@ pairs, e.g. "claude:sonnet-5" -- see roster.py and
 docs/architecture/security-review-harness.md. A lane that parks, refuses, or fails
 on some steps never blocks any other lane's dispatch or progress, and never
 prevents the consolidator from running against whatever the other lanes produced.
+
+CFGMS_SECURITY_REVIEW_ADJUDICATOR (optional) is exactly ONE harness:model pair,
+e.g. "claude:opus-5". When set, after every lane has exited the deterministic
+findings are handed -- findings only, never source -- to that model in a
+read-only investigator container (adjudicate.py, Issue #3984), which applies
+the severity rubric to each finding and assesses cross-step groups; the
+consolidator then merges that verdict beside the lanes' raw values. When
+unset, the report says so and every severity is a raw lane value. An
+adjudicator that fails, refuses, parks, or cannot be dispatched is recorded
+in the report's Incomplete section; it never blocks consolidation.
 
 Which directory a container mounts at /workspace is mode-dependent (Issue #3979).
 Every LANE container still mounts the sweep's own verified snapshot (snapshot.py,
@@ -579,6 +592,124 @@ dispatch_all_lanes() {
   dispatch_roster_lanes "$sweep_dir" "$CFGMS_SECURITY_REVIEW_LANES"
 }
 
+# record_adjudicator_dispatch_outcome <sweep_dir> <harness> <model> <outcome>
+# Writes dispatch_report.json's `adjudicator` entry (Issue #3984), preserving
+# the `planners`/`lanes` entries the two recorders above own. consolidate.py
+# reads this entry to tell "not configured" (no entry) from "dispatched but
+# left no output" (entry present, envelope missing) -- the lane rule applied
+# to the adjudication stage.
+record_adjudicator_dispatch_outcome() {
+  local sweep_dir="$1" harness="$2" model="$3" outcome="$4"
+  python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" "$harness" "$model" "$outcome" <<'PYEOF'
+import json
+import os
+import sys
+
+sec_dir, sweep_dir, harness, model, outcome = sys.argv[1:6]
+sys.path.insert(0, sec_dir)
+import atomic_write  # noqa: E402
+
+report_path = os.path.join(sweep_dir, "dispatch_report.json")
+try:
+    with open(report_path) as f:
+        report = json.load(f)
+    if not isinstance(report, dict):
+        report = {}
+except (OSError, ValueError):
+    report = {}
+report.setdefault("planners", [])
+report.setdefault("lanes", [])
+report["adjudicator"] = {
+    "requested_harness": harness,
+    "requested_model": model,
+    "passed_harness": harness,
+    "passed_model": model,
+    "outcome": outcome,
+}
+atomic_write.write_json_atomic(report_path, report)
+PYEOF
+}
+
+# dispatch_adjudicator <sweep_dir>
+# The adjudication stage (Issue #3984). A no-op when
+# CFGMS_SECURITY_REVIEW_ADJUDICATOR is unset -- the consolidator then reports
+# "not configured" and renders raw severities. Otherwise: parse the single
+# harness:model pair through roster.py (the same parser the lane roster uses;
+# more than one entry is a configuration error), have adjudicate.py prepare
+# the findings-only input and the source-free sub-sweep directory, dispatch
+# ONE launch-investigator container through adjudicate.py launch, wait for it
+# to exit, and record the outcome. Mirrors dispatch_roster_lanes' failure
+# contract exactly: a credential-unavailable skip is logged and returns 0; any
+# other launch failure is recorded and returns 1 so the caller's final exit
+# code is non-zero. Runs AFTER every lane has exited (its input is their
+# output) and BEFORE run_consolidation (which merges its envelope).
+dispatch_adjudicator() {
+  local sweep_dir="$1"
+
+  if [[ -z "${CFGMS_SECURITY_REVIEW_ADJUDICATOR:-}" ]]; then
+    return 0
+  fi
+
+  # A configured stage whose configuration cannot be used is a FAILED
+  # stage, not an unconfigured one: record launch_failed on both parse
+  # branches so the consolidator renders the gap under Incomplete (and never
+  # reuses an earlier run's envelope as if this run had adjudicated).
+  local roster_output
+  if ! roster_output=$(python3 "${SECURITY_REVIEW_DIR}/roster.py" "$CFGMS_SECURITY_REVIEW_ADJUDICATOR" 2>&1); then
+    echo "ERROR: could not parse CFGMS_SECURITY_REVIEW_ADJUDICATOR: ${roster_output}" >&2
+    record_adjudicator_dispatch_outcome "$sweep_dir" "unparsed" "$CFGMS_SECURITY_REVIEW_ADJUDICATOR" "launch_failed"
+    return 1
+  fi
+  local entry_count
+  entry_count=$(printf '%s\n' "$roster_output" | grep -c . || true)
+  if [[ "$entry_count" -ne 1 ]]; then
+    echo "ERROR: CFGMS_SECURITY_REVIEW_ADJUDICATOR must name exactly one harness:model pair, got ${entry_count}" >&2
+    record_adjudicator_dispatch_outcome "$sweep_dir" "unparsed" "$CFGMS_SECURITY_REVIEW_ADJUDICATOR" "launch_failed"
+    return 1
+  fi
+  local harness model lane_dir_name
+  IFS=$'\t' read -r harness model lane_dir_name <<<"$roster_output"
+
+  local prepare_output
+  if ! prepare_output=$(python3 "${SECURITY_REVIEW_DIR}/adjudicate.py" prepare "$sweep_dir" --repo-root "$REPO_ROOT" 2>&1); then
+    echo "ERROR: adjudication prepare failed: ${prepare_output}" >&2
+    record_adjudicator_dispatch_outcome "$sweep_dir" "$harness" "$model" "launch_failed"
+    return 1
+  fi
+  if [[ "$prepare_output" == *NOTHING_TO_ADJUDICATE* ]]; then
+    echo "adjudication skipped for ${sweep_dir}: no findings to adjudicate" >&2
+    record_adjudicator_dispatch_outcome "$sweep_dir" "$harness" "$model" "skipped_no_findings"
+    return 0
+  fi
+
+  local launch_output launch_rc=0
+  launch_output=$(python3 "${SECURITY_REVIEW_DIR}/adjudicate.py" launch "$sweep_dir" \
+    --harness "$harness" --model "$model" --repo-root "$REPO_ROOT" 2>&1) || launch_rc=$?
+
+  if [[ $launch_rc -ne 0 ]]; then
+    if _is_intentional_dispatch_skip "$launch_output"; then
+      echo "WARNING: adjudicator dispatch skipped (credentials unavailable): ${launch_output}" >&2
+      record_adjudicator_dispatch_outcome "$sweep_dir" "$harness" "$model" "credential_unavailable"
+      return 0
+    fi
+    echo "ERROR: adjudicator dispatch failed: ${launch_output}" >&2
+    record_adjudicator_dispatch_outcome "$sweep_dir" "$harness" "$model" "launch_failed"
+    return 1
+  fi
+
+  local cid
+  cid="$(printf '%s\n' "$launch_output" | sed -n 's/^LAUNCHED_INVESTIGATOR:adjudicator://p' | tail -n1)"
+  if [[ -z "$cid" ]]; then
+    echo "ERROR: adjudicator dispatched but no container id was parsed from: ${launch_output}" >&2
+    record_adjudicator_dispatch_outcome "$sweep_dir" "$harness" "$model" "launch_failed"
+    return 1
+  fi
+  docker wait "$cid" >/dev/null 2>&1 || true
+
+  record_adjudicator_dispatch_outcome "$sweep_dir" "$harness" "$model" "dispatched"
+  return 0
+}
+
 # run_consolidation <sweep_dir>
 # Reuses consolidate.py's CLI unmodified. Its own exit code is the contract:
 # non-zero only when the repository root could not be determined, which
@@ -621,6 +752,7 @@ cmd_launch() {
   local dispatch_failed=0
   dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" || dispatch_failed=1
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
+  dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then
     echo "ERROR: consolidation failed for sweep ${sweep_dir}" >&2
@@ -684,6 +816,7 @@ cmd_resume() {
   fi
 
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
+  dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then
     echo "ERROR: consolidation failed for sweep ${sweep_dir}" >&2

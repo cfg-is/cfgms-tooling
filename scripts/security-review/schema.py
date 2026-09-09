@@ -88,6 +88,15 @@ echoing caller input). `json.dumps` escapes embedded newlines and control
 characters inside string values, so routing every log line through
 `safe_log_event` guarantees a forged payload stays inside its field rather
 than rendering as a second, spoofed log record.
+
+- An **adjudication envelope** (`validate_adjudication_envelope`, Issue
+  #3984): the one record the adjudication stage writes per sweep -- the
+  same four terminal states and the same non-`complete`-needs-
+  `stop_reason_raw` rule as a step envelope, carrying `adjudications` (one
+  rubric-applied severity plus rationale per deterministic finding key) and
+  `group_assessments` (one verdict per cross-step group) on `complete`. See
+  the section above `validate_adjudication` for why this shape can annotate
+  a finding and never remove one.
 """
 from __future__ import annotations
 
@@ -155,6 +164,17 @@ DISPOSITION_VALUES = frozenset(
 )
 
 
+def _is_member(value: object, allowed: frozenset) -> bool:
+    """Type-safe enum membership: a JSON array or object in an enum-valued
+    field (`"severity": []`, `"state": {}`) is unhashable, and a bare
+    `value in frozenset` raises `TypeError` instead of returning `False` --
+    which turned a malformed saved envelope into an aborted consolidation
+    rather than an excluded file (Issue #3984 review). Every enum check in
+    this module goes through here so "never raises on malformed input"
+    holds for nested JSON types too."""
+    return isinstance(value, str) and value in allowed
+
+
 def validate_finding(finding: object) -> list[str]:
     """Return a list of validation errors; empty list means valid.
 
@@ -170,12 +190,12 @@ def validate_finding(finding: object) -> list[str]:
             continue
         value = finding[field]
         if field == "severity":
-            if value not in SEVERITY_VALUES:
+            if not _is_member(value, SEVERITY_VALUES):
                 errors.append(
                     f"severity must be one of {sorted(SEVERITY_VALUES)}, got {value!r}"
                 )
         elif field == "confidence":
-            if value not in CONFIDENCE_VALUES:
+            if not _is_member(value, CONFIDENCE_VALUES):
                 errors.append(
                     f"confidence must be one of {sorted(CONFIDENCE_VALUES)}, got {value!r}"
                 )
@@ -213,7 +233,7 @@ def validate_step_envelope(envelope: object, plan_step: object = None) -> list[s
             errors.append(f"field {field} must be a non-empty string, got {value!r}")
 
     state = envelope.get("state")
-    if "state" in envelope and state not in STEP_STATES:
+    if "state" in envelope and not _is_member(state, STEP_STATES):
         errors.append(f"state must be one of {sorted(STEP_STATES)}, got {state!r}")
 
     if state == "complete":
@@ -273,7 +293,7 @@ def validate_step_envelope(envelope: object, plan_step: object = None) -> list[s
                 errors.append(
                     f"field {field} must be a list of non-empty strings when present, got {value!r}"
                 )
-    elif state in STEP_STATES:
+    elif _is_member(state, STEP_STATES):
         raw_reason = envelope.get("stop_reason_raw")
         if not isinstance(raw_reason, str) or raw_reason == "":
             errors.append(
@@ -342,7 +362,7 @@ def validate_disposition(disposition: object) -> list[str]:
             continue
         value = disposition[field]
         if field == "disposition":
-            if value not in DISPOSITION_VALUES:
+            if not _is_member(value, DISPOSITION_VALUES):
                 errors.append(
                     f"disposition must be one of {sorted(DISPOSITION_VALUES)}, got {value!r}"
                 )
@@ -435,6 +455,211 @@ def validate_plan_step(step: object) -> list[str]:
                         )
                     else:
                         seen_ids.add(hypothesis_id)
+
+    return errors
+
+
+# --- Adjudication envelope (Issue #3984) -----------------------------------
+#
+# The record the adjudication stage writes once per sweep at
+# `<sweep_dir>/adjudication/lanes/adjudicator/adjudication.json`. It is a
+# lane-shaped citizen: the same four terminal states, the same "a non-
+# `complete` state carries a non-empty `stop_reason_raw`" rule, and the same
+# "no parseable output means it did not run" consequence in the consolidator.
+#
+# An adjudication ANNOTATES one deterministic finding -- addressed by the
+# consolidator's own de-duplication key (`file` + `symbol` + `vuln_class`)
+# -- with a rubric-applied severity and a written rationale. It carries no
+# evidence, no fix, and no line number: the adjudicator sees findings, never
+# source, so it has nothing new to say about the code. Nothing in this shape
+# can remove a finding: the consolidator merges adjudications ONTO its
+# deterministic set by key and never iterates the adjudication list as the
+# set of findings to render.
+#
+# `group_assessments` is the adjudicator's judgement on the consolidator's
+# deterministic cross-step groups (findings that share a defect class across
+# step boundaries), addressed by the group's own id.
+
+REQUIRED_ADJUDICATION_ENVELOPE_FIELDS = (
+    "sweep_id",
+    "commit_sha",
+    "lane",
+    "state",
+    "harness",
+    "model_id",
+    "input_hash",
+    "prompt_version",
+    "harness_identity",
+)
+
+REQUIRED_ADJUDICATION_FIELDS = (
+    "file",
+    "symbol",
+    "vuln_class",
+    "severity",
+    "rationale",
+)
+
+REQUIRED_GROUP_ASSESSMENT_FIELDS = (
+    "group_id",
+    "assessment",
+    "rationale",
+)
+
+GROUP_ASSESSMENT_VALUES = frozenset({"same_defect", "distinct", "unsure"})
+
+
+def validate_adjudication(adjudication: object) -> list[str]:
+    """Return a list of validation errors for one adjudication entry; empty
+    list means valid. Never raises on malformed input."""
+    if not isinstance(adjudication, dict):
+        return ["adjudication must be a JSON object"]
+    errors: list[str] = []
+    for field in REQUIRED_ADJUDICATION_FIELDS:
+        if field not in adjudication:
+            errors.append(f"missing required field: {field}")
+            continue
+        value = adjudication[field]
+        if field == "severity":
+            if not _is_member(value, SEVERITY_VALUES):
+                errors.append(
+                    f"severity must be one of {sorted(SEVERITY_VALUES)}, got {value!r}"
+                )
+        elif not isinstance(value, str) or value == "":
+            errors.append(f"field {field} must be a non-empty string, got {value!r}")
+    return errors
+
+
+def validate_group_assessment(assessment: object) -> list[str]:
+    """Return a list of validation errors for one group assessment; empty
+    list means valid. Never raises on malformed input."""
+    if not isinstance(assessment, dict):
+        return ["group assessment must be a JSON object"]
+    errors: list[str] = []
+    for field in REQUIRED_GROUP_ASSESSMENT_FIELDS:
+        if field not in assessment:
+            errors.append(f"missing required field: {field}")
+            continue
+        value = assessment[field]
+        if field == "assessment":
+            if not _is_member(value, GROUP_ASSESSMENT_VALUES):
+                errors.append(
+                    f"assessment must be one of {sorted(GROUP_ASSESSMENT_VALUES)}, got {value!r}"
+                )
+        elif not isinstance(value, str) or value == "":
+            errors.append(f"field {field} must be a non-empty string, got {value!r}")
+    return errors
+
+
+def validate_adjudication_envelope(envelope: object) -> list[str]:
+    """Return a list of validation errors; empty list means valid.
+
+    Never raises on malformed input -- a caller checks `errors == []`.
+
+    A `complete` envelope must carry an `adjudications` list (may be empty)
+    and a `group_assessments` list (may be empty), every entry of which
+    validates; any other terminal state must carry a non-empty
+    `stop_reason_raw`, exactly as `validate_step_envelope` requires.
+    """
+    if not isinstance(envelope, dict):
+        return ["adjudication envelope must be a JSON object"]
+
+    errors: list[str] = []
+    for field in REQUIRED_ADJUDICATION_ENVELOPE_FIELDS:
+        if field not in envelope:
+            errors.append(f"missing required field: {field}")
+            continue
+        if field == "state":
+            continue
+        value = envelope[field]
+        if not isinstance(value, str) or value == "":
+            errors.append(f"field {field} must be a non-empty string, got {value!r}")
+
+    state = envelope.get("state")
+    if "state" in envelope and not _is_member(state, STEP_STATES):
+        errors.append(f"state must be one of {sorted(STEP_STATES)}, got {state!r}")
+
+    # Optional bookkeeping the lane records on every state. Optional does
+    # not mean unvalidated: the consolidator builds sets from these, so a
+    # malformed nested value here must be a validation error, never a
+    # TypeError that aborts consolidation (Issue #3984 review).
+    if "unsent_findings" in envelope:
+        unsent = envelope["unsent_findings"]
+        if not isinstance(unsent, list):
+            errors.append(f"unsent_findings must be a list when present, got {unsent!r}")
+        else:
+            for index, key in enumerate(unsent):
+                if not (
+                    isinstance(key, list)
+                    and len(key) == 3
+                    and all(isinstance(part, str) and part for part in key)
+                ):
+                    errors.append(
+                        f"unsent_findings[{index}]: must be a [file, symbol, vuln_class] list of "
+                        f"non-empty strings, got {key!r}"
+                    )
+    if "unassessed_groups" in envelope:
+        unassessed = envelope["unassessed_groups"]
+        if not _non_empty_string_list(unassessed):
+            errors.append(
+                f"unassessed_groups must be a list of non-empty strings when present, got {unassessed!r}"
+            )
+    if "unsolicited_verdicts" in envelope:
+        unsolicited = envelope["unsolicited_verdicts"]
+        if not isinstance(unsolicited, int) or isinstance(unsolicited, bool) or unsolicited < 0:
+            errors.append(
+                f"unsolicited_verdicts must be a non-negative integer when present, got {unsolicited!r}"
+            )
+
+    if state == "complete":
+        adjudications = envelope.get("adjudications")
+        if not isinstance(adjudications, list):
+            errors.append(
+                "adjudications must be a list (may be empty) when state is complete, "
+                f"got {adjudications!r}"
+            )
+        else:
+            seen_keys: set = set()
+            for index, adjudication in enumerate(adjudications):
+                for error in validate_adjudication(adjudication):
+                    errors.append(f"adjudications[{index}]: {error}")
+                if isinstance(adjudication, dict):
+                    key = (
+                        adjudication.get("file"),
+                        adjudication.get("symbol"),
+                        adjudication.get("vuln_class"),
+                    )
+                    if all(isinstance(part, str) and part for part in key):
+                        if key in seen_keys:
+                            errors.append(
+                                f"adjudications[{index}]: duplicate finding key {key!r}"
+                            )
+                        seen_keys.add(key)
+        assessments = envelope.get("group_assessments")
+        if not isinstance(assessments, list):
+            errors.append(
+                "group_assessments must be a list (may be empty) when state is complete, "
+                f"got {assessments!r}"
+            )
+        else:
+            seen_groups: set = set()
+            for index, assessment in enumerate(assessments):
+                for error in validate_group_assessment(assessment):
+                    errors.append(f"group_assessments[{index}]: {error}")
+                if isinstance(assessment, dict):
+                    group_id = assessment.get("group_id")
+                    if isinstance(group_id, str) and group_id:
+                        if group_id in seen_groups:
+                            errors.append(
+                                f"group_assessments[{index}]: duplicate group_id {group_id!r}"
+                            )
+                        seen_groups.add(group_id)
+    elif _is_member(state, STEP_STATES):
+        raw_reason = envelope.get("stop_reason_raw")
+        if not isinstance(raw_reason, str) or raw_reason == "":
+            errors.append(
+                "stop_reason_raw must be present and non-empty when state is not complete"
+            )
 
     return errors
 

@@ -701,6 +701,126 @@ def test_log_event_emits_exactly_one_record():
     )
 
 
+def _adjudication_envelope(**overrides) -> dict:
+    envelope = {
+        "sweep_id": "2026-09-09T1200Z-abc1234",
+        "commit_sha": "abc1234",
+        "lane": "adjudicator",
+        "state": "complete",
+        "harness": "claude",
+        "model_id": "opus-5",
+        "input_hash": "0" * 64,
+        "prompt_version": "1" * 64,
+        "harness_identity": "2" * 64,
+        "adjudications": [
+            {"file": "pkg/a.go", "symbol": "A", "vuln_class": "x", "severity": "high", "rationale": "r"},
+        ],
+        "group_assessments": [
+            {"group_id": "group-001", "assessment": "same_defect", "rationale": "r"},
+        ],
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+def test_adjudication_envelope_valid_complete_and_non_complete():
+    check(schema.validate_adjudication_envelope(_adjudication_envelope()) == [], "adjudication: a complete envelope validates")
+    check(schema.validate_adjudication_envelope(_adjudication_envelope(adjudications=[], group_assessments=[])) == [], "adjudication: empty lists are valid on complete")
+    env = _adjudication_envelope(state="failed", stop_reason_raw="harness_exit_1")
+    del env["adjudications"]
+    del env["group_assessments"]
+    check(schema.validate_adjudication_envelope(env) == [], "adjudication: a failed envelope with stop_reason_raw validates")
+    del env["stop_reason_raw"]
+    check(any("stop_reason_raw" in e for e in schema.validate_adjudication_envelope(env)), "adjudication: a non-complete envelope needs stop_reason_raw")
+
+
+def test_adjudication_envelope_rejects_bad_shapes():
+    check(schema.validate_adjudication_envelope("x") == ["adjudication envelope must be a JSON object"], "adjudication: non-object rejected")
+    for field in schema.REQUIRED_ADJUDICATION_ENVELOPE_FIELDS:
+        env = _adjudication_envelope()
+        del env[field]
+        check(any(f"missing required field: {field}" in e for e in schema.validate_adjudication_envelope(env)), f"adjudication: missing {field} is reported")
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(state="done"))
+    check(any("state must be one of" in e for e in errors), "adjudication: unknown state rejected")
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(adjudications="nope"))
+    check(any("adjudications must be a list" in e for e in errors), "adjudication: adjudications must be a list")
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(adjudications=[{"file": "a", "symbol": "b", "vuln_class": "c", "severity": "fatal", "rationale": "r"}]))
+    check(any("adjudications[0]: severity must be one of" in e for e in errors), "adjudication: bad severity is reported with its index")
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(adjudications=[{"file": "a", "symbol": "b", "vuln_class": "c", "severity": "low"}]))
+    check(any("adjudications[0]: missing required field: rationale" in e for e in errors), "adjudication: a missing rationale is reported")
+    dup = {"file": "a", "symbol": "b", "vuln_class": "c", "severity": "low", "rationale": "r"}
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(adjudications=[dup, dict(dup)]))
+    check(any("duplicate finding key" in e for e in errors), "adjudication: duplicate finding keys are rejected")
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(group_assessments=[{"group_id": "g", "assessment": "maybe", "rationale": "r"}]))
+    check(any("group_assessments[0]: assessment must be one of" in e for e in errors), "adjudication: bad group assessment value rejected")
+    ga = {"group_id": "g", "assessment": "distinct", "rationale": "r"}
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(group_assessments=[ga, dict(ga)]))
+    check(any("duplicate group_id" in e for e in errors), "adjudication: duplicate group ids are rejected")
+    check(schema.validate_adjudication("x") == ["adjudication must be a JSON object"], "adjudication: non-object entry rejected")
+    check(schema.validate_group_assessment(7) == ["group assessment must be a JSON object"], "adjudication: non-object assessment rejected")
+
+
+def test_adjudication_envelope_optional_bookkeeping_is_validated_when_present():
+    """Re-review finding on 78bbbe84: the consolidator builds sets from
+    these optional fields, so a malformed nested value must be a validation
+    error here, never a TypeError there."""
+    good = _adjudication_envelope(unsent_findings=[["pkg/a.go", "A", "x"]], unassessed_groups=["group-001"], unsolicited_verdicts=2)
+    check(schema.validate_adjudication_envelope(good) == [], "bookkeeping: well-formed optional fields validate")
+    check(schema.validate_adjudication_envelope(_adjudication_envelope(unsent_findings=[], unassessed_groups=[], unsolicited_verdicts=0)) == [], "bookkeeping: empty lists and zero validate")
+    bad_cases = [
+        ("unassessed_groups", [{}]),
+        ("unassessed_groups", [[]]),
+        ("unassessed_groups", [""]),
+        ("unassessed_groups", "group-001"),
+        ("unassessed_groups", {"a": 1}),
+        ("unsent_findings", [[[], "F", "tenant-scoping"]]),
+        ("unsent_findings", [["only", "two"]]),
+        ("unsent_findings", [{"file": "a"}]),
+        ("unsent_findings", [["", "b", "c"]]),
+        ("unsent_findings", "pkg/a.go"),
+        ("unsolicited_verdicts", "2"),
+        ("unsolicited_verdicts", -1),
+        ("unsolicited_verdicts", True),
+        ("unsolicited_verdicts", []),
+    ]
+    for field, value in bad_cases:
+        try:
+            errors = schema.validate_adjudication_envelope(_adjudication_envelope(**{field: value}))
+            ok = any(field in e for e in errors)
+            detail = str(errors)
+        except TypeError as exc:
+            ok = False
+            detail = f"raised TypeError: {exc}"
+        check(ok, f"bookkeeping: {field}={value!r} is a validation error naming the field, never an exception", detail)
+    errors = schema.validate_adjudication_envelope(_adjudication_envelope(state="failed", stop_reason_raw="x", unassessed_groups=[{}]))
+    check(any("unassessed_groups" in e for e in errors), "bookkeeping: validated on non-complete states too")
+
+
+def test_enum_fields_holding_json_arrays_or_objects_are_errors_not_exceptions():
+    """Review finding on Issue #3984: `value in frozenset` raises TypeError on
+    an unhashable JSON array/object, which turned a malformed envelope into
+    an aborted consolidation. Every enum check must return an error."""
+    cases = [
+        ("finding severity", lambda v: schema.validate_finding({**valid_finding(), "severity": v}), "severity must be one of"),
+        ("finding confidence", lambda v: schema.validate_finding({**valid_finding(), "confidence": v}), "confidence must be one of"),
+        ("step envelope state", lambda v: schema.validate_step_envelope({**valid_step_envelope(), "state": v}), "state must be one of"),
+        ("disposition", lambda v: schema.validate_disposition({"hypothesis_id": "h1", "disposition": v, "summary": "s"}), "disposition must be one of"),
+        ("adjudication severity", lambda v: schema.validate_adjudication({"file": "a", "symbol": "b", "vuln_class": "c", "severity": v, "rationale": "r"}), "severity must be one of"),
+        ("group assessment", lambda v: schema.validate_group_assessment({"group_id": "g", "assessment": v, "rationale": "r"}), "assessment must be one of"),
+        ("adjudication envelope state", lambda v: schema.validate_adjudication_envelope(_adjudication_envelope(state=v)), "state must be one of"),
+    ]
+    for name, validate, needle in cases:
+        for bad in ([], {}, ["low"], {"a": 1}, 3, None):
+            try:
+                errors = validate(bad)
+                ok = any(needle in e for e in errors)
+                detail = str(errors)
+            except TypeError as exc:
+                ok = False
+                detail = f"raised TypeError: {exc}"
+            check(ok, f"{name}: {bad!r} is a validation error, never an exception", detail)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

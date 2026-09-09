@@ -1467,6 +1467,535 @@ def test_scanner_coverage_absent_is_stated_not_blank() -> None:
         check("no scanner evidence recorded" in section, "a sweep with no scans says so explicitly", section)
 
 
+# ---------------------------------------------------------------------------
+# Issue #3984 -- severity disagreement, adjudication layer, cross-step
+# re-aggregation, and the enforced purity claim.
+# ---------------------------------------------------------------------------
+
+
+def _two_lane_disagreement_sweep(repo: str, sweep: str) -> str:
+    """Two lanes report the same file+symbol+vuln_class in step-001, one at
+    `low` and one at `critical`. Returns the commit sha."""
+    sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+    write_plan_step(sweep, "step-001", sha)
+    write(os.path.join(sweep, ".plan-context.json"), {"sweep_id": os.path.basename(sweep), "commit_sha": sha})
+    write(
+        os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+        complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001", severity="low")]),
+    )
+    write(
+        os.path.join(sweep, "lanes", "laneB", "step-001.findings.json"),
+        complete_envelope(sha, "laneB", "step-001", [finding(sha, "laneB", "step-001", severity="critical")]),
+    )
+    return sha
+
+
+def _record_adjudicator_dispatch(sweep: str, outcome: str = "dispatched") -> None:
+    write(
+        os.path.join(sweep, "dispatch_report.json"),
+        {
+            "planners": [],
+            "lanes": [],
+            "adjudicator": {
+                "requested_harness": "claude",
+                "requested_model": "opus-5",
+                "passed_harness": "claude",
+                "passed_model": "opus-5",
+                "outcome": outcome,
+            },
+        },
+    )
+
+
+def _current_input_hash(sweep: str, repo: str) -> str:
+    report = consolidate.consolidate(sweep, repo)
+    adjudication_input = consolidate.build_adjudication_input(
+        report["sweep_id"], consolidate._sweep_commit_sha(sweep), report["findings"], report["cross_step_groups"]
+    )
+    return consolidate.adjudication_input_hash(adjudication_input)
+
+
+def _write_adjudication_envelope(
+    sweep: str,
+    repo: str,
+    sha: str,
+    adjudications: list[dict],
+    group_assessments: list[dict] | None = None,
+    state: str = "complete",
+    input_hash: str | None = None,
+) -> str:
+    envelope = {
+        "sweep_id": os.path.basename(sweep),
+        "commit_sha": sha,
+        "lane": "adjudicator",
+        "state": state,
+        "harness": "claude",
+        "model_id": "opus-5",
+        "input_hash": input_hash if input_hash is not None else _current_input_hash(sweep, repo),
+        "prompt_version": "pv",
+        "harness_identity": "hi",
+    }
+    if state == "complete":
+        envelope["adjudications"] = adjudications
+        envelope["group_assessments"] = group_assessments or []
+    else:
+        envelope["stop_reason_raw"] = f"stub {state}"
+    path = consolidate.adjudication_output_path(sweep)
+    write(path, envelope)
+    return path
+
+
+def _thing_adjudication(severity: str = "critical", rationale: str = "Critical per rubric: unauthenticated cross-tenant read.") -> dict:
+    return {
+        "file": "pkg/example/thing.go",
+        "symbol": "Thing.DoSomething",
+        "vuln_class": "tenant-scoping",
+        "severity": severity,
+        "rationale": rationale,
+    }
+
+
+def test_severity_disagreement_is_surfaced_not_collapsed_when_no_adjudicator():
+    """REQUIRED TEST (Issue #3984): two lanes, same key, `low` vs `critical`
+    -- with no adjudicator configured the report shows BOTH original values
+    and names the disagreement, never one severity with the other silently
+    discarded."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _two_lane_disagreement_sweep(repo, sweep)
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        f = report["findings"][0]
+        check(f["severity_range"]["disagreement"] is True, "consolidate: low vs critical is recorded as a disagreement")
+        check(
+            f["severity_range"] == {"lowest": "low", "highest": "critical", "disagreement": True, "by_lane": {"laneA": "low", "laneB": "critical"}},
+            "consolidate: severity_range records lowest/highest and each lane's own value",
+            str(f["severity_range"]),
+        )
+        check(f["adjudication"] is None, "consolidate: no adjudication layer when none was configured")
+        check(report["adjudication"]["status"] == "not_configured", "consolidate: adjudication status is not_configured", str(report["adjudication"]))
+        check("DISAGREEMENT" in md and "laneA=low" in md and "laneB=critical" in md, "consolidate.md: disagreement line shows both original values", md)
+        check("low → critical" in md, "consolidate.md: disagreement line shows the full range", md)
+        check("Severity (adjudicated)" not in md, "consolidate.md: nothing is rendered as adjudicated when nothing was")
+        check("no adjudicator is configured" in md, "consolidate.md: the Adjudication section says raw severities are raw", md)
+        check("## Incomplete" not in md, "consolidate.md: an unconfigured adjudicator is not an incompleteness gap", md)
+
+
+def test_adjudication_reconciles_disagreement_with_recorded_provenance():
+    """REQUIRED TEST (Issue #3984): the same low-vs-critical fixture with a
+    complete adjudication envelope -- the report shows the resolution AND
+    both original values, and consolidated.json still carries what each
+    lane actually reported."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()])
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        f = report["findings"][0]
+        check(report["adjudication"]["status"] == "complete", "consolidate: adjudication status complete", str(report["adjudication"]))
+        check(
+            isinstance(f["adjudication"], dict) and f["adjudication"]["severity"] == "critical"
+            and f["adjudication"]["harness"] == "claude" and f["adjudication"]["model_id"] == "opus-5",
+            "consolidate: the finding carries the adjudicated severity with harness/model provenance",
+            str(f.get("adjudication")),
+        )
+        check(f["adjudication"]["changed"] is True, "consolidate: a resolved disagreement is flagged as changed")
+        check(len(f["occurrences"]) == 2 and {o["severity"] for o in f["occurrences"]} == {"low", "critical"}, "consolidate: both lanes' original severities remain in occurrences")
+        check(f["severity_range"]["by_lane"] == {"laneA": "low", "laneB": "critical"}, "consolidate: severity_range is not rewritten by adjudication")
+        check("Severity (adjudicated): **critical**" in md, "consolidate.md: the adjudicated severity is rendered as adjudicated", md)
+        check("laneA=low" in md and "laneB=critical" in md, "consolidate.md: both original values render beside the adjudicated one", md)
+        check("Critical per rubric" in md, "consolidate.md: the rationale is rendered", md)
+        check("## Incomplete" not in md, "consolidate.md: a complete adjudication over every finding is not a gap", md)
+
+
+def test_failed_adjudication_stage_renders_raw_findings_and_incomplete():
+    """REQUIRED TEST (Issue #3984): the adjudication stage was dispatched and
+    produced no parseable output -- the report still renders, the
+    deterministic findings are intact, severities are marked raw, and the
+    failure appears in `## Incomplete`. Three shapes: no envelope at all, an
+    unparseable file, and a `failed` envelope."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "missing", "consolidate: dispatched with no envelope is `missing`", str(report["adjudication"]))
+        check(len(report["findings"]) == 1 and report["findings"][0]["adjudication"] is None, "consolidate: deterministic findings are intact with no adjudication layer")
+        check("## Incomplete" in md and "Adjudication stage did not complete" in md, "consolidate.md: a missing adjudication is named in Incomplete", md)
+        check("Severity (raw): **DISAGREEMENT**" in md, "consolidate.md: severities render as raw when the stage failed", md)
+        check("**This sweep is incomplete.**" in md, "consolidate.md: the opening sentence says the sweep is incomplete", md)
+
+        path = consolidate.adjudication_output_path(sweep)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        with redirect_stderr(io.StringIO()):
+            report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "invalid", "consolidate: an unparseable envelope is `invalid`", str(report["adjudication"]))
+        check("Adjudication stage did not complete" in md and "`invalid`" in md, "consolidate.md: an invalid envelope is named in Incomplete", md)
+        check(len(report["findings"]) == 1, "consolidate: findings survive an invalid envelope")
+
+        _write_adjudication_envelope(sweep, repo, sha, [], state="failed")
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "failed", "consolidate: a `failed` envelope reports status failed", str(report["adjudication"]))
+        check("stub failed" in md, "consolidate.md: the envelope's stop_reason_raw is surfaced", md)
+        check("Severity (adjudicated)" not in md, "consolidate.md: nothing is rendered as adjudicated after a failed stage")
+
+
+def test_adjudication_dispatch_outcome_other_than_dispatched_is_a_gap():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep, outcome="credential_unavailable")
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "credential_unavailable", "consolidate: a non-dispatched outcome is carried as the status", str(report["adjudication"]))
+        check("## Incomplete" in md and "credential_unavailable" in md, "consolidate.md: a skipped adjudicator dispatch is named in Incomplete", md)
+
+
+def test_adjudication_skipped_for_no_findings_is_not_a_gap():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x"})
+        write_plan_step(sweep, "step-001", sha)
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), complete_envelope(sha, "laneA", "step-001", []))
+        _record_adjudicator_dispatch(sweep, outcome="skipped_no_findings")
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "skipped_no_findings", "consolidate: skipped_no_findings status", str(report["adjudication"]))
+        check("## Incomplete" not in md, "consolidate.md: nothing to adjudicate is not incompleteness", md)
+        check("Skipped: the deterministic set contained no findings" in md, "consolidate.md: the skip is stated", md)
+
+
+def test_stale_adjudication_over_a_different_finding_set_is_not_applied():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()], input_hash="0" * 64)
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "stale", "consolidate: an input_hash mismatch is `stale`", str(report["adjudication"]))
+        check(report["findings"][0]["adjudication"] is None, "consolidate: a stale adjudication is never merged")
+        check("input_hash mismatch" in md and "## Incomplete" in md, "consolidate.md: staleness is named in Incomplete", md)
+
+
+def test_adjudication_from_another_sweep_is_rejected():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        path = _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()])
+        with open(path) as fh:
+            envelope = json.load(fh)
+        envelope["sweep_id"] = "some-other-sweep"
+        write(path, envelope)
+        with redirect_stderr(io.StringIO()):
+            report = consolidate.consolidate(sweep, repo)
+        check(report["adjudication"]["status"] == "invalid", "consolidate: an envelope naming another sweep is invalid", str(report["adjudication"]))
+        check(report["findings"][0]["adjudication"] is None, "consolidate: a foreign envelope is never merged")
+
+
+def test_cross_step_reaggregation_groups_shared_defect_class_across_steps():
+    """REQUIRED TEST (Issue #3984): a defect whose evidence spans two steps
+    -- the same vulnerability class reported in step-001 (the handler) and
+    step-002 (the audit writer) -- is grouped, and the report says so."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/api/handler.go": "a", "pkg/audit/writer.go": "b", "pkg/x/y.go": "c"})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/api")
+        write_plan_step(sweep, "step-002", sha, scope="pkg/audit")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001", file="pkg/api/handler.go", symbol="Handle", vuln_class="log-injection"),
+                finding(sha, "laneA", "step-001", file="pkg/x/y.go", symbol="Y", vuln_class="timing-compare"),
+                finding(sha, "laneA", "step-001", file="pkg/x/y.go", symbol="Z", vuln_class="timing-compare"),
+            ]),
+        )
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"),
+            complete_envelope(sha, "laneA", "step-002", [
+                finding(sha, "laneA", "step-002", file="pkg/audit/writer.go", symbol="Write", vuln_class="log-injection"),
+            ]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        groups = report["cross_step_groups"]
+        check(len(groups) == 1, "consolidate: exactly one cross-step group (same-step pairs are not groups)", str(groups))
+        if groups:
+            g = groups[0]
+            check(g["group_id"] == "group-001" and g["defect_class"] == "log-injection", "consolidate: group carries a stable id and the shared class", str(g))
+            check(g["step_ids"] == ["step-001", "step-002"], "consolidate: group spans both steps", str(g["step_ids"]))
+            check({m["file"] for m in g["members"]} == {"pkg/api/handler.go", "pkg/audit/writer.go"}, "consolidate: both members are listed", str(g["members"]))
+            check(g["assessment"] is None, "consolidate: no assessment without an adjudicator")
+        check("## Cross-step groups" in md and "group-001 — log-injection across `step-001`, `step-002`" in md, "consolidate.md: the group is rendered with its steps", md)
+        check("pkg/api/handler.go" in md.split("## Cross-step groups")[1].split("## Findings")[0], "consolidate.md: group members render under the section", md)
+        check("timing-compare across" not in md, "consolidate.md: the same-step pair is not rendered as a group", md)
+
+
+def test_cross_step_grouping_prefers_cwe_when_present():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/a/a.go": "a", "pkg/b/b.go": "b"})
+        write_plan_step(sweep, "step-001", sha)
+        write_plan_step(sweep, "step-002", sha)
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001", file="pkg/a/a.go", vuln_class="log injection", cwe="CWE-117")]))
+        write(os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"), complete_envelope(sha, "laneA", "step-002", [finding(sha, "laneA", "step-002", file="pkg/b/b.go", vuln_class="Log Injection (audit)", cwe="CWE-117")]))
+        report = consolidate.consolidate(sweep, repo)
+        check(len(report["cross_step_groups"]) == 1 and report["cross_step_groups"][0]["defect_class"] == "CWE-117", "consolidate: differently-worded classes group on a shared CWE", str(report["cross_step_groups"]))
+
+
+def test_cross_step_group_assessment_is_merged_from_adjudication():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/a/a.go": "a", "pkg/b/b.go": "b"})
+        write_plan_step(sweep, "step-001", sha)
+        write_plan_step(sweep, "step-002", sha)
+        write(os.path.join(sweep, ".plan-context.json"), {"sweep_id": os.path.basename(sweep), "commit_sha": sha})
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001", file="pkg/a/a.go", symbol="A")]))
+        write(os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"), complete_envelope(sha, "laneA", "step-002", [finding(sha, "laneA", "step-002", file="pkg/b/b.go", symbol="B")]))
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(
+            sweep, repo, sha,
+            [
+                {"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
+                {"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
+            ],
+            group_assessments=[{"group_id": "group-001", "assessment": "same_defect", "rationale": "one tenant id flows through both"}],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        g = report["cross_step_groups"][0]
+        check(isinstance(g["assessment"], dict) and g["assessment"]["assessment"] == "same_defect", "consolidate: the group carries the adjudicator's assessment", str(g))
+        check("Assessment: **same_defect**" in md and "one tenant id flows through both" in md, "consolidate.md: the assessment renders with its rationale", md)
+        check(report["adjudication"]["groups_assessed"] == 1, "consolidate: groups_assessed counts the merge")
+
+
+def test_cross_step_group_not_assessed_is_a_gap():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/a/a.go": "a", "pkg/b/b.go": "b"})
+        write_plan_step(sweep, "step-001", sha)
+        write_plan_step(sweep, "step-002", sha)
+        write(os.path.join(sweep, ".plan-context.json"), {"sweep_id": os.path.basename(sweep), "commit_sha": sha})
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001", file="pkg/a/a.go", symbol="A")]))
+        write(os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"), complete_envelope(sha, "laneA", "step-002", [finding(sha, "laneA", "step-002", file="pkg/b/b.go", symbol="B")]))
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(
+            sweep, repo, sha,
+            [
+                {"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
+                {"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
+            ],
+            group_assessments=[],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["groups_omitted"] == 1 and report["adjudication"]["omitted"] == 0, "consolidate: an unassessed group is counted even when every finding was adjudicated", str(report["adjudication"]))
+        check("## Incomplete" in md and "did not assess 1 cross-step group(s)" in md, "consolidate.md: the unassessed group is a named Incomplete gap", md)
+        check("Assessment: _none (not adjudicated)_" in md, "consolidate.md: the group renders with no assessment")
+
+
+def test_stale_no_findings_skip_does_not_cover_findings_that_arrived_later():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep, outcome="skipped_no_findings")
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(report["adjudication"]["status"] == "stale", "consolidate: a no-findings skip with findings present is stale, never accepted", str(report["adjudication"]))
+        check("## Incomplete" in md and "findings now exist" in md, "consolidate.md: the stale skip is a named Incomplete gap", md)
+        check("Skipped: the deterministic set contained no findings" not in md, "consolidate.md: the misleading no-findings explanation is not rendered")
+
+
+def test_malformed_nested_json_types_are_excluded_not_crashed_on():
+    """A JSON array or object where an enum string belongs must be a
+    validation error, never a TypeError that aborts the whole consolidation
+    -- in a finder lane's envelope and in the adjudication envelope alike."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        write(
+            os.path.join(sweep, "lanes", "laneC", "step-001.findings.json"),
+            complete_envelope(sha, "laneC", "step-001", [finding(sha, "laneC", "step-001", severity=[])]),
+        )
+        write(os.path.join(sweep, "lanes", "laneD", "step-001.status.json"), {**complete_envelope(sha, "laneD", "step-001", []), "state": {}, "stop_reason_raw": "x"})
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(sweep, repo, sha, [{**_thing_adjudication(), "severity": []}])
+        with redirect_stderr(io.StringIO()):
+            report = consolidate.consolidate(sweep, repo)
+            md = consolidate.render_markdown(report)
+        rows = {row["lane"]: row for row in report["coverage"]}
+        check(rows["laneC"]["failed"] == 1 and rows["laneD"]["failed"] == 1, "consolidate: envelopes with array/object enum values are counted failed, not crashed on", str(rows))
+        check(report["adjudication"]["status"] == "invalid", "consolidate: an adjudication envelope with an array severity is invalid, not a crash", str(report["adjudication"]))
+        check(len(report["findings"]) == 1 and "Severity (raw): **DISAGREEMENT**" in md, "consolidate: the raw-findings fallback still renders")
+        path = consolidate.adjudication_output_path(sweep)
+        with open(path) as fh:
+            envelope = json.load(fh)
+        envelope["state"] = []
+        write(path, envelope)
+        with redirect_stderr(io.StringIO()):
+            report = consolidate.consolidate(sweep, repo)
+        check(report["adjudication"]["status"] == "invalid", "consolidate: an adjudication envelope with an array state is invalid, not a crash", str(report["adjudication"]))
+
+        # Re-review finding on 78bbbe84: the optional bookkeeping lists feed
+        # set construction in the merge; malformed nested values must reach
+        # the invalid-envelope fallback, never a TypeError.
+        for field, value in (("unassessed_groups", [{}]), ("unsent_findings", [[[], "F", "tenant-scoping"]]), ("unsolicited_verdicts", [])):
+            _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()])
+            with open(path) as fh:
+                envelope = json.load(fh)
+            envelope[field] = value
+            write(path, envelope)
+            try:
+                with redirect_stderr(io.StringIO()):
+                    report = consolidate.consolidate(sweep, repo)
+                    md = consolidate.render_markdown(report)
+                ok = report["adjudication"]["status"] == "invalid" and len(report["findings"]) == 1 and "Severity (raw): **DISAGREEMENT**" in md and "## Incomplete" in md
+                detail = str(report["adjudication"])
+            except TypeError as exc:
+                ok = False
+                detail = f"raised TypeError: {exc}"
+            check(ok, f"consolidate: a malformed {field} on the envelope renders the raw-findings fallback with an invalid-envelope gap, never a crash", detail)
+
+
+def test_unsent_findings_and_groups_are_explained_in_incomplete():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/a/a.go": "a", "pkg/b/b.go": "b"})
+        write_plan_step(sweep, "step-001", sha)
+        write_plan_step(sweep, "step-002", sha)
+        write(os.path.join(sweep, ".plan-context.json"), {"sweep_id": os.path.basename(sweep), "commit_sha": sha})
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001", file="pkg/a/a.go", symbol="A")]))
+        write(os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"), complete_envelope(sha, "laneA", "step-002", [finding(sha, "laneA", "step-002", file="pkg/b/b.go", symbol="B")]))
+        _record_adjudicator_dispatch(sweep)
+        path = _write_adjudication_envelope(
+            sweep, repo, sha,
+            [{"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"}],
+            group_assessments=[],
+        )
+        with open(path) as fh:
+            envelope = json.load(fh)
+        envelope["unsent_findings"] = [["pkg/b/b.go", "B", "tenant-scoping"]]
+        envelope["unassessed_groups"] = ["group-001"]
+        write(path, envelope)
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        adj = report["adjudication"]
+        check(adj["status"] == "complete" and adj["omitted"] == 1 and adj["unsent"] == 1 and adj["groups_omitted"] == 1 and adj["groups_unsent"] == 1, "consolidate: unsent findings/groups are counted beside omitted ones", str(adj))
+        check("(1 of them never sent: over the adjudicator's prompt-size budget)" in md, "consolidate.md: an unsent finding's reason is stated", md)
+        check("never assessed on partial evidence" in md, "consolidate.md: an unsent group's reason is stated", md)
+        check("## Incomplete" in md, "consolidate.md: unsent items make the sweep incomplete")
+
+        # Defence in depth (re-review of ee8c9731): even if a lane bug let a
+        # verdict for an unsent finding or an unassessed group onto the
+        # envelope, the consolidator must not merge it.
+        envelope["adjudications"].append({"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "tenant-scoping", "severity": "critical", "rationale": "guess"})
+        envelope["group_assessments"] = [{"group_id": "group-001", "assessment": "same_defect", "rationale": "guess"}]
+        write(path, envelope)
+        with redirect_stderr(io.StringIO()):
+            report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        adj = report["adjudication"]
+        b = next(f for f in report["findings"] if f["symbol"] == "B")
+        check(b["adjudication"] is None and report["cross_step_groups"][0]["assessment"] is None, "consolidate: verdicts for an unsent finding and an unassessed group are never merged", str((b["adjudication"], report["cross_step_groups"][0]["assessment"])))
+        check(adj["unsolicited"] == 2 and adj["groups_omitted"] == 1 and adj["groups_assessed"] == 0 and adj["omitted"] == 1, "consolidate: the dropped verdicts are counted as unsolicited and the gaps still stand", str(adj))
+        check(not consolidate._sweep_complete(report) and "## Incomplete" in md, "consolidate: an unsolicited verdict cannot turn an incomplete sweep complete")
+        check("verdicts for items never sent (dropped): 2" in md, "consolidate.md: unsolicited verdicts are stated in the Adjudication section", md)
+
+
+def test_adjudication_cannot_delete_a_finding():
+    """REQUIRED TEST (Issue #3984, A2): an adjudication envelope that omits a
+    finding present in the deterministic set -- the finding still appears
+    in the final report, marked not adjudicated; the omission is counted and
+    named in `## Incomplete`. An adjudication naming a key that matches no
+    finding is dropped and counted, never rendered as a finding."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x", "pkg/example/other.go": "y"})
+        write_plan_step(sweep, "step-001", sha)
+        write(os.path.join(sweep, ".plan-context.json"), {"sweep_id": os.path.basename(sweep), "commit_sha": sha})
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001"),
+                finding(sha, "laneA", "step-001", file="pkg/example/other.go", symbol="Other", title="the one the adjudicator drops"),
+            ]),
+        )
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(
+            sweep, repo, sha,
+            [
+                _thing_adjudication(severity="high"),
+                {"file": "pkg/example/invented.go", "symbol": "Nope", "vuln_class": "tenant-scoping", "severity": "critical", "rationale": "invented"},
+            ],
+        )
+        with redirect_stderr(io.StringIO()):
+            report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        keys = {(f["file"], f["symbol"]) for f in report["findings"]}
+        check(("pkg/example/other.go", "Other") in keys, "consolidate: the omitted finding is still in consolidated.json", str(keys))
+        check(("pkg/example/invented.go", "Nope") not in keys, "consolidate: an adjudication for a non-finding does not become a finding", str(keys))
+        check(len(report["findings"]) == 2, "consolidate: the deterministic count is unchanged by the adjudication layer", str(len(report["findings"])))
+        check(report["adjudication"]["omitted"] == 1 and report["adjudication"]["unmatched"] == 1 and report["adjudication"]["adjudicated"] == 1, "consolidate: omitted/unmatched/adjudicated are counted", str(report["adjudication"]))
+        check("the one the adjudicator drops" in md, "consolidate.md: the omitted finding is rendered", md)
+        check("not adjudicated (the adjudicator omitted this finding)" in md, "consolidate.md: the omitted finding is marked as omitted, with raw severity", md)
+        check("Adjudicator omitted 1 finding(s)" in md and "## Incomplete" in md, "consolidate.md: the omission is named in Incomplete", md)
+        check("invented.go" not in md, "consolidate.md: an unmatched adjudication is never rendered", md)
+
+
+def test_report_sorts_by_adjudicated_severity_once_present():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x", "pkg/example/other.go": "y"})
+        write_plan_step(sweep, "step-001", sha)
+        write(os.path.join(sweep, ".plan-context.json"), {"sweep_id": os.path.basename(sweep), "commit_sha": sha})
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001", severity="low"),
+                finding(sha, "laneA", "step-001", file="pkg/example/other.go", symbol="Other", severity="high"),
+            ]),
+        )
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(
+            sweep, repo, sha,
+            [
+                _thing_adjudication(severity="critical"),
+                {"file": "pkg/example/other.go", "symbol": "Other", "vuln_class": "tenant-scoping", "severity": "low", "rationale": "r"},
+            ],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check([f["symbol"] for f in report["findings"]] == ["Thing.DoSomething", "Other"], "consolidate: the adjudicated-critical finding sorts first", str([f["symbol"] for f in report["findings"]]))
+
+
+def test_consolidate_issues_no_provider_call_and_dispatches_no_container():
+    """REQUIRED TEST (Issue #3984): the module docstring's purity claim --
+    never calls a provider API, never dispatches a container -- is enforced,
+    not a convention. Every subprocess `consolidate` spawns, even with an
+    adjudication envelope present to merge, is `git`; its source imports no
+    network module and never names `docker`."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()])
+
+        calls: list[list[str]] = []
+        real_run = consolidate.subprocess.run
+
+        def spy_run(argv, *args, **kwargs):
+            calls.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        consolidate.subprocess.run = spy_run
+        try:
+            report = consolidate.consolidate(sweep, repo)
+            consolidate.render_markdown(report)
+        finally:
+            consolidate.subprocess.run = real_run
+
+        check(len(calls) > 0, "purity: consolidate issues at least one subprocess call (git ls-tree)")
+        check(all(argv and argv[0] == "git" for argv in calls), "purity: every subprocess invocation is git, never a container or model call", str(calls))
+        check(report["adjudication"]["status"] == "complete", "purity: the adjudication layer was merged from disk during the spied run")
+
+        source = inspect.getsource(consolidate)
+        for banned in ("import urllib", "import http", "import socket", "import requests", "import ssl", "from urllib", "from http"):
+            check(banned not in source, f"purity: consolidate.py does not `{banned}`")
+        check('"docker"' not in source and "'docker'" not in source, "purity: consolidate.py never names the docker binary")
+        check("launch-investigator" not in source.replace("launch-investigator`", ""), "purity: consolidate.py never invokes launch-investigator")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

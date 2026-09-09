@@ -9,10 +9,14 @@ allowed-tools: Bash, Read, Write, Grep, Glob
 You are running a **periodic, advisory, report-first** security review. You read the codebase and
 reason about it; you do not modify it.
 
-The premise, from SRLabs' "Beyond Fable" work: **different models find different bugs.** Running
-independent lanes and taking the union beats any single reviewer. Lanes must never see each
-other's output — that independence is what makes agreement meaningful and disagreement
-informative.
+The premise, from SRLabs' "Beyond Fable" work
+(<https://srlabs.de/blog/beyond-fable>, the reference pipeline this harness is modelled on — check
+planning, lane, consolidation and adjudication logic against it when in doubt): **different models
+find different bugs.** Running independent lanes and taking the union beats any single reviewer.
+Lanes must never see each other's output — that independence is what makes agreement meaningful
+and disagreement informative. Discovery is cheap and wide; judgement is scarce: small finder
+models do the finding, and one frontier model adjudicates severity afterwards, over findings
+rather than source.
 
 This complements the CI scanners rather than replacing them. CodeQL, Trivy, Dependabot, gosec and
 the fuzzers catch mechanical classes on every PR. This catches the logic and authorization bugs
@@ -108,6 +112,25 @@ bind-mounted `:ro`, writable only in that lane's own `lanes/<lane-id>/` director
 default-deny behind a per-harness DNS allowlist. `docs/architecture/security-review-harness.md`
 is the full architecture reference if you need more than this summary.
 
+**The adjudicator (`CFGMS_SECURITY_REVIEW_ADJUDICATOR`, Issue #3984)** is a second, optional
+variable naming exactly one `harness:model` pair — the frontier model that judges severity after
+the finder lanes are done:
+
+```bash
+CFGMS_SECURITY_REVIEW_ADJUDICATOR=claude:opus-5
+```
+
+After every lane container has exited, `launch`/`resume` hand that model the de-duplicated
+findings — findings only, never source; its container's `/workspace` is an empty directory — in
+the same read-only investigator profile, and it applies `docs/security-review/methodology.md`'s
+rubric to each finding and assesses cross-step groups. It runs once per sweep, in batches bounded
+by prompt size (at most forty findings each; a group is assessed only when every member fits in
+one batch, otherwise it is reported as not assessed), and it can annotate but never delete: the
+consolidator merges its verdict onto the deterministic set by key. Unset, the report says so and
+every severity is a raw lane value.
+Any harness in the table above can be the adjudicator; it authenticates the same way a finder lane
+on that harness does.
+
 ## The state rule, which is the whole safety property
 
 A step is `complete` **if and only if** its `.findings.json` exists and validates against the
@@ -191,6 +214,31 @@ before the findings list; treat that section, not a bare empty `## Findings`, as
 each non-`ok` check by step, tool and scope, plus every step whose envelope recorded no scans.
 Scanner gaps do not make the sweep incomplete (the model still reviewed the source), but they
 tell you which code no tool looked at — read them before trusting a quiet step.
+
+**Adjudicated versus raw severity (Issue #3984).** `## Adjudication` states in one sentence
+whether the adjudicator ran: not configured, skipped (no findings), complete (with counts), or did
+not complete (with the state and reason, also listed under `## Incomplete`). Then every finding's
+first line is one of two shapes, and the word in the parentheses is the whole distinction:
+
+- `Severity (adjudicated): **high** — by `claude` / `opus-5`; lanes reported lane-a=low,
+  lane-b=critical. Rationale: ...` — a frontier model applied the rubric to the lanes' reports and
+  this is its call. Act on it, and use the lane values beside it to see what it overruled.
+- `Severity (raw): **DISAGREEMENT** low → critical — lanes reported ...; not adjudicated (why)`,
+  or `Severity (raw): **medium** — ...; not adjudicated (why)` — nothing judged this severity.
+  The line says why (no adjudicator configured, the stage failed, or the adjudicator omitted this
+  finding). For a disagreement, treat the highest value as the working severity until a human
+  resolves it — never the lowest, and never silently one of the two.
+
+`consolidated.json` keeps every lane's own severity in `occurrences` and the deterministic
+`severity_range` on each finding regardless of any adjudication, so what the lanes actually said
+is always recoverable. An adjudicator that failed, produced nothing parseable, was computed over
+an older finding set (`stale`), or skipped findings it was handed is an `## Incomplete` entry —
+a report never *looks* adjudicated when it is not.
+
+`## Cross-step groups` lists findings that share a defect class across different plan steps —
+one possible defect whose evidence the planner split between steps. Read each group as a unit;
+the adjudicator's `same_defect`/`distinct`/`unsure` assessment, when present, says whether it is
+one bug. The grouping is deliberately over-inclusive.
 
 ## Hand off, do not auto-file
 
