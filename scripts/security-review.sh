@@ -60,15 +60,21 @@ usage() {
 Usage: security-review.sh <command> [args...]
 
 Commands:
-  launch <ref>        Resolve <ref>, create a new sweep tree AND its immutable snapshot,
-                       verify the snapshot, run the metadata-only planner, dispatch every
-                       roster lane (CFGMS_SECURITY_REVIEW_LANES) independently, run the
+  launch <ref> [--scope-file <path>]
+                       Resolve <ref>, create a new sweep tree AND its immutable snapshot,
+                       verify the snapshot, write the auditable bundle and run the
+                       bundle-based planner, dispatch every roster lane
+                       (CFGMS_SECURITY_REVIEW_LANES) independently, run the
                        consolidator, and print the path to report/consolidated.md.
-  resume <sweep-id>   Re-verify the sweep's snapshot, re-invoke the planner against an
+                       --scope-file names an operator-supplied prose description copied
+                       verbatim into the bundle's 00-scope.md (metadata.write_bundle());
+                       omit it to record scope_provided=false instead.
+  resume <sweep-id> [--scope-file <path>]
+                       Re-verify the sweep's snapshot, re-invoke the planner against an
                        existing sweep (a no-op if plan/ is already populated) and
                        re-dispatch every roster lane -- each lane's own resume-scanner
                        integration ensures only its missing steps run again -- then
-                       re-run the consolidator.
+                       re-run the consolidator. --scope-file is the same flag as launch's.
   status <sweep-id>   Print the per-lane x per-step coverage breakdown for an existing
                        sweep. Read-only: never re-runs the planner, a lane, or the
                        consolidator.
@@ -79,19 +85,26 @@ docs/architecture/security-review-harness.md. A lane that parks, refuses, or fai
 on some steps never blocks any other lane's dispatch or progress, and never
 prevents the consolidator from running against whatever the other lanes produced.
 
-Every planner and lane container mounts the sweep's own verified snapshot
-(snapshot.py, Issue #3951) at /workspace, never the live, mutable repository
-checkout -- launch creates that snapshot right after the sweep tree, and both
-launch and resume independently re-verify it against the pinned commit before
-dispatching anything (Issue #3952, epic #3950's D1). A verify_snapshot()
-mismatch is printed to stderr and is fatal: neither the planner nor any lane is
-ever dispatched against a snapshot that does not match its own commit.
+Which directory a container mounts at /workspace is mode-dependent (Issue #3979).
+Every LANE container still mounts the sweep's own verified snapshot (snapshot.py,
+Issue #3951), never the live, mutable repository checkout -- launch creates that
+snapshot right after the sweep tree, and both launch and resume independently
+re-verify it against the pinned commit before dispatching anything (Issue #3952,
+epic #3950's D1). A verify_snapshot() mismatch is printed to stderr and is fatal:
+no lane is ever dispatched against a snapshot that does not match its own commit.
+The PLANNER container instead mounts the sweep's auditable bundle (metadata.py's
+write_bundle(), #3978) -- structured metadata, never a repository checkout -- so
+the planner has no source file body anywhere in its container to read. This is a
+narrower claim than "source code never leaves the review environment": finder
+lanes still ship file bodies to their configured provider by design: only the
+planner is walled off from source.
 
 Exit status: non-zero if the sweep base directory cannot be resolved, if
 CFGMS_SECURITY_REVIEW_LANES is unset or malformed, if the sweep's snapshot
-cannot be created or fails verification, or if consolidation could not run --
-this script never exits 0 having silently written a partial or empty sweep
-tree, or having dispatched anything against an unverified snapshot.
+cannot be created or fails verification, if the planner's bundle cannot be
+written or verified, or if consolidation could not run -- this script never
+exits 0 having silently written a partial or empty sweep tree, or having
+dispatched anything against an unverified snapshot or a missing bundle.
 EOF
 }
 
@@ -352,12 +365,40 @@ atomic_write.write_json_atomic(report_path, report)
 PYEOF
 }
 
-# dispatch_planner <sweep_dir> <commit_sha>
-# prepare() -> launch() -> wait for the container to exit -> finalize().
-# A `prepare` or `finalize` failure is logged and treated as non-fatal to the
-# overall launch/resume: a broken plan leaves the lanes nothing to do (they
-# will simply find zero outstanding steps), and the consolidator still runs
-# and renders that state visibly rather than the whole command aborting.
+# verify_bundle <sweep_dir>
+# Confirms <sweep_dir>/bundle/MANIFEST.json exists before the planner is
+# dispatched against it (Issue #3979) -- the same "check before dispatching,
+# fail loudly, dispatch nothing" shape verify_snapshot() applies to the
+# snapshot, sized down to an existence check: there is no bundle equivalent
+# of snapshot.py's byte-for-byte re-verification against the pinned commit,
+# because metadata.write_bundle() just wrote it moments earlier in this same
+# process (dispatch_planner()'s own `prepare` call below), not at sweep
+# creation like the snapshot -- so a missing MANIFEST.json here means
+# `prepare` did not actually write what it claimed to, not that time has
+# passed for something on disk to drift.
+verify_bundle() {
+  local sweep_dir="$1"
+  if [[ ! -f "${sweep_dir}/bundle/MANIFEST.json" ]]; then
+    echo "ERROR: bundle verification failed for ${sweep_dir}: ${sweep_dir}/bundle/MANIFEST.json not found" >&2
+    return 1
+  fi
+  return 0
+}
+
+# dispatch_planner <sweep_dir> <commit_sha> [<scope_file>]
+# prepare() -> verify_bundle() -> launch() -> wait for the container to exit
+# -> finalize(). A `prepare` or `finalize` failure is logged and treated as
+# non-fatal to the overall launch/resume: a broken plan leaves the lanes
+# nothing to do (they will simply find zero outstanding steps), and the
+# consolidator still runs and renders that state visibly rather than the
+# whole command aborting.
+#
+# `scope_file`, when non-empty, is forwarded to `planner.py prepare` as
+# `--scope-file` (Issue #3979) -- the operator-supplied prose
+# `metadata.write_bundle()` copies verbatim into the bundle's `00-scope.md`.
+# Omitted (the common case) means `prepare()` calls `write_bundle()` with
+# `no_scope=True`, recording the omission in `MANIFEST.json` rather than
+# leaving it to be inferred from a missing file.
 #
 # A `launch` failure is different (Issue #3930): `launch` is the one step
 # that actually calls `agent-dispatch.sh launch-investigator`, so its
@@ -368,12 +409,19 @@ PYEOF
 # so the caller can propagate a non-zero final exit code instead of silently
 # reporting the sweep as having completed cleanly.
 dispatch_planner() {
-  local sweep_dir="$1" commit_sha="$2"
+  local sweep_dir="$1" commit_sha="$2" scope_file="${3:-}"
+
+  local prepare_args=(prepare "$sweep_dir" "$commit_sha" --repo-root "$REPO_ROOT")
+  [[ -n "$scope_file" ]] && prepare_args+=(--scope-file "$scope_file")
 
   local prepare_output
-  if ! prepare_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" prepare "$sweep_dir" "$commit_sha" --repo-root "$REPO_ROOT" 2>&1); then
+  if ! prepare_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" "${prepare_args[@]}" 2>&1); then
     echo "WARNING: planner prepare failed: ${prepare_output}" >&2
     return 0
+  fi
+
+  if ! verify_bundle "$sweep_dir"; then
+    return 1
   fi
 
   # Resolved purely for the dispatch-outcome record below (Issue #3954) --
@@ -395,7 +443,7 @@ dispatch_planner() {
   fi
 
   local launch_output launch_rc=0
-  launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --snapshot-dir "${sweep_dir}/snapshot" --repo-root "$REPO_ROOT" 2>&1) || launch_rc=$?
+  launch_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" launch "$sweep_dir" --bundle-dir "${sweep_dir}/bundle" --repo-root "$REPO_ROOT" 2>&1) || launch_rc=$?
 
   local outcome="dispatched"
   if [[ $launch_rc -ne 0 ]]; then
@@ -545,7 +593,14 @@ cmd_launch() {
     echo "ERROR: launch requires a <ref> argument" >&2
     exit 1
   fi
-  local ref="$1"
+  local ref="$1"; shift
+  local scope_file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope-file) scope_file="${2:?--scope-file requires a value}"; shift 2 ;;
+      *) echo "ERROR: unknown launch argument: $1" >&2; exit 1 ;;
+    esac
+  done
   local result sweep_dir commit_sha
 
   if ! result=$(create_sweep_tree "$ref"); then
@@ -564,7 +619,7 @@ cmd_launch() {
   fi
 
   local dispatch_failed=0
-  dispatch_planner "$sweep_dir" "$commit_sha" || dispatch_failed=1
+  dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" || dispatch_failed=1
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then
@@ -589,7 +644,14 @@ cmd_resume() {
     echo "ERROR: resume requires a <sweep-id> argument" >&2
     exit 1
   fi
-  local sweep_id="$1"
+  local sweep_id="$1"; shift
+  local scope_file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope-file) scope_file="${2:?--scope-file requires a value}"; shift 2 ;;
+      *) echo "ERROR: unknown resume argument: $1" >&2; exit 1 ;;
+    esac
+  done
   local base_dir
 
   if ! base_dir=$(resolve_base_dir 2>&1); then
@@ -618,7 +680,7 @@ cmd_resume() {
   if plan_already_populated "$sweep_dir"; then
     echo "plan/ already populated for ${sweep_id}; skipping planner re-dispatch" >&2
   else
-    dispatch_planner "$sweep_dir" "$commit_sha" || dispatch_failed=1
+    dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" || dispatch_failed=1
   fi
 
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1

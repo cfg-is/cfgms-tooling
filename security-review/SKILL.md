@@ -35,9 +35,9 @@ never paste raw findings into an issue body.
 drive through its three verbs, not something to re-implement by hand:
 
 ```bash
-.claude/scripts/security-review.sh launch <ref>       # start a new sweep (usually `develop`)
-.claude/scripts/security-review.sh resume <sweep-id>   # continue an interrupted or parked sweep
-.claude/scripts/security-review.sh status <sweep-id>   # print per-lane x per-step coverage, read-only
+.claude/scripts/security-review.sh launch <ref> [--scope-file <path>]     # start a new sweep (usually `develop`)
+.claude/scripts/security-review.sh resume <sweep-id> [--scope-file <path>] # continue an interrupted or parked sweep
+.claude/scripts/security-review.sh status <sweep-id>                       # print per-lane x per-step coverage, read-only
 ```
 
 There is no `report` verb. `launch` and `resume` both run the consolidator themselves and print
@@ -46,13 +46,28 @@ file; there is nothing to regenerate.
 
 `launch <ref>` resolves the ref to a commit sha (never sweep a moving target — findings are only
 meaningful against the tree that produced them), creates the sweep tree
-(`manifest.json` / `plan/` / `lanes/<lane-id>/` / `report/`) under the base directory above, runs
-the metadata-only planner, dispatches every roster lane (below) and waits for each to finish, then
-runs the consolidator. `resume <sweep-id>` does the same against an existing sweep id, but skips
-the planner if `plan/` already has step files and only re-dispatches whatever each lane's own
-resume-scanner reports as still missing. Both fail non-zero, without printing a report path, if
-any lane's dispatch failed for a reason other than a documented credential-unavailable skip — a
-real failure is never silently reported as a clean sweep.
+(`manifest.json` / `plan/` / `bundle/` / `lanes/<lane-id>/` / `report/`) under the base directory
+above, writes the auditable bundle and runs the bundle-based planner, dispatches every roster lane
+(below) and waits for each to finish, then runs the consolidator. `resume <sweep-id>` does the
+same against an existing sweep id, but skips the planner if `plan/` already has step files and
+only re-dispatches whatever each lane's own resume-scanner reports as still missing. Both fail
+non-zero, without printing a report path, if any lane's dispatch failed for a reason other than a
+documented credential-unavailable skip — a real failure is never silently reported as a clean
+sweep.
+
+`--scope-file <path>` names an operator-supplied prose description of what's being reviewed,
+copied verbatim into the bundle's `00-scope.md` (`metadata.write_bundle()`) — who wrote it and how
+much it says is the operator's call, scaled to the target's sensitivity. Omit it and the sweep
+still runs; the bundle just records `scope_provided: false` instead of silently inferring an
+omission from a missing file.
+
+**The planner cannot read source; finder lanes still can.** Since Issue #3979, the plan-mode
+container mounts the sweep's auditable bundle (structured metadata: file paths, tiers, routes,
+config-key names) at `/workspace`, never a checkout — there is no source file body anywhere in
+that container's filesystem. Every OTHER container (a finder lane) still mounts the sweep's
+snapshot, a real checkout, unchanged. That is a narrower claim than "source code does not leave
+the review environment": finder lanes still ship file bodies to their configured provider by
+design (epic #3975) — only the planner is walled off from source.
 
 ## The roster (`.env` mechanism)
 

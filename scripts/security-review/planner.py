@@ -1,39 +1,48 @@
 #!/usr/bin/env python3
-"""Metadata-only step planner for the security review harness (Issue #3906).
+"""Bundle-based step planner for the security review harness (Issue #3906),
+cut over to the auditable bundle (#3978) by Issue #3979.
 
 Given a sweep directory already created by `manifest.py` (#3902), `prepare()`
-collects `metadata.py::collect()`'s metadata-only summary of the sweep's
-pinned commit, assembles the planner prompt around it, and writes that prompt
-to `<sweep_dir>/plan/.investigator-plan-prompt.md`. `launch()` then invokes
-`agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --snapshot-dir
-<snapshot_dir> --mode plan` (Issue #3903; `--snapshot-dir` required as of
-Issue #3952) -- the sole way any model-driven code touches this tree -- which
-execs `claude -p` inside a container whose `.claude/agents/investigator.md`
-profile restricts tool access to `Bash, Glob` only. Because `Write` is not in
-that list (nor is it in the container's `--disallowedTools`, since it was
-already unreachable), the prompt instructs the model to emit each step as a
-`Bash` heredoc redirected to `/workspace-out/step-NNN.json` -- the container's
-only writable mount in plan mode, bind-mounted at `<sweep_dir>/plan`.
+writes the auditable bundle (`metadata.py::write_bundle()`, #3978) for the
+sweep's pinned commit into `<sweep_dir>/bundle/`, builds the planner prompt
+from that bundle's own `01-tree.tsv` file inventory, and writes the prompt to
+`<sweep_dir>/plan/.investigator-plan-prompt.md`. `launch()` then invokes
+`agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --bundle-dir
+<bundle_dir> --mode plan` (Issue #3903; `--bundle-dir` required for plan mode
+as of Issue #3979) -- the sole way any model-driven code touches this tree --
+which execs `claude -p` inside a container whose `.claude/agents/
+investigator.md` profile restricts tool access to `Bash, Glob` only. Because
+`Write` is not in that list (nor is it in the container's `--disallowedTools`,
+since it was already unreachable), the prompt instructs the model to emit
+each step as a `Bash` heredoc redirected to `/workspace-out/step-NNN.json` --
+the container's only writable mount in plan mode, bind-mounted at
+`<sweep_dir>/plan`.
 
-The prompt embeds `metadata.py::render_payload()`'s output verbatim and
+The prompt embeds the bundle's `01-tree.tsv` file inventory verbatim and
 nothing else about the repository: the model never receives file contents,
 and it is told what its `Bash` access is for (writing output) and not for
-(reading source). That still relies on the model's cooperation for *reading*
-restraint -- the read-only workspace mount does not, and cannot, prevent a
-`cat` on a mounted-read-only file, since `:ro` blocks writes, not reads. The
-technical, unbypassable boundary this story provides is on the *input* side:
-`collect()`/`render_payload()` guarantee the prompt handed to the model never
-itself contains a file's body content, provable independently of what the
-model chooses to do with its shell.
+(reading source). Before Issue #3979, that reading restriction relied on the
+model's own cooperation -- the read-only `/workspace` mount blocked writes,
+not reads, so nothing technical stopped a `cat` on a mounted-read-only source
+file, only the prompt's own instruction not to. That is no longer true.
+Since #3979, `/workspace` in plan mode is the bundle directory itself, never
+a repository checkout or a snapshot of one -- there is no source file body
+anywhere in this container's filesystem for a `cat` (or `git show`, or
+anything else) to find. The boundary this module now provides is a mount,
+not a request: this docstring can state "the planner cannot read source" as
+a fact about what is reachable from the container, not a claim about what
+the model was asked to do.
 
 That input-side guarantee covers the payload's *structure* as well as its
-content: repository paths are attacker-influenceable text, so
-`render_payload()` drops any value carrying a control character before it can
-render a second line inside the `--- REPOSITORY METADATA ---` /
+content: bundle rows are attacker-influenceable text (a repository path, a
+route path, a handler symbol), so `build_prompt()` re-applies the same
+control-character filter `metadata.write_bundle()` already applies before a
+value becomes a bundle row, dropping any row it cannot prove is safe before
+it can render a second line inside the `--- REPOSITORY METADATA ---` /
 `--- END REPOSITORY METADATA ---` block and forge the closing delimiter (see
-`metadata.py`'s "Prompt injection" section). Without that filter a crafted
-directory name is not merely data the model reads -- it is text the model reads
-as harness instruction, on a container that has `Bash` and allowlisted provider
+`_read_bundle_tree_paths()`). Without that filter a crafted directory name is
+not merely data the model reads -- it is text the model would read as
+harness instruction, on a container that has `Bash` and allowlisted provider
 egress.
 
 `launch()` is deliberately fire-and-forget, matching `launch-investigator`'s
@@ -102,6 +111,18 @@ CONTEXT_FILENAME = ".plan-context.json"
 FAILURE_MARKER_FILENAME = "PLANNING_FAILED"
 STEP_FILENAME_RE = re.compile(r"^step-(\d{3,})\.json$")
 
+# Sub-directory of a sweep (or a multi-planner lane's own sub-sweep-dir) that
+# `metadata.write_bundle()` (#3978) writes into, and that `agent-dispatch.sh
+# launch-investigator --mode plan` mounts read-only at /workspace as of Issue
+# #3979 -- see `prepare()`, `launch()`, and `_materialize_lane_bundle()`.
+BUNDLE_SUBDIR = "bundle"
+
+# The bundle artifact `build_prompt()` reads for a step's file inventory
+# (`metadata.TREE_HEADER`'s columns: path, lang, loc, sha256_12, tier) --
+# named explicitly in the prompt so the model knows where its `files` values
+# come from now that there is no source tree left to `Glob`.
+TREE_ARTIFACT_NAME = "01-tree.tsv"
+
 # The plan-mode container's own resolved-model report (Issue #3954), written
 # by investigator-entrypoint.sh via `claude --output-format json` into its
 # `/workspace-out/` mount -- i.e. `<sweep_dir>/planners/<lane_dir_name>/plan/`
@@ -149,16 +170,90 @@ class PlannerError(Exception):
     validation failures through its return value instead."""
 
 
-def build_prompt(md: dict, sweep_id: str) -> str:
+def _read_bundle_tree_paths(bundle_dir: str) -> list[str]:
+    """Read `<bundle_dir>/01-tree.tsv` and return the prompt-safe repository
+    paths it lists, in file order.
+
+    This is the read-side half of Issue #3979's bundle cutover: `build_prompt()`
+    embeds every value this returns directly into the planner prompt between
+    the delimited metadata block's `--- REPOSITORY METADATA ---` / `--- END
+    REPOSITORY METADATA ---` markers, so a bundle row is exactly as taint-
+    sensitive there as the flat metadata payload's values used to be before
+    this cutover. A real bundle produced by `metadata.write_bundle()` can
+    never contain a `01-tree.tsv` row with a control character in its path --
+    `_assemble_bundle_contents()` already drops those before a row is ever
+    written -- but this function does
+    not trust that: it re-applies `metadata._prompt_safe()` itself, so the
+    guarantee holds even against a bundle this module did not produce or that
+    was tampered with after the fact.
+
+    A row that does not have exactly `len(metadata.TREE_HEADER)` tab-separated
+    fields is dropped rather than partially rendered -- the shape a control
+    character embedded raw in a path produces, since splitting the file on
+    `\\n` turns one logical row into unrelated physical lines that no longer
+    have the expected column count. Raises `PlannerError` if the file cannot
+    be read or does not start with the expected header -- a malformed or
+    missing bundle is a broken sweep, not a crafted repository path, and
+    there is nothing sensible to build a prompt from without it.
+    """
+    tree_path = os.path.join(bundle_dir, TREE_ARTIFACT_NAME)
+    try:
+        with open(tree_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        raise PlannerError(f"cannot read bundle tree listing at {tree_path}: {exc}") from exc
+
+    lines = text.split("\n")
+    if not lines or lines[0].split("\t") != list(metadata.TREE_HEADER):
+        raise PlannerError(
+            f"bundle tree listing at {tree_path} does not start with the expected header "
+            f"{metadata.TREE_HEADER!r}"
+        )
+
+    paths: list[str] = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != len(metadata.TREE_HEADER):
+            schema.log_event(
+                "prompt_unsafe_bundle_row_dropped",
+                bundle_dir=bundle_dir,
+                reason="tree row did not have the expected column count -- likely a control "
+                       "character split one logical row across physical lines",
+            )
+            continue
+        path = fields[0]
+        if not path or not metadata._prompt_safe(path):
+            schema.log_event(
+                "prompt_unsafe_bundle_row_dropped",
+                bundle_dir=bundle_dir,
+                path=path,
+                reason="tree row's path is empty or contains a control character",
+            )
+            continue
+        paths.append(path)
+    return paths
+
+
+def build_prompt(bundle_dir: str, sweep_id: str) -> str:
     """Assemble the full text handed to `claude -p` in plan mode.
 
-    Embeds `metadata.render_payload(md)` verbatim as the only description of
-    the repository the model receives -- no file contents, ever, and no value
-    able to emit a newline, so the payload cannot escape the delimiters it is
-    placed between (`render_payload()` enforces that; this function relies on
-    it). Everything else here is fixed instructional text: the step-plan
-    schema, the bounded-scope rule, and the Bash-heredoc write mechanism the
-    model must use because `Write` is not among its `Bash, Glob` tools.
+    Embeds `_read_bundle_tree_paths(bundle_dir)`'s output verbatim as the only
+    description of the repository the model receives -- no file contents,
+    ever, and no value able to emit a newline, so the payload cannot escape
+    the delimiters it is placed between (`_read_bundle_tree_paths()` enforces
+    that; this function relies on it). Everything else here is fixed
+    instructional text: the step-plan schema, the bounded-scope rule, and the
+    Bash-heredoc write mechanism the model must use because `Write` is not
+    among its `Bash, Glob` tools.
+
+    Since Issue #3979, `/workspace` in plan mode is the bundle directory
+    itself, not a repository checkout -- there is no source tree left for
+    `Glob` to discover files in, so this prompt no longer instructs the model
+    to run it. A step's `files` are instead drawn directly from the path list
+    embedded below, which is exactly why the bundle emits a full file
+    inventory rather than directory names alone.
 
     The model is deliberately never asked for `sweep_id`, `commit_sha`,
     `planners`, or a hypothesis's own `planner` field -- `finalize()` injects
@@ -167,39 +262,43 @@ def build_prompt(md: dict, sweep_id: str) -> str:
     not a trustworthy source for a sweep's own identity, so it is never asked
     to be one (Issue #3958).
     """
-    payload = metadata.render_payload(md)
+    paths = _read_bundle_tree_paths(bundle_dir)
+    payload_lines = [f"{metadata.ENTRY_PREFIX}{p}" for p in paths] if paths else ["  (none)"]
+    payload = "\n".join(payload_lines) + "\n"
     return f"""You are the metadata-only step planner for security-review sweep `{sweep_id}`.
 
-You have been given a summary of the repository's structure below. It contains only file
-paths, directory names, and a Go module path -- it deliberately does NOT contain the contents
-of any source file. Do not attempt to read any file's contents (via `cat`, `git show`, or any
-other command) to learn more than what is given here: your job is to partition this metadata
-into bounded review steps, not to review any code yourself.
+You have been given the repository's full file inventory below, read from the bundle's
+`{TREE_ARTIFACT_NAME}` artifact. It contains only repository-relative file paths -- it
+deliberately does NOT contain the contents of any source file, and there is no repository
+checkout mounted in this container for you to read one from even if you wanted to: `/workspace`
+here is the bundle itself, not a checkout. Do not attempt to read any file's contents (via `cat`,
+`git show`, or any other command) to learn more than what is given here: your job is to partition
+this inventory into bounded review steps, not to review any code yourself.
 
---- REPOSITORY METADATA (paths and names only) ---
+--- REPOSITORY METADATA (paths only) ---
 {payload}--- END REPOSITORY METADATA ---
 
-Partition the metadata above into review steps. Each step names ONE bounded scope that a later
-review pass will read in full. Default to one step per Go package (one entry in the "Go
-packages" list above); you may combine multiple small packages into one step, or split a large
-directory into more than one step, but every path in a single step's scope MUST resolve to the
-same top-level subtree -- never a scope that spans two different top-level directories, and
-never a scope that spans two different second-level directories under the same top-level one.
-This applies to any real, reviewable subtree in the repository (for example `pkg/`, `features/`,
-`cmd/`, `web/src/`, `internal/`, `api/proto/`) -- not just the four named as examples here.
+Partition the file inventory above into review steps. Each step names ONE bounded scope that a
+later review pass will read in full. Default to one step per top-level package directory (group
+paths that share the same directory); you may combine multiple small packages into one step, or
+split a large directory into more than one step, but every path in a single step's scope MUST
+resolve to the same top-level subtree -- never a scope that spans two different top-level
+directories, and never a scope that spans two different second-level directories under the same
+top-level one. This applies to any real, reviewable subtree in the repository (for example
+`pkg/`, `features/`, `cmd/`, `web/src/`, `internal/`, `api/proto/`) -- not just the four named as
+examples here.
 
 For each step, propose one or more concrete hypotheses about what a later review pass should
 investigate in that scope. A hypothesis is a specific, falsifiable claim about a security
 property -- not a restatement of the scope's name, and not "review this code for bugs." Base
-each hypothesis only on what the metadata (package/directory names, paths) suggests the code
-might do; you have not read any file's contents, so ground every hypothesis in that, not in
-invented specifics.
+each hypothesis only on what the file inventory (paths, directory names) suggests the code might
+do; you have not read any file's contents, so ground every hypothesis in that, not in invented
+specifics.
 
-For each step, use `Glob` to list the actual files inside the scope you chose (e.g.
-`pkg/example/*.go`) and record their repository-relative paths under `files`. `Glob` returns file
-names only, never file contents -- do not attempt to read any file's contents (via `cat`,
-`git show`, or any other command) to learn more than what is given here or what `Glob` returns:
-your job is to partition this metadata into bounded review steps, not to review any code yourself.
+For each step, populate `files` with the repository-relative paths from the inventory above that
+fall inside the scope you chose -- copy each path verbatim from the list above, never invent or
+guess one. There is no `Glob` step here: the inventory above is already the complete,
+authoritative file list for this commit, so there is nothing left to discover on disk.
 
 Write each step as its own JSON file. Because your tools are `Bash` and `Glob` only (no `Write`),
 create each file with a Bash heredoc, for example:
@@ -235,8 +334,9 @@ Rules for every step file:
   - `required_evidence`: what evidence in the code would confirm or refute this hypothesis.
   - Do NOT include a `planner` field on any hypothesis -- it is filled in for you, exactly like
     `sweep_id`/`commit_sha`/`planners` at the step level.
-- `files`: a JSON array of the repository-relative file paths inside this step's scope, as
-  returned by `Glob` -- may be empty if the scope names files directly rather than a directory.
+- `files`: a JSON array of the repository-relative file paths inside this step's scope, copied
+  verbatim from the file inventory above -- may be empty if the scope names files directly
+  rather than a directory.
 - Do NOT include `sweep_id`, `commit_sha`, or `planners` -- these are filled in for you.
 
 Write one file per step. Do not write anything else, anywhere else. When you are done, stop --
@@ -244,12 +344,30 @@ do not summarize your work in chat, since nothing you say outside these files is
 """
 
 
-def prepare(sweep_dir: str, commit_sha: str, repo_root: str | None = None) -> str:
-    """Collect metadata for `commit_sha` and write the plan prompt.
+def prepare(
+    sweep_dir: str,
+    commit_sha: str,
+    repo_root: str | None = None,
+    scope_file: str | None = None,
+) -> str:
+    """Write the auditable bundle for `commit_sha` and the plan prompt built
+    from it.
 
-    Returns the prompt file path. Raises `MetadataError` (propagated from
-    `metadata.collect()`) if the commit's tree cannot be read -- no prompt is
-    written in that case.
+    Returns the prompt file path. Raises `metadata.MetadataError` (propagated
+    from `metadata.write_bundle()`) if the commit's tree cannot be read, or if
+    `scope_file` fails its own validation (unreadable, oversized, or carrying
+    a planner-prompt delimiter) -- no bundle and no prompt are written in
+    either case. `scope_file` is optional operator-supplied prose (`--scope-file`
+    on this module's CLI, plumbed from `security-review.sh launch`/`resume`);
+    when omitted, `write_bundle()` is called with `no_scope=True` so the
+    omission is recorded in the bundle's own `MANIFEST.json` rather than
+    silently inferred from a missing file (see `metadata.write_bundle()`'s
+    docstring).
+
+    Writes the bundle into `<sweep_dir>/bundle/` (Issue #3979) -- the
+    directory `agent-dispatch.sh launch-investigator --mode plan` mounts
+    read-only at `/workspace` via `launch()`'s `--bundle-dir` below, replacing
+    the sweep's snapshot as the plan-mode container's sole filesystem content.
 
     Also writes `<sweep_dir>/.plan-context.json`, recording this sweep's own
     `sweep_id`/`commit_sha` -- the authoritative source `finalize()` reads
@@ -263,9 +381,17 @@ def prepare(sweep_dir: str, commit_sha: str, repo_root: str | None = None) -> st
     container (`agent-dispatch.sh`: "Mount plan/lane subpaths only -- never
     the sweep root"), which is what makes it a usable root of trust.
     """
-    md = metadata.collect(commit_sha, repo_root=repo_root)
+    bundle_dir = os.path.join(sweep_dir, BUNDLE_SUBDIR)
+    metadata.write_bundle(
+        bundle_dir,
+        commit_sha,
+        repo_root=repo_root,
+        scope_file=scope_file,
+        no_scope=scope_file is None,
+    )
+
     sweep_id = os.path.basename(os.path.normpath(sweep_dir))
-    prompt = build_prompt(md, sweep_id)
+    prompt = build_prompt(bundle_dir, sweep_id)
 
     plan_dir = os.path.join(sweep_dir, "plan")
     os.makedirs(plan_dir, exist_ok=True)
@@ -300,38 +426,38 @@ def default_dispatch_script(repo_root: str | None = None) -> str:
     return os.path.join(root, ".claude", "scripts", "agent-dispatch.sh")
 
 
-def _materialize_lane_snapshot(top_snapshot_dir: str, lane_sweep_dir: str) -> str:
+def _materialize_lane_bundle(top_bundle_dir: str, lane_sweep_dir: str) -> str:
     """Give a multi-planner lane's own sub-sweep-dir (`<sweep_dir>/planners/
-    <lane_dir_name>/`) a `snapshot/` of its own, hardlinked from the sweep's
-    one real snapshot at `top_snapshot_dir` (`<sweep_dir>/snapshot`).
+    <lane_dir_name>/`) a `bundle/` of its own, hardlinked from the sweep's
+    one real bundle at `top_bundle_dir` (`<sweep_dir>/bundle`).
 
-    `agent-dispatch.sh launch-investigator`'s `--snapshot-dir` escape check
-    (Issue #3952) requires the passed directory to resolve to EXACTLY
-    `<the --sweep-dir passed on that same call>/snapshot` -- and multi-planner
-    dispatch passes a per-lane sub-directory as `--sweep-dir`, not the sweep
-    root, so the root's own snapshot cannot be passed there directly without
-    weakening that check. Hardlinking (never symlinking -- a symlink would
-    itself fail the same escape check, by design) gives each lane a real
-    directory entry satisfying the check while sharing the same inode and
-    disk blocks as the one extraction `snapshot.create_snapshot()` already
-    made read-only on the host -- no second byte-copy, no second `git
-    archive`. Idempotent: a second call against an already-materialized lane
-    snapshot is a no-op.
+    `agent-dispatch.sh launch-investigator`'s `--bundle-dir` escape check
+    (Issue #3979, mirroring `--snapshot-dir`'s -- Issue #3952) requires the
+    passed directory to resolve to EXACTLY `<the --sweep-dir passed on that
+    same call>/bundle` -- and multi-planner dispatch passes a per-lane
+    sub-directory as `--sweep-dir`, not the sweep root, so the root's own
+    bundle cannot be passed there directly without weakening that check.
+    Hardlinking (never symlinking -- a symlink would itself fail the same
+    escape check, by design) gives each lane a real directory entry
+    satisfying the check while sharing the same inode and disk blocks as the
+    one bundle `metadata.write_bundle()` already wrote -- no second byte-copy,
+    no second bundle extraction. Idempotent: a second call against an
+    already-materialized lane bundle is a no-op.
     """
-    lane_snapshot_dir = os.path.join(lane_sweep_dir, "snapshot")
-    if not os.path.isdir(lane_snapshot_dir):
-        shutil.copytree(top_snapshot_dir, lane_snapshot_dir, copy_function=os.link)
-    return lane_snapshot_dir
+    lane_bundle_dir = os.path.join(lane_sweep_dir, BUNDLE_SUBDIR)
+    if not os.path.isdir(lane_bundle_dir):
+        shutil.copytree(top_bundle_dir, lane_bundle_dir, copy_function=os.link)
+    return lane_bundle_dir
 
 
 def launch(
     sweep_dir: str,
-    snapshot_dir: str | None = None,
+    bundle_dir: str | None = None,
     repo_root: str | None = None,
     dispatch_script: str | None = None,
     planners: "list[roster.Lane] | None" = None,
 ) -> str:
-    """Invoke `agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --snapshot-dir <snapshot_dir> --mode plan`.
+    """Invoke `agent-dispatch.sh launch-investigator --sweep-dir <sweep_dir> --bundle-dir <bundle_dir> --mode plan`.
 
     `planners` is `None` by default, which preserves this function's
     original, single hardcoded call exactly as it has always been -- no
@@ -356,7 +482,7 @@ def launch(
     before dispatch, since that is where the container looks for it
     (`investigator-entrypoint.sh`'s plan mode reads
     `/workspace-out/.investigator-plan-prompt.md`) and every planner reviews
-    the same metadata regardless of which harness/model executes it.
+    the same bundle regardless of which harness/model executes it.
     `finalize_multi_planner()` is what later reads these directories back
     and merges their output by scope.
 
@@ -376,27 +502,28 @@ def launch(
     every entry has been attempted, summarizing every failure.
 
     Raises `PlannerError` if the prompt has not been written yet, if
-    `snapshot_dir` is not given, if `agent-dispatch.sh` cannot be found, or
+    `bundle_dir` is not given, if `agent-dispatch.sh` cannot be found, or
     if any launch command exits non-zero.
 
-    `snapshot_dir` (Issue #3952, epic #3950's D1) is the sweep's own
-    verified snapshot (`<sweep_dir>/snapshot`, `snapshot.create_snapshot()`)
-    -- required, since `launch-investigator` now refuses to run without a
-    `--snapshot-dir`. Passed straight through on the single-planner call
-    below. The multi-planner branch cannot pass it straight through: each
-    entry's `--sweep-dir` is its own `<sweep_dir>/planners/<lane>/`
+    `bundle_dir` (Issue #3979) is the sweep's own auditable bundle
+    (`<sweep_dir>/bundle`, `metadata.write_bundle()` via `prepare()`) --
+    required, since `launch-investigator` now refuses to run in plan mode
+    without a `--bundle-dir`, and never falls back to mounting the sweep's
+    snapshot if one is missing. Passed straight through on the single-planner
+    call below. The multi-planner branch cannot pass it straight through:
+    each entry's `--sweep-dir` is its own `<sweep_dir>/planners/<lane>/`
     sub-directory, and `launch-investigator`'s escape check requires
-    `--snapshot-dir` to resolve to exactly `<that --sweep-dir>/snapshot` --
-    so `_materialize_lane_snapshot()` gives each lane a hardlinked
-    `snapshot/` of its own inside its sub-directory first.
+    `--bundle-dir` to resolve to exactly `<that --sweep-dir>/bundle` -- so
+    `_materialize_lane_bundle()` gives each lane a hardlinked `bundle/` of
+    its own inside its sub-directory first.
     """
     prompt_path = os.path.join(sweep_dir, "plan", PROMPT_FILENAME)
     if not os.path.isfile(prompt_path):
         raise PlannerError(
             f"plan prompt not found at {prompt_path}; call prepare() before launch()"
         )
-    if not snapshot_dir:
-        raise PlannerError("snapshot_dir is required -- pass the sweep's verified snapshot directory")
+    if not bundle_dir:
+        raise PlannerError("bundle_dir is required -- pass the sweep's prepared bundle directory")
 
     script = dispatch_script or default_dispatch_script(repo_root)
     if not os.path.isfile(script):
@@ -410,8 +537,8 @@ def launch(
                     "launch-investigator",
                     "--sweep-dir",
                     sweep_dir,
-                    "--snapshot-dir",
-                    snapshot_dir,
+                    "--bundle-dir",
+                    bundle_dir,
                     "--mode",
                     "plan",
                 ],
@@ -439,7 +566,7 @@ def launch(
         lane_plan_dir = os.path.join(lane_sweep_dir, "plan")
         os.makedirs(lane_plan_dir, exist_ok=True)
         atomic_write.write_text_atomic(os.path.join(lane_plan_dir, PROMPT_FILENAME), prompt_text)
-        lane_snapshot_dir = _materialize_lane_snapshot(snapshot_dir, lane_sweep_dir)
+        lane_bundle_dir = _materialize_lane_bundle(bundle_dir, lane_sweep_dir)
 
         try:
             result = subprocess.run(
@@ -448,8 +575,8 @@ def launch(
                     "launch-investigator",
                     "--sweep-dir",
                     lane_sweep_dir,
-                    "--snapshot-dir",
-                    lane_snapshot_dir,
+                    "--bundle-dir",
+                    lane_bundle_dir,
                     "--mode",
                     "plan",
                     "--harness",
@@ -991,6 +1118,25 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
             excluded.append(filename)
             continue
 
+        # Issue #3979: `schema.validate_plan_step()` deliberately permits an
+        # empty `files` array -- a step can legitimately describe a scope
+        # with no concrete files pinned yet, and that rule must not change.
+        # But a plan-wide empty `files` array is also exactly the symptom a
+        # broken bundle-to-prompt cutover produces: with no file inventory to
+        # draw from, a model can still name a scope and propose hypotheses
+        # while populating no files at all, and that step would otherwise
+        # validate and reach a lane that then reports it `complete` having
+        # reviewed nothing. That is a judgment about the plan as a whole, not
+        # a per-step shape rule, so it belongs here rather than in
+        # `validate_plan_step()`.
+        if isinstance(data.get("files"), list) and not data["files"]:
+            reason = "step has an empty files array -- nothing for a lane to review"
+            schema.log_event("invalid_plan_step", filename=filename, errors=[reason])
+            errors.append(f"{filename}: {reason}")
+            rejected.append({"filename": filename, "error": reason})
+            excluded.append(filename)
+            continue
+
         atomic_write.write_json_atomic(path, data)
         valid.append(filename)
 
@@ -1194,14 +1340,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
 
-    p_prepare = sub.add_parser("prepare", help="Collect metadata and write the plan prompt")
+    p_prepare = sub.add_parser("prepare", help="Write the auditable bundle and the plan prompt")
     p_prepare.add_argument("sweep_dir")
     p_prepare.add_argument("commit_sha")
     p_prepare.add_argument("--repo-root", default=None)
+    p_prepare.add_argument(
+        "--scope-file", default=None, metavar="PATH",
+        help="operator-supplied prose description, copied verbatim into the bundle's 00-scope.md "
+             "(see metadata.write_bundle()); omit to record scope_provided=false",
+    )
 
     p_launch = sub.add_parser("launch", help="Launch the investigator plan-mode container")
     p_launch.add_argument("sweep_dir")
-    p_launch.add_argument("--snapshot-dir", required=True)
+    p_launch.add_argument("--bundle-dir", required=True)
     p_launch.add_argument("--repo-root", default=None)
 
     p_finalize = sub.add_parser(
@@ -1213,7 +1364,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.action == "prepare":
         try:
-            path = prepare(args.sweep_dir, args.commit_sha, repo_root=args.repo_root)
+            path = prepare(
+                args.sweep_dir, args.commit_sha, repo_root=args.repo_root, scope_file=args.scope_file
+            )
         except metadata.MetadataError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
@@ -1229,7 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             output = launch(
                 args.sweep_dir,
-                snapshot_dir=args.snapshot_dir,
+                bundle_dir=args.bundle_dir,
                 repo_root=args.repo_root,
                 planners=planners,
             )

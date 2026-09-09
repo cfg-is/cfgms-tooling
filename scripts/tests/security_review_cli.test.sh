@@ -595,6 +595,42 @@ lane_run_log_1="$(cat "${SUB1}/lane_run.log" 2>/dev/null || true)"
 check_not_contains "the real lane run produced no import errors" "$lane_run_log_1" "Error"
 
 echo ""
+echo "== REQUIRED TEST — the auditable bundle (#3978) is written under"
+echo "   <sweep_dir>/bundle/ and mounted by the plan-mode container, never"
+echo "   the snapshot (Issue #3979) =="
+[[ -f "${SWEEP_DIR_1}/bundle/MANIFEST.json" ]] \
+  && ok "dispatch_planner's prepare() wrote the bundle's MANIFEST.json" \
+  || bad "dispatch_planner's prepare() wrote the bundle's MANIFEST.json" "not found"
+[[ -f "${SWEEP_DIR_1}/bundle/01-tree.tsv" ]] \
+  && ok "the bundle includes 01-tree.tsv" \
+  || bad "the bundle includes 01-tree.tsv" "not found"
+scope_provided_1="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_1}/bundle/MANIFEST.json'))['scope_provided'])")"
+check_eq "no --scope-file was passed, so MANIFEST.json records scope_provided=False" "$scope_provided_1" "False"
+plan_mount_call="$(grep ' plan$' "${SUB1}/docker_calls.log" | tail -1)"
+check_contains "the plan-mode docker run mounts the bundle at /workspace:ro" "$plan_mount_call" "${SWEEP_DIR_1}/bundle:/workspace:ro"
+check_not_contains "the plan-mode docker run never mounts the snapshot anywhere" "$plan_mount_call" "${SWEEP_DIR_1}/snapshot"
+
+echo ""
+echo "== REQUIRED TEST — CLI plumbing: launch --scope-file <path> forwards to"
+echo "   planner.py prepare --scope-file, landing verbatim in the bundle's"
+echo "   00-scope.md (Issue #3979) =="
+SUB_SCOPE="${SANDBOX}/case-scope-file"
+setup_sub_sandbox "$SUB_SCOPE"
+SCOPE_FILE_FIXTURE="${SUB_SCOPE}/scope.md"
+printf 'Reviewing pkg/example for tenant-scoping regressions.\n' > "$SCOPE_FILE_FIXTURE"
+scope_launch_out=$(run_cli "$SUB_SCOPE" launch HEAD --scope-file "$SCOPE_FILE_FIXTURE" 2>"${SUB_SCOPE}/stderr.log")
+scope_launch_rc=$?
+check_eq "launch --scope-file exits 0" "$scope_launch_rc" "0"
+SWEEP_DIR_SCOPE="$(dirname "$(dirname "$scope_launch_out")")"
+[[ -f "${SWEEP_DIR_SCOPE}/bundle/00-scope.md" ]] \
+  && ok "the bundle's 00-scope.md was written" \
+  || bad "the bundle's 00-scope.md was written" "not found"
+scope_content="$(cat "${SWEEP_DIR_SCOPE}/bundle/00-scope.md" 2>/dev/null || true)"
+check_eq "00-scope.md is a byte-identical copy of --scope-file" "$scope_content" "Reviewing pkg/example for tenant-scoping regressions."
+scope_provided_2="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_SCOPE}/bundle/MANIFEST.json'))['scope_provided'])")"
+check_eq "MANIFEST.json records scope_provided=True when --scope-file was passed" "$scope_provided_2" "True"
+
+echo ""
 echo "== status reports coverage read-only, without re-running anything (AC2) =="
 before_hash="$(find "$SWEEP_DIR_1" -type f -exec sha256sum {} \; | sort | sha256sum)"
 before_calls="$(wc -l < "${SUB1}/docker_calls.log")"

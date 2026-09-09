@@ -1103,17 +1103,24 @@ Commands:
                                             Exit 3 on validation failure.
   cleanup-stale-reviews                     Remove exited review containers that did not clean up
                                             their clone directory on exit.
-  launch-investigator --sweep-dir <DIR> --snapshot-dir <DIR> --mode <plan|LANE_ID>
+  launch-investigator --sweep-dir <DIR> [--snapshot-dir <DIR>] [--bundle-dir <DIR>] --mode <plan|LANE_ID>
                       [--lane-entrypoint <SCRIPT>] [--harness <ID>] [--model <ID>]
                                             Launch a read-only investigator container (Issue #3903)
                                             against an existing security-review sweep directory.
-                                            --snapshot-dir is required (Issue #3952): /workspace is
-                                            mounted :ro from it, never from the live, mutable repo
-                                            checkout -- it must already exist and resolve to exactly
-                                            <sweep-dir>/snapshot (the sweep's own verified snapshot,
-                                            snapshot.py/Issue #3951), checked before any mount is
-                                            built. A missing --snapshot-dir, or one that does not
-                                            resolve there, is a hard failure before any docker call.
+                                            Which directory --mode requires, and mounts at
+                                            /workspace, is mode-dependent (Issue #3979):
+                                            mode=plan requires --bundle-dir (the auditable bundle,
+                                            #3978) and NEVER mounts the snapshot; every other mode
+                                            (a lane) requires --snapshot-dir exactly as before
+                                            (Issue #3952) and never mounts the bundle. Whichever one
+                                            is required must already exist and resolve to exactly
+                                            <sweep-dir>/bundle or <sweep-dir>/snapshot respectively
+                                            (the sweep's own verified snapshot, snapshot.py/Issue
+                                            #3951, for the snapshot side), checked before any mount
+                                            is built. A missing required directory, or one that does
+                                            not resolve there, is a hard failure before any docker
+                                            call -- plan mode never falls back to mounting the
+                                            snapshot.
                                             No GH_TOKEN, no git identity. This call also hashes
                                             investigator-entrypoint.sh and --lane-entrypoint's script
                                             (the only two files individually mounted from the live
@@ -2726,6 +2733,7 @@ PROMPT_EOF
     #     never read or write another lane's findings or manifest.json
     inv_sweep_dir=""
     inv_snapshot_dir=""
+    inv_bundle_dir=""
     inv_mode=""
     inv_lane_entrypoint=""
     inv_harness=""
@@ -2734,6 +2742,7 @@ PROMPT_EOF
       case "$1" in
         --sweep-dir)       inv_sweep_dir="${2:?--sweep-dir requires a value}"; shift 2 ;;
         --snapshot-dir)    inv_snapshot_dir="${2:?--snapshot-dir requires a value}"; shift 2 ;;
+        --bundle-dir)      inv_bundle_dir="${2:?--bundle-dir requires a value}"; shift 2 ;;
         --mode)            inv_mode="${2:?--mode requires a value}"; shift 2 ;;
         --lane-entrypoint) inv_lane_entrypoint="${2:?--lane-entrypoint requires a value}"; shift 2 ;;
         --harness)         inv_harness="${2:?--harness requires a value}"; shift 2 ;;
@@ -2743,12 +2752,21 @@ PROMPT_EOF
     done
 
     [[ -n "$inv_sweep_dir" ]] || { echo "ERROR: launch-investigator requires --sweep-dir"; exit 1; }
-    # Checked here, before any mkdir, docker call, or mount construction
-    # (Issue #3952): --snapshot-dir is the ONLY thing ever mounted at
-    # /workspace now (see the docker run invocation below) -- a missing value
-    # must never fall through to some other default source for that mount.
-    [[ -n "$inv_snapshot_dir" ]] || { echo "ERROR: launch-investigator requires --snapshot-dir"; exit 1; }
     [[ -n "$inv_mode" ]] || { echo "ERROR: launch-investigator requires --mode (plan|<lane-id>)"; exit 1; }
+
+    # Checked here, before any mkdir, docker call, or mount construction
+    # (Issue #3979): which directory is required, and later mounted at
+    # /workspace, is mode-dependent. Plan mode mounts the bundle (#3978) and
+    # must never fall back to the snapshot if --bundle-dir is missing; every
+    # other mode (a lane) keeps requiring --snapshot-dir exactly as before
+    # (Issue #3952) and never touches --bundle-dir. A missing value for the
+    # mode's own required directory must never fall through to the other
+    # mode's directory for /workspace.
+    if [[ "$inv_mode" == "plan" ]]; then
+      [[ -n "$inv_bundle_dir" ]] || { echo "ERROR: launch-investigator --mode plan requires --bundle-dir"; exit 1; }
+    else
+      [[ -n "$inv_snapshot_dir" ]] || { echo "ERROR: launch-investigator requires --snapshot-dir"; exit 1; }
+    fi
 
     # SECURITY: --mode is concatenated into the WRITABLE bind-mount path below
     # (${inv_sweep_dir}/lanes/${inv_mode}), so it is validated as a strict lane
@@ -2778,24 +2796,55 @@ PROMPT_EOF
     [[ -d "$inv_sweep_dir" ]] || { echo "ERROR: sweep directory not found: ${inv_sweep_dir}"; exit 1; }
     inv_sweep_dir="$(realpath "$inv_sweep_dir")"
 
-    # --snapshot-dir (Issue #3952, epic #3950's D1): mount the tree from a
-    # verified, immutable snapshot instead of the live, mutable repo checkout.
-    # Validated exactly like inv_plan_dir_real/inv_lane_dir_real below: it
-    # must already exist (security-review.sh's create_sweep_tree() creates it
-    # via snapshot.create_snapshot() before ever calling this command --
-    # never mkdir -p'd here) and its realpath must land EXACTLY on
-    # <sweep-dir>/snapshot. The same reasoning as the plan/lane checks
-    # applies: docker resolves the host side of a bind mount at mount time,
-    # so a symlink at the passed path would redirect /workspace to an
-    # arbitrary host directory -- including back to the live checkout this
-    # story exists to stop mounting.
-    [[ -d "$inv_snapshot_dir" ]] || { echo "ERROR: snapshot directory not found: ${inv_snapshot_dir}"; exit 1; }
-    inv_snapshot_dir_real="$(realpath "$inv_snapshot_dir" 2>/dev/null || true)"
-    if [[ "$inv_snapshot_dir_real" != "${inv_sweep_dir}/snapshot" ]]; then
-      echo "INVESTIGATOR_REFUSED:snapshot_dir_escape:snapshot dir does not resolve inside the sweep directory"
-      exit 2
+    # Issue #3979: which directory is resolved, verified, and ultimately
+    # mounted at /workspace is mode-dependent. Plan mode resolves ONLY
+    # --bundle-dir and never touches --snapshot-dir (even if a caller passed
+    # one); every other mode (a lane) resolves ONLY --snapshot-dir, exactly
+    # as before Issue #3952. inv_workspace_dir is the one value the docker
+    # run invocation below ever mounts at /workspace -- there is no path on
+    # which plan mode falls back to the snapshot.
+    if [[ "$inv_mode" == "plan" ]]; then
+      # --bundle-dir (Issue #3979): mount the auditable bundle (#3978)
+      # instead of any repository tree at all -- the planner never gets a
+      # checkout, snapshot or otherwise, to read from. Validated exactly like
+      # --snapshot-dir below: it must already exist (security-review.sh's
+      # dispatch_planner() creates it via planner.py's prepare(), which calls
+      # metadata.write_bundle(), before ever calling this command -- never
+      # mkdir -p'd here) and its realpath must land EXACTLY on
+      # <sweep-dir>/bundle. docker resolves the host side of a bind mount at
+      # mount time, so a symlink at the passed path would redirect /workspace
+      # to an arbitrary host directory -- including back to a live checkout,
+      # which is exactly what this story exists to stop being reachable from
+      # plan mode.
+      [[ -d "$inv_bundle_dir" ]] || { echo "ERROR: bundle directory not found: ${inv_bundle_dir}"; exit 1; }
+      inv_bundle_dir_real="$(realpath "$inv_bundle_dir" 2>/dev/null || true)"
+      if [[ "$inv_bundle_dir_real" != "${inv_sweep_dir}/bundle" ]]; then
+        echo "INVESTIGATOR_REFUSED:bundle_dir_escape:bundle dir does not resolve inside the sweep directory"
+        exit 2
+      fi
+      inv_bundle_dir="$inv_bundle_dir_real"
+      inv_workspace_dir="$inv_bundle_dir"
+    else
+      # --snapshot-dir (Issue #3952, epic #3950's D1): mount the tree from a
+      # verified, immutable snapshot instead of the live, mutable repo checkout.
+      # Validated exactly like inv_plan_dir_real/inv_lane_dir_real below: it
+      # must already exist (security-review.sh's create_sweep_tree() creates it
+      # via snapshot.create_snapshot() before ever calling this command --
+      # never mkdir -p'd here) and its realpath must land EXACTLY on
+      # <sweep-dir>/snapshot. The same reasoning as the plan/lane checks
+      # applies: docker resolves the host side of a bind mount at mount time,
+      # so a symlink at the passed path would redirect /workspace to an
+      # arbitrary host directory -- including back to the live checkout this
+      # story exists to stop mounting.
+      [[ -d "$inv_snapshot_dir" ]] || { echo "ERROR: snapshot directory not found: ${inv_snapshot_dir}"; exit 1; }
+      inv_snapshot_dir_real="$(realpath "$inv_snapshot_dir" 2>/dev/null || true)"
+      if [[ "$inv_snapshot_dir_real" != "${inv_sweep_dir}/snapshot" ]]; then
+        echo "INVESTIGATOR_REFUSED:snapshot_dir_escape:snapshot dir does not resolve inside the sweep directory"
+        exit 2
+      fi
+      inv_snapshot_dir="$inv_snapshot_dir_real"
+      inv_workspace_dir="$inv_snapshot_dir"
     fi
-    inv_snapshot_dir="$inv_snapshot_dir_real"
 
     inv_sweep_id="$(basename "$inv_sweep_dir")"
     inv_mode_safe=$(printf '%s' "$inv_mode" | tr -c 'a-zA-Z0-9._-' '-')
@@ -3174,7 +3223,7 @@ PY
       --memory=2g \
       --cpus=2 \
       --stop-timeout=900 \
-      -v "${inv_snapshot_dir}:/workspace:ro" \
+      -v "${inv_workspace_dir}:/workspace:ro" \
       "${claude_creds_mount[@]}" \
       "${inv_plan_mount[@]}" \
       "${inv_out_mount[@]}" \
