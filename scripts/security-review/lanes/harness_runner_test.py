@@ -83,7 +83,9 @@ def test_output_schema_description_names_every_required_finding_field():
         "hypothesis_id",
         "file",
         "symbol",
+        "line",
         "vuln_class",
+        "cwe",
         "severity",
         "confidence",
         "title",
@@ -95,6 +97,24 @@ def test_output_schema_description_names_every_required_finding_field():
         missing == [],
         "OUTPUT_SCHEMA_DESCRIPTION names every model-supplied finding field",
         f"missing: {missing}",
+    )
+
+
+def test_output_schema_description_names_cwe_and_line_issue_3983():
+    # [REQUIRED TEST] Issue #3983: the shared schema description is the one
+    # place a lane learns about `cwe` and `line` (plus optional `end_line`) --
+    # must fail if either drops out of the single shared constant.
+    description = harness_runner.OUTPUT_SCHEMA_DESCRIPTION
+    check('"cwe"' in description, "OUTPUT_SCHEMA_DESCRIPTION names the cwe field")
+    check('"line"' in description, "OUTPUT_SCHEMA_DESCRIPTION names the line field")
+    check('"end_line"' in description, "OUTPUT_SCHEMA_DESCRIPTION names the optional end_line field")
+    check(
+        all(f'"{cwe}"' in description for cwe in harness_runner.schema.CWE_VALUES),
+        "OUTPUT_SCHEMA_DESCRIPTION lists every closed-list CWE identifier schema.py validates against",
+    )
+    check(
+        "other: <short label>" in description,
+        "OUTPUT_SCHEMA_DESCRIPTION names the 'other' escape",
     )
 
 

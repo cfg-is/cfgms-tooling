@@ -405,13 +405,27 @@ def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> di
             "evidence": finding["evidence"],
             "suggested_fix": finding["suggested_fix"],
         }
-        # Issue #3983's normalised defect identifier, when a finding carries
-        # one -- consumed by cross-step grouping (Issue #3984). Optional
-        # until #3983 lands, so an occurrence without it has no key at all
-        # rather than a null placeholder.
-        cwe = finding.get("cwe")
-        if isinstance(cwe, str) and cwe:
-            occurrence["cwe"] = cwe
+        # Issue #3983's normalised defect classification and location. Every
+        # finding this loop sees already passed `schema.validate_finding`
+        # (nested inside the `complete` envelope's own validation in
+        # `load_sweep()`), so `cwe` and `line` are always present and
+        # well-formed here -- the `isinstance`/range checks below are
+        # defence in depth, not load-bearing, and never invented findings
+        # from before Issue #3983 pass through since those envelopes never
+        # validated in the first place. `cwe` is run through
+        # `schema.normalize_cwe()` rather than stored raw, so two lanes
+        # naming the same identifier with different case or formatting
+        # (`cwe-295` vs `CWE-295: ...`) group together downstream instead of
+        # reading as two distinct classes.
+        normalized_cwe = schema.normalize_cwe(finding.get("cwe"))
+        if normalized_cwe:
+            occurrence["cwe"] = normalized_cwe
+        line = finding.get("line")
+        if isinstance(line, int) and not isinstance(line, bool) and line >= 1:
+            occurrence["line"] = line
+            end_line = finding.get("end_line")
+            if isinstance(end_line, int) and not isinstance(end_line, bool) and end_line >= line:
+                occurrence["end_line"] = end_line
         group["occurrences"].append(occurrence)
 
     return groups
@@ -461,26 +475,43 @@ def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
     )
 
 
+def _first_occurrence_field(occurrences: list[dict], field: str) -> object:
+    """The value of `field` on the first occurrence (in the given, already
+    deterministic order) that carries it, or `None` if none do. Used to pick
+    one `cwe`/`line`/`end_line` to show at the consolidated-finding level
+    beside `file` -- a deterministic pick, never a merge, since these are
+    model-generated hints for a human reader, not part of what makes two
+    findings the same finding (that stays the `file`+`symbol`+`vuln_class`
+    key, computed independently of this)."""
+    for occurrence in occurrences:
+        value = occurrence.get(field)
+        if value is not None:
+            return value
+    return None
+
+
 def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]]) -> list[dict]:
     consolidated = []
     for (file_value, symbol, vuln_class), group in sorted(groups.items()):
         step_ids = sorted(group["step_ids"])
         reported_lanes = sorted(group["lanes"])
         eligible_lanes = _eligible_lanes(step_ids, lane_step_state)
+        occurrences = sorted(group["occurrences"], key=lambda o: (o["lane"], o["step_id"]))
         consolidated.append(
             {
                 "file": file_value,
                 "symbol": symbol,
                 "vuln_class": vuln_class,
+                "cwe": _first_occurrence_field(occurrences, "cwe"),
+                "line": _first_occurrence_field(occurrences, "line"),
+                "end_line": _first_occurrence_field(occurrences, "end_line"),
                 "lanes": reported_lanes,
                 "step_ids": step_ids,
                 "agreement": {
                     "reported": len(reported_lanes),
                     "eligible": len(eligible_lanes),
                 },
-                "occurrences": sorted(
-                    group["occurrences"], key=lambda o: (o["lane"], o["step_id"])
-                ),
+                "occurrences": occurrences,
                 "severity_range": _severity_range(group["occurrences"]),
                 "adjudication": None,
             }
@@ -516,15 +547,14 @@ def _finding_key(finding: dict) -> tuple[str, str, str]:
 
 
 def _defect_class(finding: dict) -> str:
-    """The class a finding is grouped on for cross-step re-aggregation: the
-    first non-empty `cwe` any occurrence carries (Issue #3983's normalised
-    identifier, when present), else the de-duplication key's own
-    `vuln_class`."""
-    for occ in finding["occurrences"]:
-        cwe = occ.get("cwe")
-        if isinstance(cwe, str) and cwe:
-            return cwe
-    return finding["vuln_class"]
+    """The class a finding is grouped on for cross-step re-aggregation:
+    `finding["cwe"]` (Issue #3983's normalised identifier -- required on
+    every finding since that story landed, so always present here) when set,
+    else the de-duplication key's own `vuln_class` (a finding from a sweep
+    written before Issue #3983, whose envelope predates the required field
+    and so carries no `cwe` at all)."""
+    cwe = finding.get("cwe")
+    return cwe if isinstance(cwe, str) and cwe else finding["vuln_class"]
 
 
 def build_cross_step_groups(findings: list[dict]) -> list[dict]:
@@ -1040,6 +1070,22 @@ def _md_escape_inline(text: object) -> str:
     return value
 
 
+def _location_suffix(finding: dict) -> str:
+    """`:line` or `:line-end_line`, rendered immediately after `file` in a
+    finding heading, or `""` when the finding carries no `line` (a finding
+    from a sweep written before Issue #3983's required `line` field). Never
+    part of the de-duplication key -- purely a reader's hint at where in
+    `file` to look, taken from `_first_occurrence_field`'s deterministic
+    pick, and never verified as a real offset into the file."""
+    line = finding.get("line")
+    if not isinstance(line, int):
+        return ""
+    end_line = finding.get("end_line")
+    if isinstance(end_line, int) and end_line != line:
+        return f":{line}-{end_line}"
+    return f":{line}"
+
+
 def _dispatch_identity(entry: dict) -> str:
     """Derive a human-readable identity for a `dispatch_report.json`
     planner/lane entry. Neither the "planners" nor the "lanes" array carries
@@ -1422,9 +1468,12 @@ def render_markdown(report: dict) -> str:
 
     for finding in report["findings"]:
         agreement = finding["agreement"]
+        cwe = finding.get("cwe")
+        cwe_suffix = f" ({_md_escape_inline(cwe)})" if cwe else ""
         lines.append(
-            f"### {_md_escape_inline(finding['vuln_class'])} — "
-            f"{_md_escape_inline(finding['file'])} :: {_md_escape_inline(finding['symbol'])}"
+            f"### {_md_escape_inline(finding['vuln_class'])}{cwe_suffix} — "
+            f"{_md_escape_inline(finding['file'])}{_location_suffix(finding)} :: "
+            f"{_md_escape_inline(finding['symbol'])}"
         )
         lines.append("")
         lanes_text = ", ".join(_md_escape_inline(lane) for lane in finding["lanes"])

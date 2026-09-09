@@ -432,9 +432,13 @@ case "$outcome" in
   finding_low|finding_critical)
     # One finding at a fixed key (Issue #3984): two lanes, one on each of
     # these outcomes, produce the exact low-vs-critical disagreement the
-    # adjudication stage exists to resolve.
+    # adjudication stage exists to resolve. The finding carries every field
+    # `schema.validate_finding` requires, including Issue #3983's required
+    # `cwe` (a member of schema.py's closed CWE_VALUES set) and `line` -- a
+    # finding missing either is schema-invalid, so the consolidator drops it
+    # and the adjudicator is handed nothing to adjudicate.
     sev="${outcome#finding_}"
-    printf '{"findings":[{"hypothesis_id":"h1","file":"pkg/example/file.go","symbol":"Do","vuln_class":"tenant-scoping","severity":"%s","confidence":"medium","title":"stub cross-tenant read","evidence":"stub evidence","suggested_fix":"stub fix"}],"dispositions":[{"hypothesis_id":"h1","disposition":"candidate_found","summary":"stub: found one"}]}' "$sev" > "$output_path"
+    printf '{"findings":[{"hypothesis_id":"h1","file":"pkg/example/file.go","symbol":"Do","line":1,"vuln_class":"tenant-scoping","cwe":"CWE-863","severity":"%s","confidence":"medium","title":"stub cross-tenant read","evidence":"stub evidence","suggested_fix":"stub fix"}],"dispositions":[{"hypothesis_id":"h1","disposition":"candidate_found","summary":"stub: found one"}]}' "$sev" > "$output_path"
     exit 0
     ;;
   adjudication)

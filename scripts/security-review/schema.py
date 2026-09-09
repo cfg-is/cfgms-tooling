@@ -5,11 +5,30 @@ Three shapes are validated here:
 
 - A **finding** (`validate_finding`): the structured output a lane emits per
   vulnerability, matching the epic's "Finding schema" exactly. The
-  de-duplication key is `file` + `symbol` + `vuln_class` — never a line
-  number, because line ranges rot as `develop` advances while symbol names
-  survive. This module does not define or read a line-number field; a caller
-  that includes one gets it silently ignored, not rejected and not validated,
-  so nothing downstream can key on it by accident.
+  de-duplication key is `file` + `symbol` + `vuln_class` — never a location,
+  because line ranges rot as `develop` advances while symbol names survive.
+  That was always right about the *key*; it was implemented, before Issue
+  #3983, as "don't record a location at all," which is a different and
+  overly strong decision -- a finding naming a file and a symbol but no
+  location makes a human open the file and search. Issue #3983 separates the
+  two: the key stays `file` + `symbol` + `vuln_class`, unchanged, while every
+  finding now also carries `cwe` (a normalised identifier from the closed
+  vocabulary #3981's methodology document defines, or its `other: <label>`
+  escape -- validated and normalised by `normalize_cwe`, never passed through
+  as free text) and `line` (a positive integer, required) with an optional
+  `end_line` (`>= line`, when the defect spans more than one line). Both
+  `cwe` and `line` are **required**, not optional-and-ignored: the harness has
+  never been run end to end (epic #3975), so there is no corpus of prior
+  sweeps a required field could silently invalidate, and a validation failure
+  here is loud and diagnosable rather than a lane quietly omitting a field a
+  later reader assumed was always there -- the same "clean-looking report
+  over work that did not happen" failure mode this epic exists to close, one
+  field down. `line`/`end_line` are a model-generated hint at where in `file`
+  to look, never a verified offset -- this module has no file body to check
+  them against, and neither does anything downstream (`consolidate.py` does
+  not read file bodies either). A malformed `cwe` or `line`/`end_line` is
+  rejected the same way any other malformed required field is: named in the
+  returned errors, never silently coerced or dropped.
 
 - A **step envelope** (`validate_step_envelope`): the record a lane writes per
   step regardless of outcome (SEC3900 finding B7). `state` resolves to one of
@@ -101,6 +120,7 @@ than rendering as a second, spoofed log record.
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 REQUIRED_FINDING_FIELDS = (
@@ -111,7 +131,9 @@ REQUIRED_FINDING_FIELDS = (
     "hypothesis_id",
     "file",
     "symbol",
+    "line",
     "vuln_class",
+    "cwe",
     "severity",
     "confidence",
     "title",
@@ -121,6 +143,80 @@ REQUIRED_FINDING_FIELDS = (
 
 SEVERITY_VALUES = frozenset({"low", "medium", "high", "critical"})
 CONFIDENCE_VALUES = frozenset({"low", "medium", "high"})
+
+# The closed CWE identifier list Issue #3981's methodology document defines
+# under "Vulnerability classes in scope" (`docs/security-review/methodology.md`,
+# inside the always-inlined `methodology-core` section) -- kept here as a
+# literal set, rather than parsed from that document at import, so this
+# module stays dependency-free of the doc's location/parsing (that is
+# `lanes/harness_runner.py`'s concern, for a different purpose: prompt
+# assembly). `schema_test.py` cross-checks this set against the live document
+# so the two cannot drift silently. `normalize_cwe` is the only place this
+# set is consulted.
+CWE_VALUES = frozenset(
+    {
+        "CWE-295",  # Improper certificate validation
+        "CWE-287",  # Improper authentication
+        "CWE-306",  # Missing authentication for critical function
+        "CWE-862",  # Missing authorization
+        "CWE-863",  # Incorrect authorization
+        "CWE-269",  # Improper privilege management
+        "CWE-347",  # Improper signature verification
+        "CWE-345",  # Insufficient data authenticity
+        "CWE-613",  # Insufficient session or credential expiration
+        "CWE-330",  # Insufficiently random values
+        "CWE-208",  # Observable timing discrepancy
+        "CWE-798",  # Hard-coded credentials
+        "CWE-312",  # Cleartext storage of sensitive information
+        "CWE-532",  # Sensitive information in log
+        "CWE-117",  # Log output neutralization
+        "CWE-209",  # Sensitive information in error message
+        "CWE-78",  # OS command injection
+        "CWE-88",  # Argument injection
+        "CWE-89",  # SQL injection
+        "CWE-22",  # Path traversal
+        "CWE-59",  # Link following
+        "CWE-502",  # Deserialization of untrusted data
+        "CWE-20",  # Improper input validation at a trust boundary
+        "CWE-362",  # Race condition, check-then-act
+        "CWE-400",  # Uncontrolled resource consumption
+    }
+)
+
+_CWE_ID_RE = re.compile(r"^\s*cwe-?\s*0*(\d+)\s*(?::.*)?\s*$", re.IGNORECASE)
+_CWE_OTHER_RE = re.compile(r"^\s*other\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def normalize_cwe(value: object) -> str | None:
+    """Normalise a `cwe` value to its canonical form and validate it against
+    `CWE_VALUES`, or against the `other: <label>` escape #3981's methodology
+    document defines alongside that list. Returns the canonical string, or
+    `None` when `value` is not a string or names anything outside that closed
+    vocabulary.
+
+    Accepts case and minor formatting variation -- `CWE-295`, `cwe295`,
+    `Cwe-295`, `CWE-295: Improper certificate validation` all normalise to
+    `"CWE-295"` -- so two lanes naming the same identifier differently are
+    recognised as one value downstream (rendering, cross-step grouping).
+    Normalising is deliberately a different operation from de-duplication:
+    this changes what value is *stored*, never what makes two findings the
+    same finding -- the de-duplication key stays `file` + `symbol` +
+    `vuln_class` regardless of what `cwe` says.
+
+    Never raises: a non-string, an out-of-list number, or an `other:` escape
+    with an empty label all return `None`, exactly like every other
+    `validate_finding` check in this module.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _CWE_ID_RE.match(value)
+    if match:
+        canonical = f"CWE-{int(match.group(1))}"
+        return canonical if canonical in CWE_VALUES else None
+    match = _CWE_OTHER_RE.match(value)
+    if match and match.group(1):
+        return f"other: {match.group(1)}"
+    return None
 
 REQUIRED_STEP_ENVELOPE_FIELDS = (
     "sweep_id",
@@ -199,8 +295,28 @@ def validate_finding(finding: object) -> list[str]:
                 errors.append(
                     f"confidence must be one of {sorted(CONFIDENCE_VALUES)}, got {value!r}"
                 )
+        elif field == "cwe":
+            if normalize_cwe(value) is None:
+                errors.append(
+                    "cwe must be one of the closed CWE identifiers CWE_VALUES defines, or an "
+                    f"'other: <label>' escape, got {value!r}"
+                )
+        elif field == "line":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                errors.append(f"line must be a positive integer (>= 1), got {value!r}")
         elif not isinstance(value, str) or value == "":
             errors.append(f"field {field} must be a non-empty string, got {value!r}")
+
+    if "end_line" in finding:
+        end_line = finding["end_line"]
+        if isinstance(end_line, bool) or not isinstance(end_line, int):
+            errors.append(f"end_line must be an integer when present, got {end_line!r}")
+        else:
+            line = finding.get("line")
+            if isinstance(line, int) and not isinstance(line, bool) and end_line < line:
+                errors.append(
+                    f"end_line must be >= line, got end_line={end_line!r} line={line!r}"
+                )
 
     return errors
 

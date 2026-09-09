@@ -40,7 +40,9 @@ def valid_finding(**overrides) -> dict:
         "hypothesis_id": "h1",
         "file": "pkg/example/thing.go",
         "symbol": "Thing.DoSomething",
+        "line": 42,
         "vuln_class": "tenant-scoping",
+        "cwe": "CWE-863",
         "severity": "high",
         "confidence": "medium",
         "title": "cross-tenant read",
@@ -99,24 +101,171 @@ def test_validate_finding_rejects_bad_confidence():
     )
 
 
-def test_validate_finding_ignores_line_number_field():
-    # AC: the de-duplication key is file+symbol+vuln_class, never a line number.
-    # A caller-supplied line-shaped field must be inert: present or absent, of
-    # any shape, valid or garbage, it changes nothing about validation.
-    baseline_errors = schema.validate_finding(valid_finding())
-    with_line = schema.validate_finding(valid_finding(line=42))
-    with_line_number_str = schema.validate_finding(valid_finding(line_number="not-a-number"))
-    with_line_range = schema.validate_finding(valid_finding(line_range=[10, 20]))
+def test_validate_finding_dedup_key_excludes_location_and_cwe():
+    # AC: `cwe` and `line` are recorded but never part of what makes two
+    # findings the same finding -- that stays file+symbol+vuln_class. This
+    # module does not compute the key itself (consolidate.py does), so this
+    # asserts the schema-level half of the guarantee: `cwe`/`line`/`end_line`
+    # are ordinary validated fields, not enum-like identity fields, and two
+    # findings differing only in them are each independently valid.
+    a = valid_finding(line=10, cwe="CWE-295")
+    b = valid_finding(line=99, cwe="CWE-89")
     check(
-        baseline_errors == with_line == with_line_number_str == with_line_range == [],
-        "validate_finding: a line-number-shaped field is ignored, never validated",
-        f"{baseline_errors} vs {with_line} vs {with_line_number_str} vs {with_line_range}",
+        schema.validate_finding(a) == [] and schema.validate_finding(b) == [],
+        "validate_finding: two findings differing only in cwe/line both validate independently",
+        f"{schema.validate_finding(a)} / {schema.validate_finding(b)}",
+    )
+
+
+def test_validate_finding_rejects_cwe_outside_closed_list():
+    errors = schema.validate_finding(valid_finding(cwe="CWE-9999"))
+    check(
+        any("cwe" in e for e in errors),
+        "validate_finding: rejects a cwe outside the closed identifier list",
+        str(errors),
+    )
+    errors = schema.validate_finding(valid_finding(cwe="XSS"))
+    check(
+        any("cwe" in e for e in errors),
+        "validate_finding: rejects a free-text cwe value that names no identifier at all",
+        str(errors),
+    )
+
+
+def test_validate_finding_normalises_cwe_case_and_formatting():
+    # AC: a cwe differing only in case or formatting is normalised, not
+    # passed through as a distinct value -- asserted at the normalize_cwe
+    # level (what consolidate.py and rendering consume) and at the
+    # validate_finding level (both forms are accepted, not one rejected).
+    variants = ["CWE-295", "cwe-295", "Cwe295", "CWE-295: Improper certificate validation", "  cwe-0295  "]
+    normalized = {schema.normalize_cwe(v) for v in variants}
+    check(
+        normalized == {"CWE-295"},
+        "normalize_cwe: case/formatting variants of the same identifier all normalise identically",
+        str(normalized),
+    )
+    for variant in variants:
+        errors = schema.validate_finding(valid_finding(cwe=variant))
+        check(
+            errors == [],
+            f"validate_finding: accepts cwe variant {variant!r} of a closed-list identifier",
+            str(errors),
+        )
+
+
+def test_validate_finding_accepts_other_escape_with_label_rejects_without():
+    errors = schema.validate_finding(valid_finding(cwe="other: bespoke defect class"))
+    check(errors == [], "validate_finding: accepts the 'other: <label>' escape", str(errors))
+    errors = schema.validate_finding(valid_finding(cwe="other:"))
+    check(
+        any("cwe" in e for e in errors),
+        "validate_finding: rejects an 'other:' escape with an empty label",
+        str(errors),
+    )
+
+
+def test_validate_finding_rejects_malformed_line_values():
+    # [REQUIRED TEST] line of 0, -1, "12" and 1.5 are each rejected.
+    for bad_line in (0, -1, "12", 1.5):
+        errors = schema.validate_finding(valid_finding(line=bad_line))
+        check(
+            any("line" in e for e in errors),
+            f"validate_finding: rejects line={bad_line!r}",
+            str(errors),
+        )
+
+
+def test_validate_finding_accepts_positive_integer_line():
+    errors = schema.validate_finding(valid_finding(line=1))
+    check(errors == [], "validate_finding: accepts line=1 (the lower boundary)", str(errors))
+
+
+def test_validate_finding_rejects_end_line_below_line():
+    # [REQUIRED TEST] end_line below line is rejected.
+    errors = schema.validate_finding(valid_finding(line=42, end_line=10))
+    check(
+        any("end_line" in e for e in errors),
+        "validate_finding: rejects an end_line below line",
+        str(errors),
+    )
+
+
+def test_validate_finding_accepts_end_line_at_or_above_line():
+    errors = schema.validate_finding(valid_finding(line=42, end_line=42))
+    check(errors == [], "validate_finding: accepts end_line == line", str(errors))
+    errors = schema.validate_finding(valid_finding(line=42, end_line=50))
+    check(errors == [], "validate_finding: accepts end_line > line", str(errors))
+
+
+def test_validate_finding_rejects_non_integer_end_line():
+    errors = schema.validate_finding(valid_finding(end_line="50"))
+    check(
+        any("end_line" in e for e in errors),
+        "validate_finding: rejects a non-integer end_line",
+        str(errors),
+    )
+
+
+def test_validate_finding_end_line_is_optional():
+    finding = valid_finding()
+    check("end_line" not in finding, "fixture carries no end_line by default")
+    errors = schema.validate_finding(finding)
+    check(errors == [], "validate_finding: absence of end_line is valid", str(errors))
+
+
+def test_validate_finding_rejects_missing_cwe_and_missing_line():
+    # [REQUIRED TEST] a finding missing cwe, and one missing line, are both
+    # rejected -- proving the fields are required, not optional-and-ignored.
+    missing_cwe = valid_finding()
+    del missing_cwe["cwe"]
+    errors = schema.validate_finding(missing_cwe)
+    check(
+        any("missing required field: cwe" in e for e in errors),
+        "validate_finding: rejects a finding missing cwe",
+        str(errors),
+    )
+
+    missing_line = valid_finding()
+    del missing_line["line"]
+    errors = schema.validate_finding(missing_line)
+    check(
+        any("missing required field: line" in e for e in errors),
+        "validate_finding: rejects a finding missing line",
+        str(errors),
+    )
+
+
+def test_cwe_and_line_are_required_finding_fields():
+    check(
+        "cwe" in schema.REQUIRED_FINDING_FIELDS and "line" in schema.REQUIRED_FINDING_FIELDS,
+        "cwe and line are members of REQUIRED_FINDING_FIELDS",
+        str(schema.REQUIRED_FINDING_FIELDS),
     )
     check(
-        "line" not in schema.REQUIRED_FINDING_FIELDS
-        and "line_number" not in schema.REQUIRED_FINDING_FIELDS
-        and "line_range" not in schema.REQUIRED_FINDING_FIELDS,
-        "validate_finding: schema does not define any line-number field",
+        "end_line" not in schema.REQUIRED_FINDING_FIELDS,
+        "end_line stays optional -- not a member of REQUIRED_FINDING_FIELDS",
+    )
+
+
+def test_cwe_values_match_the_methodology_document():
+    # Drift guard: schema.CWE_VALUES is a literal copy of the closed
+    # identifier list docs/security-review/methodology.md (#3981) defines,
+    # not parsed from it at import (that document-parsing concern belongs to
+    # lanes/harness_runner.py, for prompt assembly). Read the live document
+    # here so an edit to either side without the other fails this test.
+    methodology_path = (
+        Path(__file__).resolve().parents[3] / "docs" / "security-review" / "methodology.md"
+    )
+    text = methodology_path.read_text(encoding="utf-8")
+    missing = [cwe for cwe in schema.CWE_VALUES if cwe not in text]
+    check(
+        missing == [],
+        "schema.CWE_VALUES: every identifier also appears in docs/security-review/methodology.md",
+        str(missing),
+    )
+    check(
+        "other: <short label>" in text,
+        "docs/security-review/methodology.md still documents the 'other' escape normalize_cwe accepts",
     )
 
 

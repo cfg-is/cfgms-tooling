@@ -89,7 +89,9 @@ def finding(commit_sha: str, lane: str, step_id: str, **overrides) -> dict:
         "hypothesis_id": "h1",
         "file": "pkg/example/thing.go",
         "symbol": "Thing.DoSomething",
+        "line": 42,
         "vuln_class": "tenant-scoping",
+        "cwe": "CWE-863",
         "severity": "high",
         "confidence": "medium",
         "title": "cross-tenant read",
@@ -176,6 +178,83 @@ def test_dedup_across_lanes_on_file_symbol_vuln_class():
                 len(report["findings"][0]["occurrences"]) == 2,
                 "consolidate: both lanes' occurrences are preserved, not collapsed away",
             )
+
+
+def test_dedup_ignores_differing_line_numbers_issue_3983():
+    # [REQUIRED TEST] Issue #3983: two lanes report the same file+symbol+
+    # vuln_class defect at two different line numbers -- they must still
+    # de-duplicate into ONE finding credited to both lanes. Must fail if
+    # `line`/`end_line` ever enters the de-duplication key: that would split
+    # one defect into two and silently destroy the multi-lane agreement
+    # signal the whole harness is built on.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [finding(sha, "laneA", "step-001", line=10, end_line=12)]),
+        )
+        write(
+            os.path.join(sweep, "lanes", "laneB", "step-001.findings.json"),
+            complete_envelope(sha, "laneB", "step-001", [finding(sha, "laneB", "step-001", line=88)]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            len(report["findings"]) == 1,
+            "consolidate: findings differing only in line/end_line still dedupe to one entry",
+            str(report["findings"]),
+        )
+        if report["findings"]:
+            finding_entry = report["findings"][0]
+            check(
+                finding_entry["lanes"] == ["laneA", "laneB"],
+                "consolidate: the deduped entry credits both lanes despite the differing line numbers",
+                str(finding_entry["lanes"]),
+            )
+            check(
+                len(finding_entry["occurrences"]) == 2,
+                "consolidate: both lanes' occurrences (each with its own line) are preserved",
+            )
+            occurrence_lines = {(o["lane"], o.get("line"), o.get("end_line")) for o in finding_entry["occurrences"]}
+            check(
+                occurrence_lines == {("laneA", 10, 12), ("laneB", 88, None)},
+                "consolidate: each occurrence keeps its own reported line/end_line, never merged",
+                str(occurrence_lines),
+            )
+            check(
+                finding_entry["line"] == 10 and finding_entry["end_line"] == 12,
+                "consolidate: the top-level line/end_line is a deterministic pick (first occurrence in lane/step order)",
+                str((finding_entry["line"], finding_entry["end_line"])),
+            )
+
+
+def test_consolidated_json_and_markdown_carry_cwe_and_location():
+    # AC: consolidated.json carries cwe/line/end_line, and consolidated.md
+    # renders the location beside the file path.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(
+                sha, "laneA", "step-001",
+                [finding(sha, "laneA", "step-001", cwe="CWE-89", line=15, end_line=20)],
+            ),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        finding_entry = report["findings"][0]
+        check(
+            finding_entry["cwe"] == "CWE-89" and finding_entry["line"] == 15 and finding_entry["end_line"] == 20,
+            "consolidate: consolidated.json's finding carries cwe/line/end_line",
+            str(finding_entry),
+        )
+        md = consolidate.render_markdown(report)
+        check(
+            "pkg/example/thing.go:15-20" in md,
+            "consolidate.md: the location renders beside the file path",
+            md,
+        )
+        check("(CWE-89)" in md, "consolidate.md: the cwe renders beside the vuln_class", md)
 
 
 def test_distinct_key_not_merged():
@@ -727,7 +806,7 @@ def test_low_severity_low_confidence_single_lane_finding_survives_to_report():
         )
         md = consolidate.render_markdown(report)
         check(
-            "### info-disclosure — pkg/quiet/whisper.go :: Whisper.Maybe" in md,
+            "### info-disclosure (CWE-863) — pkg/quiet/whisper.go:42 :: Whisper.Maybe" in md,
             "consolidate.md: the low/low finding's heading is rendered, not filtered out",
             md,
         )
@@ -1844,15 +1923,15 @@ def test_cross_step_reaggregation_groups_shared_defect_class_across_steps():
         write(
             os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
             complete_envelope(sha, "laneA", "step-001", [
-                finding(sha, "laneA", "step-001", file="pkg/api/handler.go", symbol="Handle", vuln_class="log-injection"),
-                finding(sha, "laneA", "step-001", file="pkg/x/y.go", symbol="Y", vuln_class="timing-compare"),
-                finding(sha, "laneA", "step-001", file="pkg/x/y.go", symbol="Z", vuln_class="timing-compare"),
+                finding(sha, "laneA", "step-001", file="pkg/api/handler.go", symbol="Handle", vuln_class="log-injection", cwe="CWE-117"),
+                finding(sha, "laneA", "step-001", file="pkg/x/y.go", symbol="Y", vuln_class="timing-compare", cwe="CWE-208"),
+                finding(sha, "laneA", "step-001", file="pkg/x/y.go", symbol="Z", vuln_class="timing-compare", cwe="CWE-208"),
             ]),
         )
         write(
             os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"),
             complete_envelope(sha, "laneA", "step-002", [
-                finding(sha, "laneA", "step-002", file="pkg/audit/writer.go", symbol="Write", vuln_class="log-injection"),
+                finding(sha, "laneA", "step-002", file="pkg/audit/writer.go", symbol="Write", vuln_class="log-injection", cwe="CWE-117"),
             ]),
         )
         report = consolidate.consolidate(sweep, repo)
@@ -1861,13 +1940,13 @@ def test_cross_step_reaggregation_groups_shared_defect_class_across_steps():
         check(len(groups) == 1, "consolidate: exactly one cross-step group (same-step pairs are not groups)", str(groups))
         if groups:
             g = groups[0]
-            check(g["group_id"] == "group-001" and g["defect_class"] == "log-injection", "consolidate: group carries a stable id and the shared class", str(g))
+            check(g["group_id"] == "group-001" and g["defect_class"] == "CWE-117", "consolidate: group carries a stable id and the shared class", str(g))
             check(g["step_ids"] == ["step-001", "step-002"], "consolidate: group spans both steps", str(g["step_ids"]))
             check({m["file"] for m in g["members"]} == {"pkg/api/handler.go", "pkg/audit/writer.go"}, "consolidate: both members are listed", str(g["members"]))
             check(g["assessment"] is None, "consolidate: no assessment without an adjudicator")
-        check("## Cross-step groups" in md and "group-001 — log-injection across `step-001`, `step-002`" in md, "consolidate.md: the group is rendered with its steps", md)
+        check("## Cross-step groups" in md and "group-001 — CWE-117 across `step-001`, `step-002`" in md, "consolidate.md: the group is rendered with its steps", md)
         check("pkg/api/handler.go" in md.split("## Cross-step groups")[1].split("## Findings")[0], "consolidate.md: group members render under the section", md)
-        check("timing-compare across" not in md, "consolidate.md: the same-step pair is not rendered as a group", md)
+        check("CWE-208 across" not in md, "consolidate.md: the same-step pair is not rendered as a group", md)
 
 
 def test_cross_step_grouping_prefers_cwe_when_present():

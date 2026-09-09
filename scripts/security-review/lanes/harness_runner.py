@@ -54,9 +54,10 @@ three future lane runners:
   `SURFACE` every time after.
 - The envelope this module builds always carries a `refusal_attempts`
   integer field. `schema.validate_step_envelope()` does not reject unknown
-  fields (the same tolerance it already extends to a caller-supplied
-  line-number field on a finding -- see `schema.py`'s module docstring), so
-  adding this field required no change to `schema.py`.
+  fields on the envelope itself, so adding this field required no change to
+  `schema.py`. (A finding's own fields are a stricter contract: since Issue
+  #3983, `cwe` and `line` are required and validated, not tolerated as
+  unknown extras -- see `schema.py`'s module docstring.)
 - `read_refusal_attempts()` is the only source of that count: it re-reads
   whatever envelope a step's previous attempt actually wrote to disk. This
   module keeps no in-memory record of a step's refusal history between
@@ -133,30 +134,48 @@ SYSTEM_PROMPT = (
 # The single output-schema description every harness's lane runner sends,
 # describing the exact shape `schema.py::validate_finding` requires --
 # never a second, differently-worded restatement of that shape.
-OUTPUT_SCHEMA_DESCRIPTION = (
-    'Write a single JSON object of the exact shape {"findings": [...], '
-    '"dispositions": [...]} to the output file. '
-    '"dispositions" is a JSON array with exactly one entry per hypothesis you '
-    "were given -- every hypothesis id must appear exactly once. Each entry is a "
-    'JSON object with exactly these string fields: "hypothesis_id" (the id of '
-    'the hypothesis this entry resolves), "disposition" (one of '
-    '"investigated"/"candidate_found"/"inconclusive"/"not_attempted"), and '
-    '"summary" (what you found, or why you could not investigate it). Use '
-    '"not_attempted" only for a hypothesis you genuinely could not get to -- '
-    "never fabricate a summary for one you skipped, and never invent a "
-    "hypothesis id that was not given to you. "
-    '"findings" is a JSON array, empty if you found nothing -- a '
-    "genuinely clean review is a valid, expected result. Each element is a JSON "
-    'object with exactly these string fields: "hypothesis_id" (the id of the '
-    'hypothesis this finding resulted from), "file" (repo-relative path), '
-    '"symbol" (function/method/type name), "vuln_class" (a short vulnerability-'
-    'class label), "severity" (one of "low"/"medium"/"high"/"critical"), '
-    '"confidence" (one of "low"/"medium"/"high"), "title", "evidence" (why this '
-    'is a real, exploitable issue), and "suggested_fix". Do not include a line '
-    "number field of any kind -- findings are de-duplicated by file + symbol + "
-    "vuln_class, never by line, and a line-shaped field is silently ignored "
-    "downstream. Include no fields beyond these."
-)
+#
+# `"cwe"`'s allowed-value list is generated from `schema.CWE_VALUES` rather
+# than typed out a second time here (Issue #3983): the prompt and
+# `validate_finding`'s enforcement can never drift apart, by construction --
+# the same C4 single-sourcing this module already applies to the methodology
+# document is applied here to the closed CWE vocabulary too.
+def _build_output_schema_description() -> str:
+    cwe_list = ", ".join(f'"{cwe}"' for cwe in sorted(schema.CWE_VALUES))
+    return (
+        'Write a single JSON object of the exact shape {"findings": [...], '
+        '"dispositions": [...]} to the output file. '
+        '"dispositions" is a JSON array with exactly one entry per hypothesis you '
+        "were given -- every hypothesis id must appear exactly once. Each entry is a "
+        'JSON object with exactly these string fields: "hypothesis_id" (the id of '
+        'the hypothesis this entry resolves), "disposition" (one of '
+        '"investigated"/"candidate_found"/"inconclusive"/"not_attempted"), and '
+        '"summary" (what you found, or why you could not investigate it). Use '
+        '"not_attempted" only for a hypothesis you genuinely could not get to -- '
+        "never fabricate a summary for one you skipped, and never invent a "
+        "hypothesis id that was not given to you. "
+        '"findings" is a JSON array, empty if you found nothing -- a '
+        "genuinely clean review is a valid, expected result. Each element is a JSON "
+        'object with these fields, all required except "end_line": "hypothesis_id" '
+        '(the id of the hypothesis this finding resulted from), "file" '
+        '(repo-relative path), "symbol" (function/method/type name), "line" '
+        "(integer, 1 or greater -- the primary line number the defect concerns), "
+        '"end_line" (integer >= "line", only when the defect spans more than one '
+        'line -- omit it otherwise), "vuln_class" (a short vulnerability-class '
+        f'label), "cwe" (exactly one of {cwe_list}, or "other: <short label>" when '
+        'none of those fits -- never a bare number, never free text outside that '
+        'escape), "severity" (one of "low"/"medium"/"high"/"critical"), '
+        '"confidence" (one of "low"/"medium"/"high"), "title", "evidence" (why this '
+        'is a real, exploitable issue), and "suggested_fix". "line"/"end_line" are '
+        "read as a hint at where to look, never verified against the file -- get "
+        "them as close as you can, but a defect is never dropped for an uncertain "
+        "line. Findings are de-duplicated by file + symbol + vuln_class, never by "
+        "line -- report the same defect once even if you are unsure of the exact "
+        "line. Include no fields beyond these."
+    )
+
+
+OUTPUT_SCHEMA_DESCRIPTION = _build_output_schema_description()
 
 
 # --- Review methodology: compact core and per-step anchors (Issue #3981) ----
