@@ -1419,6 +1419,144 @@ def test_incomplete_sweep_due_to_dispatch_issue_does_not_duplicate_rejected_file
         )
 
 
+def write_coverage_gates(sweep: str, coverage: dict) -> None:
+    write(os.path.join(sweep, "plan", "coverage.json"), coverage)
+
+
+def test_g3_coverage_shortfall_is_named_in_incomplete_section():
+    # [REQUIRED TEST] (Issue #3980): a sweep whose plan/coverage.json records
+    # a G-3 shortfall -- the rendered markdown must contain an ## Incomplete
+    # entry naming the short path, not only a count.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        write_coverage_gates(
+            sweep,
+            {
+                "evaluated": True,
+                "g2": {"passed": True, "unassigned_files": []},
+                "g3": {"passed": False, "short_files": ["pkg/security/auth.go"]},
+            },
+        )
+
+        report = consolidate.consolidate(sweep, repo)
+        check(report["coverage_gates"]["g3"]["passed"] is False, "setup sanity: report carries the G-3 shortfall", str(report["coverage_gates"]))
+
+        md = consolidate.render_markdown(report)
+        check("## Incomplete" in md, "consolidate.md: a G-3 shortfall alone triggers the Incomplete section", md)
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "G-3" in incomplete_section and "pkg/security/auth.go" in incomplete_section,
+            "consolidate.md: the Incomplete section names the exact short path, not only a count",
+            incomplete_section,
+        )
+
+
+def test_g2_coverage_shortfall_is_named_in_incomplete_section():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        write_coverage_gates(
+            sweep,
+            {
+                "evaluated": True,
+                "g2": {"passed": False, "unassigned_files": ["pkg/orphan/orphan.go"]},
+                "g3": {"passed": True, "short_files": []},
+            },
+        )
+
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check("## Incomplete" in md, "consolidate.md: a G-2 shortfall alone triggers the Incomplete section", md)
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "G-2" in incomplete_section and "pkg/orphan/orphan.go" in incomplete_section,
+            "consolidate.md: the Incomplete section names the exact unassigned path",
+            incomplete_section,
+        )
+
+
+def test_coverage_gates_not_evaluated_is_named_in_incomplete_section():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        write_coverage_gates(
+            sweep, {"evaluated": False, "reason": "bundle tree listing missing"}
+        )
+
+        report = consolidate.consolidate(sweep, repo)
+        check(report["coverage_gates"]["evaluated"] is False, "setup sanity: coverage_gates carries evaluated=false", str(report["coverage_gates"]))
+
+        md = consolidate.render_markdown(report)
+        check("## Incomplete" in md, "consolidate.md: an unevaluated coverage gate alone triggers the Incomplete section", md)
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "could not be evaluated" in incomplete_section.lower() and "bundle tree listing missing" in incomplete_section,
+            "consolidate.md: the Incomplete section states the coverage gates could not be evaluated, and why",
+            incomplete_section,
+        )
+
+
+def test_coverage_gates_passing_does_not_trigger_incomplete_on_its_own():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        write_coverage_gates(
+            sweep,
+            {
+                "evaluated": True,
+                "g2": {"passed": True, "unassigned_files": []},
+                "g3": {"passed": True, "short_files": []},
+            },
+        )
+
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(
+            "## Incomplete" not in md,
+            "consolidate.md: a sweep otherwise complete, with both coverage gates passing, stays complete",
+            md,
+        )
+
+
+def test_missing_coverage_json_does_not_force_incomplete():
+    # An older sweep (or one whose finalize() returned before writing
+    # coverage.json) must not be spuriously marked incomplete for a signal
+    # that was never produced.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+
+        report = consolidate.consolidate(sweep, repo)
+        check(report["coverage_gates"] is None, "setup sanity: no coverage.json was written for this sweep", str(report["coverage_gates"]))
+        md = consolidate.render_markdown(report)
+        check(
+            "## Incomplete" not in md,
+            "consolidate.md: absence of coverage.json is not itself an incompleteness signal",
+            md,
+        )
+
+
 def test_scanner_coverage_is_reported_from_envelope_scans() -> None:
     """Issue #3982: `scans` on a lane envelope (complete or not) is surfaced in
     the report as a per-lane table and a named gap list; a scanner gap never

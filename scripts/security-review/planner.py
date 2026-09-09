@@ -87,6 +87,21 @@ exist but no valid sweep context does, every step is excluded and
 `commit_sha` a step file carries, because those are exactly the model-supplied
 values the injection exists to discard -- a fallback would make deleting one
 file enough to turn the control off.
+
+`finalize()`/`finalize_multi_planner()` also run the Issue #3980 coverage
+gates over whatever plan survives per-step validation, writing the result to
+`plan/coverage.json` -- see `evaluate_coverage()`. **G-2** requires every
+`CODE_TIERS` file in the bundle's `01-tree.tsv` to appear in at least one
+step; the six remaining tiers (`vendor`, `generated`, `test`, `docs`,
+`tooling`, `config`) are exempt. **G-3** requires every `HIGH_RISK_TIERS`
+(`entrypoint`, `security`) file to appear in at least two steps whose
+hypothesis objectives genuinely differ (`_objectives_differ()`) -- two steps
+covering the same file with identical or nested objective sets do not count,
+since that is one partition reviewed twice, not independent overlap. Neither
+gate is fatal: a shortfall is recorded and the sweep still runs, exactly like
+every other incompleteness signal this harness tracks (`rejected_proposals.json`,
+`dispatch_report.json`'s non-`dispatched` outcomes) -- the remedy is
+visibility, never aborting a sweep that already ran.
 """
 from __future__ import annotations
 
@@ -163,6 +178,30 @@ REJECTED_PROPOSALS_FILENAME = "rejected_proposals.json"
 # finder lanes -- this constant is never used on that path.
 PLANNER_ID = "metadata-only-planner"
 
+# Written under `<sweep_dir>/plan/` by `finalize()`/`finalize_multi_planner()`
+# (Issue #3980): the G-2/G-3 coverage-gate result computed over the finalized
+# plan, against the tier data in `<sweep_dir>/bundle/01-tree.tsv`. Written
+# whenever a coverage-gate evaluation was attempted -- see `evaluate_coverage()`
+# -- never silently skipped: `{"evaluated": False, "reason": ...}` when the
+# tree listing could not be read, `{"evaluated": True, "g2": ..., "g3": ...}`
+# otherwise. `consolidate.py` reads this back to render a `## Incomplete`
+# entry when either gate is short.
+COVERAGE_FILENAME = "coverage.json"
+
+# G-2's non-exempt population (Issue #3980): every tier that names reviewable
+# application code. The complement, within `metadata.CLOSED_TIER_SET`, is the
+# exempt set (`vendor`, `generated`, `test`, `docs`, `tooling`, `config`) --
+# a file classified into one of those never needs a step of its own for G-2
+# to pass. Kept as an explicit tuple here (rather than derived by subtracting
+# a hardcoded exempt set from `metadata.CLOSED_TIER_SET`) so a rename of
+# either set is a one-line diff to review, not a silent set-arithmetic drift.
+CODE_TIERS = frozenset({"entrypoint", "security", "dataaccess", "business", "presentational"})
+
+# G-3's high-risk population (Issue #3980): the two tiers a compromised
+# controller admin or an attacker landing a commit can do the most damage
+# through -- see docs/architecture/security-review-harness.md's threat model.
+HIGH_RISK_TIERS = frozenset({"entrypoint", "security"})
+
 
 class PlannerError(Exception):
     """Raised when the planner cannot prepare a prompt or launch the
@@ -234,6 +273,147 @@ def _read_bundle_tree_paths(bundle_dir: str) -> list[str]:
             continue
         paths.append(path)
     return paths
+
+
+def _read_bundle_tree_tiers(bundle_dir: str) -> "tuple[dict[str, str], str | None]":
+    """Read `<bundle_dir>/01-tree.tsv` and return `(path -> tier, None)`, or
+    `({}, reason)` when the file is missing or does not parse (Issue #3980).
+
+    Sibling to `_read_bundle_tree_paths()` -- same header check, same
+    tolerance for an individual malformed row (dropped rather than fatal to
+    the whole read, since a control-character-mangled path is already
+    excluded from the bundle by `metadata._assemble_bundle_contents()`, and a
+    row a future bundle producer somehow still mangles should not blind the
+    coverage gates to every other row). It exists separately because the
+    planner prompt (`build_prompt()`) never needs a file's tier -- only the
+    coverage gates (`evaluate_coverage()`) do -- so the two read paths stay
+    independent rather than one growing a parameter the other ignores.
+
+    Unlike `_read_bundle_tree_paths()`, a missing or header-mismatched file is
+    reported back to the caller as a reason string rather than raised: a
+    coverage-gate evaluation that cannot read the tree data must record
+    `"evaluated": false` and let the sweep continue (Issue #3980's "never
+    abort the sweep for a coverage shortfall"), never raise past `finalize()`
+    into an unhandled exception.
+    """
+    tree_path = os.path.join(bundle_dir, TREE_ARTIFACT_NAME)
+    try:
+        with open(tree_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        return {}, f"cannot read bundle tree listing at {tree_path}: {exc}"
+
+    lines = text.split("\n")
+    if not lines or lines[0].split("\t") != list(metadata.TREE_HEADER):
+        return {}, (
+            f"bundle tree listing at {tree_path} does not start with the expected header "
+            f"{metadata.TREE_HEADER!r}"
+        )
+
+    path_index = metadata.TREE_HEADER.index("path")
+    tier_index = metadata.TREE_HEADER.index("tier")
+    tiers: dict[str, str] = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != len(metadata.TREE_HEADER):
+            continue
+        path = fields[path_index]
+        if not path:
+            continue
+        tiers[path] = fields[tier_index]
+    return tiers, None
+
+
+def _normalize_objective(text: str) -> str:
+    """Casefold, collapse whitespace runs to one space, strip -- the exact
+    normalisation Issue #3980 specifies for comparing two hypotheses'
+    `objective` text, so a duplicate step differing only in case or
+    whitespace cannot pass G-3."""
+    return re.sub(r"\s+", " ", text.casefold()).strip()
+
+
+def _step_objective_set(step: dict) -> "set[str]":
+    return {
+        _normalize_objective(hypothesis["objective"])
+        for hypothesis in (step.get("hypotheses") or [])
+        if isinstance(hypothesis, dict) and isinstance(hypothesis.get("objective"), str)
+    }
+
+
+def _objectives_differ(a: "set[str]", b: "set[str]") -> bool:
+    """True when neither normalised objective set is a subset of the other --
+    Issue #3980's exact G-3 rule: "each step asks at least one question the
+    other does not." Two identical sets fail (both subset relations hold);
+    one strictly containing the other also fails, deliberately -- a step
+    whose questions are a strict subset of another's buys no independent
+    review of the overlap, only its more-numerous sibling actually
+    investigating anything new."""
+    return not (a <= b) and not (b <= a)
+
+
+def evaluate_coverage(sweep_dir: str, steps: "list[dict]") -> dict:
+    """Evaluate the G-2 and G-3 coverage gates (Issue #3980) over a finalized
+    plan's `steps`, against the tier data in `<sweep_dir>/bundle/01-tree.tsv`.
+
+    Returns the exact dict `finalize()`/`finalize_multi_planner()` write to
+    `<sweep_dir>/plan/coverage.json`:
+
+    - `{"evaluated": False, "reason": <str>}` when the bundle's tree listing
+      is missing or unparseable -- never a silent pass, per Issue #3980's
+      "a silently skipped gate is the same defect class as a silently empty
+      sweep."
+    - `{"evaluated": True, "g2": {...}, "g3": {...}}` otherwise. Each gate
+      records `passed` and the specific short paths, not only a count:
+      `g2.unassigned_files` is every code-tier path (`CODE_TIERS`) that
+      appears in zero steps' `files`; `g3.short_files` is every
+      `HIGH_RISK_TIERS` path that appears in fewer than two steps, or whose
+      covering steps never satisfy `_objectives_differ()` for any pair.
+
+    `steps` is whatever the caller already holds in memory for the finalized
+    plan (the per-step-validated `data` dicts in `finalize()`, or the merged
+    candidates in `finalize_multi_planner()`) -- this function does no I/O
+    beyond the one tree-listing read, and never re-reads `plan/` itself.
+    """
+    bundle_dir = os.path.join(sweep_dir, BUNDLE_SUBDIR)
+    tiers, reason = _read_bundle_tree_tiers(bundle_dir)
+    if reason is not None:
+        return {"evaluated": False, "reason": reason}
+
+    file_to_steps: dict[str, list[dict]] = {}
+    for step in steps:
+        for f in step.get("files") or []:
+            if isinstance(f, str) and f:
+                file_to_steps.setdefault(f, []).append(step)
+
+    g2_unassigned = sorted(
+        path
+        for path, tier in tiers.items()
+        if tier in CODE_TIERS and not file_to_steps.get(path)
+    )
+
+    g3_short: list[str] = []
+    for path in sorted(tiers):
+        if tiers[path] not in HIGH_RISK_TIERS:
+            continue
+        covering = file_to_steps.get(path) or []
+        if len(covering) < 2:
+            g3_short.append(path)
+            continue
+        objective_sets = [_step_objective_set(step) for step in covering]
+        if not any(
+            _objectives_differ(objective_sets[i], objective_sets[j])
+            for i in range(len(objective_sets))
+            for j in range(i + 1, len(objective_sets))
+        ):
+            g3_short.append(path)
+
+    return {
+        "evaluated": True,
+        "g2": {"passed": not g2_unassigned, "unassigned_files": g2_unassigned},
+        "g3": {"passed": not g3_short, "short_files": g3_short},
+    }
 
 
 def build_prompt(bundle_dir: str, sweep_id: str) -> str:
@@ -1053,6 +1233,13 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     survive: `plan/PLANNING_FAILED` is written in that case, and an empty
     `plan/` is never mistaken for "nothing to review" rather than "planning
     broke".
+
+    Also writes `<sweep_dir>/plan/coverage.json` (Issue #3980): the G-2/G-3
+    coverage-gate result (`evaluate_coverage()`) computed over whichever step
+    files survived per-step validation above. A coverage-gate shortfall never
+    changes this function's own return value or aborts the sweep -- it is a
+    visibility signal `consolidate.py` surfaces in `## Incomplete`, not a
+    validation failure like a malformed step.
     """
     plan_dir = os.path.join(sweep_dir, "plan")
     filenames = _discover_step_files(plan_dir)
@@ -1061,6 +1248,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     errors: list[str] = []
     excluded: list[str] = []
     valid: list[str] = []
+    valid_data: list[dict] = []
     rejected: list[dict] = []
 
     if not filenames:
@@ -1139,6 +1327,8 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
 
         atomic_write.write_json_atomic(path, data)
         valid.append(filename)
+        if isinstance(data, dict):
+            valid_data.append(data)
 
     for filename in excluded:
         try:
@@ -1147,6 +1337,10 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
             pass
 
     _write_rejected_proposals(plan_dir, rejected)
+
+    atomic_write.write_json_atomic(
+        os.path.join(plan_dir, COVERAGE_FILENAME), evaluate_coverage(sweep_dir, valid_data)
+    )
 
     if not valid:
         _write_failure_marker(plan_dir, errors)
@@ -1224,6 +1418,12 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     `resolved_model` on `dispatch_report.json`'s "planners" entries, never
     overwriting the `lane.harness`/`lane.model` it already records for the
     requested identity (D3: requested and resolved must stay distinguishable).
+
+    Also writes `<sweep_dir>/plan/coverage.json` (Issue #3980), exactly like
+    `finalize()`, computed over the merged steps that survived post-merge
+    validation and were written to `plan/` -- never the pre-merge per-planner
+    candidates, since G-2/G-3 must be evaluated against the one plan every
+    lane actually reads.
     """
     plan_dir = os.path.join(sweep_dir, "plan")
     os.makedirs(plan_dir, exist_ok=True)
@@ -1295,6 +1495,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
         except OSError:
             pass
 
+    written_steps: list[dict] = []
     for step in merged:
         step_filename = f"{step['step_id']}.json"
         step_errors = validate_step(step, step_filename)
@@ -1306,8 +1507,13 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
             errors.extend(step_errors)
             continue
         atomic_write.write_json_atomic(os.path.join(plan_dir, step_filename), step)
+        written_steps.append(step)
 
     _write_rejected_proposals(plan_dir, rejected)
+
+    atomic_write.write_json_atomic(
+        os.path.join(plan_dir, COVERAGE_FILENAME), evaluate_coverage(sweep_dir, written_steps)
+    )
 
     if not _discover_step_files(plan_dir):
         _write_failure_marker(plan_dir, errors)

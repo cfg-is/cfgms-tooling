@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import basedir  # noqa: E402
+import consolidate  # noqa: E402
 import metadata  # noqa: E402
 import planner  # noqa: E402
 import roster  # noqa: E402
@@ -2227,6 +2228,286 @@ def test_detect_repo_root_returns_none_when_git_absent():
             result is None,
             "planner._detect_repo_root: returns None when git is absent from PATH",
             repr(result),
+        )
+
+
+# --- Coverage gates G-2/G-3 (Issue #3980) -----------------------------------
+
+def _bundle_dir(sweep_dir: str) -> str:
+    return os.path.join(sweep_dir, planner.BUNDLE_SUBDIR)
+
+
+def test_finalize_g2_fails_when_a_business_file_is_in_zero_steps():
+    # REQUIRED TEST: a fixture plan leaving one business-tier file in zero
+    # steps -- G-2 must fail and name that exact path.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(_bundle_dir(sweep_dir), [
+            ("pkg/foo/foo.go", "go", "10", "abcdef123456", "business"),
+            ("pkg/bar/bar.go", "go", "10", "abcdef123457", "business"),
+        ])
+        write_step(
+            plan_dir, "step-001.json",
+            valid_step("step-001", ["pkg/foo/foo.go"], files=["pkg/foo/foo.go"]),
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: a coverage-gate shortfall never fails the sweep itself", str(errors))
+
+        with open(os.path.join(plan_dir, planner.COVERAGE_FILENAME)) as f:
+            coverage = json.load(f)
+        check(coverage["evaluated"] is True, "coverage: evaluated is true when the bundle tree parses", str(coverage))
+        check(coverage["g2"]["passed"] is False, "coverage: G-2 fails when a business-tier file is in zero steps", str(coverage))
+        check(
+            coverage["g2"]["unassigned_files"] == ["pkg/bar/bar.go"],
+            "coverage: G-2 names the exact uncovered path, not only a count",
+            str(coverage),
+        )
+
+
+def test_finalize_g3_fails_when_a_security_file_is_in_exactly_one_step():
+    # REQUIRED TEST: a fixture plan placing a security-tier file in exactly
+    # one step -- G-3 must fail and name that exact path.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(_bundle_dir(sweep_dir), [
+            ("pkg/security/auth.go", "go", "10", "abcdef123456", "security"),
+        ])
+        write_step(
+            plan_dir, "step-001.json",
+            valid_step("step-001", ["pkg/security/auth.go"], files=["pkg/security/auth.go"]),
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: a coverage-gate shortfall never fails the sweep itself", str(errors))
+
+        with open(os.path.join(plan_dir, planner.COVERAGE_FILENAME)) as f:
+            coverage = json.load(f)
+        check(coverage["g2"]["passed"] is True, "coverage: G-2 passes -- the one code file is covered once", str(coverage))
+        check(coverage["g3"]["passed"] is False, "coverage: G-3 fails when a security file is in exactly one step", str(coverage))
+        check(
+            coverage["g3"]["short_files"] == ["pkg/security/auth.go"],
+            "coverage: G-3 names the exact short path",
+            str(coverage),
+        )
+
+
+def test_finalize_g3_fails_when_two_covering_steps_share_the_same_objective_under_different_ids():
+    # REQUIRED TEST: two steps cover the same security-tier file with
+    # hypothesis `id`s that differ but `objective` text that is identical
+    # apart from case and whitespace -- G-3 must still fail. Without this, a
+    # planner satisfies G-3 by duplicating a step under fresh ids, which
+    # reviews the same partition twice rather than genuinely overlapping.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(_bundle_dir(sweep_dir), [
+            ("pkg/security/auth.go", "go", "10", "abcdef123456", "security"),
+        ])
+        write_step(
+            plan_dir, "step-001.json",
+            valid_step(
+                "step-001", ["pkg/security/auth.go"], files=["pkg/security/auth.go"],
+                hypotheses=[valid_hypothesis(id="h1", objective="  Tenant Scoping ON the read PATH  ")],
+            ),
+        )
+        write_step(
+            plan_dir, "step-002.json",
+            valid_step(
+                "step-002", ["pkg/security/auth.go"], files=["pkg/security/auth.go"],
+                hypotheses=[valid_hypothesis(id="h9", objective="tenant scoping on the read path")],
+            ),
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: a coverage-gate shortfall never fails the sweep itself", str(errors))
+
+        with open(os.path.join(plan_dir, planner.COVERAGE_FILENAME)) as f:
+            coverage = json.load(f)
+        check(
+            coverage["g3"]["passed"] is False,
+            "coverage: G-3 fails when two covering steps' objectives are the same modulo case/whitespace",
+            str(coverage),
+        )
+        check(
+            coverage["g3"]["short_files"] == ["pkg/security/auth.go"],
+            "coverage: G-3 still names the file even though it technically appears in two steps",
+            str(coverage),
+        )
+
+
+def test_finalize_g2_passes_when_only_exempt_tier_files_are_uncovered():
+    # REQUIRED TEST: a fixture plan where a docs-tier and a tooling-tier file
+    # appear in zero steps -- G-2 must PASS. An implementation that exempts
+    # only vendor/generated/test would fail G-2 on every real sweep and the
+    # signal would be discarded as noise.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(_bundle_dir(sweep_dir), [
+            ("pkg/foo/foo.go", "go", "10", "abcdef123456", "business"),
+            ("docs/README.md", "markdown", "5", "abcdef123457", "docs"),
+            ("scripts/build.sh", "shell", "5", "abcdef123458", "tooling"),
+        ])
+        write_step(
+            plan_dir, "step-001.json",
+            valid_step("step-001", ["pkg/foo/foo.go"], files=["pkg/foo/foo.go"]),
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: succeeds", str(errors))
+
+        with open(os.path.join(plan_dir, planner.COVERAGE_FILENAME)) as f:
+            coverage = json.load(f)
+        check(
+            coverage["g2"]["passed"] is True,
+            "coverage: G-2 passes when only docs/tooling (exempt-tier) files are uncovered",
+            str(coverage),
+        )
+        check(coverage["g2"]["unassigned_files"] == [], "coverage: no exempt-tier path is ever named as unassigned", str(coverage))
+
+
+def test_finalize_both_gates_pass_for_a_fully_covered_plan():
+    # REQUIRED TEST: every non-exempt file in >=1 step, every high-risk file
+    # in >=2 steps with differing hypotheses -- both gates must PASS and
+    # consolidate.py must render no ## Incomplete coverage entry. An
+    # implementation hardcoding "gate failed" would satisfy every other test
+    # while defeating this story's purpose, which is why this test also
+    # checks the positive case end to end into the report-rendering helper.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(_bundle_dir(sweep_dir), [
+            ("pkg/foo/foo.go", "go", "10", "abcdef123456", "business"),
+            ("pkg/security/auth.go", "go", "10", "abcdef123457", "security"),
+            ("docs/README.md", "markdown", "5", "abcdef123458", "docs"),
+        ])
+        write_step(
+            plan_dir, "step-001.json",
+            valid_step("step-001", ["pkg/foo/foo.go"], files=["pkg/foo/foo.go"]),
+        )
+        write_step(
+            plan_dir, "step-002.json",
+            valid_step(
+                "step-002", ["pkg/security/auth.go"], files=["pkg/security/auth.go"],
+                hypotheses=[valid_hypothesis(id="h1", objective="tenant scoping on the read path")],
+            ),
+        )
+        write_step(
+            plan_dir, "step-003.json",
+            valid_step(
+                "step-003", ["pkg/security/auth.go"], files=["pkg/security/auth.go"],
+                hypotheses=[valid_hypothesis(id="h1", objective="input validation on the write path")],
+            ),
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: succeeds", str(errors))
+
+        with open(os.path.join(plan_dir, planner.COVERAGE_FILENAME)) as f:
+            coverage = json.load(f)
+        check(coverage["evaluated"] is True, "coverage: evaluated is true", str(coverage))
+        check(coverage["g2"]["passed"] is True, "coverage: G-2 passes for a fully-covered plan", str(coverage))
+        check(
+            coverage["g3"]["passed"] is True,
+            "coverage: G-3 passes when the security file's two steps ask genuinely different questions",
+            str(coverage),
+        )
+
+        incomplete_lines = consolidate._coverage_gate_lines(coverage)
+        check(
+            incomplete_lines == [],
+            "consolidate: a fully passing coverage result renders no ## Incomplete coverage entry",
+            str(incomplete_lines),
+        )
+
+
+def test_finalize_records_coverage_evaluated_false_when_bundle_tree_is_missing():
+    # AC: a missing or unparseable bundle tree listing must record
+    # evaluated=false with a reason -- never a silent pass -- and must never
+    # abort the sweep.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        write_step(
+            plan_dir, "step-001.json",
+            valid_step("step-001", ["pkg/foo/foo.go"], files=["pkg/foo/foo.go"]),
+        )
+        # No bundle/ directory at all -- 01-tree.tsv is absent.
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: still runs the sweep even though coverage cannot be evaluated", str(errors))
+
+        with open(os.path.join(plan_dir, planner.COVERAGE_FILENAME)) as f:
+            coverage = json.load(f)
+        check(
+            coverage["evaluated"] is False,
+            "coverage: a missing bundle tree listing records evaluated=false, never a silent pass",
+            str(coverage),
+        )
+        check(
+            isinstance(coverage.get("reason"), str) and coverage["reason"],
+            "coverage: a non-empty reason is recorded",
+            str(coverage),
+        )
+        check(
+            "g2" not in coverage and "g3" not in coverage,
+            "coverage: no gate verdict is fabricated when evaluation could not run",
+            str(coverage),
+        )
+
+
+def test_evaluate_coverage_records_evaluated_false_on_a_malformed_tree_header():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        bundle_dir = _bundle_dir(sweep_dir)
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "01-tree.tsv"), "w", encoding="utf-8") as f:
+            f.write("not\tthe\texpected\theader\n")
+
+        coverage = planner.evaluate_coverage(sweep_dir, [])
+        check(coverage["evaluated"] is False, "evaluate_coverage: a malformed header records evaluated=false", str(coverage))
+        check(
+            "does not start with the expected header" in coverage["reason"],
+            "evaluate_coverage: the reason names the header mismatch",
+            coverage.get("reason", ""),
+        )
+
+
+def test_finalize_multi_planner_writes_coverage_json_over_the_merged_plan():
+    # finalize_multi_planner() must evaluate coverage over the MERGED steps
+    # actually written to plan/, not the pre-merge per-planner candidates.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1")
+        _write_tree_tsv(_bundle_dir(sweep_dir), [
+            ("pkg/foo/foo.go", "go", "10", "abcdef123456", "business"),
+            ("pkg/bar/bar.go", "go", "10", "abcdef123457", "business"),
+        ])
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/foo/foo.go"], files=["pkg/foo/foo.go"]),
+        )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: succeeds", str(errors))
+
+        coverage_path = os.path.join(sweep_dir, "plan", planner.COVERAGE_FILENAME)
+        check(os.path.isfile(coverage_path), "finalize_multi_planner: writes plan/coverage.json")
+        with open(coverage_path) as f:
+            coverage = json.load(f)
+        check(coverage["evaluated"] is True, "finalize_multi_planner: coverage is evaluated", str(coverage))
+        check(
+            coverage["g2"]["unassigned_files"] == ["pkg/bar/bar.go"],
+            "finalize_multi_planner: G-2 is computed over the merged plan actually written to disk",
+            str(coverage),
         )
 
 

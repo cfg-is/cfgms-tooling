@@ -78,9 +78,9 @@ Commands:
                        re-dispatch every roster lane -- each lane's own resume-scanner
                        integration ensures only its missing steps run again -- then
                        re-run the consolidator. --scope-file is the same flag as launch's.
-  status <sweep-id>   Print the per-lane x per-step coverage breakdown for an existing
-                       sweep. Read-only: never re-runs the planner, a lane, or the
-                       consolidator.
+  status <sweep-id>   Print the per-lane x per-step coverage breakdown, plus the G-2/G-3
+                       plan coverage-gate result (Issue #3980), for an existing sweep.
+                       Read-only: never re-runs the planner, a lane, or the consolidator.
 
 CFGMS_SECURITY_REVIEW_LANES (required) is a comma-separated list of harness:model
 pairs, e.g. "claude:sonnet-5" -- see roster.py and
@@ -864,6 +864,7 @@ import consolidate  # noqa: E402
 
 lanes, step_ids, lane_step_state, lane_step_files, _findings, plan_failed = consolidate.load_sweep(sweep_dir)
 coverage = consolidate.build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
+coverage_gates = consolidate.load_coverage_gates(sweep_dir)
 
 print(f"Sweep: {sweep_dir}")
 if plan_failed:
@@ -890,6 +891,26 @@ else:
                 f"{str(row['not_started']) + '/' + str(total):>13}"
                 f"{row['files_short']:>13}"
             )
+
+print("")
+if coverage_gates is None:
+    print("Coverage gates (G-2/G-3): not evaluated for this sweep (no plan/coverage.json)")
+elif not coverage_gates.get("evaluated"):
+    reason = coverage_gates.get("reason", "no detail recorded")
+    print(f"Coverage gates (G-2/G-3): COULD NOT EVALUATE -- {reason}")
+else:
+    g2 = coverage_gates.get("g2") or {}
+    g3 = coverage_gates.get("g3") or {}
+    if g2.get("passed"):
+        g2_status = "PASS"
+    else:
+        g2_status = f"FAIL ({len(g2.get('unassigned_files') or [])} file(s) unassigned)"
+    if g3.get("passed"):
+        g3_status = "PASS"
+    else:
+        g3_status = f"FAIL ({len(g3.get('short_files') or [])} file(s) short)"
+    print(f"Coverage gate G-2 (every code-tier file reviewed):        {g2_status}")
+    print(f"Coverage gate G-3 (entrypoint/security reviewed twice):   {g3_status}")
 PYEOF
 }
 

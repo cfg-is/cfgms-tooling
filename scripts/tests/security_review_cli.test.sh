@@ -369,6 +369,14 @@ seed_harness_fixture_repo() {
   # Byte-compiled caches of the very modules under test have no business in a
   # snapshot that is verified byte-for-byte against its own commit.
   find "${dest}/.claude" -type d -name '__pycache__' -prune -exec rm -rf {} +
+  # .claude/metrics/token_report.py (and its test) coincidentally match the
+  # #3978 tier table's `*token*` security-tier pattern -- a real file this
+  # fixture never needs (agent-dispatch.sh only conditionally mounts it if
+  # present, and nothing in this test suite exercises that mount). Left in
+  # place, the #3980 G-2/G-3 coverage gates would fail on every single-planner
+  # sweep in this file for a "security"-tier file no stub plan below ever
+  # covers -- a gap this fixture repo neither intends nor tests.
+  rm -rf "${dest}/.claude/metrics"
   # harness_runner.py loads the review methodology from
   # docs/security-review/methodology.md at import (Issue #3981) and fails
   # closed without it, so the snapshot the lane runs against must carry that
@@ -523,7 +531,15 @@ if [[ "$mode" == "plan" ]]; then
     # container never writes them either. A step missing `files` or
     # `hypotheses` is rejected by schema.validate_plan_step() -- the shared
     # C1 shape every lane reads -- and finalize() would drop it.
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go"]}' \
+    # Both fixture business-tier files are always named in `files` (never
+    # `scope`, which must stay a single bounded subtree) so every stub-
+    # generated plan, regardless of step count, satisfies the #3980 G-2
+    # coverage gate over this fixture repo's tree -- otherwise pkg/other/
+    # file.go (created by seed_harness_fixture_repo for the dedicated
+    # multi-planner merge test below) would sit permanently uncovered here
+    # and every single-planner sweep in this file would render "## Incomplete"
+    # for a coverage gap unrelated to whatever the test itself exercises.
+    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go","pkg/other/file.go"]}' \
       "$step_id" > "$step_file"
   done
 else
@@ -668,10 +684,172 @@ check_eq "status exits 0" "$status_rc" "0"
 check_contains "status reports steps discovered" "$status_out" "Steps discovered: 2"
 check_contains "status lists the claude-model-a lane" "$status_out" "claude-model-a"
 check_contains "status shows 2/2 complete for claude-model-a lane" "$status_out" "2/2"
+# The G-2/G-3 gate block (Issue #3980) against the coverage.json the REAL
+# planner.finalize() wrote for this sweep: both fixture code-tier files are
+# named by every stub plan step and the fixture tree carries no
+# entrypoint/security-tier path, so a correctly-rendered gate block reads
+# PASS/PASS here.
+check_contains "status renders the G-2 gate as PASS for a fully covered plan" \
+  "$status_out" "Coverage gate G-2 (every code-tier file reviewed):        PASS"
+check_contains "status renders the G-3 gate as PASS for a fully covered plan" \
+  "$status_out" "Coverage gate G-3 (entrypoint/security reviewed twice):   PASS"
+check_not_contains "a sweep whose planner wrote coverage.json is never reported as un-evaluated" \
+  "$status_out" "not evaluated for this sweep"
 after_hash="$(find "$SWEEP_DIR_1" -type f -exec sha256sum {} \; | sort | sha256sum)"
 after_calls="$(wc -l < "${SUB1}/docker_calls.log")"
 check_eq "status does not modify any file under the sweep tree" "$after_hash" "$before_hash"
 check_eq "status dispatches no containers" "$after_calls" "$before_calls"
+
+echo ""
+echo "== REQUIRED TEST — status renders every G-2/G-3 coverage-gate outcome"
+echo "   (PASS above, FAIL, COULD-NOT-EVALUATE, and not-evaluated here), and a"
+echo "   failing gate is reported rather than turned into a status failure"
+echo "   (Issue #3980) =="
+SUB_GATES="${SANDBOX}/case-coverage-gates"
+setup_sub_sandbox "$SUB_GATES"
+mkdir -p "${SUB_GATES}/base"
+
+# clone_sweep_for_gates <new-sweep-id> -- a byte copy of the real sweep built by
+# the launch case above (real manifest, real finalized plan, real bundle, real
+# lane envelopes) under this case's own base dir, so each gate variant below
+# edits its own tree and SWEEP_DIR_1 stays untouched for the read-only checks.
+clone_sweep_for_gates() {
+  local dest="${SUB_GATES}/base/$1"
+  cp -r "$SWEEP_DIR_1" "$dest"
+  printf '%s' "$dest"
+}
+
+# recompute_coverage <sweep-dir> -- re-derive plan/coverage.json by calling the
+# REAL planner.evaluate_coverage() over this sweep's finalized plan steps and
+# its (edited) bundle tree listing, writing it exactly where and how
+# planner.finalize() does. The gate verdicts asserted below are therefore
+# production output, not hand-written fixtures.
+recompute_coverage() {
+  python3 - "$SECURITY_REVIEW_DIR" "$1" <<'PYEOF'
+import glob
+import json
+import os
+import sys
+
+sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, sec_dir)
+import atomic_write  # noqa: E402
+import planner  # noqa: E402
+
+steps = []
+for path in sorted(glob.glob(os.path.join(sweep_dir, "plan", "step-*.json"))):
+    with open(path, "r", encoding="utf-8") as f:
+        steps.append(json.load(f))
+coverage = planner.evaluate_coverage(sweep_dir, steps)
+atomic_write.write_json_atomic(os.path.join(sweep_dir, "plan", "coverage.json"), coverage)
+print(json.dumps(coverage))
+PYEOF
+}
+
+# --- G-2 FAIL: two code-tier files in the tree that no plan step names -------
+GATE_G2_ID="gate-g2-fail"
+GATE_G2_DIR="$(clone_sweep_for_gates "$GATE_G2_ID")"
+{
+  printf '\npkg/uncovered/one.go\tgo\t12\t0123456789ab\tbusiness'
+  printf '\npkg/uncovered/two.go\tgo\t12\tba9876543210\tbusiness\n'
+} >> "${GATE_G2_DIR}/bundle/01-tree.tsv"
+g2_coverage="$(recompute_coverage "$GATE_G2_DIR")"
+check_contains "setup sanity: the real evaluate_coverage() names both unassigned code-tier files" \
+  "$g2_coverage" '"unassigned_files": ["pkg/uncovered/one.go", "pkg/uncovered/two.go"]'
+set +e
+g2_status_out=$(run_cli "$SUB_GATES" status "$GATE_G2_ID" 2>&1)
+g2_status_rc=$?
+set -e
+check_eq "status exits 0 even though a coverage gate failed" "$g2_status_rc" "0"
+check_contains "status renders G-2 as FAIL with the unassigned-file count" \
+  "$g2_status_out" "Coverage gate G-2 (every code-tier file reviewed):        FAIL (2 file(s) unassigned)"
+check_contains "a G-2 failure leaves G-3 rendered independently as PASS" \
+  "$g2_status_out" "Coverage gate G-3 (entrypoint/security reviewed twice):   PASS"
+
+# --- G-3 FAIL: a covered file whose tier makes it high-risk, reviewed by two
+# --- steps that ask the same question ---------------------------------------
+GATE_G3_ID="gate-g3-fail"
+GATE_G3_DIR="$(clone_sweep_for_gates "$GATE_G3_ID")"
+python3 - "${GATE_G3_DIR}/bundle/01-tree.tsv" <<'PYEOF'
+import sys
+
+# Reclassify the file every stub plan step already covers from business to
+# security tier: it stays assigned (G-2 still passes) but is now a
+# HIGH_RISK_TIERS path reviewed by two steps whose hypotheses are identical,
+# which is exactly the G-3 shortfall.
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.read().split("\n")
+rewritten = []
+for line in lines:
+    fields = line.split("\t")
+    if fields[0] == "pkg/example/file.go" and len(fields) == 5:
+        fields[-1] = "security"
+        line = "\t".join(fields)
+    rewritten.append(line)
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(rewritten))
+PYEOF
+g3_coverage="$(recompute_coverage "$GATE_G3_DIR")"
+check_contains "setup sanity: the real evaluate_coverage() names the short high-risk file" \
+  "$g3_coverage" '"short_files": ["pkg/example/file.go"]'
+set +e
+g3_status_out=$(run_cli "$SUB_GATES" status "$GATE_G3_ID" 2>&1)
+g3_status_rc=$?
+set -e
+check_eq "status exits 0 for a G-3 shortfall" "$g3_status_rc" "0"
+check_contains "status renders G-3 as FAIL with the short-file count" \
+  "$g3_status_out" "Coverage gate G-3 (entrypoint/security reviewed twice):   FAIL (1 file(s) short)"
+check_contains "a G-3 failure leaves G-2 rendered independently as PASS" \
+  "$g3_status_out" "Coverage gate G-2 (every code-tier file reviewed):        PASS"
+
+# --- COULD NOT EVALUATE: the gates could not read the bundle tree listing ----
+GATE_UNEVAL_ID="gate-could-not-evaluate"
+GATE_UNEVAL_DIR="$(clone_sweep_for_gates "$GATE_UNEVAL_ID")"
+rm -f "${GATE_UNEVAL_DIR}/bundle/01-tree.tsv"
+uneval_coverage="$(recompute_coverage "$GATE_UNEVAL_DIR")"
+check_contains "setup sanity: the real evaluate_coverage() records evaluated=false with a reason" \
+  "$uneval_coverage" '"evaluated": false'
+set +e
+uneval_status_out=$(run_cli "$SUB_GATES" status "$GATE_UNEVAL_ID" 2>&1)
+uneval_status_rc=$?
+set -e
+check_eq "status exits 0 when the gates could not be evaluated" "$uneval_status_rc" "0"
+check_contains "status reports COULD NOT EVALUATE with the recorded reason" \
+  "$uneval_status_out" "Coverage gates (G-2/G-3): COULD NOT EVALUATE -- cannot read bundle tree listing"
+check_not_contains "an un-evaluated gate set never renders a PASS line" "$uneval_status_out" "PASS"
+check_not_contains "an un-evaluated gate set never renders a FAIL line" "$uneval_status_out" "FAIL"
+
+# --- COULD NOT EVALUATE with no reason recorded ------------------------------
+GATE_NOREASON_ID="gate-no-reason"
+GATE_NOREASON_DIR="$(clone_sweep_for_gates "$GATE_NOREASON_ID")"
+printf '{"evaluated": false}' > "${GATE_NOREASON_DIR}/plan/coverage.json"
+set +e
+noreason_status_out=$(run_cli "$SUB_GATES" status "$GATE_NOREASON_ID" 2>&1)
+noreason_status_rc=$?
+set -e
+check_eq "status exits 0 for a coverage.json carrying no reason" "$noreason_status_rc" "0"
+check_contains "status states the missing detail rather than rendering an empty reason" \
+  "$noreason_status_out" "Coverage gates (G-2/G-3): COULD NOT EVALUATE -- no detail recorded"
+
+# --- not evaluated: a sweep from before the gates existed --------------------
+GATE_ABSENT_ID="gate-absent"
+GATE_ABSENT_DIR="$(clone_sweep_for_gates "$GATE_ABSENT_ID")"
+rm -f "${GATE_ABSENT_DIR}/plan/coverage.json"
+set +e
+absent_status_out=$(run_cli "$SUB_GATES" status "$GATE_ABSENT_ID" 2>&1)
+absent_status_rc=$?
+set -e
+check_eq "status exits 0 for a sweep with no plan/coverage.json" "$absent_status_rc" "0"
+check_contains "status distinguishes 'no coverage.json' from a gate failure" \
+  "$absent_status_out" "Coverage gates (G-2/G-3): not evaluated for this sweep (no plan/coverage.json)"
+check_contains "the per-lane coverage table is still rendered without coverage.json" \
+  "$absent_status_out" "Steps discovered: 2"
+check_not_contains "a sweep with no coverage.json never renders a gate verdict line" \
+  "$absent_status_out" "Coverage gate G-2"
+
+gate_calls="$(wc -l < "${SUB_GATES}/docker_calls.log")"
+check_eq "none of the coverage-gate status runs dispatched a container" "$gate_calls" "0"
 
 echo ""
 echo "== REQUIRED TEST — resume completes only missing steps, never re-runs or"
@@ -1302,7 +1480,15 @@ if [[ "$mode" == "plan" ]]; then
     step_id=$(printf "step-%03d" "$i")
     step_file="${out_dir}/${step_id}.json"
     [[ -f "$step_file" ]] && continue
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go"]}' \
+    # Both fixture business-tier files are always named in `files` (never
+    # `scope`, which must stay a single bounded subtree) so every stub-
+    # generated plan, regardless of step count, satisfies the #3980 G-2
+    # coverage gate over this fixture repo's tree -- otherwise pkg/other/
+    # file.go (created by seed_harness_fixture_repo for the dedicated
+    # multi-planner merge test below) would sit permanently uncovered here
+    # and every single-planner sweep in this file would render "## Incomplete"
+    # for a coverage gap unrelated to whatever the test itself exercises.
+    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go","pkg/other/file.go"]}' \
       "$step_id" > "$step_file"
   done
 else

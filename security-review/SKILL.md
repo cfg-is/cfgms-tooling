@@ -41,7 +41,7 @@ drive through its three verbs, not something to re-implement by hand:
 ```bash
 .claude/scripts/security-review.sh launch <ref> [--scope-file <path>]     # start a new sweep (usually `develop`)
 .claude/scripts/security-review.sh resume <sweep-id> [--scope-file <path>] # continue an interrupted or parked sweep
-.claude/scripts/security-review.sh status <sweep-id>                       # print per-lane x per-step coverage, read-only
+.claude/scripts/security-review.sh status <sweep-id>                       # print per-lane x per-step coverage plus the G-2/G-3 plan coverage-gate result, read-only
 ```
 
 There is no `report` verb. `launch` and `resume` both run the consolidator themselves and print
@@ -209,6 +209,16 @@ counts as a gap too. Whenever any of that is
 true, `render_markdown()` says so up front and adds a `## Incomplete` section naming every gap
 before the findings list; treat that section, not a bare empty `## Findings`, as the answer to
 "did this sweep actually cover the code."
+
+**Plan coverage gates G-2/G-3 (Issue #3980)** are two more signals in that same `## Incomplete`
+section, evaluated over the frozen plan itself rather than over lane execution: G-2 fails if any
+non-exempt (code-tier) file in the tree was never assigned to any step at all; G-3 fails if any
+`entrypoint`/`security`-tier file was assigned to fewer than two steps, or to two steps that turned
+out to ask the same question. Either failure names the exact short paths, never only a count — read
+them as "a human should look at this file by hand," since no lane ever got a planned second look at
+it. `security-review.sh status <sweep-id>` prints a one-line PASS/FAIL for each gate alongside the
+per-lane table. A gate failing never means the sweep didn't run — it ran in full; the gate is
+telling you the *plan* itself left a gap, independent of whether every lane finished cleanly.
 
 `## Scanner coverage` follows: a per-lane table of scanner checks by status and a gap list naming
 each non-`ok` check by step, tool and scope, plus every step whose envelope recorded no scans.

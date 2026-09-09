@@ -90,6 +90,19 @@ were somehow bypassed.
 malformed file goes through `schema.log_event`/`safe_log_event`, never a raw
 f-string interpolation of tainted content -- matching `resume.py`.
 
+**Coverage gates (Issue #3980):** `load_coverage_gates()` reads
+`<sweep_dir>/plan/coverage.json`, the G-2 ("every code-tier file reviewed at
+least once") / G-3 ("every entrypoint/security file reviewed by at least two
+steps that genuinely differ in what they investigate") result
+`planner.py`'s `finalize()`/`finalize_multi_planner()` compute over the
+finalized plan. A gate that failed, or that could not be evaluated at all
+(a missing or unparseable bundle tree listing), folds into `_sweep_complete()`
+exactly like any other gap and is named -- by path, never only by count -- in
+`## Incomplete`. Absence of `coverage.json` itself (a sweep from before this
+story, or one whose `finalize()` returned before the write) carries no
+signal and is judged on every other check alone, same as any other optional
+artifact this module reads.
+
 **Honest incompleteness (Issue #3961):** an empty `findings` array means "no
 candidates reported in the tasks that completed," never "clean" -- the two
 read identically only when every lane finished every planned step. Whenever
@@ -994,6 +1007,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "scanner_coverage": scanner_coverage,
         "dispatch": dispatch,
         "rejected_proposals": _load_rejected_proposals(sweep_dir),
+        "coverage_gates": load_coverage_gates(sweep_dir),
         "adjudication": adjudication,
         "cross_step_groups": cross_step_groups,
         "findings": consolidated_findings,
@@ -1095,6 +1109,21 @@ def _sweep_complete(report: dict) -> bool:
         return False
     if report.get("rejected_proposals"):
         return False
+    coverage_gates = report.get("coverage_gates")
+    if isinstance(coverage_gates, dict):
+        # Issue #3980: a coverage-gate evaluation that could not run (missing
+        # or unparseable bundle tree listing) is treated exactly like a gate
+        # that ran and failed -- never a silent pass. A sweep with no
+        # coverage.json at all (produced before this story, or one whose
+        # finalize() returned before reaching the write) carries no signal
+        # here and is judged on every other check alone, same as any other
+        # optional artifact this function reads.
+        if not coverage_gates.get("evaluated"):
+            return False
+        if not (coverage_gates.get("g2") or {}).get("passed", False):
+            return False
+        if not (coverage_gates.get("g3") or {}).get("passed", False):
+            return False
     adjudication = report.get("adjudication") or {}
     if adjudication:
         # Issue #3984: an adjudication stage that was configured but did not
@@ -1201,8 +1230,47 @@ def _incomplete_lines(report: dict) -> list[str]:
     if rejected_count:
         lines.append(f"- {rejected_count} rejected proposal(s) recorded; see `## Dispatch` below.")
 
+    lines.extend(_coverage_gate_lines(report.get("coverage_gates")))
     lines.extend(_adjudication_incomplete_lines(report.get("adjudication") or {}))
 
+    return lines
+
+
+def _coverage_gate_lines(coverage_gates: object) -> list[str]:
+    """One or two bullets naming a G-2/G-3 coverage-gate shortfall (Issue
+    #3980), or an evaluation failure -- never only a count. `coverage_gates`
+    is `None` when no `coverage.json` exists for this sweep (an older sweep,
+    or one whose `finalize()` returned before the write); that renders no
+    lines at all, since there is no signal to report, matching every other
+    optional artifact this module reads."""
+    if not isinstance(coverage_gates, dict):
+        return []
+    if not coverage_gates.get("evaluated"):
+        reason = coverage_gates.get("reason") or "no detail recorded"
+        return [
+            f"- **Coverage gates could not be evaluated**: {_md_escape_inline(reason)}. "
+            "G-2 (every file reviewed) and G-3 (high-risk files reviewed twice) status is "
+            "unknown for this sweep."
+        ]
+
+    lines: list[str] = []
+    g2 = coverage_gates.get("g2") or {}
+    if not g2.get("passed", True):
+        unassigned = g2.get("unassigned_files") or []
+        paths = ", ".join(f"`{_md_escape_inline(p)}`" for p in unassigned)
+        lines.append(
+            f"- **G-2 coverage gate failed**: {len(unassigned)} code-tier file(s) appear in "
+            f"zero plan steps: {paths}."
+        )
+    g3 = coverage_gates.get("g3") or {}
+    if not g3.get("passed", True):
+        short = g3.get("short_files") or []
+        paths = ", ".join(f"`{_md_escape_inline(p)}`" for p in short)
+        lines.append(
+            f"- **G-3 coverage gate failed**: {len(short)} entrypoint/security file(s) appear "
+            "in fewer than two steps, or in two steps whose hypothesis objectives do not "
+            f"genuinely differ: {paths}."
+        )
     return lines
 
 
@@ -1529,6 +1597,26 @@ def _load_rejected_proposals(sweep_dir: str) -> list[dict]:
     renders as "nothing to report", never an error."""
     data = _load_json(os.path.join(sweep_dir, "plan", planner.REJECTED_PROPOSALS_FILENAME))
     return data if isinstance(data, list) else []
+
+
+def load_coverage_gates(sweep_dir: str) -> dict | None:
+    """Read `<sweep_dir>/plan/coverage.json` (Issue #3980) -- the G-2/G-3
+    coverage-gate result `planner.py`'s `finalize()`/`finalize_multi_planner()`
+    write over the finalized plan.
+
+    Absent or malformed returns `None` -- "no coverage-gate signal for this
+    sweep" -- matching every other optional artifact this module reads
+    (`_load_rejected_proposals`, `_load_dispatch_report`): a sweep produced
+    before this story landed, or one whose `finalize()` returned before
+    reaching the coverage-gate write (zero step files produced, or a missing
+    sweep context), has nothing here to report, and that absence must never
+    be read as the gates having passed. Public (no leading underscore, unlike
+    most of this module's loaders) because `security-review.sh status` reads
+    it directly, exactly as it already calls `load_sweep()`/
+    `build_coverage_table()` directly rather than through `render_markdown()`.
+    """
+    data = _load_json(os.path.join(sweep_dir, "plan", planner.COVERAGE_FILENAME))
+    return data if isinstance(data, dict) else None
 
 
 def _detect_repo_root() -> str | None:
