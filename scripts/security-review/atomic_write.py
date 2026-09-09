@@ -35,14 +35,23 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Callable, TextIO
+from typing import Callable, IO
 
 
-def _write_atomic(path: str, write_body: Callable[[TextIO], None]) -> None:
+def _write_atomic(path: str, write_body: Callable[[IO], None], mode: str = "w") -> None:
+    """`mode` is `"w"` (text, UTF-8 explicitly -- never the locale default,
+    so a byte-identical-reproducibility guarantee over a text artifact holds
+    regardless of the host's locale) or `"wb"` (raw bytes, for a verbatim
+    copy of content that must round-trip exactly regardless of encoding,
+    e.g. an operator-supplied file -- see `write_bytes_atomic`)."""
     directory = os.path.dirname(path) or "."
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".atomic-write-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
+        if "b" in mode:
+            f = os.fdopen(fd, mode)
+        else:
+            f = os.fdopen(fd, mode, encoding="utf-8")
+        with f:
             write_body(f)
             f.flush()
             os.fsync(f.fileno())
@@ -69,7 +78,7 @@ def _write_atomic(path: str, write_body: Callable[[TextIO], None]) -> None:
 
 
 def write_json_atomic(path: str, data: object) -> None:
-    def _write(f: TextIO) -> None:
+    def _write(f: IO) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
 
@@ -77,7 +86,21 @@ def write_json_atomic(path: str, data: object) -> None:
 
 
 def write_text_atomic(path: str, text: str) -> None:
-    def _write(f: TextIO) -> None:
+    def _write(f: IO) -> None:
         f.write(text)
 
     _write_atomic(path, _write)
+
+
+def write_bytes_atomic(path: str, data: bytes) -> None:
+    """Byte-for-byte atomic write -- for content that must round-trip exactly
+    regardless of encoding (a verbatim copy of an operator-supplied file, a
+    dependency manifest read straight from git). Same guarantees as
+    `write_text_atomic`/`write_json_atomic`: `mkstemp`'s unpredictable name,
+    `fsync` before `os.replace`, temp file removed on any failure before the
+    replace.
+    """
+    def _write(f: IO) -> None:
+        f.write(data)
+
+    _write_atomic(path, _write, mode="wb")

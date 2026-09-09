@@ -1,41 +1,63 @@
 #!/usr/bin/env python3
 """Metadata-only repository summary for the security review harness planner
-(Issue #3906).
+(Issue #3906), extended with an auditable bundle emitter (Issue #3978).
 
-`collect(commit_sha)` is the sole input the planner (`planner.py`) ever hands
-to a model: file paths, a Go module path, package directory paths, route
-registrar file paths, and `web/src/` top-level directory names. **No function
-in this module ever reads a source file's body.**
+Two independent outputs live in this module:
 
-Everything is read against the sweep's pinned `commit_sha` via `git ls-tree`/
-`git show <sha>:<path>` -- never the live working tree, so metadata stays
-correct regardless of what has landed on `develop` since the sweep started
-(the same reasoning `manifest.py` applies when it resolves `ref` once, up
-front, at sweep creation).
+- `collect(commit_sha)` / `render_payload(metadata)` -- the flat, in-memory
+  payload `planner.py` embeds in its prompt today. Unchanged by this story;
+  every existing caller keeps working exactly as before.
+- `write_bundle(dest, commit_sha, ...)` -- writes the auditable bundle
+  directory (`MANIFEST.json`, `00-scope.md`, `01-tree.tsv`, `03-routes.tsv`,
+  `05-deps/`, `06-config-surface.tsv`) that will become the planner's only
+  input once #WS2-2 cuts it over. This story only produces the bundle; it is
+  written but not yet consumed by anything downstream.
 
-**The one exemption, and why it is not a loophole:** `go.mod` is a
-dependency manifest, not source -- `_module_path()` runs `git show
-<sha>:go.mod` and extracts only the `module <path>` directive via regex, never
-the full file body and never any other line. This is the single file-content
-read in this module; every other function below works from the `git ls-tree`
-path list alone (paths, directory names, filename suffixes). The Go package
-list is derived from directory structure under that path listing --
-`_go_packages()` never invokes `go list ./...` (that needs a real build
-environment and reads the live working tree, not the pinned commit) and never
-opens a `.go` file.
+Everything both paths read is read against the sweep's pinned `commit_sha`
+via `git ls-tree` / `git cat-file --batch` (a batch read of the exact blob
+objects `git ls-tree` named at that commit -- content-addressed, so it is
+exactly equivalent to `git show <sha>:<path>` for each file, not a live
+working-tree read) -- never the live working tree, so metadata stays correct
+regardless of what has landed on `develop` since the sweep started (the same
+reasoning `manifest.py` applies when it resolves `ref` once, up front, at
+sweep creation).
 
-**Log injection.** `_route_registrars()`'s discovery is logged via
-`schema.log_event`/`safe_log_event`, matching `resume.py`/`consolidate.py`:
-a route-registrar path is drawn from the repository tree, which is nominally
-attacker-influenced (a crafted file name) even though it carries no finding
+**Corrected invariant (this story revises the previous claim).** Earlier
+versions of this module stated that no function here ever reads a source
+file's body. That stopped being true the moment route extraction was added:
+`03-routes.tsv` is built by reading the bodies of `features/controller/api/*.go`
+files and regex-matching route registration calls, because the alternative
+(deriving routes from `_route_registrars()`'s discovery alone) finds the
+*registrar* file and not a single route inside it. The honest invariant is:
+**this module may read a file's body to derive a structured fact (a tier, a
+route, a config-key name), and it never copies a file's body into a bundle
+artifact.** `00-scope.md` is the one verbatim copy this module ever writes,
+and it is never a repository file -- it is supplied from outside the
+repository entirely (see `write_bundle`'s docstring). `go.mod`'s `module`
+directive remains the one exemption on the flat-payload side: parsed via
+regex, never the full file body, and no other line of it read.
+
+**No claim about source code leaving the environment.** This module's
+separation between "read to derive a fact" and "copied into a bundle" is a
+structural property of the extractor, not a promise about what happens after
+a bundle leaves this process. Finder lanes downstream ship file bodies to
+cloud providers by design (epic #3975). Nothing in this module, its tests, or
+its bundle should be read as a claim that source code never leaves the
+review environment.
+
+**Log injection.** `_route_registrars()`'s discovery and every new bundle
+extractor below log via `schema.log_event`/`safe_log_event`, matching
+`resume.py`/`consolidate.py`: a path or a file-content-derived value is
+nominally attacker-influenced, even though none of it carries finding
 content. `json.dumps` escapes embedded newlines and control characters inside
 string values, so a payload crafted to look like a second log line stays
 inside this record's field instead of becoming one.
 
-**Prompt injection.** A repository path is tainted for the *prompt* channel for
-exactly the same reason it is tainted for the log channel, and the prompt is
-what this module exists to feed. `_list_tree()` deliberately keeps raw control
-bytes (see its docstring), and `planner.build_prompt()` embeds
+**Prompt injection.** A repository path is tainted for the *prompt* channel
+for exactly the same reason it is tainted for the log channel, and the
+flat-payload prompt (and, later, the bundle) is what this module exists to
+feed. `_list_tree()`/`_list_tree_with_blobs()` deliberately keep raw control
+bytes (see their docstrings), and `planner.build_prompt()` embeds
 `render_payload()`'s output between `--- REPOSITORY METADATA ---` /
 `--- END REPOSITORY METADATA ---` delimiters, so a path containing a newline
 would render as two prompt lines -- the second of which can forge the closing
@@ -46,17 +68,37 @@ record, and every surviving entry is emitted with a fixed line prefix. With no
 control character left in any value, no entry can contribute a second physical
 line, so no entry can begin a line at all -- the delimiter structure of the
 prompt is a property of this function, not of the model's cooperation.
+
+`write_bundle()`'s extractors apply the same `_prompt_safe()` filter to every
+bundle row, and additionally constrain every file-content-derived value
+(route path, handler symbol, method, config key) to a tight accepted shape --
+those values are higher-taint than a path, because an attacker who lands a
+commit controls the file *content* directly, not just its name. A value
+failing either check is dropped from the row and logged as
+`prompt_unsafe_route_value_dropped` (route fields) or
+`prompt_unsafe_config_key_dropped` (config keys); it is never emitted
+partially or escaped in place.
+
+**Purity.** This module's only subprocess is `git`. No function here makes a
+network call, calls a model, or shells out to an agent CLI -- the bundle is
+auditable specifically because a human can read this file and know exactly
+what it can and cannot emit.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
+import fnmatch
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_write  # noqa: E402
 import schema  # noqa: E402
 
 MODULE_DIRECTIVE_RE = re.compile(r"^module\s+(\S+)\s*$", re.MULTILINE)
@@ -71,7 +113,8 @@ ENTRY_PREFIX = "  - "
 
 
 class MetadataError(Exception):
-    """Raised when the pinned commit's tree cannot be read via git."""
+    """Raised when the pinned commit's tree cannot be read via git, or when a
+    bundle cannot be produced closed (see `write_bundle`)."""
 
 
 def _run_git(args: list[str], repo_root: str | None, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -128,8 +171,10 @@ def _go_packages(files: list[str]) -> list[str]:
 
 def _route_registrars(files: list[str]) -> list[str]:
     """Paths matching the route-registrar naming convention -- existence and
-    path only, never contents (parsing route names out of the file body would
-    read a source file's body, which this module never does)."""
+    path only, never contents. (The bundle's `03-routes.tsv`, below, *does*
+    read file contents to extract actual routes -- this function stays
+    path-only because it feeds the flat payload's "route registrar files"
+    section, unchanged by this story.)"""
     return sorted(p for p in files if p.endswith(ROUTE_REGISTRAR_SUFFIX))
 
 
@@ -259,11 +304,657 @@ def render_payload(metadata: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# Bundle emission (Issue #3978)
+# ---------------------------------------------------------------------------
+
+BUNDLE_VERSION = "1"
+EXTRACTOR_VERSION = "1.0.0"
+
+# Basename patterns never read into a bundle artifact's content, and never
+# even opened for hashing/loc purposes -- matched against the file's basename
+# only, so a match at any directory depth is caught. `.env.*` covers
+# `.env.example` (which routinely carries a realistic-looking value in
+# practice) alongside `.env.local` etc.
+DENY_PATTERNS = (".env", ".env.*", "*.pem", "*.key")
+
+# Ordered path-rule tier table (spec table, first match wins). Matched with
+# `fnmatch` semantics against the repo-relative path and against
+# `*/<pattern>` (so a root-anchored pattern like `Makefile` also classifies a
+# nested `sub/Makefile`). This is the exact table validated by the Tech Lead
+# against origin/develop's 3,260 files with zero `unknown` -- see Issue #3978.
+TIER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("vendor", ("vendor/*",)),
+    ("generated", ("*.pb.go", "*_generated.go", "web/dist/*", "*package-lock.json", "go.sum")),
+    ("test", ("*_test.go", "test/*", "*/testdata/*", "*_test.sh", "*.test.ts", "*.test.tsx", "*/mocks/*")),
+    ("entrypoint", (
+        "cmd/*",
+        "api/proto/*",
+        "features/controller/api/route_registry.go",
+        "features/controller/api/routes_*.go",
+        "features/controller/api/server.go",
+        "web/src/api/*",
+        "web/embed.go",
+    )),
+    ("security", (
+        "pkg/cert/*", "pkg/secrets/*", "pkg/security/*", "pkg/session/*", "pkg/registration/*",
+        "*/auth/*", "*/auth*/*", "*auth*.go", "*permission*", "*token*",
+    )),
+    ("dataaccess", ("pkg/storage/*",)),
+    ("presentational", ("web/src/*",)),
+    ("business", ("features/*", "internal/*", "pkg/*")),
+    ("docs", ("docs/*", "*.md", "LICENSE", "LICENSE.*", "examples/*")),
+    ("tooling", (
+        ".github/*", ".devcontainer/*", ".claude/*", ".serena/*", "scripts/*", "build/*",
+        "*.sh", "*.ps1", "Makefile", "Dockerfile*", "docker-compose*.yml", "buf.yaml", "buf.*.yaml",
+    )),
+    ("config", (
+        "*.yaml", "*.yml", "*.json", "*.toml", "*.cfg", "*.conf", "*.tsv", "*.jsonl", "*.txt",
+        "templates/*", "web/*", "go.mod", "CODEOWNERS", "*.example", "*ignore", "*.baseline",
+        ".gitattributes", ".nvmrc", "staticcheck.conf", "*.wxs", "*.xml", "*.html", "*.js", "postinstall",
+    )),
+)
+
+UNKNOWN_TIER = "unknown"
+
+# The closed set of tiers `_classify_tier()` can return, plus `UNKNOWN_TIER` as
+# the fail state. Consumed by #3980's coverage gates (G-2's exempt set is the
+# six non-code tiers here) -- do not rename a tier without updating that story.
+CLOSED_TIER_SET = frozenset(tier for tier, _ in TIER_RULES)
+
+LANG_BY_EXT = {
+    ".go": "go", ".py": "python", ".ts": "typescript", ".tsx": "typescript",
+    ".js": "javascript", ".jsx": "javascript", ".proto": "protobuf", ".md": "markdown",
+    ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".sh": "shell", ".ps1": "powershell",
+    ".sql": "sql", ".html": "html", ".css": "css", ".toml": "toml", ".tsv": "tsv",
+}
+
+ROUTE_DISCOVERY_PREFIX = "features/controller/api/"
+
+SUBROUTER_DEF_RE = re.compile(
+    r'(\w+)\s*:=\s*([A-Za-z_][\w.]*)\.PathPrefix\(\s*"((?:[^"\\]|\\.)*)"\s*\)\.Subrouter\(\)'
+)
+ROUTE_CALL_RE = re.compile(r'([A-Za-z_][\w.]*)\.(?:Handle|HandleFunc)\(')
+REQUIRE_PERMISSION_RE = re.compile(r'requirePermission\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)')
+TEST_ONLY_RE = re.compile(r'\btestOnly\(')
+HANDLER_WRAPPER_RES = (
+    re.compile(r'HandlerFunc\(\s*([A-Za-z0-9_.]+)\s*\)'),
+    re.compile(r'testOnly\(\s*([A-Za-z0-9_.]+)\s*\)'),
+)
+BARE_HANDLER_RE = re.compile(r'^([A-Za-z0-9_.]+)\s*$')
+METHODS_ARG_RE = re.compile(r'"([A-Za-z]+)"')
+ROUTE_PATH_LITERAL_RE = re.compile(r'\s*"((?:[^"\\]|\\.)*)"')
+
+ROUTE_PATH_SHAPE_RE = re.compile(r'^[A-Za-z0-9/_{}.:*-]{1,256}$')
+HANDLER_SYMBOL_SHAPE_RE = re.compile(r'^[A-Za-z0-9_.]{1,128}$')
+METHOD_SHAPE_RE = re.compile(r'^[A-Z]{3,7}$')
+
+ENV_VAR_RE = re.compile(r'\bos\.(?:Getenv|LookupEnv)\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)')
+ENV_KEY_SHAPE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
+
+DEPS_FILES = ("go.mod", "go.sum", "web/package.json")
+
+SCOPE_FILE_MAX_BYTES = 300_000
+SCOPE_OPEN_DELIM = "--- REPOSITORY METADATA ---"
+SCOPE_CLOSE_DELIM = "--- END REPOSITORY METADATA ---"
+
+TREE_HEADER = ("path", "lang", "loc", "sha256_12", "tier")
+ROUTES_HEADER = ("method", "path", "handler_file", "handler_symbol", "auth_middleware", "framework")
+CONFIG_HEADER = ("key", "source", "referenced_in_count", "has_default", "tier")
+
+
+def _is_denied(path: str) -> bool:
+    """True when `path`'s basename matches the deny list -- never read into
+    any bundle artifact, never even opened for hashing (see `DENY_PATTERNS`)."""
+    basename = path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatchcase(basename, pattern) for pattern in DENY_PATTERNS)
+
+
+def _classify_tier(path: str) -> str:
+    """Ordered path-rule classification (`TIER_RULES`), first match wins.
+    Never reads a file body -- path string only. Returns `UNKNOWN_TIER` when
+    no rule matches, which is a fail-closed condition the caller must act on
+    (see `write_bundle`)."""
+    for tier, patterns in TIER_RULES:
+        for pattern in patterns:
+            if fnmatch.fnmatchcase(path, pattern) or fnmatch.fnmatchcase(path, f"*/{pattern}"):
+                return tier
+    return UNKNOWN_TIER
+
+
+def _detect_lang(path: str) -> str:
+    _, ext = os.path.splitext(path)
+    if not ext:
+        return "none"
+    return LANG_BY_EXT.get(ext.lower(), ext.lower().lstrip("."))
+
+
+def _list_tree_with_blobs(commit_sha: str, repo_root: str | None) -> list[tuple[str, str]]:
+    """Return `(path, blob_sha)` for every path in the tree at `commit_sha`.
+
+    Same `-z` reasoning as `_list_tree()`. The blob sha lets the caller batch
+    every file's content through one `git cat-file --batch` call instead of
+    one `git show` per file.
+    """
+    result = _run_git(["ls-tree", "-r", "-z", commit_sha], repo_root)
+    raw = result.stdout.decode("utf-8", errors="surrogateescape")
+    entries: list[tuple[str, str]] = []
+    for chunk in raw.split("\x00"):
+        if not chunk:
+            continue
+        meta, _, path = chunk.partition("\t")
+        parts = meta.split(" ")
+        if len(parts) != 3:
+            continue
+        _mode, _objtype, blob_sha = parts
+        entries.append((path, blob_sha))
+    return entries
+
+
+def _cat_file_batch(blob_shas: list[str], repo_root: str | None) -> dict[str, bytes]:
+    """Read every blob in `blob_shas` in one `git cat-file --batch` call.
+
+    Content-addressed: each blob sha was named by `git ls-tree` at the pinned
+    commit, so reading it is equivalent to `git show <commit>:<path>` for the
+    file that named it -- never the live working tree.
+    """
+    if not blob_shas:
+        return {}
+    cmd = ["git"]
+    if repo_root is not None:
+        cmd += ["-C", repo_root]
+    cmd += ["cat-file", "--batch"]
+    input_data = ("\n".join(blob_shas) + "\n").encode("utf-8")
+    try:
+        result = subprocess.run(cmd, input=input_data, capture_output=True, timeout=300, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MetadataError(f"`git cat-file --batch` failed: {exc}") from exc
+
+    output = result.stdout
+    contents: dict[str, bytes] = {}
+    pos = 0
+    for sha in blob_shas:
+        nl = output.index(b"\n", pos)
+        header = output[pos:nl].decode("ascii", errors="replace")
+        pos = nl + 1
+        parts = header.split(" ")
+        if len(parts) < 3 or parts[0] != sha:
+            raise MetadataError(f"unexpected `git cat-file --batch` header: {header!r}")
+        size = int(parts[2])
+        contents[sha] = output[pos:pos + size]
+        pos += size + 1
+    return contents
+
+
+def _find_matching_close_paren(text: str, open_idx: int) -> int:
+    """Return the index of the `)` matching the `(` at `text[open_idx]`,
+    tracking string literals so a paren inside a quoted Go string is never
+    mistaken for a structural one. Returns -1 if unbalanced."""
+    depth = 0
+    i = open_idx
+    in_string = False
+    str_char = ""
+    escape = False
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == str_char:
+                in_string = False
+        else:
+            if c in ('"', "`"):
+                in_string = True
+                str_char = c
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def _route_source_files(files: list[str]) -> list[str]:
+    """`features/controller/api/*.go` minus `*_test.go` -- a flat glob, not
+    recursive. This is the discovery set Issue #3978 specifies: it is NOT
+    derived from `_route_registrars()`'s output, which names exactly one
+    18-line file declaring the registrar type and not a single route."""
+    result = []
+    for path in sorted(files):
+        if not path.startswith(ROUTE_DISCOVERY_PREFIX):
+            continue
+        rest = path[len(ROUTE_DISCOVERY_PREFIX):]
+        if "/" in rest or not rest.endswith(".go") or rest.endswith("_test.go"):
+            continue
+        result.append(path)
+    return result
+
+
+def _route_row_shape_ok(row: dict) -> bool:
+    return (
+        bool(METHOD_SHAPE_RE.match(row["method"]))
+        and bool(ROUTE_PATH_SHAPE_RE.match(row["path"]))
+        and bool(HANDLER_SYMBOL_SHAPE_RE.match(row["handler_symbol"]))
+        and _prompt_safe(row["auth_middleware"])
+    )
+
+
+def _extract_routes_from_source(path: str, text: str, commit_sha: str) -> list[dict]:
+    """Regex-scan one route file's body for `.Handle(`/`.HandleFunc(` calls
+    joined to a trailing `.Methods(...)`, resolving each call's subrouter
+    prefix from `X := Y.PathPrefix("...").Subrouter()` assignments earlier in
+    the same file. This reads a source file's body -- see the module
+    docstring's corrected invariant. Every extracted value is checked against
+    a tight accepted shape before being emitted (`_route_row_shape_ok`); a
+    value that fails is dropped and logged, never emitted partially.
+    """
+    prefix_map: dict[str, str] = {"s.router": "", "s.apiRouter": "/api/v1", "api": "/api/v1"}
+    for m in SUBROUTER_DEF_RE.finditer(text):
+        var, base, literal = m.group(1), m.group(2), m.group(3)
+        prefix_map[var] = prefix_map.get(base, "") + literal
+
+    rows: list[dict] = []
+    for m in ROUTE_CALL_RE.finditer(text):
+        recv = m.group(1)
+        open_idx = m.end() - 1
+        close_idx = _find_matching_close_paren(text, open_idx)
+        if close_idx == -1:
+            continue
+        body = text[open_idx + 1:close_idx]
+
+        after = text[close_idx + 1:]
+        stripped_len = len(after) - len(after.lstrip(" \t\r\n"))
+        methods_pos = close_idx + 1 + stripped_len
+        if text[methods_pos:methods_pos + 9] != ".Methods(":
+            continue
+        methods_open = methods_pos + 8
+        methods_close = _find_matching_close_paren(text, methods_open)
+        if methods_close == -1:
+            continue
+        methods_body = text[methods_open + 1:methods_close]
+        found_methods = METHODS_ARG_RE.findall(methods_body)
+        if not found_methods:
+            continue
+
+        path_m = ROUTE_PATH_LITERAL_RE.match(body)
+        if not path_m:
+            continue
+        route_literal = path_m.group(1)
+        handler_expr = body[path_m.end():].lstrip()
+        if handler_expr.startswith(","):
+            handler_expr = handler_expr[1:]
+
+        full_path = prefix_map.get(recv, "") + route_literal
+
+        auth_middleware = "(none)"
+        perm_m = REQUIRE_PERMISSION_RE.search(handler_expr)
+        if perm_m:
+            resource, action = perm_m.group(1), perm_m.group(2)
+            auth_middleware = f"requirePermission({resource},{action})"
+        elif TEST_ONLY_RE.search(handler_expr):
+            auth_middleware = "testOnly"
+
+        handler_symbol = None
+        for wrapper_re in HANDLER_WRAPPER_RES:
+            wm = wrapper_re.search(handler_expr)
+            if wm:
+                handler_symbol = wm.group(1)
+                break
+        if handler_symbol is None:
+            bare_m = BARE_HANDLER_RE.match(handler_expr.strip())
+            if bare_m:
+                handler_symbol = bare_m.group(1)
+        if handler_symbol is None:
+            continue
+
+        for method in found_methods:
+            candidate = {
+                "method": method,
+                "path": full_path,
+                "handler_file": path,
+                "handler_symbol": handler_symbol,
+                "auth_middleware": auth_middleware,
+                "framework": "gorilla/mux",
+            }
+            if _route_row_shape_ok(candidate):
+                rows.append(candidate)
+            else:
+                schema.log_event(
+                    "prompt_unsafe_route_value_dropped",
+                    commit_sha=commit_sha,
+                    handler_file=path,
+                    method=method,
+                    path=full_path,
+                    handler_symbol=handler_symbol,
+                )
+    return rows
+
+
+def _extract_routes(files: list[str], path_to_content: dict[str, bytes], commit_sha: str) -> list[dict]:
+    rows: list[dict] = []
+    for path in _route_source_files(files):
+        content = path_to_content.get(path)
+        if content is None:
+            continue
+        text = content.decode("utf-8", errors="replace")
+        rows.extend(_extract_routes_from_source(path, text, commit_sha))
+    rows.sort(key=lambda r: (r["path"], r["method"], r["handler_file"], r["handler_symbol"]))
+    return rows
+
+
+def _extract_config_surface(
+    files: list[str],
+    path_to_content: dict[str, bytes],
+    path_to_tier: dict[str, str],
+    commit_sha: str,
+) -> list[dict]:
+    """Environment-variable *names* referenced via `os.Getenv`/`os.LookupEnv`,
+    with a reference count and the tier of the first (lexicographically)
+    referencing file -- never a value, never a default, and never read from a
+    file matching the deny list (`.env` and friends are already excluded from
+    `files`/`path_to_content` by the caller; the basename check here is
+    belt-and-suspenders against a future caller that forgets to filter).
+
+    `has_default` is always `"unknown"`: reliably detecting a default-value
+    idiom via static regex is not something this module attempts, and
+    claiming `"false"` when the extractor simply did not look would repeat
+    the kind of overclaim this story exists to correct. The column exists so
+    a later story can fill it in without changing the artifact's shape.
+    """
+    occurrences: dict[str, set[str]] = {}
+    for path in files:
+        if _is_denied(path):
+            continue
+        content = path_to_content.get(path)
+        if content is None:
+            continue
+        text = content.decode("utf-8", errors="replace")
+        for m in ENV_VAR_RE.finditer(text):
+            key = m.group(1)
+            occurrences.setdefault(key, set()).add(path)
+
+    rows: list[dict] = []
+    for key in sorted(occurrences):
+        if not ENV_KEY_SHAPE_RE.match(key) or not _prompt_safe(key):
+            schema.log_event(
+                "prompt_unsafe_config_key_dropped",
+                commit_sha=commit_sha,
+                key=key,
+            )
+            continue
+        referencing_files = sorted(occurrences[key])
+        tier = path_to_tier.get(referencing_files[0], UNKNOWN_TIER)
+        rows.append({
+            "key": key,
+            "source": "env",
+            "referenced_in_count": str(len(referencing_files)),
+            "has_default": "unknown",
+            "tier": tier,
+        })
+    return rows
+
+
+def _assemble_bundle_contents(commit_sha: str, repo_root: str | None) -> dict:
+    entries = sorted(_list_tree_with_blobs(commit_sha, repo_root), key=lambda e: e[0])
+
+    files_excluded_by_deny = 0
+    kept_entries: list[tuple[str, str]] = []
+    for path, blob_sha in entries:
+        if _is_denied(path):
+            files_excluded_by_deny += 1
+            continue
+        kept_entries.append((path, blob_sha))
+
+    unique_shas = sorted({sha for _, sha in kept_entries})
+    blob_contents = _cat_file_batch(unique_shas, repo_root)
+
+    safe_entries: list[tuple[str, str]] = []
+    for path, blob_sha in kept_entries:
+        if _prompt_safe(path):
+            safe_entries.append((path, blob_sha))
+        else:
+            schema.log_event(
+                "prompt_unsafe_path_dropped",
+                commit_sha=commit_sha,
+                field="bundle_path",
+                path=path,
+                reason="value contains a control character and would break a bundle artifact "
+                       "or a prompt block that later renders it",
+            )
+
+    path_to_content = {path: blob_contents[blob_sha] for path, blob_sha in safe_entries}
+    files = [path for path, _ in safe_entries]
+
+    tree_rows = []
+    unknown_tier_count = 0
+    for path, blob_sha in safe_entries:
+        content = blob_contents[blob_sha]
+        tier = _classify_tier(path)
+        if tier == UNKNOWN_TIER:
+            unknown_tier_count += 1
+        tree_rows.append({
+            "path": path,
+            "lang": _detect_lang(path),
+            "loc": str(content.count(b"\n")),
+            "sha256_12": hashlib.sha256(content).hexdigest()[:12],
+            "tier": tier,
+        })
+
+    path_to_tier = {row["path"]: row["tier"] for row in tree_rows}
+    route_rows = _extract_routes(files, path_to_content, commit_sha)
+    config_rows = _extract_config_surface(files, path_to_content, path_to_tier, commit_sha)
+
+    deps: dict[str, bytes] = {}
+    for rel in DEPS_FILES:
+        if rel in path_to_content:
+            deps[rel] = path_to_content[rel]
+
+    return {
+        "tree_rows": tree_rows,
+        "route_rows": route_rows,
+        "config_rows": config_rows,
+        "deps": deps,
+        "unknown_tier_count": unknown_tier_count,
+        "files_excluded_by_deny": files_excluded_by_deny,
+    }
+
+
+def _render_tsv(header: tuple[str, ...], rows: list[dict]) -> str:
+    lines = ["\t".join(header)]
+    for row in rows:
+        lines.append("\t".join(str(row[col]) for col in header))
+    return "\n".join(lines) + "\n"
+
+
+def _read_and_validate_scope_file(scope_file: str) -> bytes:
+    """Read and validate an operator-supplied `--scope-file`.
+
+    Bounded read (`SCOPE_FILE_MAX_BYTES` + 1 byte): an operator pointing at
+    the wrong (huge) file fails loudly here rather than blowing up later
+    trying to load it whole. Rejects a file containing either planner-prompt
+    delimiter outright rather than escaping it -- an operator-supplied file
+    that already contains the harness's own control strings is a mistake
+    worth surfacing, not silently neutralizing.
+    """
+    try:
+        with open(scope_file, "rb") as f:
+            data = f.read(SCOPE_FILE_MAX_BYTES + 1)
+    except OSError as exc:
+        raise MetadataError(f"cannot read --scope-file {scope_file!r}: {exc}") from exc
+
+    if len(data) > SCOPE_FILE_MAX_BYTES:
+        raise MetadataError(
+            f"--scope-file {scope_file!r} exceeds the {SCOPE_FILE_MAX_BYTES}-byte cap"
+        )
+
+    text = data.decode("utf-8", errors="replace")
+    if SCOPE_OPEN_DELIM in text or SCOPE_CLOSE_DELIM in text:
+        raise MetadataError(
+            f"--scope-file {scope_file!r} contains a planner prompt delimiter "
+            f"({SCOPE_OPEN_DELIM!r} or {SCOPE_CLOSE_DELIM!r}); an operator-supplied file must "
+            "never be able to forge the metadata block boundary"
+        )
+    return data
+
+
+def _extractor_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def write_bundle(
+    dest: str,
+    commit_sha: str,
+    repo_root: str | None = None,
+    scope_file: str | None = None,
+    no_scope: bool = False,
+) -> dict:
+    """Write the auditable bundle directory to `dest` for `commit_sha`.
+
+    `scope_file` XOR `no_scope` is required -- a silently absent scope
+    description degrades planning quality invisibly, which is exactly the
+    failure class this harness exists to prevent, so there is no default.
+    Raises `MetadataError`, writing nothing, if neither or both are given, or
+    if `scope_file` fails `_read_and_validate_scope_file`.
+
+    `00-scope.md`, when present, is a byte-identical copy of `scope_file`'s
+    bytes -- it is never generated, summarised, or re-rendered by this
+    module. The file is supplied from *outside* the pinned commit (an
+    operator or an operator-directed agent wrote it, looking at the
+    repository from outside this extractor's isolation boundary), so bundle
+    reproducibility is over `(commit_sha, extractor_version, scope-file
+    digest)`, not `commit_sha` alone -- see `MANIFEST.json`'s `scope_file`
+    entry.
+
+    A file matching no tier rule (`tier == "unknown"`) does not by itself
+    stop the bundle from being written: the manifest's `redaction_log.
+    unknown_tier_count` records it, and this function's caller (`main`)
+    exits non-zero after the bundle is written, so an operator can inspect
+    exactly what was unclassifiable rather than resuming a sweep with a
+    silently-dropped, unreviewed file.
+    """
+    if bool(scope_file) == bool(no_scope):
+        raise MetadataError(
+            "--bundle requires exactly one of --scope-file <path> or --no-scope"
+        )
+
+    scope_bytes: bytes | None = None
+    if scope_file:
+        scope_bytes = _read_and_validate_scope_file(scope_file)
+
+    contents = _assemble_bundle_contents(commit_sha, repo_root)
+
+    os.makedirs(dest, exist_ok=True)
+    deps_dir = os.path.join(dest, "05-deps")
+    os.makedirs(deps_dir, exist_ok=True)
+
+    artifacts: dict[str, dict] = {}
+
+    def _record(rel_path: str, data: bytes) -> None:
+        artifacts[rel_path] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    if scope_bytes is not None:
+        scope_path = os.path.join(dest, "00-scope.md")
+        atomic_write.write_bytes_atomic(scope_path, scope_bytes)
+        _record("00-scope.md", scope_bytes)
+
+    tree_text = _render_tsv(TREE_HEADER, contents["tree_rows"])
+    atomic_write.write_text_atomic(os.path.join(dest, "01-tree.tsv"), tree_text)
+    _record("01-tree.tsv", tree_text.encode("utf-8"))
+
+    routes_text = _render_tsv(ROUTES_HEADER, contents["route_rows"])
+    atomic_write.write_text_atomic(os.path.join(dest, "03-routes.tsv"), routes_text)
+    _record("03-routes.tsv", routes_text.encode("utf-8"))
+
+    for rel in sorted(contents["deps"]):
+        data = contents["deps"][rel]
+        dep_path = os.path.join(deps_dir, rel)
+        os.makedirs(os.path.dirname(dep_path), exist_ok=True)
+        atomic_write.write_bytes_atomic(dep_path, data)
+        _record(f"05-deps/{rel}", data)
+
+    config_text = _render_tsv(CONFIG_HEADER, contents["config_rows"])
+    atomic_write.write_text_atomic(os.path.join(dest, "06-config-surface.tsv"), config_text)
+    _record("06-config-surface.tsv", config_text.encode("utf-8"))
+
+    if repo_root:
+        repo_label = os.path.basename(os.path.abspath(repo_root))
+    else:
+        repo_label = os.path.basename(os.path.abspath(os.getcwd()))
+
+    manifest: dict = {
+        "bundle_version": BUNDLE_VERSION,
+        "extractor_version": EXTRACTOR_VERSION,
+        "extractor_sha256": _extractor_sha256(),
+        "repo": repo_label,
+        "commit_sha": commit_sha,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "scope_provided": scope_bytes is not None,
+        "artifacts": artifacts,
+        "redaction_log": {
+            "files_excluded_by_deny": contents["files_excluded_by_deny"],
+            "unknown_tier_count": contents["unknown_tier_count"],
+        },
+    }
+    if scope_bytes is not None:
+        manifest["scope_file"] = {
+            "sha256": hashlib.sha256(scope_bytes).hexdigest(),
+            "bytes": len(scope_bytes),
+            "from_commit": False,
+        }
+
+    atomic_write.write_json_atomic(os.path.join(dest, "MANIFEST.json"), manifest)
+
+    return {
+        "unknown_tier_count": contents["unknown_tier_count"],
+        "files_excluded_by_deny": contents["files_excluded_by_deny"],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("commit_sha")
     parser.add_argument("--repo-root", default=None)
+    parser.add_argument(
+        "--bundle", default=None, metavar="DEST",
+        help="write the auditable bundle directory to DEST instead of printing the flat JSON payload",
+    )
+    parser.add_argument(
+        "--scope-file", default=None, metavar="PATH",
+        help="operator-supplied prose description, copied verbatim into 00-scope.md (--bundle mode only)",
+    )
+    parser.add_argument(
+        "--no-scope", action="store_true",
+        help="explicitly record that no scope description was supplied (--bundle mode only)",
+    )
     args = parser.parse_args(argv)
+
+    if args.bundle:
+        try:
+            result = write_bundle(
+                args.bundle,
+                args.commit_sha,
+                repo_root=args.repo_root,
+                scope_file=args.scope_file,
+                no_scope=args.no_scope,
+            )
+        except MetadataError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        if result["unknown_tier_count"] > 0:
+            print(
+                f"ERROR: {result['unknown_tier_count']} file(s) at {args.commit_sha} matched no "
+                f"tier rule; bundle written to {args.bundle} for inspection, but the tier table "
+                "must be extended before this commit can be reviewed",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
 
     try:
         metadata = collect(args.commit_sha, repo_root=args.repo_root)

@@ -222,6 +222,55 @@ def test_write_text_atomic_interrupted_write_leaves_no_file_when_none_existed():
         check(not os.path.exists(path), "write_text_atomic: interrupted write with no prior file leaves nothing at final path")
 
 
+def test_write_bytes_atomic_round_trips_arbitrary_bytes():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "00-scope.md")
+        data = "héllo — wörld 日本語\n".encode("utf-8") + b"\xff\xfe\x00binary-tail"
+        atomic_write.write_bytes_atomic(path, data)
+        with open(path, "rb") as f:
+            got = f.read()
+        check(got == data, "write_bytes_atomic: round trips arbitrary bytes byte-for-byte", repr(got))
+        check(not os.path.exists(path + ".tmp"), "write_bytes_atomic: no .tmp sibling left after a successful write")
+
+
+def test_write_bytes_atomic_does_not_touch_a_planted_fixed_tmp_symlink():
+    with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+        path = os.path.join(tmp, "dep.bin")
+        victim = os.path.join(outside, "victim.txt")
+        with open(victim, "w") as f:
+            f.write("original host content\n")
+        os.symlink(victim, f"{path}.tmp")
+
+        atomic_write.write_bytes_atomic(path, b"real content")
+
+        with open(victim) as f:
+            victim_content = f.read()
+        check(
+            victim_content == "original host content\n",
+            "write_bytes_atomic: a symlink planted at the fixed <path>.tmp name is never followed or touched",
+            victim_content,
+        )
+        with open(path, "rb") as f:
+            got = f.read()
+        check(got == b"real content", "write_bytes_atomic: the real write still succeeds despite the planted symlink")
+
+
+def test_write_bytes_atomic_interrupted_write_leaves_no_file_when_none_existed():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dep-2.bin")
+
+        def boom(f):
+            raise RuntimeError("simulated crash mid-write")
+
+        raised = False
+        try:
+            atomic_write._write_atomic(path, boom, mode="wb")
+        except RuntimeError:
+            raised = True
+        check(raised, "write_bytes_atomic: propagates the underlying write failure")
+        check(not os.path.exists(path), "write_bytes_atomic: interrupted write with no prior file leaves nothing at final path")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
