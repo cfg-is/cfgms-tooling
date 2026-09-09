@@ -369,6 +369,13 @@ seed_harness_fixture_repo() {
   # Byte-compiled caches of the very modules under test have no business in a
   # snapshot that is verified byte-for-byte against its own commit.
   find "${dest}/.claude" -type d -name '__pycache__' -prune -exec rm -rf {} +
+  # harness_runner.py loads the review methodology from
+  # docs/security-review/methodology.md at import (Issue #3981) and fails
+  # closed without it, so the snapshot the lane runs against must carry that
+  # directory too -- exactly as the real `git archive <commit>` snapshot of
+  # this repository does.
+  mkdir -p "${dest}/docs"
+  cp -r "${REPO_ROOT}/docs/security-review" "${dest}/docs/security-review"
   # The two repo-relative paths the stub plan steps below name in their
   # `scope`/`files`, so read_step_files() reads real content rather than
   # logging a skipped read for every step.
@@ -379,7 +386,7 @@ seed_harness_fixture_repo() {
 
 commit_harness_fixture_repo() {
   local dest="$1"
-  git -C "$dest" add .claude .devcontainer pkg
+  git -C "$dest" add .claude .devcontainer docs pkg
   git -C "$dest" commit --quiet -m "fixture: harness code and reviewable content"
 }
 
@@ -390,6 +397,10 @@ fixture_committed_schema="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:.claude/scr
 live_schema="$(sha256sum "${SECURITY_REVIEW_DIR}/schema.py" | cut -d' ' -f1)"
 check_eq "the fixture repo's HEAD commit carries this checkout's live schema.py (the lane imports it from there)" \
   "$fixture_committed_schema" "$live_schema"
+fixture_committed_methodology="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:docs/security-review/methodology.md | sha256sum | cut -d' ' -f1)"
+live_methodology="$(sha256sum "${REPO_ROOT}/docs/security-review/methodology.md" | cut -d' ' -f1)"
+check_eq "the fixture repo's HEAD commit carries this checkout's live methodology.md (harness_runner loads it from there)" \
+  "$fixture_committed_methodology" "$live_methodology"
 
 # Stub harness CLI binary (Issue #3934) -- the ONLY thing lane mode stubs.
 # Reads the same env var contract claude_lane.py::call_claude_harness sets

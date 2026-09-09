@@ -20,6 +20,19 @@ the union stops being evidence about the models." A per-harness deviation
 concern for that harness's own runner script, layered around these two
 constants, never a second copy of them.
 
+## Review methodology: compact core and per-step anchors (Issue #3981)
+
+`docs/security-review/methodology.md` is the single copy of the review
+methodology every lane is held to -- threat model, the closed CWE shortlist
+plus its `other:` escape, attacker tiers, the four severity definitions, and
+worked CFGMS examples ("anchors") calibrating each level. This module loads
+it once at import and is the only place its text becomes prompt content:
+`METHODOLOGY_CORE` (always inlined, bounded by `METHODOLOGY_CORE_MAX_CHARS`)
+and `METHODOLOGY_ANCHORS` (one per severity level inlined per step, chosen
+deterministically by `select_anchors()`). Every lane's `build_prompt` starts
+from `shared_preamble(step)` -- the same C4 rule as the two constants above,
+extended: no lane assembles or copies any of this text itself.
+
 ## Refusal-retry-once bookkeeping (finding 9)
 
 `resume.py` is correct and untouched, per the epic's non-goals -- its own
@@ -70,6 +83,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -139,6 +153,305 @@ OUTPUT_SCHEMA_DESCRIPTION = (
 )
 
 
+# --- Review methodology: compact core and per-step anchors (Issue #3981) ----
+#
+# `docs/security-review/methodology.md` is the one copy of the review
+# methodology every lane is held to. This module loads that document once,
+# at import, and is the only place its text becomes a prompt constant -- the
+# same C4 single-sourcing contract `SYSTEM_PROMPT` and
+# `OUTPUT_SCHEMA_DESCRIPTION` carry: every lane's `build_prompt` calls
+# `shared_preamble(step)` and never assembles its own copy.
+#
+# Delivery is split so the cost stays bounded at ~250 steps per lane:
+#   - `METHODOLOGY_CORE` (the text between the `methodology-core` markers) is
+#     inlined into every step prompt and must stay at or under
+#     `METHODOLOGY_CORE_MAX_CHARS`. The loader refuses a larger core.
+#   - Anchors are inlined one per severity level per step, chosen by
+#     `select_anchors()` -- a pure function of the step's own scope, files,
+#     description and hypotheses, so the same step always gets the same
+#     anchors and two steps about different subsystems get different ones.
+#     Each anchor must stay at or under `ANCHOR_MAX_CHARS`.
+#
+# The loader fails closed: a missing document, a missing or duplicated
+# marker, a level with fewer than `MIN_ANCHORS_PER_LEVEL` anchors, or an
+# oversized core or anchor raises `MethodologyError` at import, so a lane
+# cannot start with the methodology silently dropped from its prompts.
+
+SEVERITY_LEVELS = ("critical", "high", "medium", "low")
+METHODOLOGY_RELATIVE_PATH = "docs/security-review/methodology.md"
+METHODOLOGY_CORE_MAX_CHARS = 8_000
+ANCHOR_MAX_CHARS = 1_200
+MIN_ANCHORS_PER_LEVEL = 2
+ANCHORS_PER_STEP = len(SEVERITY_LEVELS)
+MIN_TERM_LENGTH = 3
+
+_CORE_BEGIN = "<!-- methodology-core:begin -->"
+_CORE_END = "<!-- methodology-core:end -->"
+_ANCHOR_BEGIN_PREFIX = "<!-- anchor:begin"
+_ANCHOR_END = "<!-- anchor:end -->"
+_ANCHOR_RE = re.compile(
+    r"<!-- anchor:begin id=(?P<id>\S+) severity=(?P<severity>\S+) tags=(?P<tags>\S+) -->"
+    r"\s*(?P<text>.*?)\s*<!-- anchor:end -->",
+    re.DOTALL,
+)
+_TERM_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+_CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+
+class MethodologyError(ValueError):
+    """The methodology document is missing or malformed. Raised at import so
+    a lane never starts with the methodology silently absent from its
+    prompts."""
+
+
+def methodology_path() -> Path:
+    """Locate `docs/security-review/methodology.md`: under
+    `CFGMS_SECURITY_REVIEW_REPO_ROOT` when set (the same override every
+    lane's import bootstrap honours), else four directories above this file
+    -- the repository root both in a checkout and in the investigator
+    container, where the whole repository is bind-mounted at `/workspace`
+    and this module is imported from
+    `/workspace/.claude/scripts/security-review/lanes/`."""
+    roots = []
+    env_root = os.environ.get("CFGMS_SECURITY_REVIEW_REPO_ROOT")
+    if env_root:
+        roots.append(Path(env_root))
+    roots.append(Path(__file__).resolve().parents[4])
+    for root in roots:
+        candidate = root / METHODOLOGY_RELATIVE_PATH
+        if candidate.is_file():
+            return candidate
+    raise MethodologyError(
+        f"methodology document not found at {METHODOLOGY_RELATIVE_PATH} "
+        f"under any of {[str(r) for r in roots]}"
+    )
+
+
+def parse_methodology(text: str) -> tuple:
+    """Split the methodology document into `(core, anchors)`, enforcing every
+    structural rule the document's own *Editing rules* section states.
+    `anchors` is a tuple of dicts `{id, severity, tags (frozenset), text}`
+    in document order -- that order is the deterministic tie-break
+    `select_anchors()` relies on."""
+    if text.count(_CORE_BEGIN) != 1 or text.count(_CORE_END) != 1:
+        raise MethodologyError("methodology core markers must each appear exactly once")
+    core = text.split(_CORE_BEGIN, 1)[1].split(_CORE_END, 1)[0].strip()
+    if not core:
+        raise MethodologyError("methodology core is empty")
+    if len(core) > METHODOLOGY_CORE_MAX_CHARS:
+        raise MethodologyError(
+            f"methodology core is {len(core)} chars; ceiling is {METHODOLOGY_CORE_MAX_CHARS}"
+        )
+    if _ANCHOR_RE.search(core):
+        raise MethodologyError("anchors must sit outside the methodology core")
+
+    anchors = []
+    seen_ids = set()
+    for match in _ANCHOR_RE.finditer(text):
+        anchor_id = match.group("id")
+        severity = match.group("severity")
+        body = match.group("text")
+        tags = frozenset(t for t in match.group("tags").lower().split(",") if t)
+        if anchor_id in seen_ids:
+            raise MethodologyError(f"duplicate anchor id {anchor_id!r}")
+        if severity not in SEVERITY_LEVELS:
+            raise MethodologyError(f"anchor {anchor_id!r} has unknown severity {severity!r}")
+        if not body:
+            raise MethodologyError(f"anchor {anchor_id!r} is empty")
+        if len(body) > ANCHOR_MAX_CHARS:
+            raise MethodologyError(
+                f"anchor {anchor_id!r} is {len(body)} chars; ceiling is {ANCHOR_MAX_CHARS}"
+            )
+        if not tags:
+            raise MethodologyError(f"anchor {anchor_id!r} has no tags")
+        seen_ids.add(anchor_id)
+        anchors.append({"id": anchor_id, "severity": severity, "tags": tags, "text": body})
+
+    # Every marker in the document must belong to exactly one well-formed
+    # anchor. `finditer` alone silently skips a begin marker with a missing
+    # or misspelled attribute, an orphaned end marker, or a begin nested
+    # inside another anchor's body -- each of which would drop or merge an
+    # example without any error. Counting the raw markers against the
+    # matched pairs closes that: the counts agree only when every marker
+    # was consumed by a complete, non-nested pair.
+    begin_count = text.count(_ANCHOR_BEGIN_PREFIX)
+    end_count = text.count(_ANCHOR_END)
+    if begin_count != len(anchors) or end_count != len(anchors):
+        raise MethodologyError(
+            f"anchor markers do not pair up: {begin_count} begin marker(s), "
+            f"{end_count} end marker(s), {len(anchors)} well-formed anchor(s)"
+        )
+
+    for level in SEVERITY_LEVELS:
+        count = sum(1 for anchor in anchors if anchor["severity"] == level)
+        if count < MIN_ANCHORS_PER_LEVEL:
+            raise MethodologyError(
+                f"severity {level!r} has {count} anchor(s); at least {MIN_ANCHORS_PER_LEVEL} required"
+            )
+    return core, tuple(anchors)
+
+
+def load_methodology(path: Path | None = None) -> tuple:
+    """Read and parse the methodology document at `path` (default:
+    `methodology_path()`)."""
+    document = Path(path) if path is not None else methodology_path()
+    try:
+        text = document.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MethodologyError(f"cannot read methodology document {document}: {exc}") from exc
+    return parse_methodology(text)
+
+
+METHODOLOGY_CORE, METHODOLOGY_ANCHORS = load_methodology()
+
+
+def step_terms(step: dict) -> frozenset:
+    """The lower-case token set of a plan step's own subject matter: `scope`
+    (string or list), `description`, `files`, and every hypothesis's
+    `objective`/`required_evidence`. Paths and camel-case identifiers are
+    split into words (`pkg/cert/manager.go` -> `pkg`, `cert`, `manager`,
+    `go`; `SanitizeLogValue` -> `sanitize`, `log`, `value`) so an anchor tag
+    written as a plain word matches how planners actually name code. Tokens
+    shorter than `MIN_TERM_LENGTH` are dropped. Pure: no I/O, no randomness,
+    no dependence on call order."""
+    parts: list = []
+    if not isinstance(step, dict):
+        return frozenset()
+    scope = step.get("scope")
+    if isinstance(scope, list):
+        parts.extend(s for s in scope if isinstance(s, str))
+    elif isinstance(scope, str):
+        parts.append(scope)
+    description = step.get("description")
+    if isinstance(description, str):
+        parts.append(description)
+    for value in step.get("files") or []:
+        if isinstance(value, str):
+            parts.append(value)
+    for hypothesis in step.get("hypotheses") or []:
+        if isinstance(hypothesis, dict):
+            for key in ("objective", "required_evidence"):
+                value = hypothesis.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+    text = _CAMEL_RE.sub(r"\1 \2", " ".join(parts)).lower()
+    return frozenset(t for t in _TERM_SPLIT_RE.split(text) if len(t) >= MIN_TERM_LENGTH)
+
+
+def select_anchors(step: dict, anchors: tuple | None = None) -> list:
+    """Pick exactly one anchor per severity level, in `SEVERITY_LEVELS`
+    order: for each level, the anchor of that level with the most tags in
+    `step_terms(step)`, ties broken by document order. Deterministic by
+    construction -- a pure function of the step's content and the anchor
+    corpus, never of a model's choice -- and subject-sensitive: two steps
+    naming different subsystems select different anchors wherever the corpus
+    has an anchor tagged for each. A step overlapping nothing gets the first
+    anchor of each level in document order."""
+    corpus = METHODOLOGY_ANCHORS if anchors is None else tuple(anchors)
+    terms = step_terms(step)
+    selected: list = []
+    for level in SEVERITY_LEVELS:
+        best = None
+        best_score = -1
+        for anchor in corpus:
+            if anchor["severity"] != level:
+                continue
+            score = len(anchor["tags"] & terms)
+            if score > best_score:
+                best, best_score = anchor, score
+        if best is not None:
+            selected.append(best)
+    return selected
+
+
+# The fixed text `render_anchors` wraps around a step's anchors. Two
+# variants: one for a step whose subject matter matched at least one anchor's
+# tags, one for a step that matched nothing and therefore received the first
+# anchor of each level -- labelled as such, so a lane is never told that a
+# general example was "chosen for this step's subject" when it was not.
+ANCHOR_SECTION_HEADING_MATCHED = "## Severity calibration examples for this step"
+ANCHOR_SECTION_INSTRUCTION_MATCHED = (
+    "Illustrative CFGMS-shaped defects chosen for this step's subject matter, one per "
+    "level. Rate each finding against them, and say in `evidence` which example it is "
+    "nearest and why it sits above or below that example."
+)
+ANCHOR_SECTION_HEADING_FALLBACK = "## General severity calibration examples"
+ANCHOR_SECTION_INSTRUCTION_FALLBACK = (
+    "This step's subject matter matched none of the worked examples, so these are the "
+    "first example of each level: they calibrate the scale, not this step's subsystem. "
+    "Rate each finding against them, and say in `evidence` which example it is nearest "
+    "and why it sits above or below that example."
+)
+
+
+def render_anchors(selected: list, subject_matched: bool = True) -> str:
+    """Render selected anchors as the prompt section that follows the core.
+    `subject_matched` is False when the step overlapped no anchor's tags and
+    the selection is the document-order fallback."""
+    if subject_matched:
+        heading, instruction = ANCHOR_SECTION_HEADING_MATCHED, ANCHOR_SECTION_INSTRUCTION_MATCHED
+    else:
+        heading, instruction = ANCHOR_SECTION_HEADING_FALLBACK, ANCHOR_SECTION_INSTRUCTION_FALLBACK
+    lines = [heading, "", instruction, ""]
+    for anchor in selected:
+        lines.append(f"### {anchor['severity']}: {anchor['id']}")
+        lines.append("")
+        lines.append(anchor["text"])
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def shared_preamble(step: dict) -> str:
+    """The one shared prompt preamble every lane's `build_prompt` starts
+    with (C4): `SYSTEM_PROMPT`, the methodology core, this step's selected
+    anchors, then `OUTPUT_SCHEMA_DESCRIPTION`. A lane appends only its own
+    delivery instruction (where its output goes) and the step's content."""
+    selected = select_anchors(step)
+    terms = step_terms(step)
+    subject_matched = any(anchor["tags"] & terms for anchor in selected)
+    return "\n\n".join(
+        [
+            SYSTEM_PROMPT,
+            METHODOLOGY_CORE,
+            render_anchors(selected, subject_matched),
+            OUTPUT_SCHEMA_DESCRIPTION,
+        ]
+    )
+
+
+def anchor_identity(anchor: dict) -> str:
+    """The version-material line for one anchor: its id, severity and sorted
+    tags, then its text. Tags are part of it because they drive
+    `select_anchors()` -- a tag edit changes which examples a step's prompt
+    carries, so it must change `prompt_version` even when no example's text
+    changed."""
+    tags = ",".join(sorted(anchor["tags"]))
+    return f"{anchor['id']}|{anchor['severity']}|{tags}\n{anchor['text']}"
+
+
+def prompt_corpus(anchors: tuple | None = None) -> str:
+    """Every byte of shared prompt material any step of any lane can receive,
+    in a fixed order: `SYSTEM_PROMPT`, the methodology core, the fixed text
+    `render_anchors` wraps around a selection (both variants), every anchor's
+    identity line and text (not only the ones a given step selects), and
+    `OUTPUT_SCHEMA_DESCRIPTION`. This is what `compute_prompt_version()`
+    hashes; `anchors` exists so a test can show the hash moves when only an
+    anchor's tags, id or severity move."""
+    corpus = METHODOLOGY_ANCHORS if anchors is None else tuple(anchors)
+    return "\n\n".join(
+        [
+            SYSTEM_PROMPT,
+            METHODOLOGY_CORE,
+            ANCHOR_SECTION_HEADING_MATCHED,
+            ANCHOR_SECTION_INSTRUCTION_MATCHED,
+            ANCHOR_SECTION_HEADING_FALLBACK,
+            ANCHOR_SECTION_INSTRUCTION_FALLBACK,
+            *(anchor_identity(anchor) for anchor in corpus),
+            OUTPUT_SCHEMA_DESCRIPTION,
+        ]
+    )
+
+
 def compute_plan_hash(plan_dir: str, step_id: str) -> str:
     """SHA-256 hex digest of `<plan_dir>/<step_id>.json`'s own raw bytes on
     disk (Issue #3962) -- one of the two identity bindings a step's envelope
@@ -156,15 +469,18 @@ def compute_plan_hash(plan_dir: str, step_id: str) -> str:
 
 
 def compute_prompt_version() -> str:
-    """SHA-256 hex digest of `SYSTEM_PROMPT`'s own UTF-8 bytes (Issue #3962)
-    -- recorded on every envelope so a changed system prompt is visible
-    directly on the envelope, without a human needing to diff two envelopes'
-    worth of embedded prompt text. Unlike `plan_hash`/`harness_identity`,
+    """SHA-256 hex digest of `prompt_corpus()`'s UTF-8 bytes (Issue #3962;
+    widened by Issue #3981 from `SYSTEM_PROMPT` alone to the whole shared
+    corpus -- system prompt, methodology core, anchor-section wording, every
+    anchor's id/severity/tags/text, output-schema description) -- recorded
+    on every envelope so a changed prompt, rubric, worked example or
+    selection tag is visible directly on the envelope, without a human
+    needing to diff two envelopes' worth of embedded prompt text. Unlike `plan_hash`/`harness_identity`,
     `resume.missing_steps()` does not check this value against a current
     one -- it is provenance recorded on the envelope, not a third
     resume-time binding.
     """
-    return hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    return hashlib.sha256(prompt_corpus().encode("utf-8")).hexdigest()
 
 
 def refusal_decision(refusal_attempts: int) -> str:

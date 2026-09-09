@@ -322,8 +322,9 @@ def _render_hypotheses(hypotheses: list) -> str:
 
 def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     """Assemble the full prompt handed to the `opencode` harness for one
-    step: the shared system prompt and output-schema description (C4, never
-    a second copy), the step's own scope and hypotheses list, every readable
+    step: the shared preamble -- system prompt, review methodology core, this
+    step's severity anchors, output-schema description
+    (`harness_runner.shared_preamble`, C4, never a second copy), the step's own scope and hypotheses list, every readable
     file's content, and an explicit instruction naming the one file this
     harness must write its findings to. Identical wording to `claude_lane.py::
     build_prompt` -- both lanes capture their result via the model's own
@@ -341,8 +342,7 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     sections = [f"## {path}\n```\n{content}\n```" for path, content in file_contents.items()]
     body = "\n\n".join(sections)
     return (
-        f"{harness_runner.SYSTEM_PROMPT}\n\n"
-        f"{harness_runner.OUTPUT_SCHEMA_DESCRIPTION}\n\n"
+        f"{harness_runner.shared_preamble(step)}\n\n"
         f"Write your findings, and only your findings, to exactly this file path "
         f"and no other: {output_path}\n\n"
         f"Scope: {scope_text}\n"

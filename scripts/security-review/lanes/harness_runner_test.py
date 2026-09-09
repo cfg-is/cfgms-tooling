@@ -286,10 +286,20 @@ def test_compute_plan_hash_changes_when_file_content_changes():
         check(first != second, "compute_plan_hash: changes when the plan step file's content changes", f"{first} {second}")
 
 
-def test_compute_prompt_version_matches_sha256_of_system_prompt():
-    expected = hashlib.sha256(harness_runner.SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+def test_compute_prompt_version_matches_sha256_of_the_shared_prompt_corpus():
+    # Issue #3981 widened the hash from SYSTEM_PROMPT alone to the whole
+    # shared corpus, so a rubric or anchor edit is visible on every envelope.
+    corpus = harness_runner.prompt_corpus()
+    expected = hashlib.sha256(corpus.encode("utf-8")).hexdigest()
     actual = harness_runner.compute_prompt_version()
-    check(actual == expected, "compute_prompt_version: matches sha256 of SYSTEM_PROMPT's own bytes", actual)
+    check(actual == expected, "compute_prompt_version: matches sha256 of prompt_corpus()'s own bytes", actual)
+    check(
+        harness_runner.SYSTEM_PROMPT in corpus
+        and harness_runner.METHODOLOGY_CORE in corpus
+        and harness_runner.OUTPUT_SCHEMA_DESCRIPTION in corpus
+        and all(anchor["text"] in corpus for anchor in harness_runner.METHODOLOGY_ANCHORS),
+        "prompt_corpus: carries the system prompt, the methodology core, every anchor, and the schema description",
+    )
 
 
 def test_compute_prompt_version_is_stable_across_calls():
@@ -847,6 +857,506 @@ def test_written_envelope_round_trips_through_schema_validate():
             "the envelope actually written to disk validates and carries refusal_attempts",
             str(on_disk),
         )
+
+
+# --- Review methodology: compact core and per-step anchors (Issue #3981) ----
+# The methodology document is human-owned and lives in docs/; harness_runner
+# loads it once at import. These tests read the live document and the live
+# architecture doc from disk -- never a copy baked into the test -- so a drift
+# between code, document and docs fails here, not silently.
+
+METHODOLOGY_MD_PATH = REPO_ROOT / "docs/security-review/methodology.md"
+ARCHITECTURE_MD_PATH = REPO_ROOT / "docs/architecture/security-review-harness.md"
+SECURITY_REVIEW_DIR = REPO_ROOT / ".claude/scripts/security-review"
+PROMPT_CONSTANT_NAMES = ("SYSTEM_PROMPT", "OUTPUT_SCHEMA_DESCRIPTION", "METHODOLOGY_CORE", "METHODOLOGY_ANCHORS")
+
+
+def _cert_step() -> dict:
+    return {
+        "step_id": "step-001",
+        "scope": "pkg/cert",
+        "description": "mTLS certificate chain verification on the steward transport",
+        "files": ["pkg/cert/manager.go", "pkg/transport/quic/tls.go"],
+        "hypotheses": [
+            {
+                "id": "h1",
+                "objective": "the QUIC client verifies the server certificate against the controller CA",
+                "required_evidence": "a dial path with verification disabled",
+            }
+        ],
+    }
+
+
+def _tenant_step() -> dict:
+    return {
+        "step_id": "step-002",
+        "scope": "features/api/tenants",
+        "description": "REST handler tenant authorization",
+        "files": ["features/api/tenants/handler.go"],
+        "hypotheses": [
+            {
+                "id": "h1",
+                "objective": "the write handler derives the tenant from the principal, not the URL",
+                "required_evidence": "a handler trusting a client-supplied tenant path",
+            }
+        ],
+    }
+
+
+def _raises_methodology_error(fn) -> bool:
+    try:
+        fn()
+    except harness_runner.MethodologyError:
+        return True
+    return False
+
+
+def test_methodology_document_exists_and_loads_with_two_anchors_per_level():
+    check(METHODOLOGY_MD_PATH.is_file(), "docs/security-review/methodology.md exists")
+    check(
+        harness_runner.methodology_path() == METHODOLOGY_MD_PATH,
+        "harness_runner.methodology_path() resolves to the in-repo document",
+        str(harness_runner.methodology_path()),
+    )
+    check(
+        isinstance(harness_runner.METHODOLOGY_CORE, str) and harness_runner.METHODOLOGY_CORE != "",
+        "METHODOLOGY_CORE is a single non-empty string constant",
+    )
+    per_level = {
+        level: [a["id"] for a in harness_runner.METHODOLOGY_ANCHORS if a["severity"] == level]
+        for level in harness_runner.SEVERITY_LEVELS
+    }
+    check(
+        all(len(ids) >= harness_runner.MIN_ANCHORS_PER_LEVEL for ids in per_level.values()),
+        "every severity level has at least two worked CFGMS examples",
+        str({k: len(v) for k, v in per_level.items()}),
+    )
+
+
+def test_methodology_core_contains_threat_model_cwe_shortlist_and_severity_definitions():
+    core = harness_runner.METHODOLOGY_CORE
+    check("## Threat model" in core, "core has a CFGMS threat-model section")
+    check(
+        "may already be compromised" in core and "phished" in core,
+        "core restates the CFGMS threat model (compromised steward hosts, phished admins)",
+    )
+    for level in harness_runner.SEVERITY_LEVELS:
+        check(f"- **{level}.**" in core, f"core defines severity level {level!r}")
+    for tier in ("T0", "T1", "T2", "T3"):
+        check(f"**{tier} " in core, f"core names attacker tier {tier} (D3)")
+    check(
+        "CWE-295" in core and "CWE-863" in core and "CWE-117" in core and "CWE-347" in core,
+        "core names CWE identifiers for the in-scope vulnerability classes (D2)",
+    )
+    check("other: <short label>" in core, "core states the explicit `other` escape (D2)")
+
+
+def test_every_anchor_states_attacker_level_and_movement_within_its_ceiling():
+    for anchor in harness_runner.METHODOLOGY_ANCHORS:
+        text = anchor["text"]
+        check(
+            "Attacker:" in text and "Level:" in text and ("Up to" in text or "Down to" in text),
+            f"anchor {anchor['id']} states the attacker assumed, why it is that level, and what moves it",
+            text[:100],
+        )
+        check(
+            len(text) <= harness_runner.ANCHOR_MAX_CHARS,
+            f"anchor {anchor['id']} is at or under ANCHOR_MAX_CHARS",
+            f"{len(text)} > {harness_runner.ANCHOR_MAX_CHARS}",
+        )
+
+
+def test_always_inlined_core_is_under_the_declared_ceiling_and_is_not_the_whole_document():
+    # REQUIRED TEST: must fail if the whole methodology document were inlined
+    # per step -- the ceiling is below the document's size by construction.
+    document = METHODOLOGY_MD_PATH.read_text()
+    core = harness_runner.METHODOLOGY_CORE
+    check(
+        len(core) <= harness_runner.METHODOLOGY_CORE_MAX_CHARS,
+        "always-inlined core is at or under METHODOLOGY_CORE_MAX_CHARS",
+        f"{len(core)} > {harness_runner.METHODOLOGY_CORE_MAX_CHARS}",
+    )
+    check(
+        len(document) > harness_runner.METHODOLOGY_CORE_MAX_CHARS,
+        "the ceiling is smaller than the whole document, so inlining the whole document cannot pass",
+        f"document={len(document)} ceiling={harness_runner.METHODOLOGY_CORE_MAX_CHARS}",
+    )
+    check(
+        all(anchor["text"] not in core for anchor in harness_runner.METHODOLOGY_ANCHORS),
+        "no anchor text sits inside the always-inlined core",
+    )
+    architecture = ARCHITECTURE_MD_PATH.read_text()
+    check(
+        "METHODOLOGY_CORE_MAX_CHARS" in architecture
+        and f"{harness_runner.METHODOLOGY_CORE_MAX_CHARS:,}" in architecture
+        and f"{harness_runner.ANCHOR_MAX_CHARS:,}" in architecture,
+        "docs/architecture/security-review-harness.md records the declared ceilings",
+    )
+
+
+def test_shared_preamble_size_is_bounded_for_any_step():
+    ceiling = (
+        len(harness_runner.SYSTEM_PROMPT)
+        + len(harness_runner.OUTPUT_SCHEMA_DESCRIPTION)
+        + harness_runner.METHODOLOGY_CORE_MAX_CHARS
+        + harness_runner.ANCHORS_PER_STEP * harness_runner.ANCHOR_MAX_CHARS
+        + 1_000  # section headings and separators
+    )
+    for step in (_cert_step(), _tenant_step(), {"scope": "zzz"}, {}):
+        size = len(harness_runner.shared_preamble(step))
+        check(size <= ceiling, "shared_preamble stays within the per-step budget", f"{size} > {ceiling}")
+
+
+def test_parse_methodology_fails_closed_on_oversized_or_malformed_documents():
+    def doc(core_text: str, anchors_text: str) -> str:
+        return (
+            "intro\n<!-- methodology-core:begin -->\n"
+            f"{core_text}\n<!-- methodology-core:end -->\n{anchors_text}\n"
+        )
+
+    def anchor(anchor_id: str, severity: str, body: str = "body", tags: str = "alpha") -> str:
+        return f"<!-- anchor:begin id={anchor_id} severity={severity} tags={tags} -->\n{body}\n<!-- anchor:end -->\n"
+
+    good_anchors = "".join(
+        anchor(f"a{i}", level)
+        for i, level in enumerate(level for level in harness_runner.SEVERITY_LEVELS for _ in range(2))
+    )
+    core, anchors = harness_runner.parse_methodology(doc("core text", good_anchors))
+    check(core == "core text" and len(anchors) == 8, "parse_methodology accepts a well-formed document")
+
+    oversized = "x" * (harness_runner.METHODOLOGY_CORE_MAX_CHARS + 1)
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(doc(oversized, good_anchors))),
+        "parse_methodology rejects a core one character above the ceiling",
+    )
+    check(
+        _raises_methodology_error(
+            lambda: harness_runner.parse_methodology(doc("c", good_anchors).replace("<!-- methodology-core:end -->", "", 1))
+        ),
+        "parse_methodology rejects a missing core marker",
+    )
+    check(
+        _raises_methodology_error(
+            lambda: harness_runner.parse_methodology(doc("c", good_anchors) + "<!-- methodology-core:begin -->")
+        ),
+        "parse_methodology rejects a duplicated core marker",
+    )
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(doc("", good_anchors))),
+        "parse_methodology rejects an empty core",
+    )
+    short_low = "".join(
+        anchor(f"a{i}", level)
+        for i, level in enumerate(["critical", "critical", "high", "high", "medium", "medium", "low"])
+    )
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(doc("c", short_low))),
+        "parse_methodology rejects a severity level with fewer than two anchors",
+    )
+    big = anchor("big", "low", body="y" * (harness_runner.ANCHOR_MAX_CHARS + 1))
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(doc("c", good_anchors + big))),
+        "parse_methodology rejects an anchor above ANCHOR_MAX_CHARS",
+    )
+    check(
+        _raises_methodology_error(
+            lambda: harness_runner.parse_methodology(doc("c", good_anchors + anchor("a0", "low")))
+        ),
+        "parse_methodology rejects a duplicate anchor id",
+    )
+    check(
+        _raises_methodology_error(
+            lambda: harness_runner.parse_methodology(doc("c", good_anchors + anchor("odd", "severe")))
+        ),
+        "parse_methodology rejects an unknown severity",
+    )
+    check(
+        _raises_methodology_error(
+            lambda: harness_runner.parse_methodology(doc("c" + anchor("inner", "low"), good_anchors))
+        ),
+        "parse_methodology rejects an anchor placed inside the core",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        check(
+            _raises_methodology_error(lambda: harness_runner.load_methodology(Path(tmp) / "missing.md")),
+            "load_methodology fails closed when the document is missing",
+        )
+
+
+def test_step_terms_splits_paths_and_camel_case_identifiers():
+    terms = harness_runner.step_terms(
+        {
+            "scope": ["pkg/cert"],
+            "files": ["pkg/logging/SanitizeLogValue.go"],
+            "description": "",
+            "hypotheses": [{"objective": "TenantPathChain", "required_evidence": "x"}],
+        }
+    )
+    expected = {"pkg", "cert", "logging", "sanitize", "log", "value", "tenant", "path", "chain"}
+    check(expected <= terms, "step_terms splits paths and camel-case identifiers into words", str(sorted(terms)))
+    check("go" not in terms and "x" not in terms, "step_terms drops tokens shorter than MIN_TERM_LENGTH")
+    check(harness_runner.step_terms({}) == frozenset() and harness_runner.step_terms(None) == frozenset(), "step_terms tolerates an empty or non-dict step")
+
+
+def test_select_anchors_is_deterministic_and_subject_sensitive():
+    # REQUIRED TEST: same step twice -> same anchors; two steps with different
+    # subject matter -> different anchors. Without the second half a fixed
+    # anchor set would pass while defeating the purpose.
+    first = [a["id"] for a in harness_runner.select_anchors(_cert_step())]
+    second = [a["id"] for a in harness_runner.select_anchors(_cert_step())]
+    check(first == second, "select_anchors: the same step selects the same anchors across two runs", f"{first} vs {second}")
+
+    with tempfile.TemporaryDirectory() as plan_dir:
+        path = os.path.join(plan_dir, "step-001.json")
+        with open(path, "w") as f:
+            json.dump(_cert_step(), f)
+        with open(path, "r") as f:
+            reloaded = json.load(f)
+    check(
+        [a["id"] for a in harness_runner.select_anchors(reloaded)] == first,
+        "select_anchors: a step re-read from disk selects identically",
+    )
+
+    other = [a["id"] for a in harness_runner.select_anchors(_tenant_step())]
+    check(first != other, "select_anchors: two steps with different subject matter select different anchors", f"{first} vs {other}")
+    check(
+        first[0] == "crit-mtls-verify" and other[0] == "crit-tenant-from-path",
+        "select_anchors: the critical anchor tracks the step's subsystem (certificates vs tenant authorization)",
+        f"{first[0]} / {other[0]}",
+    )
+    levels = [a["severity"] for a in harness_runner.select_anchors(_cert_step())]
+    check(
+        levels == list(harness_runner.SEVERITY_LEVELS) and len(levels) == harness_runner.ANCHORS_PER_STEP,
+        "select_anchors: exactly one anchor per severity level, in level order",
+        str(levels),
+    )
+
+
+def test_select_anchors_with_no_overlap_falls_back_to_document_order():
+    ids = [a["id"] for a in harness_runner.select_anchors({"scope": "zzz"})]
+    expected = [
+        next(a["id"] for a in harness_runner.METHODOLOGY_ANCHORS if a["severity"] == level)
+        for level in harness_runner.SEVERITY_LEVELS
+    ]
+    check(ids == expected, "select_anchors: no overlap selects the first anchor of each level in document order", str(ids))
+    check(
+        [a["id"] for a in harness_runner.select_anchors({})] == expected,
+        "select_anchors: an empty step selects the same fallback set",
+    )
+
+
+def test_shared_preamble_carries_prompt_core_anchors_and_schema_in_order():
+    # REQUIRED TEST: the assembled prompt for a step contains the severity
+    # level definitions and at least one worked example; fails if the
+    # methodology is dropped from prompt assembly.
+    step = _cert_step()
+    text = harness_runner.shared_preamble(step)
+    i_system = text.find(harness_runner.SYSTEM_PROMPT)
+    i_core = text.find(harness_runner.METHODOLOGY_CORE)
+    i_anchors = text.find("## Severity calibration examples for this step")
+    i_schema = text.find(harness_runner.OUTPUT_SCHEMA_DESCRIPTION)
+    check(
+        0 <= i_system < i_core < i_anchors < i_schema,
+        "shared_preamble order: system prompt, methodology core, anchors, output-schema description",
+        str((i_system, i_core, i_anchors, i_schema)),
+    )
+    check(
+        all(f"- **{level}.**" in text for level in harness_runner.SEVERITY_LEVELS),
+        "shared_preamble carries every severity level definition",
+    )
+    selected = harness_runner.select_anchors(step)
+    check(
+        selected and all(anchor["text"] in text for anchor in selected),
+        "shared_preamble carries every anchor selected for this step",
+    )
+    unselected = [a for a in harness_runner.METHODOLOGY_ANCHORS if a not in selected]
+    check(
+        unselected and all(anchor["text"] not in text for anchor in unselected),
+        "shared_preamble does not carry anchors that were not selected for this step",
+    )
+
+
+def test_prompt_constants_are_defined_in_exactly_one_module():
+    # REQUIRED TEST: SYSTEM_PROMPT / OUTPUT_SCHEMA_DESCRIPTION (and the
+    # methodology constants) are assigned in exactly one module -- fails if a
+    # lane gains its own copy.
+    import ast  # local import: only this test needs it
+
+    definers: dict = {name: [] for name in PROMPT_CONSTANT_NAMES}
+    for py in sorted(SECURITY_REVIEW_DIR.rglob("*.py")):
+        tree = ast.parse(py.read_text(), filename=str(py))
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            for target in targets:
+                elements = target.elts if isinstance(target, ast.Tuple) else [target]
+                for element in elements:
+                    if isinstance(element, ast.Name) and element.id in definers:
+                        definers[element.id].append(py.relative_to(REPO_ROOT).as_posix())
+    for name, files in definers.items():
+        check(
+            files == [".claude/scripts/security-review/lanes/harness_runner.py"],
+            f"{name} is assigned in exactly one module (harness_runner.py)",
+            str(files),
+        )
+
+    this_file = Path(__file__).resolve()
+    system_prompt_phrase = "syntactically valid code doing"
+    carriers = sorted(
+        py.name for py in SECURITY_REVIEW_DIR.rglob("*.py")
+        if py.resolve() != this_file and system_prompt_phrase in py.read_text()
+    )
+    check(carriers == ["harness_runner.py"], "the system prompt's own text appears in exactly one module", str(carriers))
+
+    core_phrase = "impact given the assumed attacker"
+    core_carriers = sorted(
+        py.name for py in SECURITY_REVIEW_DIR.rglob("*.py")
+        if py.resolve() != this_file and core_phrase in py.read_text()
+    )
+    check(core_carriers == [], "no module carries a textual copy of the methodology core (it is loaded from docs/)", str(core_carriers))
+
+
+def test_every_lane_builds_its_prompt_from_shared_preamble():
+    lane_files = sorted((SECURITY_REVIEW_DIR / "lanes").glob("*_lane.py"))
+    check(len(lane_files) >= 4, "at least the four landed lane runners are present", str([p.name for p in lane_files]))
+    for lane_file in lane_files:
+        source = lane_file.read_text()
+        check(
+            "harness_runner.shared_preamble(step)" in source
+            and "harness_runner.SYSTEM_PROMPT}" not in source
+            and "harness_runner.OUTPUT_SCHEMA_DESCRIPTION}" not in source,
+            f"{lane_file.name} builds its prompt from shared_preamble, never by interpolating the constants itself",
+        )
+
+
+def test_skill_md_points_at_the_methodology():
+    check(
+        "docs/security-review/methodology.md" in SKILL_MD_PATH.read_text(),
+        "SKILL.md points an operator at docs/security-review/methodology.md",
+    )
+
+
+# --- Review-pass regressions (Codex review of 1de0fcf0) ------------------------
+
+
+def _three_per_level_doc() -> str:
+    anchors = "".join(
+        f"<!-- anchor:begin id=a{i} severity={level} tags=t{i},alpha -->\nbody {i}\n<!-- anchor:end -->\n"
+        for i, level in enumerate(level for level in harness_runner.SEVERITY_LEVELS for _ in range(3))
+    )
+    return f"intro\n<!-- methodology-core:begin -->\ncore text\n<!-- methodology-core:end -->\n{anchors}"
+
+
+def test_parse_methodology_rejects_malformed_orphaned_or_nested_anchor_markers():
+    # Three anchors per level, so the minimum-count check cannot mask a
+    # silently dropped anchor -- the marker-pairing check must catch it.
+    good = _three_per_level_doc()
+    _core, anchors = harness_runner.parse_methodology(good)
+    check(len(anchors) == 12, "a well-formed three-per-level document parses to twelve anchors", str(len(anchors)))
+    check(
+        _raises_methodology_error(
+            lambda: harness_runner.parse_methodology(good.replace("<!-- anchor:begin", "<!-- broken:begin", 1))
+        ),
+        "a misspelled begin marker is rejected even though every level still has >= 2 anchors",
+    )
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(good + "<!-- anchor:end -->\n")),
+        "an orphaned end marker is rejected",
+    )
+    missing_tags = good.replace(
+        "<!-- anchor:begin id=a0 severity=critical tags=t0,alpha -->",
+        "<!-- anchor:begin id=a0 severity=critical -->",
+        1,
+    )
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(missing_tags)),
+        "a begin marker missing its tags attribute is rejected",
+    )
+    nested = good.replace(
+        "body 0\n", "body 0\n<!-- anchor:begin id=inner severity=critical tags=x -->\ninner\n", 1
+    )
+    check(
+        _raises_methodology_error(lambda: harness_runner.parse_methodology(nested)),
+        "a begin marker nested inside another anchor's body is rejected",
+    )
+    live = METHODOLOGY_MD_PATH.read_text()
+    check(
+        live.count("<!-- anchor:begin") == len(harness_runner.METHODOLOGY_ANCHORS) == live.count("<!-- anchor:end -->"),
+        "every anchor marker in the live document belongs to exactly one well-formed anchor",
+    )
+
+
+def test_prompt_version_material_covers_anchor_identity_tags_and_render_text():
+    corpus = harness_runner.prompt_corpus()
+    for anchor in harness_runner.METHODOLOGY_ANCHORS:
+        identity = f"{anchor['id']}|{anchor['severity']}|{','.join(sorted(anchor['tags']))}"
+        check(identity in corpus, f"prompt_corpus carries the id, severity and sorted tags of {anchor['id']}")
+    for text in (
+        harness_runner.ANCHOR_SECTION_HEADING_MATCHED,
+        harness_runner.ANCHOR_SECTION_INSTRUCTION_MATCHED,
+        harness_runner.ANCHOR_SECTION_HEADING_FALLBACK,
+        harness_runner.ANCHOR_SECTION_INSTRUCTION_FALLBACK,
+    ):
+        check(text in corpus, f"prompt_corpus carries the anchor-section wording: {text[:40]!r}")
+
+    base = list(harness_runner.METHODOLOGY_ANCHORS)
+
+    def mutated(**changes) -> tuple:
+        first = dict(base[0])
+        first.update(changes)
+        return tuple([first] + base[1:])
+
+    check(
+        harness_runner.prompt_corpus(mutated(tags=frozenset(base[0]["tags"] | {"zz-new-tag"}))) != corpus,
+        "a tag-only change (which changes selection) moves the version material",
+    )
+    check(harness_runner.prompt_corpus(mutated(id="renamed")) != corpus, "an id-only change moves the version material")
+    check(
+        harness_runner.prompt_corpus(mutated(severity="low")) != corpus,
+        "a severity-only change moves the version material",
+    )
+
+
+def test_fallback_selection_is_labelled_general_not_step_specific():
+    fallback = harness_runner.shared_preamble({"scope": "zzz"})
+    check(
+        harness_runner.ANCHOR_SECTION_HEADING_FALLBACK in fallback
+        and harness_runner.ANCHOR_SECTION_HEADING_MATCHED not in fallback,
+        "a step matching no anchor tags is told its examples are general, not chosen for its subject",
+    )
+    matched = harness_runner.shared_preamble(_cert_step())
+    check(
+        harness_runner.ANCHOR_SECTION_HEADING_MATCHED in matched
+        and harness_runner.ANCHOR_SECTION_HEADING_FALLBACK not in matched,
+        "a step matching anchor tags gets the step-specific heading",
+    )
+
+
+def test_rubric_and_anchors_agree_on_cross_tenant_write_and_read():
+    # Calibration-consistency guard: the core and the anchors must put the
+    # same attacker/impact pair at the same level, or selecting a different
+    # anchor changes the scale instead of calibrating it.
+    # Markdown wraps paragraphs across source lines, so normalize whitespace
+    # before phrase checks -- a harmless re-wrap must not read as drift.
+    core = re.sub(r"\s+", " ", harness_runner.METHODOLOGY_CORE)
+    check("cross-tenant write, from any tier including T2" in core, "core: a cross-tenant write is critical from any tier")
+    check("A cross-tenant read, from any tier" in core, "core: a cross-tenant read is high from any tier")
+    check(
+        "The level definitions take precedence" in core and "never lowers severity" in core,
+        "core: level definitions take precedence over movement heuristics; protective settings never lower severity",
+    )
+    by_id = {anchor["id"]: anchor for anchor in harness_runner.METHODOLOGY_ANCHORS}
+    tenant = by_id["crit-tenant-from-path"]
+    check(
+        tenant["severity"] == "critical" and "cross-tenant write" in tenant["text"],
+        "anchor crit-tenant-from-path: T2 cross-tenant write rated critical, matching the core",
+    )
+    secrets = by_id["high-secrets-device-filter"]
+    check("stays high" in secrets["text"], "anchor high-secrets-device-filter: a cross-tenant read stays high, matching the core")
 
 
 def main() -> int:

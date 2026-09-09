@@ -124,6 +124,12 @@ importance before reporting: a lane must never discard a grounded candidate for 
 low-confidence, because a candidate dropped inside one lane can never be agreed or disagreed with
 by another lane — which is the entire value of running independent lanes at all.
 
+Severity and `vuln_class` are calibrated by one shared methodology,
+`docs/security-review/methodology.md` — the CFGMS threat model, the attacker tiers, the four
+severity definitions and the worked examples every lane receives in its prompt. Read it before
+triaging a report: a `high` in the report means what that document says it means, for the attacker
+it names.
+
 ## Reading the report
 
 `report/consolidated.md` opens with a per-lane × per-step coverage table — counts of `complete` /

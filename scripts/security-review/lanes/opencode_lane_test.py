@@ -890,6 +890,45 @@ def test_unhandled_step_error_is_failed_and_the_lane_continues() -> None:
         )
 
 
+def test_build_prompt_starts_with_the_shared_methodology_preamble():
+    # REQUIRED (Issue #3981): per-lane prompt assembly picks up the review
+    # methodology through harness_runner.shared_preamble -- no per-harness
+    # variant, no second copy of the core or of any anchor.
+    step = {
+        "step_id": "step-001",
+        "sweep_id": SWEEP_ID,
+        "commit_sha": COMMIT_SHA,
+        "scope": "pkg/cert",
+        "description": "mTLS certificate chain verification",
+        "files": ["pkg/cert/manager.go"],
+        "hypotheses": [
+            {
+                "id": "h1",
+                "objective": "server certificate verified against the controller CA",
+                "required_evidence": "a dial path with verification disabled",
+                "planner": "planner-1",
+            }
+        ],
+        "planners": ["planner-1"],
+    }
+    prompt = opencode_lane.build_prompt(step, {"pkg/cert/manager.go": "package cert\n"}, "/nonexistent/out.json")
+    preamble = harness_runner.shared_preamble(step)
+    check(prompt.startswith(preamble), "build_prompt starts with harness_runner.shared_preamble(step)", prompt[:120])
+    check(
+        harness_runner.METHODOLOGY_CORE in prompt and "- **critical.**" in prompt,
+        "build_prompt carries the methodology core with the severity level definitions",
+    )
+    check(
+        all(anchor["text"] in prompt for anchor in harness_runner.select_anchors(step)),
+        "build_prompt carries this step's selected worked examples",
+    )
+    check(
+        prompt.count(harness_runner.SYSTEM_PROMPT) == 1
+        and prompt.count(harness_runner.OUTPUT_SCHEMA_DESCRIPTION) == 1,
+        "system prompt and output-schema description each appear exactly once",
+    )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

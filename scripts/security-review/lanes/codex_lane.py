@@ -228,8 +228,10 @@ def _render_hypotheses(hypotheses: list) -> str:
 
 def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     """Assemble the full prompt handed to the `codex` harness for one step:
-    the shared system prompt and output-schema description (C4, never a
-    second copy), the step's own scope and hypotheses list, every readable
+    the shared preamble -- system prompt, review methodology core, this
+    step's severity anchors, output-schema description
+    (`harness_runner.shared_preamble`, C4, never a second copy), the step's
+    own scope and hypotheses list, every readable
     file's content, and an explicit instruction to answer with the findings
     JSON as its final message.
 
@@ -253,8 +255,7 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     sections = [f"## {path}\n```\n{content}\n```" for path, content in file_contents.items()]
     body = "\n\n".join(sections)
     return (
-        f"{harness_runner.SYSTEM_PROMPT}\n\n"
-        f"{harness_runner.OUTPUT_SCHEMA_DESCRIPTION}\n\n"
+        f"{harness_runner.shared_preamble(step)}\n\n"
         f"Respond with your final message containing exactly that JSON object "
         f"and nothing else -- no prose before or after it.\n\n"
         f"Scope: {scope_text}\n"
