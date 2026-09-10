@@ -241,8 +241,9 @@ def test_exit_zero_unauthenticated_response_is_failed_not_complete() -> None:
         check(state != "complete", "unauthenticated: state is never complete", repr(written))
         check(state != "refused", "unauthenticated: state is never refused", repr(written))
         check(
-            bool(written[0].get("stop_reason_raw")),
-            "unauthenticated: stop_reason_raw is non-empty",
+            written[0].get("stop_reason_raw") == "ollama_key_not_signed_in",
+            "unauthenticated: stop_reason_raw names the key-not-signed-in condition, "
+            "not a generic exit-code reason (Issue #4005)",
             repr(written),
         )
         check(
@@ -440,6 +441,11 @@ def test_json_shaped_auth_error_is_failed_not_refused() -> None:
         check(state == "failed", "json auth error: state is failed", repr(written))
         check(state != "refused", "json auth error: state is never refused", repr(written))
         check(state != "complete", "json auth error: state is never complete", repr(written))
+        check(
+            written[0].get("stop_reason_raw") == "ollama_key_not_signed_in",
+            "json auth error: stop_reason_raw names the key-not-signed-in condition (Issue #4005)",
+            repr(written),
+        )
         check(
             not os.path.isfile(os.path.join(out_dir, "step-001.findings.json")),
             "json auth error: no findings.json created for this step",
@@ -740,6 +746,25 @@ def test_looks_rate_limited() -> None:
     check(ollama_lane._looks_rate_limited("Usage limit reached, try later"), "detects 'usage limit'")
     check(ollama_lane._looks_rate_limited("HTTP 429 too many requests"), "detects '429'")
     check(not ollama_lane._looks_rate_limited("here are your findings"), "does not false-positive on normal output")
+
+
+def test_looks_not_signed_in() -> None:
+    check(
+        ollama_lane._looks_not_signed_in("You need to be signed in to Ollama to run Cloud models."),
+        "detects the real Ollama Cloud 401 text",
+    )
+    check(
+        ollama_lane._looks_not_signed_in('{"error": "unauthorized: you need to be signed in"}'),
+        "detects the JSON-shaped variant of the same message",
+    )
+    check(
+        ollama_lane._looks_not_signed_in("SIGNED IN required"),
+        "case-insensitive",
+    )
+    check(
+        not ollama_lane._looks_not_signed_in("here are your findings"),
+        "does not false-positive on normal output",
+    )
 
 
 def test_import_isolation_single_file_layout() -> None:

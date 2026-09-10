@@ -101,25 +101,22 @@ read-only credential mount, never an OS-keychain API key):
 | `opencode` | `qwen3-coder`, `glm-4.6` (OpenCode Zen catalog) | OpenCode lane runner (#3936) |
 | `ollama` | `glm-5.3-flash:cloud` (Ollama Cloud only — never a local/GPU model) | Ollama Cloud lane runner (#3976) |
 
-**`ollama` needs the key at `~/.ollama/id_ed25519` to be signed in to Ollama Cloud** before it
-can be used — the operator's own Cloud subscription keypair, the same "subscription session, never
-an API key" contract every other harness follows. On a host where Ollama runs as a systemd service,
-`ollama signin` signs in the *service user's* key (`/usr/share/ollama/.ollama/id_ed25519`), not the
-key the lane mounts. Connect the user key instead: run `ollama signin` inside a container that
-mounts the same two key files the lane mounts, and open the URL it prints (it says "already
-signed in" once the key is connected):
+**`ollama` needs an `ollama signin` session** before it can be used — the same "subscription
+session, never an API key" contract every other harness follows. Without it, `--harness ollama`
+fails closed as a recorded, skippable `credential_unavailable` dispatch outcome; every other
+roster lane still runs.
 
-```bash
-docker run --rm --cap-add NET_ADMIN -e CFGMS_SECURITY_REVIEW_HARNESS=ollama \
-  -v "$HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro" \
-  -v "$HOME/.ollama/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro" \
-  --entrypoint bash cfg-agent:latest \
-  -c 'init-firewall.sh >/dev/null && (ollama serve >/tmp/ollama-serve.log 2>&1 &) && sleep 3 && ollama signin'
-```
-
-Without the key file, `--harness ollama` fails closed as a
-recorded, skippable `credential_unavailable` dispatch outcome; every other roster lane still runs.
-With a key file that is not signed in, the lane dispatches and every step records `failed`.
+**Which account must be signed in depends on how Ollama runs on this host (Issue #4005).** On a
+host where Ollama runs as a systemd service (`ollama.service`, the shape the upstream installer
+sets up), `ollama run <model>:cloud` and `ollama signin` go through the DAEMON, and the daemon
+signs Cloud requests with the keypair under **its own service account's home directory** — never
+the invoking admin's `~/.ollama`, a different account entirely. Run `systemctl status
+ollama.service` first: if it reports a running unit, sign in as that unit's account (`systemctl
+show -p User --value ollama.service` names it; an empty result means the unit runs as `root`) —
+e.g. `sudo -u ollama ollama signin` — not as yourself. `launch-investigator` auto-detects this
+shape and mounts that account's keypair; `--ollama-key-dir <DIR>` overrides detection for a host
+shape it cannot cover (a non-systemd init, a renamed unit). If `ollama.service` is not a systemd
+unit at all, `ollama signin` as yourself is correct, exactly as before.
 
 Every roster entry dispatches through `.claude/scripts/agent-dispatch.sh launch-investigator`
 (Issue #3903): one short-lived, read-only container per lane per invocation — `/workspace`

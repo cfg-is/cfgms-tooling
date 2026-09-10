@@ -243,6 +243,43 @@ esac
 STUB
 chmod +x "${FAKEBIN}/docker"
 
+# Test doubles for the ollama systemd-service detection (Issue #4005). Both
+# default to "no systemd unit" so every pre-#4005 ollama test below (and
+# every non-ollama test) keeps exercising the $HOME/.ollama fallback exactly
+# as before, whether or not it sets these vars -- only the tests that opt in
+# by exporting FAKE_OLLAMA_LOAD_STATE=loaded see any different behavior.
+cat > "${FAKEBIN}/systemctl" <<'STUB'
+#!/usr/bin/env bash
+# Understands only the two `show -p <PROP> --value ollama.service` queries
+# agent-dispatch.sh's ollama credential detection issues.
+if [[ "$1" == "show" && "$2" == "-p" && "$4" == "--value" && "$5" == "ollama.service" ]]; then
+  case "$3" in
+    LoadState) printf '%s\n' "${FAKE_OLLAMA_LOAD_STATE:-not-found}" ;;
+    User)      printf '%s\n' "${FAKE_OLLAMA_USER:-}" ;;
+    *) printf '\n' ;;
+  esac
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "${FAKEBIN}/systemctl"
+
+cat > "${FAKEBIN}/getent" <<'STUB'
+#!/usr/bin/env bash
+# Understands only `getent passwd <user>`, resolving "ollama" and "root" to
+# whatever home directory this test case set via env var.
+if [[ "$1" == "passwd" ]]; then
+  case "$2" in
+    ollama) printf 'ollama:x:1000:1000::%s:/usr/sbin/nologin\n' "${FAKE_OLLAMA_SERVICE_HOME:?}" ;;
+    root)   printf 'root:x:0:0:root:%s:/bin/bash\n' "${FAKE_ROOT_SERVICE_HOME:?}" ;;
+    *) exit 2 ;;
+  esac
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "${FAKEBIN}/getent"
+
 SWEEP_DIR="${SANDBOX}/sweep/2026-09-05T0000Z-abc123"
 mkdir -p "${SWEEP_DIR}/plan" "${SWEEP_DIR}/lanes"
 mkdir -p "${SANDBOX}/HOME/.claude"
@@ -723,6 +760,125 @@ claude_still_out3=$(PATH="${FAKEBIN}:${PATH}" \
 check_contains "a claude lane on the same (ollama-credential-less) host still dispatches" "$claude_still_out3" "LAUNCHED_INVESTIGATOR:claude-still-fine-3:fake-container-id"
 claude_still_run_call3="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call3" "${NO_OLLAMA_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4005) — on a systemd-service-managed ollama host,"
+echo "   --harness ollama mounts the SERVICE ACCOUNT's keypair, never the"
+echo "   invoking user's \$HOME/.ollama, even when the latter also has a"
+echo "   (wrong, never-signed-in-by-the-daemon) key present =="
+OLLAMA_SERVICE_HOME="${SANDBOX}/ollama-service-home"
+mkdir -p "${OLLAMA_SERVICE_HOME}/.ollama"
+echo 'service-account-private-key' > "${OLLAMA_SERVICE_HOME}/.ollama/id_ed25519"
+echo 'service-account-public-key' > "${OLLAMA_SERVICE_HOME}/.ollama/id_ed25519.pub"
+: > "$DOCKER_CALL_LOG"
+ollama_svc_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  FAKE_OLLAMA_LOAD_STATE="loaded" \
+  FAKE_OLLAMA_USER="ollama" \
+  FAKE_OLLAMA_SERVICE_HOME="$OLLAMA_SERVICE_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode ollama-service-managed \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "service-managed ollama launch reports LAUNCHED_INVESTIGATOR" "$ollama_svc_out" "LAUNCHED_INVESTIGATOR:ollama-service-managed:fake-container-id"
+ollama_svc_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "mounts the service account's id_ed25519" "$ollama_svc_run_call" "${OLLAMA_SERVICE_HOME}/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+check_contains "mounts the service account's id_ed25519.pub" "$ollama_svc_run_call" "${OLLAMA_SERVICE_HOME}/.ollama/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro"
+check_not_contains "never falls back to mounting the invoking user's \$HOME/.ollama key" "$ollama_svc_run_call" "${SANDBOX}/HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4005) — a loaded ollama.service unit with no"
+echo "   explicit User= is treated as root (systemd's real default), never"
+echo "   misread as 'not service-managed' and silently falling back to"
+echo "   \$HOME (the gap left open by PR #4024, closed here with a test"
+echo "   double for exactly this unit shape) =="
+ROOT_SERVICE_HOME="${SANDBOX}/root-service-home"
+mkdir -p "${ROOT_SERVICE_HOME}/.ollama"
+echo 'root-account-private-key' > "${ROOT_SERVICE_HOME}/.ollama/id_ed25519"
+echo 'root-account-public-key' > "${ROOT_SERVICE_HOME}/.ollama/id_ed25519.pub"
+: > "$DOCKER_CALL_LOG"
+ollama_root_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  FAKE_OLLAMA_LOAD_STATE="loaded" \
+  FAKE_OLLAMA_USER="" \
+  FAKE_ROOT_SERVICE_HOME="$ROOT_SERVICE_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode ollama-service-root \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "empty-User= (root) service launch reports LAUNCHED_INVESTIGATOR" "$ollama_root_out" "LAUNCHED_INVESTIGATOR:ollama-service-root:fake-container-id"
+ollama_root_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "empty User= resolves to root's home, not \$HOME" "$ollama_root_run_call" "${ROOT_SERVICE_HOME}/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+check_not_contains "empty User= never falls through to \$HOME/.ollama" "$ollama_root_run_call" "${SANDBOX}/HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4005) — no ollama.service unit at all falls back"
+echo "   to the invoking user's \$HOME/.ollama, exactly as a non-systemd host =="
+: > "$DOCKER_CALL_LOG"
+ollama_nounit_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  FAKE_OLLAMA_LOAD_STATE="not-found" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode ollama-no-unit \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "no-unit launch reports LAUNCHED_INVESTIGATOR" "$ollama_nounit_out" "LAUNCHED_INVESTIGATOR:ollama-no-unit:fake-container-id"
+ollama_nounit_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "no unit found: mounts \$HOME/.ollama as before" "$ollama_nounit_run_call" "${SANDBOX}/HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4005) — a service-managed host with no signed-in"
+echo "   key at the SERVICE account's directory fails closed with a message"
+echo "   that says 'key not signed in' and names the account checked, not a"
+echo "   generic auth error =="
+EMPTY_OLLAMA_SERVICE_HOME="${SANDBOX}/ollama-service-home-empty"
+mkdir -p "$EMPTY_OLLAMA_SERVICE_HOME"
+: > "$DOCKER_CALL_LOG"
+set +e
+ollama_svc_missing_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  FAKE_OLLAMA_LOAD_STATE="loaded" \
+  FAKE_OLLAMA_USER="ollama" \
+  FAKE_OLLAMA_SERVICE_HOME="$EMPTY_OLLAMA_SERVICE_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode ollama-service-missing-key \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+ollama_svc_missing_rc=$?
+set -e
+if [[ "$ollama_svc_missing_rc" -ne 0 ]]; then
+  ok "service-managed host with no signed-in key exits non-zero"
+else
+  bad "service-managed host with no signed-in key exits non-zero" "exited 0"
+fi
+check_contains "the failure is reported as credential_unavailable" "$ollama_svc_missing_out" "credential_unavailable"
+check_contains "the failure message says 'key not signed in', not a generic auth error" "$ollama_svc_missing_out" "key not signed in"
+check_contains "the failure message names the service account it checked" "$ollama_svc_missing_out" "ollama.service systemd unit's account (ollama)"
+check_not_contains "no container is ever dispatched" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4005) — --ollama-key-dir bypasses systemd"
+echo "   detection entirely, even when a service unit IS present, so an"
+echo "   operator can point at the correct directory on a host shape"
+echo "   detection cannot cover =="
+EXPLICIT_KEY_DIR="${SANDBOX}/explicit-ollama-key-dir"
+mkdir -p "$EXPLICIT_KEY_DIR"
+echo 'explicit-private-key' > "${EXPLICIT_KEY_DIR}/id_ed25519"
+echo 'explicit-public-key' > "${EXPLICIT_KEY_DIR}/id_ed25519.pub"
+: > "$DOCKER_CALL_LOG"
+ollama_explicit_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  FAKE_OLLAMA_LOAD_STATE="loaded" \
+  FAKE_OLLAMA_USER="ollama" \
+  FAKE_OLLAMA_SERVICE_HOME="$OLLAMA_SERVICE_HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode ollama-explicit-key-dir \
+    --harness ollama --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" --ollama-key-dir "$EXPLICIT_KEY_DIR" 2>&1)
+check_contains "--ollama-key-dir launch reports LAUNCHED_INVESTIGATOR" "$ollama_explicit_out" "LAUNCHED_INVESTIGATOR:ollama-explicit-key-dir:fake-container-id"
+ollama_explicit_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "mounts the --ollama-key-dir path, not the detected service home" "$ollama_explicit_run_call" "${EXPLICIT_KEY_DIR}/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+check_not_contains "never mounts the systemd-detected service home despite the unit being present" "$ollama_explicit_run_call" "${OLLAMA_SERVICE_HOME}/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
 
 echo ""
 echo "== REQUIRED TEST evidence — --mode path traversal cannot widen the writable mount =="

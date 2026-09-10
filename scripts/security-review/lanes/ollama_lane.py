@@ -184,10 +184,26 @@ OLLAMA_TIMEOUT_SECONDS = 600.0
 # set every other lane uses.
 _RATE_LIMIT_MARKERS = ("rate limit", "usage limit", "quota exceeded", "429")
 
+# The exact phrase Ollama Cloud's own 401 response carries, confirmed against
+# the real CLI while writing #3976 ("You need to be signed in to Ollama to run
+# Cloud models.") and reused verbatim in this story's own JSON-shaped variant
+# (`{"error": "unauthorized: you need to be signed in"}`). Issue #4005: a
+# mounted key that exists on disk but was never signed in with the daemon
+# actually reachable at container runtime (the wrong-key bug this story
+# fixes, or a signin that lapsed) produces exactly this text on stdout. That
+# is a distinct, actionable condition from "the harness exited non-zero for
+# some other reason" and must not collapse into the same generic
+# `harness_exit_N` stop_reason_raw the latter gets -- see `run_lane`.
+_NOT_SIGNED_IN_MARKER = "signed in"
+
 
 def _looks_rate_limited(text: str) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def _looks_not_signed_in(text: str) -> bool:
+    return _NOT_SIGNED_IN_MARKER in text.lower()
 
 
 def _is_safe_repo_relative_path(value: object) -> bool:
@@ -720,7 +736,15 @@ def run_lane(
                     elif task_state == terminal_state.REFUSED:
                         stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
                     elif task_state == terminal_state.FAILED and exit_code != 0:
-                        stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
+                        # Issue #4005: the mounted-key-not-signed-in case gets its
+                        # own named reason instead of the generic exit-code one,
+                        # so a triager (or a future automated retry policy) can
+                        # tell "credential is wrong" apart from "the harness
+                        # crashed" without reading harness_output_tail.
+                        if _looks_not_signed_in(output_tail):
+                            stop_reason_raw = stop_reason_raw or "ollama_key_not_signed_in"
+                        else:
+                            stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
                     else:
                         stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
 

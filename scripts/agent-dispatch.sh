@@ -1104,7 +1104,7 @@ Commands:
   cleanup-stale-reviews                     Remove exited review containers that did not clean up
                                             their clone directory on exit.
   launch-investigator --sweep-dir <DIR> [--snapshot-dir <DIR>] [--bundle-dir <DIR>] --mode <plan|LANE_ID>
-                      [--lane-entrypoint <SCRIPT>] [--harness <ID>] [--model <ID>]
+                      [--lane-entrypoint <SCRIPT>] [--harness <ID>] [--model <ID>] [--ollama-key-dir <DIR>]
                                             Launch a read-only investigator container (Issue #3903)
                                             against an existing security-review sweep directory.
                                             Which directory --mode requires, and mounts at
@@ -1154,6 +1154,25 @@ Commands:
                                             (Issue #3933 retired the OS-keychain per-lane
                                             credential-name flag in full, with the three REST lanes
                                             that were its only callers).
+                                            --harness ollama mounts the `ollama signin` session
+                                            keypair, id_ed25519{,.pub}, read-only (Issue #3976). Its
+                                            directory is auto-detected (Issue #4005): when
+                                            ollama.service is a loaded systemd unit, the keypair the
+                                            daemon actually signs Cloud requests with lives under
+                                            THAT SERVICE ACCOUNT's home directory (resolved via
+                                            `getent passwd`), not the invoking user's $HOME -- `ollama
+                                            signin` run by hand writes to the human account's
+                                            ~/.ollama, which the daemon never reads. A loaded unit
+                                            with no explicit User= runs as root; `systemctl show -p
+                                            User --value` prints an EMPTY string for that case, not
+                                            "root", so empty is resolved to root, never treated as
+                                            "not service-managed". Falls back to
+                                            $HOME/.ollama when no systemd unit is found, or when
+                                            --ollama-key-dir names a directory explicitly (bypassing
+                                            detection for hosts it cannot cover -- a non-systemd
+                                            init, a renamed unit). Fails closed with
+                                            LAUNCH_FAILED:...:credential_unavailable naming the exact
+                                            directory it looked in when the keypair is not there.
   launch          <NUM>                     Launch agent container (issue mode)
   launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
@@ -2738,6 +2757,7 @@ PROMPT_EOF
     inv_lane_entrypoint=""
     inv_harness=""
     inv_model=""
+    inv_ollama_key_dir_flag=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --sweep-dir)       inv_sweep_dir="${2:?--sweep-dir requires a value}"; shift 2 ;;
@@ -2747,6 +2767,7 @@ PROMPT_EOF
         --lane-entrypoint) inv_lane_entrypoint="${2:?--lane-entrypoint requires a value}"; shift 2 ;;
         --harness)         inv_harness="${2:?--harness requires a value}"; shift 2 ;;
         --model)           inv_model="${2:?--model requires a value}"; shift 2 ;;
+        --ollama-key-dir)  inv_ollama_key_dir_flag="${2:?--ollama-key-dir requires a value}"; shift 2 ;;
         *) echo "Unknown flag for launch-investigator: $1"; exit 1 ;;
       esac
     done
@@ -3074,18 +3095,67 @@ PROMPT_EOF
           ;;
         ollama)
           # Ollama's own session credential (Issue #3976): the `ollama
-          # signin` keypair, `~/.ollama/id_ed25519{,.pub}` -- confirmed
-          # against the installed CLI (`ollama signin`, host verification
-          # while writing this story: `~/.ollama/config.json` holds no
-          # token; the local daemon signs Cloud requests with this keypair
-          # instead). Same existence-gated fail-closed shape as codex and
-          # opencode above: a host that has never run `ollama signin` fails
-          # the launch closed with credential_unavailable, which
-          # security-review.sh's _is_intentional_dispatch_skip already
-          # recognizes.
+          # signin` keypair, `id_ed25519{,.pub}` -- confirmed against the
+          # installed CLI (`ollama signin`, host verification while writing
+          # that story: `~/.ollama/config.json` holds no token; the local
+          # daemon signs Cloud requests with this keypair instead). Same
+          # existence-gated fail-closed shape as codex and opencode above: a
+          # host with no signed-in keypair fails the launch closed with
+          # credential_unavailable, which security-review.sh's
+          # _is_intentional_dispatch_skip already recognizes.
           #
-          # The two key files are mounted individually, never the
-          # ~/.ollama directory itself: `ollama serve` (started by
+          # WHICH DIRECTORY (Issue #4005): on a host where Ollama runs as a
+          # systemd service (`User=ollama`, the shape the upstream install
+          # script sets up), `ollama signin` and `ollama run <model>:cloud`
+          # invoked BY THE DAEMON go through that service account, whose
+          # keypair lives under ITS home directory -- never the invoking
+          # (human) admin's $HOME, a different account entirely. Mounting
+          # the human's ~/.ollama/id_ed25519 in that case presents a key
+          # that was never signed in: ollama.com answers 401 on
+          # /api/generate and the lane records `failed`, even though the
+          # host CLI works fine (confirmed end to end while writing #4005:
+          # the public key the container presented, read off the `ollama
+          # signin` connect URL, matched the human's ~/.ollama/id_ed25519.pub
+          # exactly -- not the daemon's).
+          #
+          # Detection: a loaded ollama.service systemd unit means
+          # service-managed; `getent passwd` resolves that unit's User= to
+          # an actual home directory rather than assuming any single path
+          # (`/usr/share/ollama` is the common installer default, not a
+          # guarantee). `systemctl show -p User --value` prints an EMPTY
+          # STRING, not "root", for a loaded unit with no explicit User= --
+          # systemd still runs that unit as root, so empty is resolved to
+          # "root" here, never read as "not service-managed" (the gap a
+          # closed prior attempt at this story, PR #4024, left open: it fell
+          # through to $HOME/.ollama for exactly this shape and silently
+          # reproduced the wrong-key bug this story exists to fix).
+          # `LoadState` is checked first so "no such unit at all" (a
+          # non-systemd host, or Ollama not installed as a service) falls
+          # back to $HOME/.ollama rather than being misread the same way.
+          #
+          # --ollama-key-dir bypasses detection entirely for a host shape it
+          # cannot cover (a non-systemd init, a renamed unit, a containerized
+          # daemon) -- an operator names the correct directory directly.
+          inv_ollama_key_dir="${HOME}/.ollama"
+          inv_ollama_key_source="the invoking user's home directory"
+          if [[ -n "$inv_ollama_key_dir_flag" ]]; then
+            inv_ollama_key_dir="$inv_ollama_key_dir_flag"
+            inv_ollama_key_source="--ollama-key-dir"
+          elif command -v systemctl >/dev/null 2>&1 && command -v getent >/dev/null 2>&1; then
+            inv_ollama_unit_load_state=$(systemctl show -p LoadState --value ollama.service 2>/dev/null || true)
+            if [[ "$inv_ollama_unit_load_state" == "loaded" ]]; then
+              inv_ollama_unit_user=$(systemctl show -p User --value ollama.service 2>/dev/null || true)
+              [[ -z "$inv_ollama_unit_user" ]] && inv_ollama_unit_user="root"
+              inv_ollama_unit_home=$(getent passwd "$inv_ollama_unit_user" 2>/dev/null | cut -d: -f6 || true)
+              if [[ -n "$inv_ollama_unit_home" ]]; then
+                inv_ollama_key_dir="${inv_ollama_unit_home}/.ollama"
+                inv_ollama_key_source="the ollama.service systemd unit's account (${inv_ollama_unit_user})"
+              fi
+            fi
+          fi
+
+          # The two key files are mounted individually, never the key
+          # directory itself: `ollama serve` (started by
           # investigator-entrypoint.sh once inside the container) writes
           # other daemon state (models dir, config.json, history) into that
           # same directory, and a directory bind mount from the host would
@@ -3096,13 +3166,13 @@ PROMPT_EOF
           # failing, so an absent id_ed25519.pub alone would silently mount a
           # directory at the path the daemon expects a file, rather than
           # failing closed the same way a missing private key does.
-          if [[ ! -f "${HOME}/.ollama/id_ed25519" || ! -f "${HOME}/.ollama/id_ed25519.pub" ]]; then
-            echo "LAUNCH_FAILED:${container_name}:credential_unavailable:no ollama session found at ${HOME}/.ollama/id_ed25519{,.pub} -- run 'ollama signin' on the host"
+          if [[ ! -f "${inv_ollama_key_dir}/id_ed25519" || ! -f "${inv_ollama_key_dir}/id_ed25519.pub" ]]; then
+            echo "LAUNCH_FAILED:${container_name}:credential_unavailable:ollama key not signed in -- no session keypair at ${inv_ollama_key_dir}/id_ed25519{,.pub} (looked in ${inv_ollama_key_source}); run 'ollama signin' as that account, or pass --ollama-key-dir to point at the correct directory"
             exit 1
           fi
           inv_harness_creds_mount=(
-            -v "${HOME}/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
-            -v "${HOME}/.ollama/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro"
+            -v "${inv_ollama_key_dir}/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+            -v "${inv_ollama_key_dir}/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro"
           )
           ;;
       esac

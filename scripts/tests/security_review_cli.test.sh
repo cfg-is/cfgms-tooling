@@ -577,6 +577,26 @@ echo "fake-container-id-${mode}-$RANDOM-$$"
 STUB
 chmod +x "${FAKEBIN}/docker"
 
+# Stub systemctl (Issue #4005 test hygiene): agent-dispatch.sh's ollama
+# credential-mount case below asserts a fixed fallback mount path
+# ($HOME/.ollama, this file's own fixture), which is only true when no
+# ollama.service systemd unit is detected on the HOST running this suite.
+# Left unstubbed, `command -v systemctl` finds the real binary whenever one
+# exists on PATH, and a host that actually has Ollama installed as a systemd
+# service (the exact shape #4005 fixes) makes the real detection logic
+# resolve a completely different account's home directory, breaking this
+# fixed-path assertion non-deterministically depending on the machine the
+# suite runs on. Always reporting "not loaded" pins this file to the
+# fallback path deliberately, since this file tests roster dispatch/mount
+# plumbing, not systemd detection itself -- that lives in its own dedicated
+# cases (service-managed mount, empty-User=-as-root, --ollama-key-dir
+# override) in investigator_launch.test.sh.
+cat > "${FAKEBIN}/systemctl" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "${FAKEBIN}/systemctl"
+
 # Global roster fixture (Issue #3933/#3934): every case below dispatches
 # through CFGMS_SECURITY_REVIEW_LANES by default -- three "claude" lanes
 # differing only by model, standing in for where
