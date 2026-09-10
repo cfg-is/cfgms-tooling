@@ -61,8 +61,12 @@ must never be relied on to source its own identity -- and validates each
 step against `schema.validate_plan_step()` plus the bounded-scope rule (a
 step's `scope` must resolve to exactly one top-level subtree; every path
 resolving inside the repository tree is a valid subtree unless explicitly
-excluded -- a denylist, not the old four-name allowlist). A step that fails
-either check is *excluded*: its file is removed and the reason recorded,
+excluded -- a denylist, not the old four-name allowlist; a file with no
+directory component at all, i.e. one that sits directly in the repository
+root, is its own subtree too, shared by every other such file -- Issue
+#4011 -- so a step grouping `Makefile`, `go.mod`, and `.gitleaks.toml`
+together is valid, not a span across three singleton subtrees). A step that
+fails either check is *excluded*: its file is removed and the reason recorded,
 while every other, independently valid step file is left in place. Only when
 *zero* steps remain valid does `finalize()` remove nothing further (there is
 nothing left to remove) and write a `plan/PLANNING_FAILED` marker -- an empty
@@ -461,12 +465,7 @@ this inventory into bounded review steps, not to review any code yourself.
 Partition the file inventory above into review steps. Each step names ONE bounded scope that a
 later review pass will read in full. Default to one step per top-level package directory (group
 paths that share the same directory); you may combine multiple small packages into one step, or
-split a large directory into more than one step, but every path in a single step's scope MUST
-resolve to the same top-level subtree -- never a scope that spans two different top-level
-directories, and never a scope that spans two different second-level directories under the same
-top-level one. This applies to any real, reviewable subtree in the repository (for example
-`pkg/`, `features/`, `cmd/`, `web/src/`, `internal/`, `api/proto/`) -- not just the four named as
-examples here.
+split a large directory into more than one step, but {BOUNDED_SCOPE_RULE}
 
 For each step, propose one or more concrete hypotheses about what a later review pass should
 investigate in that scope. A hypothesis is a specific, falsifiable claim about a security
@@ -799,8 +798,50 @@ def _scope_paths(scope: object) -> list[str] | None:
 # plumbing, never reviewable application source.
 EXCLUDED_TOP_LEVEL_DIRS = frozenset({".git"})
 
+# The boundary `_scope_boundary()` returns for a path with no directory
+# component at all that is KNOWN to be a file sitting directly in the
+# repository root, such as `Makefile`, `go.mod`, or `.gitleaks.toml` (Issue
+# #4011). Every such file shares this one sentinel rather than each being its
+# own singleton boundary, which is what made a step grouping two or more root
+# files always fail the "spans more than one top-level subtree" check: with no
+# directory component to key on, the old code returned the bare filename
+# itself as the boundary, so `Makefile` and `go.mod` were as distinct as
+# `pkg/` and `cmd/` are. Chosen to be unmistakably not a real repository path
+# (no real top-level entry ever collides with it), so it can never coincide
+# with an actual `<top>/<name>` boundary computed below.
+#
+# "Known to be a file" is load-bearing and is decided against the harness-
+# written bundle inventory, never against the shape of the string alone: a
+# bare `pkg` is also a single-segment path, and collapsing it to this sentinel
+# too would make `["pkg", "cmd", "features", "web", "internal"]` a single
+# bounded scope -- the whole repository in one step, which is precisely the
+# unbounded-scope collapse `validate_step()` exists to prevent.
+REPO_ROOT_BOUNDARY = "(repository root)"
 
-def _scope_boundary(path: str) -> str | None:
+# The bounded-scope rule, in prose, quoted VERBATIM into both `build_prompt()`
+# (what the planner model is told) and `validate_step()`'s rejection message
+# (what a human or a later planning pass is told when a proposal is
+# rejected) -- Issue #4011's "one source" requirement. Before this, the
+# prompt's own paraphrase of the rule and `finalize()`'s enforcement of it
+# could drift independently, which is exactly how the prompt ended up telling
+# the model nothing about repository-root files while the validator rejected
+# any step that grouped them.
+BOUNDED_SCOPE_RULE = (
+    "every path in a single step's scope must resolve to the same top-level subtree -- never a "
+    "scope that spans two different top-level directories, and never a scope that spans two "
+    "different second-level directories under the same top-level one. This applies to any real, "
+    "reviewable subtree in the repository (for example `pkg/`, `features/`, `cmd/`, `web/src/`, "
+    "`internal/`, `api/proto/`) -- not just the ones named here. `web/src/` in particular keeps "
+    "the second-level split deliberately: it fans out into many independently large, unrelated "
+    "areas (components, pages, hooks, ...), so `web/src/components` and `web/src/pages` are "
+    "different subtrees, not one. A file with no directory component at all -- one that sits "
+    "directly in the repository root, such as `Makefile`, `go.mod`, or `.gitleaks.toml` -- is the "
+    "one exception: every such file belongs to a single shared repository-root subtree, so any "
+    "number of root-level files may be grouped into one step."
+)
+
+
+def _scope_boundary(path: str, root_files: "frozenset[str] | None" = None) -> str | None:
     """The bounded top-level unit `path` belongs to, or `None` if `path` is
     excluded outright.
 
@@ -818,7 +859,43 @@ def _scope_boundary(path: str) -> str | None:
     The boundary itself is still computed the same way it always was: the
     top-level directory plus its immediate child (`<top>/<name>`), with
     `web/src/<name>` kept as a three-segment special case since `web/src/` is
-    itself the meaningful top-level unit for that tree.
+    itself the meaningful top-level unit for that tree -- see
+    `BOUNDED_SCOPE_RULE` for why that case is kept deliberately rather than
+    relaxed alongside the repository-root case below.
+
+    A path with no directory component at all -- a single path segment -- is
+    handled per Issue #4011, but only for the case that issue was about: a
+    FILE that lives directly in the repository root, such as `Makefile` or
+    `go.mod`. Before #4011, each such file returned itself as a singleton
+    boundary (`_scope_boundary("Makefile") == "Makefile"`), so no two root
+    files could ever share a step: a proposal grouping them always "spanned
+    more than one top-level subtree" even though there is exactly one
+    repository root. Such a file now resolves to the shared
+    `REPO_ROOT_BOUNDARY` sentinel instead, matching `BOUNDED_SCOPE_RULE`'s
+    text exactly.
+
+    `root_files` is what makes that a file-only relaxation rather than a
+    string-shape one, and it is REQUIRED for the sentinel to ever be returned:
+    it is the set of single-segment paths the harness's own bundle inventory
+    lists as repository-root files (`_repository_root_files()`, read from
+    `01-tree.tsv`, which is a git blob listing and so contains files only).
+    A single-segment path that is not in that set -- a top-level DIRECTORY
+    like `pkg`, `cmd`, `features`, `web` or `internal`, a path the inventory
+    does not know, or any path at all when no inventory could be read -- keeps
+    returning itself as its own boundary, exactly as it did before #4011.
+
+    That distinction is the control, not a detail. `scope` legitimately
+    accepts a directory path (`build_prompt()` tells the planning model so),
+    and treating every single-segment path as the shared repository-root
+    boundary let one step claim `["pkg", "cmd", "features", "web",
+    "internal"]` -- five distinct subtrees collapsing to one boundary and
+    validating clean, i.e. the entire repository in a single step. The bounded
+    scope a later pass can read in full is the property `validate_step()`
+    exists to hold, and the G-2/G-3 coverage gates do not substitute for it:
+    a single mega-step listing every file satisfies both. Falling back to the
+    singleton boundary when the inventory is unavailable fails closed -- the
+    worst outcome is that a step grouping several genuine root files is
+    rejected as spanning, never that an unbounded one is accepted.
     """
     if not path or os.path.isabs(path):
         return None
@@ -833,10 +910,47 @@ def _scope_boundary(path: str) -> str | None:
         return f"web/src/{parts[2]}"
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
+    if root_files is not None and normalized in root_files:
+        return REPO_ROOT_BOUNDARY
     return parts[0]
 
 
-def validate_step(data: object, filename: str) -> list[str]:
+def _repository_root_files(sweep_dir: str) -> "frozenset[str]":
+    """The repository-root FILES the sweep's own bundle inventory lists --
+    every path in `<sweep_dir>/bundle/01-tree.tsv` with no directory component
+    (Issue #4011 / #3985's finding).
+
+    This is the authority `_scope_boundary()` uses to tell a root file
+    (`Makefile`, `go.mod`) from a top-level directory (`pkg`, `cmd`): both are
+    single-segment strings, and only the inventory can distinguish them. It is
+    harness-written data, never the model's own bytes -- `01-tree.tsv` comes
+    from `metadata.write_bundle()`'s `git ls-tree -r` listing, which enumerates
+    blobs, so a single-segment row is a root file by construction. Reading the
+    step's own `files` array instead would put the distinction back under the
+    control of the output being validated: a proposal could simply assert that
+    `pkg` is a file.
+
+    Returns an empty set -- never raises -- when the bundle is absent or
+    unreadable, which `_scope_boundary()` treats as "no path is a known root
+    file" and so fails closed. `finalize()` must not abort on a missing
+    bundle: it reports validation failures through its return value.
+    """
+    bundle_dir = os.path.join(sweep_dir, BUNDLE_SUBDIR)
+    try:
+        paths = _read_bundle_tree_paths(bundle_dir)
+    except PlannerError as exc:
+        schema.log_event(
+            "bundle_root_file_inventory_unavailable",
+            sweep_dir=sweep_dir,
+            reason=str(exc),
+        )
+        return frozenset()
+    return frozenset(p for p in paths if os.sep not in p and "/" not in p)
+
+
+def validate_step(
+    data: object, filename: str, root_files: "frozenset[str] | None" = None
+) -> list[str]:
     """Return validation errors for one parsed `step-NNN.json` payload; empty
     means valid. Never raises -- a caller checks `errors == []`.
 
@@ -844,7 +958,16 @@ def validate_step(data: object, filename: str) -> list[str]:
     shared `schema.validate_plan_step()` -- the one place this shape is
     defined, per C1. This function layers on the two checks that only make
     sense with the file name in hand: `step_id` must match the file it lives
-    in, and `scope` must resolve to exactly one bounded top-level subtree.
+    in, and `scope` must resolve to exactly one bounded top-level subtree
+    (`_scope_boundary()`, enforcing `BOUNDED_SCOPE_RULE` -- the same text
+    `build_prompt()` gives the planning model, so the instruction and its
+    enforcement cannot drift apart).
+
+    `root_files` is the sweep's repository-root file inventory
+    (`_repository_root_files()`), passed straight through to
+    `_scope_boundary()`; omitting it means no single-segment path is treated
+    as a repository-root file, which rejects more than it accepts and never
+    the reverse. `finalize()` and `finalize_multi_planner()` always supply it.
     """
     if not isinstance(data, dict):
         return [f"{filename}: step must be a JSON object"]
@@ -862,7 +985,7 @@ def validate_step(data: object, filename: str) -> list[str]:
     if "scope" in data:
         paths = _scope_paths(data["scope"])
         if paths is not None:
-            boundaries = {_scope_boundary(p) for p in paths}
+            boundaries = {_scope_boundary(p, root_files) for p in paths}
             if None in boundaries:
                 errors.append(
                     f"{filename}: scope contains a path that is excluded or invalid "
@@ -870,8 +993,8 @@ def validate_step(data: object, filename: str) -> list[str]:
                 )
             elif len(boundaries) > 1:
                 errors.append(
-                    f"{filename}: scope spans more than one top-level subtree: "
-                    f"{sorted(boundaries)}"
+                    f"{filename}: scope spans more than one top-level subtree "
+                    f"({sorted(boundaries)}): {BOUNDED_SCOPE_RULE}"
                 )
 
     return errors
@@ -1244,6 +1367,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     plan_dir = os.path.join(sweep_dir, "plan")
     filenames = _discover_step_files(plan_dir)
     context = _read_sweep_context(sweep_dir)
+    root_files = _repository_root_files(sweep_dir)
 
     errors: list[str] = []
     excluded: list[str] = []
@@ -1298,7 +1422,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
             data["planners"] = [PLANNER_ID]
             _inject_hypothesis_provenance(data, PLANNER_ID)
 
-        step_errors = validate_step(data, filename)
+        step_errors = validate_step(data, filename, root_files)
         if step_errors:
             schema.log_event("invalid_plan_step", filename=filename, errors=step_errors)
             errors.extend(step_errors)
@@ -1437,6 +1561,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     atomic_write.write_json_atomic(os.path.join(sweep_dir, RESOLVED_MODELS_FILENAME), resolved_models)
 
     context = _read_sweep_context(sweep_dir)
+    root_files = _repository_root_files(sweep_dir)
 
     errors: list[str] = []
 
@@ -1472,7 +1597,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
                 data["planners"] = [lane.lane_dir_name]
                 _inject_hypothesis_provenance(data, lane.lane_dir_name)
 
-            step_errors = validate_step(data, filename)
+            step_errors = validate_step(data, filename, root_files)
             if step_errors:
                 schema.log_event("invalid_plan_step", filename=label, errors=step_errors)
                 errors.extend(f"{lane.lane_dir_name}/{e}" for e in step_errors)
@@ -1498,7 +1623,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     written_steps: list[dict] = []
     for step in merged:
         step_filename = f"{step['step_id']}.json"
-        step_errors = validate_step(step, step_filename)
+        step_errors = validate_step(step, step_filename, root_files)
         if step_errors:
             # Unreachable in practice: every candidate already validated
             # individually, and merging only unions `files`/`planners`

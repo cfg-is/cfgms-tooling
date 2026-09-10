@@ -472,6 +472,173 @@ def test_validate_step_accepts_web_src_single_subtree():
     check(errors == [], "validate_step: a scope confined to one web/src/ subtree is valid", str(errors))
 
 
+def test_validate_step_rejects_scope_spanning_pkg_and_cmd():
+    step = valid_step("step-001", ["pkg/storage/interfaces/store.go", "cmd/steward/main.go"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(len(errors) == 1 and "spans more than one" in errors[0], "validate_step: rejects a scope spanning pkg/ and cmd/", str(errors))
+
+
+def test_validate_step_rejects_scope_spanning_two_web_src_second_level_dirs():
+    # REQUIRED TEST (Issue #4011 / #3985's finding): the second-level split
+    # under web/src/ stays a rejection -- only the repository-root case below
+    # is being relaxed. `web/src/components` and `web/src/pages` are
+    # different second-level directories under the same top-level `web/src/`.
+    step = valid_step("step-001", ["web/src/components/Button.tsx", "web/src/pages/Home.tsx"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(len(errors) == 1 and "spans more than one" in errors[0], "validate_step: still rejects a scope spanning two different web/src/ second-level dirs", str(errors))
+
+
+def test_scope_boundary_repository_root_files_share_one_boundary():
+    # Issue #4011: a file with no directory component used to be its own
+    # singleton boundary (_scope_boundary("Makefile") == "Makefile"), so no
+    # two root files could ever share a step. Every root file known to the
+    # bundle inventory must now resolve to the same shared boundary.
+    root_files = ["Makefile", "go.mod", "Dockerfile.test-runner", ".gitleaks.toml", ".mcp.json"]
+    inventory = frozenset(root_files)
+    boundaries = {planner._scope_boundary(p, inventory) for p in root_files}
+    check(len(boundaries) == 1, "_scope_boundary: every repository-root file resolves to one shared boundary", str(boundaries))
+    check(
+        planner._scope_boundary("Makefile", inventory) != planner._scope_boundary("pkg/example/thing.go", inventory),
+        "_scope_boundary: the repository-root boundary is distinct from a real pkg/ subtree",
+    )
+
+
+def test_scope_boundary_single_segment_directory_is_its_own_boundary():
+    # REQUIRED TEST (#3985's HIGH finding on #4011): `pkg` and `Makefile` are
+    # both single-segment strings, and #4011's first cut collapsed BOTH to the
+    # shared repository-root sentinel -- so a scope of ["pkg", "cmd", ...]
+    # became one boundary and validated clean. A top-level directory must keep
+    # returning itself as its own boundary, whether or not an inventory is
+    # supplied, since the inventory lists files only.
+    inventory = frozenset({"Makefile", "go.mod"})
+    for directory in ("pkg", "cmd", "features", "web", "internal"):
+        check(
+            planner._scope_boundary(directory, inventory) == directory,
+            f"_scope_boundary: top-level directory {directory!r} is its own boundary, not the repo-root sentinel",
+            str(planner._scope_boundary(directory, inventory)),
+        )
+    check(
+        planner._scope_boundary("pkg", inventory) != planner._scope_boundary("cmd", inventory),
+        "_scope_boundary: two different top-level directories are two different boundaries",
+    )
+
+
+def test_scope_boundary_without_an_inventory_never_returns_the_root_sentinel():
+    # Fail closed: with no bundle inventory to consult, nothing is known to be
+    # a repository-root file, so no single-segment path may claim the shared
+    # boundary. Rejecting a legitimate root-file grouping is the acceptable
+    # direction; accepting an unbounded scope is not.
+    for path in ("Makefile", "go.mod", "pkg"):
+        check(
+            planner._scope_boundary(path) == path,
+            f"_scope_boundary: {path!r} with no inventory is its own boundary",
+            str(planner._scope_boundary(path)),
+        )
+
+
+def test_validate_step_rejects_a_scope_claiming_every_top_level_directory():
+    # REQUIRED TEST (#3985's HIGH finding): the unbounded-scope collapse.
+    # A single step naming five top-level directories must be rejected as
+    # spanning more than one subtree -- one bounded scope a later pass can
+    # read in full is the property this validator exists to hold, and the
+    # G-2/G-3 coverage gates do not compensate for losing it.
+    step = valid_step("step-001", ["pkg", "cmd", "features", "web", "internal"])
+    for inventory in (None, frozenset({"Makefile", "go.mod"})):
+        errors = planner.validate_step(step, "step-001.json", inventory)
+        check(
+            len(errors) == 1 and "spans more than one" in errors[0],
+            f"validate_step: rejects a scope claiming every top-level directory (inventory={inventory is not None})",
+            str(errors),
+        )
+
+
+def test_validate_step_rejects_a_root_file_grouped_with_a_top_level_directory():
+    # A known root file and a top-level directory are two different
+    # boundaries, so grouping them is still a rejection.
+    step = valid_step("step-001", ["Makefile", "pkg"], files=["Makefile"])
+    errors = planner.validate_step(step, "step-001.json", frozenset({"Makefile", "go.mod"}))
+    check(
+        len(errors) == 1 and "spans more than one" in errors[0],
+        "validate_step: rejects a root file grouped with a top-level directory",
+        str(errors),
+    )
+
+
+def test_repository_root_files_reads_only_root_level_paths_from_the_bundle():
+    # The inventory is harness-written data (`01-tree.tsv`, a git blob
+    # listing), never the step's own `files` array: a proposal cannot assert
+    # that `pkg` is a file.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        _write_tree_tsv(
+            os.path.join(sweep_dir, planner.BUNDLE_SUBDIR),
+            [
+                ("Makefile", "none", "10", "abcdef123456", "build"),
+                ("go.mod", "none", "5", "abcdef123457", "build"),
+                ("pkg/widget/widget.go", "go", "20", "abcdef123458", "business"),
+            ],
+        )
+        root_files = planner._repository_root_files(sweep_dir)
+    check(
+        root_files == frozenset({"Makefile", "go.mod"}),
+        "_repository_root_files: returns exactly the single-segment bundle paths",
+        str(root_files),
+    )
+
+
+def test_repository_root_files_is_empty_when_the_bundle_is_missing():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        root_files = planner._repository_root_files(sweep_dir)
+    check(
+        root_files == frozenset(),
+        "_repository_root_files: a missing bundle yields an empty inventory rather than raising",
+        str(root_files),
+    )
+
+
+def test_validate_step_accepts_a_step_grouping_only_repository_root_files():
+    # AC1: a step whose files are all repository-root files passes
+    # finalize()/validate_step() -- this was Issue #4011's core defect: the
+    # 25 root files from #3985's sweep (Makefile, go.mod,
+    # Dockerfile.test-runner, .gitleaks.toml, .gosec.json, .trivyignore,
+    # .mcp.json, .pre-commit-config.yaml, among others) could never share one
+    # step.
+    root_files = [
+        "Makefile",
+        "go.mod",
+        "go.sum",
+        "Dockerfile.test-runner",
+        ".gitleaks.toml",
+        ".gosec.json",
+        ".trivyignore",
+        ".mcp.json",
+        ".pre-commit-config.yaml",
+    ]
+    step = valid_step("step-001", root_files, files=root_files)
+    errors = planner.validate_step(step, "step-001.json", frozenset(root_files))
+    check(errors == [], "validate_step: a scope grouping only repository-root files is valid", str(errors))
+
+
+def test_validate_step_root_file_scope_error_and_prompt_share_the_same_rule_text():
+    # AC2: the prompt rule and the validator rule are the same text-derived
+    # rule (one source), so they cannot drift again. Assert the exact same
+    # BOUNDED_SCOPE_RULE string appears verbatim in both the rejection
+    # message for a spanning scope and the planner prompt.
+    step = valid_step("step-001", ["pkg/storage/interfaces/store.go", "cmd/steward/main.go"])
+    errors = planner.validate_step(step, "step-001.json")
+    check(
+        len(errors) == 1 and planner.BOUNDED_SCOPE_RULE in errors[0],
+        "validate_step: rejection message quotes BOUNDED_SCOPE_RULE verbatim",
+        str(errors),
+    )
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
+        prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
+    check(
+        planner.BOUNDED_SCOPE_RULE in prompt,
+        "build_prompt: the prompt quotes the exact same BOUNDED_SCOPE_RULE text used by validate_step",
+    )
+
+
 def test_validate_step_accepts_scope_previously_outside_the_allowlist():
     # The bounded-scope rule is a DENYLIST now, not a four-name allowlist: a
     # path that isn't pkg/features/cmd/web-src is still a valid scope as long
@@ -587,6 +754,73 @@ def test_finalize_accepts_a_fully_valid_plan():
         check(errors == [], "finalize: no errors for a valid plan")
         check(os.path.isfile(os.path.join(plan_dir, "step-001.json")), "finalize: valid step files are left in place")
         check(not os.path.exists(os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)), "finalize: no failure marker is written on success")
+
+
+def test_finalize_rejects_a_step_claiming_every_top_level_directory():
+    # REQUIRED TEST (#3985's HIGH finding, end to end): finalize() runs
+    # validate_step() AFTER field injection, so a step whose scope names every
+    # top-level directory must be excluded there -- not merely by the
+    # standalone validator -- and must not reach a lane.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(
+            os.path.join(sweep_dir, planner.BUNDLE_SUBDIR),
+            [
+                ("Makefile", "none", "10", "abcdef123456", "build"),
+                ("go.mod", "none", "5", "abcdef123457", "build"),
+                ("pkg/foo/bar.go", "go", "20", "abcdef123458", "business"),
+            ],
+        )
+        mega = valid_step(
+            "step-001",
+            ["pkg", "cmd", "features", "web", "internal"],
+            files=["pkg/foo/bar.go"],
+        )
+        write_step(plan_dir, "step-001.json", mega)
+        write_step(plan_dir, "step-002.json", valid_step("step-002", ["pkg/foo/bar.go"]))
+
+        ok, errors = planner.finalize(sweep_dir)
+
+        check(ok is True, "finalize: the independently valid step still survives")
+        check(
+            not os.path.exists(os.path.join(plan_dir, "step-001.json")),
+            "finalize: a step claiming every top-level directory is removed",
+        )
+        check(
+            any("spans more than one" in e for e in errors),
+            "finalize: reports the unbounded scope as spanning more than one subtree",
+            str(errors),
+        )
+
+
+def test_finalize_accepts_a_root_file_step_using_the_bundle_inventory():
+    # The #4011 relaxation still works where it was meant to: with the sweep's
+    # own bundle listing Makefile/go.mod as root files, a step grouping them
+    # validates and is written back to disk.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(
+            os.path.join(sweep_dir, planner.BUNDLE_SUBDIR),
+            [
+                ("Makefile", "none", "10", "abcdef123456", "build"),
+                ("go.mod", "none", "5", "abcdef123457", "build"),
+            ],
+        )
+        root_files = ["Makefile", "go.mod"]
+        write_step(plan_dir, "step-001.json", valid_step("step-001", root_files, files=root_files))
+
+        ok, errors = planner.finalize(sweep_dir)
+
+        check(ok is True, "finalize: a step grouping bundle-listed root files is accepted", str(errors))
+        check(errors == [], "finalize: no errors for a root-file step", str(errors))
+        check(
+            os.path.isfile(os.path.join(plan_dir, "step-001.json")),
+            "finalize: the root-file step is left on disk",
+        )
 
 
 def test_finalize_fails_closed_on_zero_steps():
@@ -1110,6 +1344,15 @@ def test_finalize_invalid_step_logs_single_safe_record():
         plan_dir = os.path.join(sweep_dir, "plan")
         os.makedirs(plan_dir)
         write_context(sweep_dir)
+        # A real sweep always has the bundle `prepare()` wrote, and
+        # `finalize()` reads its repository-root file inventory before
+        # validating (Issue #4011 / #3985's finding). Writing it here keeps
+        # this test's subject the one invalid-step record, rather than that
+        # record plus a bundle-unavailable diagnostic.
+        _write_tree_tsv(
+            os.path.join(sweep_dir, planner.BUNDLE_SUBDIR),
+            [("features/other/thing.go", "go", "10", "abcdef123456", "business")],
+        )
         write_step(plan_dir, "step-001.json", valid_step("step-001", [forged, "features/other/thing.go"]))
 
         buf = io.StringIO()
