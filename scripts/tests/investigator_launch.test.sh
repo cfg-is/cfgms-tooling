@@ -487,6 +487,17 @@ check_not_contains "--harness codex never mounts the Claude credential file" "$c
 check_not_contains "--harness codex launch has no GH_TOKEN" "$codex_run_call" "GH_TOKEN"
 
 echo ""
+echo "== REQUIRED TEST — the image pre-creates /home/agent/.codex as agent-owned,"
+echo "   mirroring .claude/.ollama, so the auth.json bind mount above lands in an"
+echo "   already-writable directory instead of a root:root one Docker would"
+echo "   create on demand (Issue #4004) =="
+dockerfile_src="$(cat "${REPO_ROOT}/.devcontainer/Dockerfile")"
+check_contains "Dockerfile creates /home/agent/.codex" "$dockerfile_src" \
+  "mkdir -p /home/agent/.codex"
+check_contains "Dockerfile chowns /home/agent/.codex to agent:agent" "$dockerfile_src" \
+  "chown agent:agent /home/agent/.codex"
+
+echo ""
 echo "== REQUIRED TEST — a codex lane with no ~/.codex/auth.json on the host fails"
 echo "   closed as a recorded, skippable credential_unavailable, and never mounts"
 echo "   a broken/nonexistent path (Issue #3935) =="

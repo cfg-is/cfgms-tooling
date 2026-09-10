@@ -226,14 +226,23 @@ RUN set -eu; \
     install -m 0755 /tmp/bin/ollama /usr/local/bin/ollama; \
     rm -rf "/tmp/${ARCHIVE}" /tmp/bin
 
-# Non-root agent user with sudo for iptables only
+# Non-root agent user with sudo for iptables only. The three harness credential
+# directories below (.claude/.ollama/.codex) are pre-created agent-owned so a
+# later `docker run -v <host-file>:<this-dir>/<file>:ro` (agent-dispatch.sh)
+# lands in an already-writable directory: Docker creates a missing bind-mount
+# parent as root:root 755, and each harness needs to write other state
+# (session/history files, not the mounted credential itself) alongside the
+# mount. Confirmed against codex 0.153.4, which fails every step closed with
+# "Permission denied (os error 13)" before any network call when ~/.codex is
+# root-owned (Issue #4004).
 RUN useradd -m -s /bin/bash agent \
     && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
     && mkdir -p /persist && chown agent:agent /persist \
     && mkdir -p /home/agent/.cache/go-build /home/agent/go/pkg/mod \
     && chown -R agent:agent /home/agent/.cache /home/agent/go \
     && mkdir -p /home/agent/.claude && chown agent:agent /home/agent/.claude \
-    && mkdir -p /home/agent/.ollama && chown agent:agent /home/agent/.ollama
+    && mkdir -p /home/agent/.ollama && chown agent:agent /home/agent/.ollama \
+    && mkdir -p /home/agent/.codex && chown agent:agent /home/agent/.codex
 
 # Pre-download Trivy vulnerability DB (avoids runtime download behind firewall)
 RUN trivy fs --download-db-only --cache-dir /home/agent/.cache/trivy 2>/dev/null || true
