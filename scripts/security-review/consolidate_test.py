@@ -2371,6 +2371,82 @@ def test_consolidate_issues_no_provider_call_and_dispatches_no_container():
         check("launch-investigator" not in source.replace("launch-investigator`", ""), "purity: consolidate.py never invokes launch-investigator")
 
 
+# --- Issue #4012: --path subtree scope filter --------------------------------
+
+def test_consolidate_reads_scope_paths_from_manifest():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "manifest.json"),
+            {"sweep_id": "s", "commit_sha": sha, "ref": "HEAD", "scope_paths": ["pkg/cert", "pkg/session"]},
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            report["scope_paths"] == ["pkg/cert", "pkg/session"],
+            "consolidate: report scope_paths is read from manifest.json",
+            str(report["scope_paths"]),
+        )
+
+
+def test_consolidate_scope_paths_is_none_without_a_manifest():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            report["scope_paths"] is None,
+            "consolidate: report scope_paths is None when manifest.json is absent (unscoped, or pre-#4012 sweep)",
+            str(report["scope_paths"]),
+        )
+
+
+def test_consolidate_scope_paths_is_none_when_manifest_omits_it():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(os.path.join(sweep, "manifest.json"), {"sweep_id": "s", "commit_sha": sha, "ref": "HEAD"})
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            report["scope_paths"] is None,
+            "consolidate: report scope_paths is None when manifest.json has no scope_paths field (unscoped)",
+            str(report["scope_paths"]),
+        )
+
+
+def test_render_markdown_states_bounded_scope_and_relative_coverage():
+    report = {
+        "sweep_id": "s", "lanes": [], "steps_discovered": [], "plan_failed": False,
+        "scope_paths": ["pkg/cert", "pkg/session"], "coverage": [], "scanner_coverage": [],
+        "dispatch": {"planners": [], "lanes": []}, "rejected_proposals": [], "coverage_gates": None,
+        "adjudication": {"status": "not_configured"}, "cross_step_groups": [], "findings": [],
+        "failed_step_tails": [],
+    }
+    md = consolidate.render_markdown(report)
+    check(
+        "**Scope:** bounded to `pkg/cert`, `pkg/session`" in md,
+        "render_markdown: the Coverage section names every scoped subtree",
+        md,
+    )
+    check(
+        "relative to this scope" in md,
+        "render_markdown: the report states coverage is relative to the scope, not the full repository",
+        md,
+    )
+
+
+def test_render_markdown_states_full_repository_when_unscoped():
+    report = {
+        "sweep_id": "s", "lanes": [], "steps_discovered": [], "plan_failed": False,
+        "scope_paths": None, "coverage": [], "scanner_coverage": [],
+        "dispatch": {"planners": [], "lanes": []}, "rejected_proposals": [], "coverage_gates": None,
+        "adjudication": {"status": "not_configured"}, "cross_step_groups": [], "findings": [],
+        "failed_step_tails": [],
+    }
+    md = consolidate.render_markdown(report)
+    check("**Scope:** full repository." in md, "render_markdown: an unscoped sweep states its scope is the full repository", md)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -165,6 +165,44 @@ def test_create_sweep_writes_manifest_with_required_fields():
         )
 
 
+def test_create_sweep_records_scope_paths_from_the_path_filter():
+    # Issue #4012: security-review.sh launch's --path arguments arrive here
+    # as create_sweep()'s `paths` tuple and must be recorded verbatim in
+    # manifest.json so `resume` can recover them without the operator
+    # re-passing --path.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
+        init_real_git_repo(repo)
+        env = {"CFGMS_SECURITY_REVIEW_BASE": base}
+        with mock.patch.dict(os.environ, env, clear=True):
+            sweep_dir = manifest.create_sweep(
+                "HEAD", lanes=TEST_LANES, repo_root=repo, paths=("pkg/cert", "pkg/session")
+            )
+
+        with open(os.path.join(sweep_dir, "manifest.json")) as f:
+            data = json.load(f)
+        check(
+            data.get("scope_paths") == ["pkg/cert", "pkg/session"],
+            "create_sweep: manifest.json scope_paths records the --path filter",
+            str(data.get("scope_paths")),
+        )
+
+
+def test_create_sweep_scope_paths_is_null_when_unscoped():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
+        init_real_git_repo(repo)
+        env = {"CFGMS_SECURITY_REVIEW_BASE": base}
+        with mock.patch.dict(os.environ, env, clear=True):
+            sweep_dir = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
+
+        with open(os.path.join(sweep_dir, "manifest.json")) as f:
+            data = json.load(f)
+        check(
+            data.get("scope_paths") is None,
+            "create_sweep: manifest.json scope_paths is null for an unscoped sweep",
+            str(data.get("scope_paths")),
+        )
+
+
 def test_create_sweep_creates_directory_skeleton():
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
         init_real_git_repo(repo)

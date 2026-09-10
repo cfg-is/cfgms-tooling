@@ -63,7 +63,7 @@ usage() {
 Usage: security-review.sh <command> [args...]
 
 Commands:
-  launch <ref> [--scope-file <path>]
+  launch <ref> [--scope-file <path>] [--path <subtree>]...
                        Resolve <ref>, create a new sweep tree AND its immutable snapshot,
                        verify the snapshot, write the auditable bundle and run the
                        bundle-based planner, dispatch every roster lane
@@ -72,12 +72,22 @@ Commands:
                        --scope-file names an operator-supplied prose description copied
                        verbatim into the bundle's 00-scope.md (metadata.write_bundle());
                        omit it to record scope_provided=false instead.
+                       --path (repeatable; Issue #4012) bounds the sweep to one or more
+                       repository-relative subtrees, e.g. "--path pkg/cert --path
+                       pkg/session": the bundle's 01-tree.tsv/03-routes.tsv, the planner
+                       prompt's file inventory, and the coverage denominator all narrow to
+                       those subtrees instead of the whole repository. Recorded in
+                       manifest.json's scope_paths so `resume` keeps it automatically. Omit
+                       for the previous, unscoped, full-repository behavior.
   resume <sweep-id> [--scope-file <path>]
                        Re-verify the sweep's snapshot, re-invoke the planner against an
                        existing sweep (a no-op if plan/ is already populated) and
                        re-dispatch every roster lane -- each lane's own resume-scanner
                        integration ensures only its missing steps run again -- then
                        re-run the consolidator. --scope-file is the same flag as launch's.
+                       A sweep created with launch's --path keeps that scope automatically,
+                       read back from manifest.json -- there is no --path flag here, and
+                       none is needed.
   status <sweep-id>   Print the per-lane x per-step coverage breakdown, plus the G-2/G-3
                        plan coverage-gate result (Issue #3980), for an existing sweep.
                        Read-only: never re-runs the planner, a lane, or the consolidator.
@@ -129,16 +139,23 @@ resolve_base_dir() {
   python3 "${SECURITY_REVIEW_DIR}/basedir.py" --repo-root "$REPO_ROOT"
 }
 
-# create_sweep_tree <ref>
+# create_sweep_tree <ref> [<path> ...]
 # Prints "<sweep_dir><TAB><commit_sha>" on success. Resolves
 # CFGMS_SECURITY_REVIEW_LANES via roster.py (the only lane-dispatch path,
-# Issue #3933) into a lane_dir_name list and hands it to manifest.py's
-# create_sweep(), which resolves the base directory (fail-closed) before
-# creating anything -- a BaseDirError here means zero directories were
-# created, satisfying the "write no partial sweep tree" exit-code contract.
-# A missing or malformed CFGMS_SECURITY_REVIEW_LANES fails closed here too,
-# before any sweep directory exists -- there is no hardcoded lane set to
-# fall back to.
+# Issue #3933) into a lane_dir_name list and hands it, plus any trailing
+# <path> arguments (Issue #4012's --path subtree filter, zero or more), to
+# manifest.py's create_sweep(), which resolves the base directory
+# (fail-closed) before creating anything -- a BaseDirError here means zero
+# directories were created, satisfying the "write no partial sweep tree"
+# exit-code contract. A missing or malformed CFGMS_SECURITY_REVIEW_LANES
+# fails closed here too, before any sweep directory exists -- there is no
+# hardcoded lane set to fall back to.
+#
+# The <path> arguments are recorded verbatim in manifest.json's scope_paths
+# field by create_sweep() -- this function does not validate or normalize
+# them itself (metadata.write_bundle(), via planner.py prepare(), is the one
+# place that happens). Passing none at all means an unscoped, full-repository
+# sweep, unchanged from before this story.
 #
 # Immediately after manifest.create_sweep() succeeds, this also materializes
 # <sweep_dir>/snapshot/ via snapshot.create_snapshot() (Issue #3952, epic
@@ -152,7 +169,8 @@ resolve_base_dir() {
 # sweep id that already exists (same ref, same UTC minute) must not crash on
 # `create_snapshot()`'s "dest_dir already contains files" guard.
 create_sweep_tree() {
-  local ref="$1"
+  local ref="$1"; shift
+  local paths=("$@")
 
   if [[ -z "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then
     echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:claude-sonnet-5\") -- the roster is the only lane-dispatch path" >&2
@@ -167,19 +185,22 @@ create_sweep_tree() {
   local lane_dir_names
   lane_dir_names=$(printf '%s\n' "$roster_output" | cut -f3 | paste -sd, -)
 
-  python3 - "$SECURITY_REVIEW_DIR" "$REPO_ROOT" "$ref" "$lane_dir_names" <<'PYEOF'
+  python3 - "$SECURITY_REVIEW_DIR" "$REPO_ROOT" "$ref" "$lane_dir_names" "${paths[@]:-}" <<'PYEOF'
 import json
 import os
 import sys
 
 sec_dir, repo_root, ref, lane_dir_names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+paths = [p for p in sys.argv[5:] if p]
 sys.path.insert(0, sec_dir)
 import manifest  # noqa: E402
 import snapshot  # noqa: E402
 
 lanes = tuple(lane_dir_names.split(","))
 try:
-    sweep_dir = manifest.create_sweep(ref, lanes=lanes, repo_root=repo_root)
+    sweep_dir = manifest.create_sweep(
+        ref, lanes=lanes, repo_root=repo_root, paths=tuple(paths) if paths else None
+    )
 except Exception as exc:
     print(f"ERROR: {exc}", file=sys.stderr)
     sys.exit(1)
@@ -233,6 +254,29 @@ _is_intentional_dispatch_skip() {
 plan_already_populated() {
   local sweep_dir="$1"
   compgen -G "${sweep_dir}/plan/step-*.json" >/dev/null 2>&1
+}
+
+# read_scope_paths <sweep_dir>
+# Prints the sweep's own manifest.json `scope_paths` (Issue #4012), one path
+# per line, or nothing at all when the sweep is unscoped (`scope_paths` is
+# `null`, absent -- an older sweep predating this story -- or the manifest
+# cannot be read). This is how `cmd_resume` recovers the `--path` filter an
+# operator passed at `launch` time without asking them to pass it again: the
+# manifest, written once by create_sweep_tree() at sweep creation, is this
+# sweep's durable record of what it was bounded to.
+read_scope_paths() {
+  local sweep_dir="$1"
+  python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        m = json.load(f)
+except (OSError, ValueError):
+    sys.exit(0)
+for p in (m.get('scope_paths') or []):
+    if isinstance(p, str) and p:
+        print(p)
+" "${sweep_dir}/manifest.json"
 }
 
 # verify_snapshot <sweep_dir> <commit_sha>
@@ -479,7 +523,7 @@ atomic_write.write_json_atomic(
 PYEOF
 }
 
-# dispatch_planner <sweep_dir> <commit_sha> [<scope_file>]
+# dispatch_planner <sweep_dir> <commit_sha> [<scope_file>] [<path> ...]
 # prepare() -> verify_bundle() -> launch() -> wait for the container to exit
 # -> finalize(). A `prepare` failure is logged and treated as non-fatal to
 # the overall launch/resume: a broken plan leaves the lanes nothing to do
@@ -492,6 +536,13 @@ PYEOF
 # Omitted (the common case) means `prepare()` calls `write_bundle()` with
 # `no_scope=True`, recording the omission in `MANIFEST.json` rather than
 # leaving it to be inferred from a missing file.
+#
+# Every trailing <path> argument (Issue #4012) is forwarded to `planner.py
+# prepare` as its own `--path <path>` -- the operator's subtree filter,
+# already resolved by the caller (cmd_launch from its own `--path` flags,
+# cmd_resume from the sweep's own manifest.json `scope_paths`, never
+# re-derived here). Zero <path> arguments means an unscoped, full-repository
+# bundle, unchanged from before this story.
 #
 # A `launch` failure is different (Issue #3930): `launch` is the one step
 # that actually calls `agent-dispatch.sh launch-investigator`, so its
@@ -510,9 +561,15 @@ PYEOF
 # `launch_failed`, so the caller does not report the sweep as clean either.
 dispatch_planner() {
   local sweep_dir="$1" commit_sha="$2" scope_file="${3:-}"
+  shift $(( $# >= 3 ? 3 : $# ))
+  local scope_paths=("$@")
 
   local prepare_args=(prepare "$sweep_dir" "$commit_sha" --repo-root "$REPO_ROOT")
   [[ -n "$scope_file" ]] && prepare_args+=(--scope-file "$scope_file")
+  local p
+  for p in "${scope_paths[@]:-}"; do
+    [[ -n "$p" ]] && prepare_args+=(--path "$p")
+  done
 
   local prepare_output
   if ! prepare_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" "${prepare_args[@]}" 2>&1); then
@@ -856,15 +913,17 @@ cmd_launch() {
   fi
   local ref="$1"; shift
   local scope_file=""
+  local scope_paths=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scope-file) scope_file="${2:?--scope-file requires a value}"; shift 2 ;;
+      --path) scope_paths+=("${2:?--path requires a value}"); shift 2 ;;
       *) echo "ERROR: unknown launch argument: $1" >&2; exit 1 ;;
     esac
   done
   local result sweep_dir commit_sha
 
-  if ! result=$(create_sweep_tree "$ref"); then
+  if ! result=$(create_sweep_tree "$ref" "${scope_paths[@]:-}"); then
     exit 1
   fi
   sweep_dir="$(printf '%s' "$result" | cut -f1)"
@@ -880,7 +939,7 @@ cmd_launch() {
   fi
 
   local dispatch_failed=0
-  dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" || dispatch_failed=1
+  dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" "${scope_paths[@]:-}" || dispatch_failed=1
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
   dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 
@@ -938,11 +997,18 @@ cmd_resume() {
     exit 1
   fi
 
+  # Recovered from the manifest, never re-passed on the command line (Issue
+  # #4012, AC3): a scoped sweep keeps its scope across `resume` calls.
+  local scope_paths=()
+  while IFS= read -r scope_path; do
+    [[ -n "$scope_path" ]] && scope_paths+=("$scope_path")
+  done < <(read_scope_paths "$sweep_dir")
+
   local dispatch_failed=0
   if plan_already_populated "$sweep_dir"; then
     echo "plan/ already populated for ${sweep_id}; skipping planner re-dispatch" >&2
   else
-    dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" || dispatch_failed=1
+    dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" "${scope_paths[@]:-}" || dispatch_failed=1
   fi
 
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1

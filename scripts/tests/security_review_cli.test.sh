@@ -706,6 +706,55 @@ scope_provided_2="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_S
 check_eq "MANIFEST.json records scope_provided=True when --scope-file was passed" "$scope_provided_2" "True"
 
 echo ""
+echo "== REQUIRED TEST (Issue #4012) — launch --path bounds the bundle and the"
+echo "   planner prompt to the named subtree(s), and report/consolidated.md"
+echo "   states the scope (AC1, AC2) =="
+SUB_PATH="${SANDBOX}/case-path-scope"
+setup_sub_sandbox "$SUB_PATH"
+path_launch_out=$(run_cli "$SUB_PATH" launch HEAD --path pkg/example 2>"${SUB_PATH}/stderr.log")
+path_launch_rc=$?
+check_eq "launch --path exits 0" "$path_launch_rc" "0"
+SWEEP_DIR_PATH="$(dirname "$(dirname "$path_launch_out")")"
+
+tree_paths_path="$(cut -f1 "${SWEEP_DIR_PATH}/bundle/01-tree.tsv" | tail -n +2 | sort -u)"
+check_eq "launch --path bounds the bundle's 01-tree.tsv to pkg/example only" "$tree_paths_path" "pkg/example/file.go"
+
+manifest_scope_path="$(python3 -c "import json; print(json.dumps(json.load(open('${SWEEP_DIR_PATH}/manifest.json'))['scope_paths']))")"
+check_eq "the sweep manifest.json records scope_paths" "$manifest_scope_path" '["pkg/example"]'
+
+bundle_manifest_scope="$(python3 -c "import json; print(json.dumps(json.load(open('${SWEEP_DIR_PATH}/bundle/MANIFEST.json'))['scope_paths']))")"
+check_eq "the bundle MANIFEST.json records scope_paths" "$bundle_manifest_scope" '["pkg/example"]'
+
+prompt_content_path="$(cat "${SWEEP_DIR_PATH}/plan/.investigator-plan-prompt.md")"
+check_contains "the planner prompt states the inventory is a bounded scope" "$prompt_content_path" "BOUNDED sweep"
+check_contains "the planner prompt names the scoped subtree" "$prompt_content_path" "pkg/example"
+check_not_contains "the planner prompt does not list the out-of-scope sibling file" "$prompt_content_path" "pkg/other/file.go"
+
+report_content_path="$(cat "${SWEEP_DIR_PATH}/report/consolidated.md")"
+check_contains "report/consolidated.md states the scope" "$report_content_path" '**Scope:** bounded to `pkg/example`'
+check_contains "report/consolidated.md states coverage is relative to the scope" "$report_content_path" "relative to this scope"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4012, AC3) — resume on a scoped sweep keeps the"
+echo "   scope without re-passing --path =="
+# Force the planner to actually re-dispatch on resume: remove the frozen plan
+# so plan_already_populated() is false, matching a sweep whose planner never
+# produced a valid plan (or was interrupted before producing one).
+rm -f "${SWEEP_DIR_PATH}"/plan/step-*.json
+: > "${SUB_PATH}/docker_calls.log"
+
+resume_path_out=$(run_cli "$SUB_PATH" resume "$(basename "$SWEEP_DIR_PATH")" 2>"${SUB_PATH}/stderr.log")
+resume_path_rc=$?
+check_eq "resume (no --path) on a scoped sweep exits 0" "$resume_path_rc" "0"
+
+resume_tree_paths="$(cut -f1 "${SWEEP_DIR_PATH}/bundle/01-tree.tsv" | tail -n +2 | sort -u)"
+check_eq "resume's re-written bundle is still bounded to pkg/example only, with no --path re-passed" \
+  "$resume_tree_paths" "pkg/example/file.go"
+
+resume_bundle_manifest_scope="$(python3 -c "import json; print(json.dumps(json.load(open('${SWEEP_DIR_PATH}/bundle/MANIFEST.json'))['scope_paths']))")"
+check_eq "resume's bundle MANIFEST.json still records the original --path scope" "$resume_bundle_manifest_scope" '["pkg/example"]'
+
+echo ""
 echo "== status reports coverage read-only, without re-running anything (AC2) =="
 before_hash="$(find "$SWEEP_DIR_1" -type f -exec sha256sum {} \; | sort | sha256sum)"
 before_calls="$(wc -l < "${SUB1}/docker_calls.log")"

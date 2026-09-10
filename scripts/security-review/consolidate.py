@@ -1074,6 +1074,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "lanes": lanes,
         "steps_discovered": step_ids,
         "plan_failed": plan_failed,
+        "scope_paths": _sweep_scope_paths(sweep_dir),
         "coverage": coverage,
         "scanner_coverage": scanner_coverage,
         "dispatch": dispatch,
@@ -1084,6 +1085,28 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "findings": consolidated_findings,
         "failed_step_tails": _failed_step_tails(lanes, step_ids, lane_step_state, lane_step_tail),
     }
+
+
+def _sweep_scope_paths(sweep_dir: str) -> "list[str] | None":
+    """The repository-relative subtree filter this sweep was bounded to
+    (Issue #4012), read from `<sweep_dir>/manifest.json`'s `scope_paths`
+    field -- the same durable record `security-review.sh`'s `resume` command
+    reads back so an operator never re-passes `--path`. `None` (absent,
+    `null`, or a manifest that cannot be read) means an unscoped,
+    full-repository sweep, including every sweep created before this story.
+    Never read from a bundle's own `MANIFEST.json`: a multi-planner sweep has
+    one bundle per roster entry (`planners/<lane>/bundle/`), all filtered
+    identically by the one `--path` set `dispatch_planner()` passed to every
+    `planner.py prepare` call, so the sweep-root manifest is the one place
+    this fact is recorded exactly once rather than N times.
+    """
+    data = _load_json(os.path.join(sweep_dir, "manifest.json"))
+    if not isinstance(data, dict):
+        return None
+    scope_paths = data.get("scope_paths")
+    if isinstance(scope_paths, list) and scope_paths and all(isinstance(p, str) and p for p in scope_paths):
+        return scope_paths
+    return None
 
 
 def _sweep_commit_sha(sweep_dir: str) -> str:
@@ -1398,6 +1421,24 @@ def _coverage_gate_lines(coverage_gates: object) -> list[str]:
     return lines
 
 
+def _scope_line(scope_paths: "list[str] | None") -> str:
+    """One Markdown sentence naming this sweep's scope (Issue #4012),
+    rendered at the top of `## Coverage` so the denominator's meaning is
+    never ambiguous: a scoped sweep's coverage counts (steps discovered, the
+    per-lane table, the G-2/G-3 gates) are all computed over the bundle's
+    already-filtered `01-tree.tsv`/plan, so they are relative to the named
+    subtree(s), never the full repository, and this line says so explicitly
+    rather than leaving a reader to infer it from a short-looking step
+    count."""
+    if scope_paths:
+        scope_list = ", ".join(f"`{_md_escape_inline(p)}`" for p in scope_paths)
+        return (
+            f"**Scope:** bounded to {scope_list} -- coverage below is relative to this scope, "
+            "not the full repository."
+        )
+    return "**Scope:** full repository."
+
+
 def render_markdown(report: dict) -> str:
     sweep_complete = _sweep_complete(report)
 
@@ -1416,6 +1457,8 @@ def render_markdown(report: dict) -> str:
     lines.append("")
 
     lines.append("## Coverage")
+    lines.append("")
+    lines.append(_scope_line(report.get("scope_paths")))
     lines.append("")
     if report.get("plan_failed"):
         lines.append(

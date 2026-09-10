@@ -39,9 +39,9 @@ never paste raw findings into an issue body.
 drive through its three verbs, not something to re-implement by hand:
 
 ```bash
-.claude/scripts/security-review.sh launch <ref> [--scope-file <path>]     # start a new sweep (usually `develop`)
-.claude/scripts/security-review.sh resume <sweep-id> [--scope-file <path>] # continue an interrupted or parked sweep
-.claude/scripts/security-review.sh status <sweep-id>                       # print per-lane x per-step coverage plus the G-2/G-3 plan coverage-gate result, read-only
+.claude/scripts/security-review.sh launch <ref> [--scope-file <path>] [--path <subtree>]...  # start a new sweep (usually `develop`)
+.claude/scripts/security-review.sh resume <sweep-id> [--scope-file <path>]                    # continue an interrupted or parked sweep
+.claude/scripts/security-review.sh status <sweep-id>                                          # print per-lane x per-step coverage plus the G-2/G-3 plan coverage-gate result, read-only
 ```
 
 There is no `report` verb. `launch` and `resume` both run the consolidator themselves and print
@@ -63,7 +63,17 @@ sweep.
 copied verbatim into the bundle's `00-scope.md` (`metadata.write_bundle()`) — who wrote it and how
 much it says is the operator's call, scaled to the target's sensitivity. Omit it and the sweep
 still runs; the bundle just records `scope_provided: false` instead of silently inferring an
-omission from a missing file.
+omission from a missing file. It is prose only — it does not bound which files the planner reads.
+
+`--path <subtree>` (repeatable, `launch` only) bounds the sweep itself to one or more
+repository-relative subtrees instead of the whole repository — e.g.
+`launch develop --path pkg/cert --path pkg/session`. A bounded sweep is a first-class operation,
+not a pruned full-repository plan: the bundle's `01-tree.tsv`/`03-routes.tsv`, the planner prompt's
+file inventory, the finalized plan, and `report/consolidated.md`'s coverage table all describe only
+the named subtree(s), and the report states the scope explicitly so a short-looking step count
+reads as "this scope is small," never "coverage looks incomplete." The filter is recorded in
+`manifest.json` at sweep creation, so `resume` recovers it automatically — there is no `--path` flag
+on `resume`, and none is needed. Omit `--path` entirely for the previous, unscoped behavior.
 
 **The planner cannot read source; finder lanes still can.** Since Issue #3979, the plan-mode
 container mounts the sweep's auditable bundle (structured metadata: file paths, tiers, routes,

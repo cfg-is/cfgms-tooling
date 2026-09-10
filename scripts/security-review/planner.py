@@ -434,6 +434,50 @@ def evaluate_coverage(sweep_dir: str, steps: "list[dict]") -> dict:
     }
 
 
+def _read_bundle_scope_paths(bundle_dir: str) -> "list[str] | None":
+    """Read `<bundle_dir>/MANIFEST.json`'s `scope_paths` field (Issue #4012):
+    the repository-relative subtree(s) `metadata.write_bundle()` bounded this
+    bundle to, or `None` when the bundle covers the full repository.
+
+    Tolerant, not fail-closed: a missing, unreadable, or malformed
+    `MANIFEST.json` -- including every bundle a test hand-writes with only a
+    `01-tree.tsv` (see `_write_tree_tsv()` in `planner_test.py`) -- returns
+    `None`, exactly like an explicitly unscoped bundle. `build_prompt()` only
+    ever uses this to choose which sentence to show the model; a bundle
+    that has already been filtered by `write_bundle()` carries the correct
+    file inventory either way, so a manifest read failure here can degrade
+    the prompt's wording, never what the model is actually given to
+    partition.
+
+    The manifest is an on-disk artifact under `$CFGMS_SECURITY_REVIEW_BASE`,
+    not a trusted in-process value, so -- exactly as `_read_bundle_tree_paths()`
+    does for the file inventory -- this function re-applies
+    `metadata._prompt_safe()` and rejects either prompt delimiter here rather
+    than relying on `metadata._normalize_scope_paths()` having validated the
+    value when the bundle was written. An entry failing either check makes the
+    whole field untrustworthy, so the sweep is reported as unscoped: the prompt
+    then shows the full-repository sentence instead of a forged one, and the
+    inventory the model actually partitions is unchanged.
+    """
+    manifest_path = os.path.join(bundle_dir, "MANIFEST.json")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    scope_paths = manifest.get("scope_paths")
+    if not (isinstance(scope_paths, list) and scope_paths):
+        return None
+    for p in scope_paths:
+        if not isinstance(p, str) or not p or not metadata._prompt_safe(p):
+            return None
+        if metadata.SCOPE_OPEN_DELIM in p or metadata.SCOPE_CLOSE_DELIM in p:
+            return None
+    return scope_paths
+
+
 def build_prompt(bundle_dir: str, sweep_id: str) -> str:
     """Assemble the full text handed to `claude -p` in plan mode.
 
@@ -445,6 +489,16 @@ def build_prompt(bundle_dir: str, sweep_id: str) -> str:
     instructional text: the step-plan schema, the bounded-scope rule, and the
     Bash-heredoc write mechanism the model must use because `Write` is not
     among its `Bash, Glob` tools.
+
+    Since Issue #4012, the inventory embedded below may itself already be
+    bounded to one or more operator-chosen subtrees (`security-review.sh
+    launch <ref> --path <subtree>`, plumbed through `metadata.write_bundle()`'s
+    `paths` filter) rather than the full repository. `_read_bundle_scope_paths()`
+    reads that back from the bundle's own `MANIFEST.json` so the prompt can
+    say so explicitly -- a planner that is not told its inventory is already
+    bounded has no way to distinguish "this small file list is the whole
+    repository" from "this is a slice", and the two call for different
+    partitioning judgment.
 
     Since Issue #3979, `/workspace` in plan mode is the bundle directory
     itself, not a repository checkout -- there is no source tree left for
@@ -463,9 +517,24 @@ def build_prompt(bundle_dir: str, sweep_id: str) -> str:
     paths = _read_bundle_tree_paths(bundle_dir)
     payload_lines = [f"{metadata.ENTRY_PREFIX}{p}" for p in paths] if paths else ["  (none)"]
     payload = "\n".join(payload_lines) + "\n"
+    scope_paths = _read_bundle_scope_paths(bundle_dir)
+    if scope_paths:
+        scope_list = ", ".join(f"`{p}`" for p in scope_paths)
+        scope_line = (
+            f"This is a BOUNDED sweep, not a full-repository review: the inventory below is "
+            f"scoped to {scope_list} only. Partition and propose steps only within this scope -- "
+            f"there is nothing outside it for you to cover."
+        )
+    else:
+        scope_line = (
+            "This sweep covers the full repository -- the inventory below is not bounded to any "
+            "subtree."
+        )
     return f"""You are the metadata-only step planner for security-review sweep `{sweep_id}`.
 
-You have been given the repository's full file inventory below, read from the bundle's
+{scope_line}
+
+You have been given the file inventory below, read from the bundle's
 `{TREE_ARTIFACT_NAME}` artifact. It contains only repository-relative file paths -- it
 deliberately does NOT contain the contents of any source file, and there is no repository
 checkout mounted in this container for you to read one from even if you wanted to: `/workspace`
@@ -542,20 +611,28 @@ def prepare(
     commit_sha: str,
     repo_root: str | None = None,
     scope_file: str | None = None,
+    paths: "list[str] | None" = None,
 ) -> str:
     """Write the auditable bundle for `commit_sha` and the plan prompt built
     from it.
 
     Returns the prompt file path. Raises `metadata.MetadataError` (propagated
-    from `metadata.write_bundle()`) if the commit's tree cannot be read, or if
+    from `metadata.write_bundle()`) if the commit's tree cannot be read, if
     `scope_file` fails its own validation (unreadable, oversized, or carrying
-    a planner-prompt delimiter) -- no bundle and no prompt are written in
-    either case. `scope_file` is optional operator-supplied prose (`--scope-file`
-    on this module's CLI, plumbed from `security-review.sh launch`/`resume`);
-    when omitted, `write_bundle()` is called with `no_scope=True` so the
-    omission is recorded in the bundle's own `MANIFEST.json` rather than
-    silently inferred from a missing file (see `metadata.write_bundle()`'s
-    docstring).
+    a planner-prompt delimiter), or if `paths` fails
+    `metadata._normalize_scope_paths()` -- no bundle and no prompt are written
+    in any of those cases. `scope_file` is optional operator-supplied prose
+    (`--scope-file` on this module's CLI, plumbed from `security-review.sh
+    launch`/`resume`); when omitted, `write_bundle()` is called with
+    `no_scope=True` so the omission is recorded in the bundle's own
+    `MANIFEST.json` rather than silently inferred from a missing file (see
+    `metadata.write_bundle()`'s docstring).
+
+    `paths` (Issue #4012) is the operator's `--path` subtree filter
+    (`security-review.sh launch <ref> --path <subtree>`, repeatable), passed
+    straight through to `metadata.write_bundle()` -- this function adds no
+    filtering logic of its own. `None` or empty means the full repository,
+    unchanged from before this story.
 
     Writes the bundle into `<sweep_dir>/bundle/` (Issue #3979) -- the
     directory `agent-dispatch.sh launch-investigator --mode plan` mounts
@@ -581,6 +658,7 @@ def prepare(
         repo_root=repo_root,
         scope_file=scope_file,
         no_scope=scope_file is None,
+        paths=paths,
     )
 
     sweep_id = os.path.basename(os.path.normpath(sweep_dir))
@@ -1740,6 +1818,11 @@ def main(argv: list[str] | None = None) -> int:
         help="operator-supplied prose description, copied verbatim into the bundle's 00-scope.md "
              "(see metadata.write_bundle()); omit to record scope_provided=false",
     )
+    p_prepare.add_argument(
+        "--path", action="append", default=None, metavar="SUBTREE",
+        help="repository-relative subtree to bound the sweep to (repeatable); omit for the full "
+             "repository (Issue #4012)",
+    )
 
     p_launch = sub.add_parser("launch", help="Launch the investigator plan-mode container")
     p_launch.add_argument("sweep_dir")
@@ -1756,7 +1839,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "prepare":
         try:
             path = prepare(
-                args.sweep_dir, args.commit_sha, repo_root=args.repo_root, scope_file=args.scope_file
+                args.sweep_dir, args.commit_sha, repo_root=args.repo_root, scope_file=args.scope_file,
+                paths=args.path,
             )
         except metadata.MetadataError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

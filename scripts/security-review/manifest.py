@@ -94,6 +94,7 @@ def create_sweep(
     ref: str,
     lanes: tuple[str, ...],
     repo_root: str | None = None,
+    paths: "tuple[str, ...] | None" = None,
 ) -> str:
     """Create (or resume) the on-disk sweep tree for `ref`.
 
@@ -101,13 +102,25 @@ def create_sweep(
     (`roster.py::parse_roster()`, e.g. `("claude-sonnet-5",)`) -- required,
     with no module-level default (see the module docstring).
 
+    `paths` (Issue #4012) is the operator's `--path` subtree filter from
+    `security-review.sh launch` -- e.g. `("pkg/cert", "pkg/session")` -- or
+    `None`/empty for an unscoped, full-repository sweep. Recorded verbatim as
+    `manifest.json`'s `scope_paths` field (a list, or `null` when unscoped)
+    so `security-review.sh resume` can read the scope back without the
+    operator re-passing `--path`: the manifest, not the command line, is this
+    sweep's durable record of what it was bounded to. This module does no
+    validation of `paths` itself -- `metadata.write_bundle()` (via
+    `planner.py prepare()`) is the one place that happens, so a malformed
+    value still fails the sweep, just one call later than it would if
+    validated twice.
+
     Returns the sweep directory path. Idempotent: a second call against the
     same resolved sweep id creates no new directories that do not already
-    exist and never overwrites an existing `manifest.json`.
-
-    Resolves the base directory via `basedir.resolve_base_dir()` first and
-    lets `BaseDirError` propagate -- no sweep directory is created when
-    base-dir resolution fails.
+    exist and never overwrites an existing `manifest.json` -- including its
+    `scope_paths`: a `resume`-triggered call passes the manifest's own
+    previously recorded value back in, but even if it passed nothing, the
+    existing file (and the scope it recorded at sweep creation) would still
+    win.
     """
     resolved_base = basedir.resolve_base_dir(repo_root=repo_root)
     sweep_id, commit_sha, _short_sha = compute_sweep_id(ref, repo_root=repo_root)
@@ -127,6 +140,7 @@ def create_sweep(
             "lanes": list(lanes),
             "status": "planning",
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "scope_paths": list(paths) if paths else None,
         }
         atomic_write.write_json_atomic(manifest_path, manifest_data)
 

@@ -69,6 +69,17 @@ control character left in any value, no entry can contribute a second physical
 line, so no entry can begin a line at all -- the delimiter structure of the
 prompt is a property of this function, not of the model's cooperation.
 
+An operator-supplied `--path` (Issue #4012) is the same class of input
+reaching the same prompt, but it is *not* covered by `render_payload()`'s
+per-entry filter: it is persisted to `manifest.json` / `MANIFEST.json`, read
+back off disk at `resume` time, and rendered unescaped into the prompt's
+bounded-sweep sentence by `planner.build_prompt()`.
+`_normalize_scope_paths()` therefore applies `_prompt_safe()` and the
+`SCOPE_OPEN_DELIM`/`SCOPE_CLOSE_DELIM` check itself, *rejecting* rather than
+dropping (a silently dropped scope path widens the sweep past what the
+operator asked for), before any git call or bundle write -- the same posture
+`_read_and_validate_scope_file()` takes toward a `--scope-file`.
+
 `write_bundle()`'s extractors apply the same `_prompt_safe()` filter to every
 bundle row, and additionally constrain every file-content-derived value
 (route path, handler symbol, method, config key) to a tight accepted shape --
@@ -110,6 +121,13 @@ WEB_SRC_PREFIX = "web/src/"
 # start a new one -- see the module docstring's "Prompt injection" section.
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 ENTRY_PREFIX = "  - "
+
+# The planner prompt's metadata block boundary. Defined here, above the first
+# function that enforces it (`_normalize_scope_paths`), because two separate
+# operator-input paths -- `--path` and `--scope-file` -- must both refuse to
+# carry it.
+SCOPE_OPEN_DELIM = "--- REPOSITORY METADATA ---"
+SCOPE_CLOSE_DELIM = "--- END REPOSITORY METADATA ---"
 
 
 class MetadataError(Exception):
@@ -190,15 +208,103 @@ def _web_src_dirs(files: list[str]) -> list[str]:
     return sorted(dirs)
 
 
-def collect(commit_sha: str, repo_root: str | None = None) -> dict:
+def _normalize_scope_paths(paths: "list[str] | None") -> "list[str] | None":
+    """Validate and normalize an operator-supplied `--path` subtree filter
+    (Issue #4012).
+
+    Returns `None` when `paths` is `None` or empty -- the unscoped case,
+    where every file is in scope, matching every caller's behavior before
+    this story. Otherwise returns the de-duplicated, order-preserving list of
+    trimmed, trailing-slash-stripped path strings (`pkg/cert/` and `pkg/cert`
+    name the same subtree).
+
+    Raises `MetadataError` on any path that cannot possibly bound a real
+    subtree -- empty, absolute, or containing a `.`/`..` component -- failing
+    loudly before any git call or bundle write, the same posture
+    `_read_and_validate_scope_file` applies to a malformed `--scope-file`.
+    This is deliberately not the full `_scope_boundary()` bounded-scope rule
+    planner.py enforces on a plan *step*'s `scope`: an operator's `--path` is
+    a coarser, sweep-wide filter, not a single step's boundary, and may
+    legitimately name more than one top-level subtree at once (the acceptance
+    example is `--path pkg/cert --path pkg/session`).
+
+    It *also* raises on a path carrying a C0/DEL control character
+    (`_prompt_safe()`) or containing either planner-prompt delimiter, for the
+    same reason `_read_and_validate_scope_file` rejects those delimiters: a
+    normalized `--path` is not merely a git filter. It is persisted verbatim
+    to the sweep's `manifest.json` and the bundle's `MANIFEST.json`, read back
+    off disk by `security-review.sh resume`, and rendered unescaped into the
+    planner prompt's bounded-sweep line (`planner.build_prompt()`), *outside*
+    `render_payload()`'s per-entry filter. A newline would therefore render as
+    a second physical prompt line able to forge
+    `--- END REPOSITORY METADATA ---` and continue as top-level instruction --
+    exactly the escape the module docstring's "Prompt injection" section says
+    is a property of this code rather than of the model's cooperation. Unlike
+    a tree path derived from repository content, a `--path` is rejected rather
+    than dropped: dropping one silently would widen the sweep's scope past
+    what the operator asked for, and there is no partial normalization that is
+    safe to persist.
+    """
+    if not paths:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        candidate = raw.strip().rstrip("/")
+        if not candidate:
+            raise MetadataError(f"--path {raw!r} must not be empty")
+        if not _prompt_safe(candidate):
+            raise MetadataError(
+                f"--path {raw!r} contains a control character; a scope path is persisted to the "
+                "sweep manifest and rendered into the planner prompt, where it must never be able "
+                "to start a line of its own"
+            )
+        if SCOPE_OPEN_DELIM in candidate or SCOPE_CLOSE_DELIM in candidate:
+            raise MetadataError(
+                f"--path {raw!r} contains a planner prompt delimiter "
+                f"({SCOPE_OPEN_DELIM!r} or {SCOPE_CLOSE_DELIM!r}); an operator-supplied path must "
+                "never be able to forge the metadata block boundary"
+            )
+        if candidate.startswith("/"):
+            raise MetadataError(f"--path {raw!r} must be repository-relative, not absolute")
+        if any(part in (".", "..") for part in candidate.split("/")):
+            raise MetadataError(f"--path {raw!r} must not contain a '.' or '..' component")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
+
+
+def _in_scope(path: str, scope_paths: "list[str] | None") -> bool:
+    """True when `path` falls inside one of `scope_paths`'s subtrees, or when
+    `scope_paths` is falsy (unscoped: every path is in scope). A path is in a
+    subtree `prefix` when it equals `prefix` exactly (a scope naming a single
+    file) or starts with `prefix + "/"` (a scope naming a directory) -- never
+    a bare string-prefix match, so `pkg/cert` does not also match a sibling
+    directory like `pkg/certutil`."""
+    if not scope_paths:
+        return True
+    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in scope_paths)
+
+
+def collect(commit_sha: str, repo_root: str | None = None, paths: "list[str] | None" = None) -> dict:
     """Assemble the metadata-only repository summary for `commit_sha`.
 
+    `paths` (Issue #4012) bounds the summary to the given repository-relative
+    subtrees -- see `_normalize_scope_paths()`. `None` or empty means the
+    full repository, unchanged from before this story.
+
     Returns a dict with `commit_sha`, `go_module`, `go_packages`,
-    `route_registrars`, and `web_src_dirs` -- paths, a module path string, and
-    directory names only. Raises `MetadataError` if the commit's tree cannot
-    be read.
+    `route_registrars`, `web_src_dirs`, and `scope_paths` -- paths, a module
+    path string, directory names, and the normalized scope filter (`None`
+    when unscoped) only. Raises `MetadataError` if the commit's tree cannot
+    be read, or if `paths` fails `_normalize_scope_paths()`.
     """
+    scope_paths = _normalize_scope_paths(paths)
     files = _list_tree(commit_sha, repo_root)
+    if scope_paths:
+        files = [p for p in files if _in_scope(p, scope_paths)]
     route_registrars = _route_registrars(files)
 
     for path in route_registrars:
@@ -210,6 +316,7 @@ def collect(commit_sha: str, repo_root: str | None = None) -> dict:
         "go_packages": _go_packages(files),
         "route_registrars": route_registrars,
         "web_src_dirs": _web_src_dirs(files),
+        "scope_paths": scope_paths,
     }
 
 
@@ -395,8 +502,6 @@ ENV_KEY_SHAPE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
 DEPS_FILES = ("go.mod", "go.sum", "web/package.json")
 
 SCOPE_FILE_MAX_BYTES = 300_000
-SCOPE_OPEN_DELIM = "--- REPOSITORY METADATA ---"
-SCOPE_CLOSE_DELIM = "--- END REPOSITORY METADATA ---"
 
 TREE_HEADER = ("path", "lang", "loc", "sha256_12", "tier")
 ROUTES_HEADER = ("method", "path", "handler_file", "handler_symbol", "auth_middleware", "framework")
@@ -699,8 +804,12 @@ def _extract_config_surface(
     return rows
 
 
-def _assemble_bundle_contents(commit_sha: str, repo_root: str | None) -> dict:
+def _assemble_bundle_contents(
+    commit_sha: str, repo_root: str | None, scope_paths: "list[str] | None" = None
+) -> dict:
     entries = sorted(_list_tree_with_blobs(commit_sha, repo_root), key=lambda e: e[0])
+    if scope_paths:
+        entries = [(path, blob_sha) for path, blob_sha in entries if _in_scope(path, scope_paths)]
 
     files_excluded_by_deny = 0
     kept_entries: list[tuple[str, str]] = []
@@ -812,6 +921,7 @@ def write_bundle(
     repo_root: str | None = None,
     scope_file: str | None = None,
     no_scope: bool = False,
+    paths: "list[str] | None" = None,
 ) -> dict:
     """Write the auditable bundle directory to `dest` for `commit_sha`.
 
@@ -820,6 +930,20 @@ def write_bundle(
     failure class this harness exists to prevent, so there is no default.
     Raises `MetadataError`, writing nothing, if neither or both are given, or
     if `scope_file` fails `_read_and_validate_scope_file`.
+
+    `paths` (Issue #4012) is an independent, orthogonal filter: the
+    repository-relative subtree(s) (e.g. `["pkg/cert", "pkg/session"]`) this
+    bundle is bounded to, validated via `_normalize_scope_paths()` before
+    anything else in this function runs. `None` or empty means the full
+    repository, exactly as before this story. It bounds `01-tree.tsv` and
+    `03-routes.tsv` to only the in-scope entries -- route extraction and the
+    config-surface scan both walk the same, already-filtered file list, so
+    they narrow for free -- and is recorded verbatim as `MANIFEST.json`'s
+    `scope_paths` field (`null` when unscoped) so a bundle is self-describing
+    about what it does and does not cover. This is a different axis from
+    `scope_file`/`no_scope`: `--path` bounds *which files* are read at all;
+    `--scope-file` is operator prose describing *what to look for* within
+    whatever is read. A sweep can use either, both, or neither.
 
     `00-scope.md`, when present, is a byte-identical copy of `scope_file`'s
     bytes -- it is never generated, summarised, or re-rendered by this
@@ -842,11 +966,13 @@ def write_bundle(
             "--bundle requires exactly one of --scope-file <path> or --no-scope"
         )
 
+    scope_paths = _normalize_scope_paths(paths)
+
     scope_bytes: bytes | None = None
     if scope_file:
         scope_bytes = _read_and_validate_scope_file(scope_file)
 
-    contents = _assemble_bundle_contents(commit_sha, repo_root)
+    contents = _assemble_bundle_contents(commit_sha, repo_root, scope_paths=scope_paths)
 
     os.makedirs(dest, exist_ok=True)
     deps_dir = os.path.join(dest, "05-deps")
@@ -894,6 +1020,7 @@ def write_bundle(
         "commit_sha": commit_sha,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "scope_provided": scope_bytes is not None,
+        "scope_paths": scope_paths,
         "artifacts": artifacts,
         "redaction_log": {
             "files_excluded_by_deny": contents["files_excluded_by_deny"],
@@ -931,6 +1058,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-scope", action="store_true",
         help="explicitly record that no scope description was supplied (--bundle mode only)",
     )
+    parser.add_argument(
+        "--path", action="append", default=None, metavar="SUBTREE",
+        help="repository-relative subtree to bound the sweep to (repeatable); omit for the full "
+             "repository (Issue #4012)",
+    )
     args = parser.parse_args(argv)
 
     if args.bundle:
@@ -941,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root=args.repo_root,
                 scope_file=args.scope_file,
                 no_scope=args.no_scope,
+                paths=args.path,
             )
         except MetadataError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -957,7 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        metadata = collect(args.commit_sha, repo_root=args.repo_root)
+        metadata = collect(args.commit_sha, repo_root=args.repo_root, paths=args.path)
     except MetadataError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
