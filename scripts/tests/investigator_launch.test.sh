@@ -330,6 +330,13 @@ check_contains "rendered disallowed-tools env var refuses curl" "$run_call" "Bas
 check_contains "rendered disallowed-tools env var refuses wget" "$run_call" "Bash(wget:*)"
 check_contains "plan mode without --harness mounts the Claude credential read-only" "$run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 check_cred_mount_count "plan mode without --harness renders exactly one credential mount" "$run_call" 1
+echo ""
+echo "== REQUIRED TEST (Issue #4003) — plan mode mounts .claude/agents/investigator.md"
+echo "   read-only at /home/agent/.claude/agents/investigator.md against the REAL"
+echo "   repo checkout (CFGMS_TEST_REPO_ROOT=\$REPO_ROOT here), so this fails if the"
+echo "   file the launcher actually mounts and the file .claude/agents/investigator.md"
+echo "   documents ever diverge in path =="
+check_contains "plan mode mounts the real investigator agent profile read-only" "$run_call" "${AGENT_PROFILE}:/home/agent/.claude/agents/investigator.md:ro"
 
 : > "$DOCKER_CALL_LOG"
 # --lane-entrypoint must point at an existing file; use this test script
@@ -363,6 +370,7 @@ check_not_contains "lane mode never mounts REPO_ROOT at /workspace" "$lane_run_c
 check_not_contains "lane mode never mounts the bundle at /workspace" "$lane_run_call" "${BUNDLE_DIR}:/workspace:ro"
 check_not_contains "lane mode never mounts the bundle dir anywhere at all" "$lane_run_call" "$BUNDLE_DIR"
 check_not_contains "lane mode has no GH_TOKEN" "$lane_run_call" "GH_TOKEN"
+check_not_contains "lane mode never mounts the agent profile (plan-mode-only, Issue #4003; lanes get it via the snapshot instead)" "$lane_run_call" "/home/agent/.claude/agents/investigator.md"
 check_contains "lane mode delivers harness credentials read-only" "$lane_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 # Lane mode reads raw third-party model output, so its egress containment
 # matters at least as much as the planner's.
@@ -437,6 +445,7 @@ check_cred_mount_count "plan --harness claude renders exactly one credential mou
 check_contains "plan --harness claude mounts the credential read-only" "$plan_harness_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 check_contains "plan --harness claude sets CFGMS_SECURITY_REVIEW_HARNESS=claude" "$plan_harness_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
 check_contains "plan --harness claude still mounts plan/ as /workspace-out:rw" "$plan_harness_run_call" "${SWEEP_DIR}/plan:/workspace-out:rw"
+check_contains "plan --harness claude still mounts the agent profile (Issue #4003, harness-independent)" "$plan_harness_run_call" "${AGENT_PROFILE}:/home/agent/.claude/agents/investigator.md:ro"
 
 : > "$DOCKER_CALL_LOG"
 plan_foreign_out=$(PATH="${FAKEBIN}:${PATH}" \
@@ -451,6 +460,7 @@ plan_foreign_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_cred_mount_count "plan --harness stub renders NO credential mount" "$plan_foreign_run_call" 0
 check_not_contains "plan --harness stub never sees the host Claude credential" "$plan_foreign_run_call" ".claude/.credentials.json"
 check_contains "plan --harness stub still sets CFGMS_SECURITY_REVIEW_HARNESS" "$plan_foreign_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
+check_contains "plan --harness stub still mounts the agent profile (Issue #4003, harness-independent)" "$plan_foreign_run_call" "${AGENT_PROFILE}:/home/agent/.claude/agents/investigator.md:ro"
 
 echo ""
 echo "== REQUIRED TEST — --harness codex mounts ~/.codex/auth.json read-only, sets"
@@ -1049,9 +1059,15 @@ echo "   non-test .py under the mounted trusted harness tree), sensitive to"
 echo "   the mounted inputs and insensitive to everything else =="
 
 HARNESS_ID_REPO="${SANDBOX}/harness-id-repo"
-mkdir -p "${HARNESS_ID_REPO}/.devcontainer/scripts" "${HARNESS_ID_REPO}/.claude/scripts/security-review"
+mkdir -p "${HARNESS_ID_REPO}/.devcontainer/scripts" "${HARNESS_ID_REPO}/.claude/scripts/security-review" "${HARNESS_ID_REPO}/.claude/agents"
 ENTRYPOINT_FIXTURE="${HARNESS_ID_REPO}/.devcontainer/scripts/investigator-entrypoint.sh"
 SIBLING_FIXTURE="${HARNESS_ID_REPO}/.claude/scripts/security-review/schema.py"
+# Plan mode's own agent-profile mount (Issue #4003) requires this file to
+# exist under CFGMS_TEST_REPO_ROOT for every plan-mode call below, exactly as
+# it requires investigator-entrypoint.sh to exist -- a missing one is now a
+# hard failure, same as a missing entrypoint would be.
+AGENT_PROFILE_FIXTURE="${HARNESS_ID_REPO}/.claude/agents/investigator.md"
+printf 'investigator agent profile v1\n' > "$AGENT_PROFILE_FIXTURE"
 mkdir -p "${HARNESS_ID_REPO}/docs/security-review"
 printf 'methodology v1\n' > "${HARNESS_ID_REPO}/docs/security-review/methodology.md"
 LANE_ENTRYPOINT_A="${SANDBOX}/lane-entrypoint-a.py"
@@ -1124,6 +1140,60 @@ if [[ -n "$hash_entry_before" && -n "$hash_entry_after" && "$hash_entry_before" 
 else
   bad "changing investigator-entrypoint.sh's content changes the recorded hash" "before=${hash_entry_before} after=${hash_entry_after}"
 fi
+
+echo ""
+echo "== REQUIRED TEST (Issue #4003) — changing .claude/agents/investigator.md's"
+echo "   content between two PLAN-mode calls changes the recorded hash: the"
+echo "   agent profile is now one of the files this command individually mounts"
+echo "   into the plan-mode container, so its identity belongs in"
+echo "   harness_identity.json exactly like the entrypoint's does =="
+printf '#!/usr/bin/env bash\necho entrypoint-v1\n' > "$ENTRYPOINT_FIXTURE"
+printf 'investigator agent profile v1\n' > "$AGENT_PROFILE_FIXTURE"
+hash_agent_profile_before="$(run_hid_launch plan "")"
+printf 'investigator agent profile v2 CHANGED\n' > "$AGENT_PROFILE_FIXTURE"
+hash_agent_profile_after="$(run_hid_launch plan "")"
+if [[ -n "$hash_agent_profile_before" && -n "$hash_agent_profile_after" && "$hash_agent_profile_before" != "$hash_agent_profile_after" ]]; then
+  ok "changing .claude/agents/investigator.md's content changes the recorded hash in plan mode"
+else
+  bad "changing .claude/agents/investigator.md's content changes the recorded hash in plan mode" "before=${hash_agent_profile_before} after=${hash_agent_profile_after}"
+fi
+check_contains "harness_identity.json lists the agent profile among plan mode's hashed files" \
+  "$(cat "${HID_SWEEP_DIR}/harness_identity.json")" '.claude/agents/investigator.md'
+printf 'investigator agent profile v1\n' > "$AGENT_PROFILE_FIXTURE"
+
+echo ""
+echo "== REQUIRED TEST (Issue #4003) — a missing .claude/agents/investigator.md"
+echo "   is a hard failure in plan mode, before any docker run, exactly like a"
+echo "   missing investigator-entrypoint.sh already is =="
+rm -f "$AGENT_PROFILE_FIXTURE"
+: > "$DOCKER_CALL_LOG"
+set +e
+missing_profile_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_ID_REPO" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$HID_SWEEP_DIR" --snapshot-dir "$HID_SNAPSHOT_DIR" --bundle-dir "$HID_BUNDLE_DIR" --mode plan 2>&1)
+missing_profile_rc=$?
+set -e
+check_contains "missing investigator agent profile is reported" "$missing_profile_out" "investigator agent profile not found"
+if [[ "$missing_profile_rc" -ne 0 ]]; then ok "missing agent profile exits non-zero"; else bad "missing agent profile exits non-zero" "exited 0"; fi
+check_not_contains "missing agent profile never reaches docker run" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+printf 'investigator agent profile v1\n' > "$AGENT_PROFILE_FIXTURE"
+
+echo ""
+echo "== REQUIRED TEST evidence — planner mode loads the investigator agent"
+echo "   profile FROM THE CONTAINER FILESYSTEM (Issue #4003): since Issue #3979"
+echo "   moved plan mode's /workspace from a repo checkout to the read-only"
+echo "   bundle, .claude/agents/ is no longer reachable from inside the"
+echo "   container at all unless mounted individually, or 'claude --agent"
+echo "   investigator' fails closed with 'not found' before the planner ever"
+echo "   runs. Removing this mount is exactly the regression this test guards"
+echo "   against =="
+run_hid_launch plan "" >/dev/null
+plan_profile_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "plan mode mounts the agent profile read-only at the user-level agents path" \
+  "$plan_profile_run_call" "${HARNESS_ID_REPO}/.claude/agents/investigator.md:/home/agent/.claude/agents/investigator.md:ro"
 
 echo ""
 echo "== REQUIRED TEST — passing a different --lane-entrypoint VALUE (different"

@@ -2874,6 +2874,8 @@ PROMPT_EOF
     inv_out_mount=()
     inv_plan_mount=()
     claude_creds_mount=()
+    inv_agent_profile_mount=()
+    inv_agent_profile_host_path=""
     # The disallowed-tools value below BLOCKS the "gh issue create" invocation
     # (via --disallowedTools); it never runs it. It is built from a variable so
     # the literal phrase never appears contiguously in this file's source and
@@ -2952,6 +2954,25 @@ PROMPT_EOF
       if [[ -z "$inv_harness" ]]; then
         claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
       fi
+
+      # Issue #4003: since #3979 moved /workspace from a repo checkout to the
+      # read-only bundle, .claude/agents/ is no longer reachable from inside
+      # the container at all, so entrypoint's `claude --agent investigator`
+      # (Issue #3938) fails closed with "not found" and the container exits 1
+      # before the planner ever runs. Mounted individually at the user-level
+      # agents directory `claude` reads regardless of cwd, never by mounting a
+      # whole .claude/agents/ directory (which would also need to exist and
+      # would pull in every OTHER agent definition this profile has no reason
+      # to see). Read-only: the profile is a trust boundary (AC2 of #3938),
+      # not planner output. Lane mode never passes --agent (claude_lane.py)
+      # and its /workspace is the snapshot, which already contains this file,
+      # so this mount is plan-mode-only.
+      inv_agent_profile_host_path="${REPO_ROOT}/.claude/agents/investigator.md"
+      if [[ ! -f "$inv_agent_profile_host_path" ]]; then
+        echo "ERROR: investigator agent profile not found: ${inv_agent_profile_host_path}"
+        exit 1
+      fi
+      inv_agent_profile_mount=(-v "${inv_agent_profile_host_path}:/home/agent/.claude/agents/investigator.md:ro")
     else
       # Second, independent check on the same property the lane-id pattern
       # above enforces syntactically: the thing about to be mounted rw must
@@ -3119,40 +3140,43 @@ PROMPT_EOF
     fi
 
     # Trusted-harness identity (Issue #3952, epic #3950's D1 correction on
-    # revision 3): hash exactly the two files this command individually
-    # mounts from the live repo checkout -- investigator-entrypoint.sh
-    # always, and the --lane-entrypoint script when one is passed (plan mode
-    # passes none). Every OTHER file a lane runner imports (schema.py,
-    # harness_runner.py, atomic_write.py, roster.py, terminal_state.py,
-    # resume.py, the other lane files) has no mount of its own: in
-    # production the import bootstrap resolves those from /workspace, which
-    # after this story's own snapshot cutover above is the frozen snapshot,
-    # not the live tree -- their identity is already implied by commit_sha,
-    # so hashing them here would be redundant at best and describe code that
-    # never actually ran at worst (a sweep whose pinned commit differs from
-    # the live checkout). Each file's REPO_ROOT-relative path is fed into
-    # the digest ahead of its bytes, in a fixed order (entrypoint, then lane
-    # entrypoint), so a rename with unchanged content still changes the
-    # recorded identity -- the path is part of what actually got mounted
-    # where. Runs on the host, before the docker run call, using the same
-    # $REPO_ROOT the mount flags above are already built from. This is
-    # recording, not freezing: the value is written fresh on every call and
-    # never compared against a prior one -- binding it into a step envelope
-    # and quarantining a mismatch on resume is STORY-12 (D6), which consumes
-    # this value; it is not produced here.
+    # revision 3; extended by Issue #4003): hash exactly the files this
+    # command individually mounts from the live repo checkout --
+    # investigator-entrypoint.sh always, the --lane-entrypoint script when one
+    # is passed (plan mode passes none), and .claude/agents/investigator.md
+    # when plan mode mounts it (lane mode passes none -- its /workspace is the
+    # snapshot, which already contains the file, so no mount of this script's
+    # own exists for it there). Every OTHER file a lane runner imports
+    # (schema.py, harness_runner.py, atomic_write.py, roster.py,
+    # terminal_state.py, resume.py, the other lane files) has no mount of its
+    # own: in production the import bootstrap resolves those from /workspace,
+    # which after this story's own snapshot cutover above is the frozen
+    # snapshot, not the live tree -- their identity is already implied by
+    # commit_sha, so hashing them here would be redundant at best and describe
+    # code that never actually ran at worst (a sweep whose pinned commit
+    # differs from the live checkout). Each file's REPO_ROOT-relative path is
+    # fed into the digest ahead of its bytes, in a fixed order (entrypoint,
+    # lane entrypoint, agent profile), so a rename with unchanged content
+    # still changes the recorded identity -- the path is part of what
+    # actually got mounted where. Runs on the host, before the docker run
+    # call, using the same $REPO_ROOT the mount flags above are already built
+    # from. This is recording, not freezing: the value is written fresh on
+    # every call and never compared against a prior one -- binding it into a
+    # step envelope and quarantining a mismatch on resume is STORY-12 (D6),
+    # which consumes this value; it is not produced here.
     inv_entrypoint_host_path="${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh"
-    inv_harness_identity_hash=$(python3 - "$REPO_ROOT" "$inv_entrypoint_host_path" "$inv_lane_entrypoint" "${inv_sweep_dir}/harness_identity.json" <<'PY'
+    inv_harness_identity_hash=$(python3 - "$REPO_ROOT" "$inv_entrypoint_host_path" "$inv_lane_entrypoint" "$inv_agent_profile_host_path" "${inv_sweep_dir}/harness_identity.json" <<'PY'
 import hashlib
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
-repo_root, entrypoint_path, lane_entrypoint_path, dest_path = sys.argv[1:5]
+repo_root, entrypoint_path, lane_entrypoint_path, agent_profile_path, dest_path = sys.argv[1:6]
 
 digest = hashlib.sha256()
 files = []
-paths = [entrypoint_path, lane_entrypoint_path]
+paths = [entrypoint_path, lane_entrypoint_path, agent_profile_path]
 # Issue #3982: a lane runs the whole trusted harness tree (mounted at
 # /opt/cfgms-harness/security-review), not just its entrypoint file, so
 # every Python module in it is part of the harness identity a resume checks.
@@ -3225,6 +3249,7 @@ PY
       --stop-timeout=900 \
       -v "${inv_workspace_dir}:/workspace:ro" \
       "${claude_creds_mount[@]}" \
+      "${inv_agent_profile_mount[@]}" \
       "${inv_plan_mount[@]}" \
       "${inv_out_mount[@]}" \
       "${inv_harness_creds_mount[@]}" \
