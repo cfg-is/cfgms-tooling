@@ -689,8 +689,14 @@ echo ""
 echo "== status reports coverage read-only, without re-running anything (AC2) =="
 before_hash="$(find "$SWEEP_DIR_1" -type f -exec sha256sum {} \; | sort | sha256sum)"
 before_calls="$(wc -l < "${SUB1}/docker_calls.log")"
+# set +e so that a non-zero `status` exit is reported by the check below
+# instead of aborting the whole file under `set -e` -- a broken status command
+# must fail this one assertion and still let the rest of the section run
+# (matching the gate-variant cases further down).
+set +e
 status_out=$(run_cli "$SUB1" status "$(basename "$SWEEP_DIR_1")" 2>&1)
 status_rc=$?
+set -e
 check_eq "status exits 0" "$status_rc" "0"
 check_contains "status reports steps discovered" "$status_out" "Steps discovered: 2"
 check_contains "status lists the claude-model-a lane" "$status_out" "claude-model-a"

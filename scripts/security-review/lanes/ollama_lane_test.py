@@ -96,11 +96,13 @@ def good_finding(**overrides) -> dict:
     return finding
 
 
-def make_harness_stub(exit_code: int = 0, raw_body=None, rate_limited: bool = False, raise_exc: bool = False):
+def make_harness_stub(
+    exit_code: int = 0, raw_body=None, rate_limited: bool = False, raise_exc: bool = False, output_tail: str = ""
+):
     """Returns a `call_harness_fn`-shaped callable that writes `raw_body` (if
     given) to the output path -- standing in for `call_ollama_harness` having
     already extracted a JSON object from stdout -- then reports
-    `(exit_code, rate_limited)`."""
+    `(exit_code, rate_limited, output_tail)` (Issue #4008)."""
 
     def _stub(model, prompt, output_path):
         if raise_exc:
@@ -108,7 +110,7 @@ def make_harness_stub(exit_code: int = 0, raw_body=None, rate_limited: bool = Fa
         if raw_body is not None:
             with open(output_path, "w") as f:
                 json.dump(raw_body, f)
-        return exit_code, rate_limited
+        return exit_code, rate_limited, output_tail
 
     return _stub
 
@@ -308,7 +310,7 @@ def test_call_ollama_harness_passes_nowordwrap_hidethinking_and_format_json() ->
     `--hidethinking`, and `--format json`, not just some of them."""
     with tempfile.TemporaryDirectory() as out_dir:
         with stub_ollama_recording_argv('{"findings": []}\n') as argv_path:
-            exit_code, _ = ollama_lane.call_ollama_harness(
+            exit_code, _rate_limited, _output_tail = ollama_lane.call_ollama_harness(
                 MODEL, "prompt text", os.path.join(out_dir, "raw.json")
             )
             with open(argv_path) as f:
@@ -547,6 +549,48 @@ def test_nonzero_exit_is_failed() -> None:
         )
 
 
+def test_nonzero_exit_carries_the_harness_output_tail() -> None:
+    """[REQUIRED TEST] (Issue #4008) A failed step's envelope must carry the
+    harness's own combined stdout+stderr, not just `harness_exit_1`."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(
+                exit_code=1, raw_body={"findings": []}, output_tail="You need to be signed in"
+            ),
+        )
+        check(
+            written[0].get("harness_output_tail") == "You need to be signed in",
+            "nonzero exit: the envelope carries the harness output tail",
+            repr(written),
+        )
+        check(
+            schema.validate_step_envelope(written[0]) == [],
+            "nonzero exit: the envelope carrying harness_output_tail is still schema-valid",
+            repr(written),
+        )
+
+
+def test_complete_step_never_carries_a_harness_output_tail() -> None:
+    """[REQUIRED TEST] (Issue #4008) A `complete` step's envelope must never
+    carry harness_output_tail, even if the harness printed something."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(
+                exit_code=0, raw_body={"findings": []}, output_tail="some incidental stderr noise"
+            ),
+        )
+        check(written[0]["state"] == "complete", "complete: state is complete", repr(written))
+        check(
+            "harness_output_tail" not in written[0],
+            "complete: the envelope never carries harness_output_tail",
+            repr(written),
+        )
+
+
 def test_subprocess_launch_exception_is_failed() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")
@@ -584,7 +628,7 @@ def test_resume_skips_a_complete_step() -> None:
             calls["n"] += 1
             with open(output_path, "w") as f:
                 json.dump({"findings": []}, f)
-            return 0, False
+            return 0, False, ""
 
         first = ollama_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=stub)
         check(first[0]["state"] == "complete", "resume: first run completes the step", repr(first))
@@ -643,7 +687,7 @@ def test_unsafe_file_path_is_skipped() -> None:
             seen_prompts.append(prompt)
             with open(output_path, "w") as f:
                 json.dump({"findings": []}, f)
-            return 0, False
+            return 0, False, ""
 
         ollama_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=stub)
         check(

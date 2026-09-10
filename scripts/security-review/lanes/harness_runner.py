@@ -565,6 +565,7 @@ def build_envelope(
     files_read: list[str] | None = None,
     dispositions: list[dict] | None = None,
     scans: list[dict] | None = None,
+    harness_output_tail: str | None = None,
 ) -> dict:
     """Build a step envelope carrying `refusal_attempts` alongside the fields
     `schema.py::validate_step_envelope` requires. `context` supplies
@@ -615,6 +616,17 @@ def build_envelope(
     produced output, failed, timed out or was truncated, is coverage
     information a reader needs for a failed step as much as a complete one.
     Omitted only when the caller passed `None` (a lane predating scans).
+
+    `harness_output_tail` (Issue #4008) is the bounded, control-character-free
+    tail of the harness subprocess's own combined stdout+stderr -- see
+    `sanitize_harness_output_tail()` -- attached only on a non-`complete`
+    envelope, and only when non-empty. Before this, a failed step's envelope
+    carried only `stop_reason_raw: "harness_exit_1"`: no auth failure, no
+    "unrecognised model id", no crash text, nothing an operator could read
+    without re-running the harness call by hand. A `complete` step never
+    carries this field at all, matching `findings`'s own conditional --
+    whatever the harness printed on a successful run is not a diagnostic
+    worth keeping.
     """
     envelope = {
         "sweep_id": context["sweep_id"],
@@ -635,6 +647,8 @@ def build_envelope(
         envelope["dispositions"] = dedupe_dispositions(dispositions)
     else:
         envelope["stop_reason_raw"] = stop_reason_raw or state
+        if harness_output_tail:
+            envelope["harness_output_tail"] = harness_output_tail
     if scans is not None:
         envelope["scans"] = list(scans)
     return envelope
@@ -754,6 +768,7 @@ def apply_refusal_policy(
     files_read: list[str] | None = None,
     dispositions: list[dict] | None = None,
     scans: list[dict] | None = None,
+    harness_output_tail: str | None = None,
 ) -> dict:
     """Apply the refusal-retry-once policy on top of one `terminal_state.classify()`
     result and return the envelope to write.
@@ -800,6 +815,7 @@ def apply_refusal_policy(
         files_read=files_read,
         dispositions=dispositions,
         scans=scans,
+        harness_output_tail=harness_output_tail,
     )
 
 
@@ -833,6 +849,42 @@ def write_envelope(lane_dir: str, step_id: str, envelope: dict, plan_step: dict 
 # length (a `write_envelope` rejection quotes the offending hypothesis ids);
 # the envelope records why a step failed, not an unbounded transcript.
 MAX_STOP_REASON_CHARS = 500
+
+# Cap on `harness_output_tail` (Issue #4008). Deliberately wider than
+# `MAX_STOP_REASON_CHARS`: `stop_reason_raw` is a one-line classification
+# this module derives itself, while the harness output tail is the
+# subprocess's own combined stdout+stderr -- the only place a wrong model
+# id, an auth failure, or a crash actually says what happened. Still a
+# bounded TAIL beside a step's status, never the full transcript a lane's
+# harness call produced (out of scope for this issue).
+HARNESS_OUTPUT_TAIL_MAX_CHARS = 4_000
+
+# Control characters stripped from a harness output tail before it is
+# attached to an envelope -- newline and tab kept (multi-line stderr, e.g. a
+# stack trace, stays readable), matching the convention `_sanitize_output`
+# below applies to scanner output. Unlike scanner output, a tail is never
+# re-embedded in a later prompt, so delimiter neutralisation does not apply
+# here -- `consolidate.py`'s own `_md_escape_inline` is what makes it safe
+# to render in `report/consolidated.md`.
+_HARNESS_OUTPUT_TAIL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_harness_output_tail(text: str) -> str:
+    """Bounded, control-character-free tail of a harness subprocess's own
+    combined stdout+stderr, for `harness_output_tail` on a non-`complete`
+    step envelope. Returns `""` for empty/falsy input.
+
+    Only the LAST `HARNESS_OUTPUT_TAIL_MAX_CHARS` characters are kept: the
+    signal that actually explains a failure -- a raised exception, an
+    "unrecognised model id", an auth error -- is overwhelmingly at the end
+    of a harness's output, not the beginning, so truncating the head keeps
+    the useful part rather than discarding it."""
+    if not text:
+        return ""
+    cleaned = _HARNESS_OUTPUT_TAIL_CONTROL_RE.sub("", text)
+    if len(cleaned) > HARNESS_OUTPUT_TAIL_MAX_CHARS:
+        cleaned = cleaned[-HARNESS_OUTPUT_TAIL_MAX_CHARS:]
+    return cleaned
 
 
 def remove_step_temp_artifacts(lane_dir: str, step_id: str) -> None:

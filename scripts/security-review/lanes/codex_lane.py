@@ -283,10 +283,14 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
 
 def call_codex_harness(model: str, prompt: str, output_path: str, timeout: float = CODEX_TIMEOUT_SECONDS) -> tuple:
     """Invoke the `codex` harness for one step. Returns `(exit_code,
-    rate_limited)`. A transport-level failure to even launch the subprocess
-    (binary missing, timeout) is folded into a synthetic non-zero exit code
-    rather than propagating -- the caller treats every step independently and
-    must not abort the whole lane over one step's launch failure.
+    rate_limited, output_tail)` -- `output_tail` (Issue #4008) is the
+    sanitized tail of the subprocess's own combined stdout+stderr, via
+    `harness_runner.sanitize_harness_output_tail`, so a step's envelope can
+    carry it when this call did not end `complete`. A transport-level
+    failure to even launch the subprocess (binary missing, timeout) is
+    folded into a synthetic non-zero exit code rather than propagating -- the
+    caller treats every step independently and must not abort the whole lane
+    over one step's launch failure.
 
     Flags confirmed against the installed CLI (`codex exec --help`,
     `@openai/codex@0.153.4`):
@@ -331,7 +335,7 @@ def call_codex_harness(model: str, prompt: str, output_path: str, timeout: float
     except (OSError, subprocess.SubprocessError) as exc:
         exit_code = 1
         combined = str(exc)
-    return exit_code, _looks_rate_limited(combined)
+    return exit_code, _looks_rate_limited(combined), harness_runner.sanitize_harness_output_tail(combined)
 
 
 def _raw_output_path(out_dir: str, step_id: str) -> str:
@@ -558,6 +562,7 @@ def run_lane(
             task_dispositions: list = []
             task_states: list = []
             stop_reason_raw = None
+            harness_output_tail = None
             launch_exc = None
 
             for task_index, task_hypotheses in enumerate(tasks):
@@ -573,7 +578,7 @@ def run_lane(
 
                 prompt = build_prompt(task_step, file_contents, raw_path)
                 try:
-                    exit_code, rate_limited = call_harness_fn(model, prompt, raw_path)
+                    exit_code, rate_limited, output_tail = call_harness_fn(model, prompt, raw_path)
                 except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
                     launch_exc = exc
                     break
@@ -586,14 +591,16 @@ def run_lane(
                 if task_state == terminal_state.COMPLETE:
                     task_findings.extend(enriched or [])
                     task_dispositions.extend(_build_dispositions(raw_path, task_hypotheses, step_id))
-                elif task_state == terminal_state.PARKED:
-                    stop_reason_raw = stop_reason_raw or "rate_limited"
-                elif task_state == terminal_state.REFUSED:
-                    stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
-                elif task_state == terminal_state.FAILED and exit_code != 0:
-                    stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
                 else:
-                    stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
+                    harness_output_tail = harness_output_tail or output_tail
+                    if task_state == terminal_state.PARKED:
+                        stop_reason_raw = stop_reason_raw or "rate_limited"
+                    elif task_state == terminal_state.REFUSED:
+                        stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
+                    elif task_state == terminal_state.FAILED and exit_code != 0:
+                        stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
+                    else:
+                        stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
 
                 for stale in (raw_path, candidate_path):
                     try:
@@ -637,6 +644,7 @@ def run_lane(
                 files_read=list(file_contents.keys()),
                 scans=harness_runner.scan_summary(scan_evidence),
                 dispositions=task_dispositions if state == terminal_state.COMPLETE else None,
+                harness_output_tail=harness_output_tail if state != terminal_state.COMPLETE else None,
             )
             harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)
             schema.log_event(

@@ -93,11 +93,14 @@ def good_finding(**overrides) -> dict:
     return finding
 
 
-def make_harness_stub(exit_code: int = 0, raw_body=None, rate_limited: bool = False, raise_exc: bool = False):
+def make_harness_stub(
+    exit_code: int = 0, raw_body=None, rate_limited: bool = False, raise_exc: bool = False, output_tail: str = ""
+):
     """Returns a `call_harness_fn`-shaped callable that writes `raw_body` (if
     given) to the raw output path -- standing in for whatever a real `claude`
     subprocess + harness would have written -- then reports `(exit_code,
-    rate_limited)` exactly as `call_claude_harness` does."""
+    rate_limited, output_tail)` exactly as `call_claude_harness` does
+    (Issue #4008)."""
 
     def _stub(model, prompt, output_path):
         if raise_exc:
@@ -105,7 +108,7 @@ def make_harness_stub(exit_code: int = 0, raw_body=None, rate_limited: bool = Fa
         if raw_body is not None:
             with open(output_path, "w") as f:
                 json.dump(raw_body, f)
-        return exit_code, rate_limited
+        return exit_code, rate_limited, output_tail
 
     return _stub
 
@@ -194,7 +197,7 @@ def test_changed_binding_quarantines_and_reruns_the_step() -> None:
             calls["n"] += 1
             with open(output_path, "w") as f:
                 json.dump({"findings": []}, f)
-            return 0, False
+            return 0, False, ""
 
         def run(identity):
             with harness_identity_env(identity):
@@ -294,7 +297,7 @@ def test_prose_refusal_is_refused() -> None:
         def stub(model, prompt, output_path):
             with open(output_path, "w") as f:
                 f.write("I can't help with that request.")
-            return 0, False
+            return 0, False, ""
 
         written = claude_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=stub)
         check(written[0]["state"] == "refused", "prose refusal: state is refused", repr(written))
@@ -327,6 +330,52 @@ def test_nonzero_exit_is_failed() -> None:
         check(
             written[0]["stop_reason_raw"] == "harness_exit_1",
             "nonzero exit: stop_reason_raw carries the exit code",
+            repr(written),
+        )
+
+
+def test_nonzero_exit_carries_the_harness_output_tail() -> None:
+    """[REQUIRED TEST] (Issue #4008) A failed step's envelope must carry the
+    harness's own combined stdout+stderr, not just `harness_exit_1` -- this is
+    the whole point of the story: an operator reading the envelope should not
+    have to re-run the harness call by hand to see e.g. an unrecognised model
+    id or an auth failure."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(
+                exit_code=1, raw_body={"findings": []}, output_tail="Error: model 'sonnet-5' not found"
+            ),
+        )
+        check(
+            written[0].get("harness_output_tail") == "Error: model 'sonnet-5' not found",
+            "nonzero exit: the envelope carries the harness output tail",
+            repr(written),
+        )
+        check(
+            schema.validate_step_envelope(written[0]) == [],
+            "nonzero exit: the envelope carrying harness_output_tail is still schema-valid",
+            repr(written),
+        )
+
+
+def test_complete_step_never_carries_a_harness_output_tail() -> None:
+    """[REQUIRED TEST] (Issue #4008) A successful harness call can still
+    print incidental text to stdout/stderr -- a `complete` step's envelope
+    must never carry it (unchanged envelope size on the happy path)."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(
+                exit_code=0, raw_body={"findings": []}, output_tail="some incidental stderr noise"
+            ),
+        )
+        check(written[0]["state"] == "complete", "complete: state is complete", repr(written))
+        check(
+            "harness_output_tail" not in written[0],
+            "complete: the envelope never carries harness_output_tail",
             repr(written),
         )
 
@@ -406,7 +455,7 @@ def test_unsafe_file_path_is_skipped() -> None:
             seen_prompts.append(prompt)
             with open(output_path, "w") as f:
                 json.dump({"findings": []}, f)
-            return 0, False
+            return 0, False, ""
 
         claude_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=stub)
         check(
@@ -540,7 +589,7 @@ def test_budget_split_invokes_harness_per_task_and_merges_dispositions() -> None
                         )
                 with open(output_path, "w") as f:
                     json.dump({"findings": [], "dispositions": dispositions}, f)
-                return 0, False
+                return 0, False, ""
 
             # A real file so read_step_files actually returns non-empty
             # content -- the split decision is driven by file byte length.
@@ -615,7 +664,7 @@ def test_disallowed_tools_reaches_the_real_subprocess() -> None:
         os.environ["PATH"] = f"{bin_dir}:{original_path}"
         os.environ[claude_lane.DISALLOWED_TOOLS_ENV] = "Edit,Write,Bash(gh pr create:*)"
         try:
-            exit_code, rate_limited = claude_lane.call_claude_harness(
+            exit_code, rate_limited, _output_tail = claude_lane.call_claude_harness(
                 MODEL, "prompt body", os.path.join(work_dir, "raw.json")
             )
         finally:
@@ -863,7 +912,7 @@ def test_run_lane_folds_scanner_evidence_into_prompt_and_envelope() -> None:
             prompts.append(prompt)
             with open(output_path, "w") as f:
                 json.dump({"findings": []}, f)
-            return 0, False
+            return 0, False, ""
 
         with harness_identity_env("h"):
             written = claude_lane.run_lane(plan_dir, out_dir, repo, LANE_ID, MODEL, call_harness_fn=stub)

@@ -439,6 +439,121 @@ def test_apply_refusal_policy_omits_files_fields_when_surfaced_as_failed():
         )
 
 
+# --- harness output tail (Issue #4008) --------------------------------------
+
+
+def test_sanitize_harness_output_tail_strips_control_characters():
+    raw = "line one\x00\x07\nline two\ttabbed\x1b[31mred\x1b[0m"
+    cleaned = harness_runner.sanitize_harness_output_tail(raw)
+    check(
+        "\x00" not in cleaned and "\x07" not in cleaned and "\x1b" not in cleaned,
+        "sanitize_harness_output_tail: strips control characters",
+        repr(cleaned),
+    )
+    check(
+        "\n" in cleaned and "\t" in cleaned,
+        "sanitize_harness_output_tail: keeps newline and tab",
+        repr(cleaned),
+    )
+
+
+def test_sanitize_harness_output_tail_keeps_the_end_when_over_the_cap():
+    head = "a" * (harness_runner.HARNESS_OUTPUT_TAIL_MAX_CHARS + 500)
+    tail = "the actual error: model not found"
+    cleaned = harness_runner.sanitize_harness_output_tail(head + tail)
+    check(
+        cleaned.endswith(tail),
+        "sanitize_harness_output_tail: keeps the tail, not the head, when over the cap",
+        repr(cleaned[-80:]),
+    )
+    check(
+        len(cleaned) == harness_runner.HARNESS_OUTPUT_TAIL_MAX_CHARS,
+        "sanitize_harness_output_tail: bounded to HARNESS_OUTPUT_TAIL_MAX_CHARS",
+        str(len(cleaned)),
+    )
+
+
+def test_sanitize_harness_output_tail_empty_input_returns_empty_string():
+    check(harness_runner.sanitize_harness_output_tail("") == "", "sanitize_harness_output_tail: empty input returns ''")
+    check(harness_runner.sanitize_harness_output_tail(None) == "", "sanitize_harness_output_tail: None returns ''")
+
+
+def test_build_envelope_includes_harness_output_tail_when_not_complete():
+    envelope = harness_runner.build_envelope(
+        make_context(),
+        "claude-sonnet-5",
+        terminal_state.FAILED,
+        0,
+        stop_reason_raw="harness_exit_1",
+        harness_output_tail="Error: model 'sonnet-5' not found",
+    )
+    check(
+        envelope.get("harness_output_tail") == "Error: model 'sonnet-5' not found",
+        "build_envelope: harness_output_tail passes through on a non-complete envelope",
+        str(envelope),
+    )
+
+
+def test_build_envelope_omits_harness_output_tail_when_empty_or_absent():
+    envelope = harness_runner.build_envelope(
+        make_context(), "claude-sonnet-5", terminal_state.FAILED, 0, stop_reason_raw="harness_exit_1"
+    )
+    check(
+        "harness_output_tail" not in envelope,
+        "build_envelope: harness_output_tail is omitted when the caller passes nothing",
+        str(envelope),
+    )
+    envelope_empty = harness_runner.build_envelope(
+        make_context(),
+        "claude-sonnet-5",
+        terminal_state.FAILED,
+        0,
+        stop_reason_raw="harness_exit_1",
+        harness_output_tail="",
+    )
+    check(
+        "harness_output_tail" not in envelope_empty,
+        "build_envelope: an empty harness_output_tail is omitted, never written as ''",
+        str(envelope_empty),
+    )
+
+
+def test_build_envelope_never_includes_harness_output_tail_on_complete():
+    envelope = harness_runner.build_envelope(
+        make_context(),
+        "claude-sonnet-5",
+        terminal_state.COMPLETE,
+        0,
+        findings=[],
+        harness_output_tail="stray text a lane should never attach here",
+    )
+    check(
+        "harness_output_tail" not in envelope,
+        "build_envelope: a complete envelope never carries harness_output_tail, even if the caller passes one",
+        str(envelope),
+    )
+
+
+def test_apply_refusal_policy_passes_harness_output_tail_through_when_failed():
+    with tempfile.TemporaryDirectory() as lane_dir:
+        step_id = "step-410"
+        context = make_context(step_id=step_id)
+        status_path = harness_runner.status_envelope_path(lane_dir, step_id)
+        envelope = harness_runner.apply_refusal_policy(
+            terminal_state.FAILED,
+            status_path,
+            context,
+            "claude-sonnet-5",
+            stop_reason_raw="harness_exit_1",
+            harness_output_tail="unrecognised model id: sonnet-5",
+        )
+        check(
+            envelope.get("harness_output_tail") == "unrecognised model id: sonnet-5",
+            "apply_refusal_policy: threads harness_output_tail through to build_envelope",
+            str(envelope),
+        )
+
+
 # --- dispositions passthrough (Issue #3959) ---------------------------------
 
 

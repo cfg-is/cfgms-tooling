@@ -988,7 +988,15 @@ sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
 sys.path.insert(0, sec_dir)
 import consolidate  # noqa: E402
 
-lanes, step_ids, lane_step_state, lane_step_files, _findings, plan_failed = consolidate.load_sweep(sweep_dir)
+(
+    lanes,
+    step_ids,
+    lane_step_state,
+    lane_step_files,
+    _findings,
+    plan_failed,
+    _lane_step_tail,
+) = consolidate.load_sweep(sweep_dir)
 coverage = consolidate.build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
 coverage_gates = consolidate.load_coverage_gates(sweep_dir)
 

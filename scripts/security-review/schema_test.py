@@ -422,6 +422,53 @@ def test_validate_step_envelope_rejects_non_string_entry_in_files_read():
     )
 
 
+def test_validate_step_envelope_accepts_harness_output_tail_on_non_complete_states():
+    for state in ("parked", "refused", "failed"):
+        envelope = valid_step_envelope(state=state, stop_reason_raw="harness_exit_1", harness_output_tail="model not found: sonnet-5")
+        del envelope["findings"]
+        del envelope["dispositions"]
+        errors = schema.validate_step_envelope(envelope)
+        check(
+            errors == [],
+            f"validate_step_envelope: state={state} with harness_output_tail is valid",
+            str(errors),
+        )
+
+
+def test_validate_step_envelope_harness_output_tail_is_optional_on_non_complete_states():
+    envelope = valid_step_envelope(state="failed", stop_reason_raw="harness_exit_1")
+    del envelope["findings"]
+    del envelope["dispositions"]
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        errors == [],
+        "validate_step_envelope: a non-complete envelope with no harness_output_tail is still valid",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_rejects_non_string_harness_output_tail():
+    envelope = valid_step_envelope(state="failed", stop_reason_raw="harness_exit_1", harness_output_tail=123)
+    del envelope["findings"]
+    del envelope["dispositions"]
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("harness_output_tail" in e for e in errors),
+        "validate_step_envelope: rejects a non-string harness_output_tail",
+        str(errors),
+    )
+
+
+def test_validate_step_envelope_rejects_harness_output_tail_on_complete():
+    envelope = valid_step_envelope(harness_output_tail="leftover diagnostic text")
+    errors = schema.validate_step_envelope(envelope)
+    check(
+        any("harness_output_tail" in e for e in errors),
+        "validate_step_envelope: a complete envelope must not carry harness_output_tail",
+        str(errors),
+    )
+
+
 def test_validate_step_envelope_missing_fields_distinct_errors():
     envelope = valid_step_envelope()
     del envelope["sweep_id"]

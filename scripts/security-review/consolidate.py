@@ -224,7 +224,7 @@ def _plan_failed(sweep_dir: str, step_ids: list[str]) -> bool:
 def load_sweep(sweep_dir: str):
     """Read the frozen plan and every lane's step files under `sweep_dir`.
 
-    Returns `(lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed)`:
+    Returns `(lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail)`:
     - `lanes`: sorted lane directory names discovered under `lanes/`.
     - `step_ids`: sorted step ids read from `plan/step-*.json` -- the frozen
       plan, never a union of lane-produced artifact files. Empty when the
@@ -244,12 +244,18 @@ def load_sweep(sweep_dir: str):
       a schema-valid `state == "complete"` envelope.
     - `plan_failed`: True when `plan/PLANNING_FAILED` is present or `plan/`
       contains zero step files -- coverage cannot be computed for this sweep.
+    - `lane_step_tail`: `{lane: {step_id: harness_output_tail}}` (Issue #4008)
+      -- populated only for a non-`complete` step whose envelope carries a
+      non-empty `harness_output_tail`. An envelope written before this story,
+      by a lane that has not yet been upgraded, or that genuinely has nothing
+      to show simply has no entry here rather than an empty string.
     """
     lanes = _discover_lanes(sweep_dir)
     step_ids = _discover_plan_step_ids(sweep_dir)
     plan_failed = _plan_failed(sweep_dir, step_ids)
     lane_step_state: dict[str, dict[str, str]] = {lane: {} for lane in lanes}
     lane_step_files: dict[str, dict[str, dict]] = {lane: {} for lane in lanes}
+    lane_step_tail: dict[str, dict[str, str]] = {lane: {} for lane in lanes}
     findings: list[tuple[str, str, dict]] = []
 
     for lane in lanes:
@@ -305,6 +311,9 @@ def load_sweep(sweep_dir: str):
                         }
                 else:
                     lane_step_state[lane][step_id] = state
+                    tail = envelope.get("harness_output_tail")
+                    if isinstance(tail, str) and tail:
+                        lane_step_tail[lane][step_id] = tail
                 continue
 
             if os.path.isfile(status_path):
@@ -326,13 +335,16 @@ def load_sweep(sweep_dir: str):
                     continue
 
                 lane_step_state[lane][step_id] = envelope["state"]
+                tail = envelope.get("harness_output_tail")
+                if isinstance(tail, str) and tail:
+                    lane_step_tail[lane][step_id] = tail
                 continue
 
             # Neither file exists: this lane never ran this step. Left absent
             # from lane_step_state -- build_coverage_table() counts it as
             # not_started rather than dropping it from every bucket.
 
-    return lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed
+    return lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail
 
 
 def _tree_files(repo_root: str, commit_sha: str, cache: dict[str, frozenset]) -> frozenset:
@@ -999,10 +1011,39 @@ def build_scanner_coverage(lanes: list[str], step_ids: list[str], lane_step_scan
     return rows
 
 
+def _failed_step_tails(
+    lanes: list[str],
+    step_ids: list[str],
+    lane_step_state: dict[str, dict[str, str]],
+    lane_step_tail: dict[str, dict[str, str]],
+) -> list[dict]:
+    """One entry per (lane, step_id) with a recorded `harness_output_tail`
+    (Issue #4008), in deterministic lane/step order -- never a dict keyed on
+    lane, since a report reader wants a flat, orderable list of concrete
+    gaps, exactly like every other `## Incomplete` bullet. A step with no
+    tail recorded (an envelope written before this story, or a state that
+    genuinely had nothing to show) is simply absent, never an empty string."""
+    entries = []
+    for lane in lanes:
+        for step_id in step_ids:
+            tail = lane_step_tail.get(lane, {}).get(step_id)
+            if not tail:
+                continue
+            entries.append(
+                {
+                    "lane": lane,
+                    "step_id": step_id,
+                    "state": lane_step_state.get(lane, {}).get(step_id, "failed"),
+                    "harness_output_tail": tail,
+                }
+            )
+    return entries
+
+
 def consolidate(sweep_dir: str, repo_root: str) -> dict:
     """Read `sweep_dir` and return the full consolidated report as a dict --
     the exact shape written to `report/consolidated.json`."""
-    lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed = load_sweep(sweep_dir)
+    lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail = load_sweep(sweep_dir)
     groups = _group_findings(findings, repo_root)
     consolidated_findings = _finalize_findings(groups, lane_step_state)
     coverage = build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
@@ -1041,6 +1082,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "adjudication": adjudication,
         "cross_step_groups": cross_step_groups,
         "findings": consolidated_findings,
+        "failed_step_tails": _failed_step_tails(lanes, step_ids, lane_step_state, lane_step_tail),
     }
 
 
@@ -1287,6 +1329,18 @@ def _incomplete_lines(report: dict) -> list[str]:
             lines.append(
                 f"- Lane `{lane}`: {row['files_short']} step(s) read fewer "
                 "files than declared (`files_short`)."
+            )
+
+    tails = report.get("failed_step_tails") or []
+    if tails:
+        lines.append(
+            f"- Harness output recorded for {len(tails)} non-complete step(s) -- the "
+            "diagnostic behind `stop_reason_raw`, not just its name:"
+        )
+        for entry in tails:
+            lines.append(
+                f"  - Lane `{_md_escape_inline(entry['lane'])}` step `{_md_escape_inline(entry['step_id'])}` "
+                f"(`{_md_escape_inline(entry['state'])}`): `{_md_escape_inline(entry['harness_output_tail'])}`"
             )
 
     dispatch = report.get("dispatch") or {}

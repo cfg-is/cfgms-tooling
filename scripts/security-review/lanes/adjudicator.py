@@ -697,7 +697,12 @@ def run_adjudication(
         _remove(raw_path)
         prompt = build_prompt(batch, raw_path, harness)
         try:
-            exit_code, rate_limited = call_harness_fn(model, prompt, raw_path)
+            # Issue #4008: a real `call_<harness>_harness` now returns a third
+            # element (the sanitized output tail); this stage does not surface
+            # it on its own envelope shape, so a 2-tuple test stub keeps
+            # working unchanged.
+            harness_result = call_harness_fn(model, prompt, raw_path)
+            exit_code, rate_limited = harness_result[0], harness_result[1]
         except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed stage, never a crash
             _remove(raw_path)
             return finish(terminal_state.FAILED, f"launch_exception:{exc}", batches=len(batches), unsent_findings=unsent_findings, unassessed_groups=unassessed_groups)

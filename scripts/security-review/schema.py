@@ -45,7 +45,12 @@ Three shapes are validated here:
   rather than only `files_read`, is what lets a report distinguish "reviewed
   everything declared and found nothing" from "skipped every declared file
   and still returned an empty findings array" — the two are otherwise
-  indistinguishable from `findings: []` alone. `plan_hash`/`prompt_version`/
+  indistinguishable from `findings: []` alone. `harness_output_tail` (Issue
+  #4008) is the mirror-image optional field: a bounded, control-character-free
+  tail of the harness subprocess's own combined stdout+stderr, valid only on a
+  non-`complete` envelope — a `complete` step's harness output is not a
+  diagnostic worth keeping, exactly as `files_intended`/`files_read` are not
+  written on a step that never got that far. `plan_hash`/`prompt_version`/
   `harness_identity` (Issue #3962) are required on every envelope regardless
   of `state`, exactly like `sweep_id`/`commit_sha`/`lane`/`step_id`/`model_id`
   — the identity of the frozen plan step, system prompt, and harness code a
@@ -409,11 +414,17 @@ def validate_step_envelope(envelope: object, plan_step: object = None) -> list[s
                 errors.append(
                     f"field {field} must be a list of non-empty strings when present, got {value!r}"
                 )
+        if "harness_output_tail" in envelope:
+            errors.append("harness_output_tail must not be present when state is complete")
     elif _is_member(state, STEP_STATES):
         raw_reason = envelope.get("stop_reason_raw")
         if not isinstance(raw_reason, str) or raw_reason == "":
             errors.append(
                 "stop_reason_raw must be present and non-empty when state is not complete"
+            )
+        if "harness_output_tail" in envelope and not isinstance(envelope["harness_output_tail"], str):
+            errors.append(
+                f"harness_output_tail must be a string when present, got {envelope['harness_output_tail']!r}"
             )
 
     return errors

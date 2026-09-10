@@ -1526,6 +1526,82 @@ def test_incomplete_sweep_due_to_refused_step_names_lane_in_incomplete_section()
         )
 
 
+def test_failed_step_harness_output_tail_is_shown_in_incomplete_section():
+    """[REQUIRED TEST] (Issue #4008) A failed step's `.status.json` carrying
+    `harness_output_tail` must surface that text in `report/consolidated.md`'s
+    `## Incomplete` section -- not just `stop_reason_raw`'s bare name."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        failed = {
+            **status_envelope(sha, "laneA", "step-001", "failed"),
+            "stop_reason_raw": "harness_exit_1",
+            "harness_output_tail": "Error: model 'sonnet-5' not found",
+        }
+        assert schema.validate_step_envelope(failed) == [], "test fixture must be schema-valid"
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.status.json"), failed)
+
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            report["failed_step_tails"] == [
+                {
+                    "lane": "laneA",
+                    "step_id": "step-001",
+                    "state": "failed",
+                    "harness_output_tail": "Error: model 'sonnet-5' not found",
+                }
+            ],
+            "consolidate: failed_step_tails records the lane/step/state/tail",
+            str(report["failed_step_tails"]),
+        )
+
+        md = consolidate.render_markdown(report)
+        incomplete_section = _section(md, "## Incomplete")
+        check(
+            "laneA" in incomplete_section
+            and "step-001" in incomplete_section
+            and "Error: model 'sonnet-5' not found" in incomplete_section,
+            "consolidate.md: the Incomplete section shows the harness output tail for the failed step",
+            incomplete_section,
+        )
+
+
+def test_step_with_no_harness_output_tail_recorded_is_not_listed():
+    # An envelope written before this story (or by a lane with nothing to
+    # show) carries no harness_output_tail at all -- failed_step_tails must
+    # stay empty, never synthesize a blank entry.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        failed = status_envelope(sha, "laneA", "step-001", "failed")
+        assert schema.validate_step_envelope(failed) == [], "test fixture must be schema-valid"
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.status.json"), failed)
+
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            report["failed_step_tails"] == [],
+            "consolidate: no harness_output_tail on disk means no entry, not a blank one",
+            str(report["failed_step_tails"]),
+        )
+
+
+def test_complete_step_never_appears_in_failed_step_tails():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        write_plan_step(sweep, "step-001", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            report["failed_step_tails"] == [],
+            "consolidate: a complete step never contributes to failed_step_tails",
+            str(report["failed_step_tails"]),
+        )
+
+
 def test_zero_lanes_dispatched_is_incomplete_not_clean():
     # A valid, non-empty plan with zero lanes dispatched has reviewed
     # nothing -- the exact "unreviewed package looks clean" failure mode
