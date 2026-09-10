@@ -396,6 +396,41 @@ def test_subprocess_launch_exception_is_failed() -> None:
         )
 
 
+def test_unrecognized_model_stops_the_lane_after_one_step() -> None:
+    """[REQUIRED TEST] (Issue #4006) The pinned CLI rejects an unrecognised
+    model id identically on every step -- the configured model, not any
+    step's content, is what is broken -- so the lane must record exactly ONE
+    failed envelope naming the model id and stop dispatching, instead of
+    spending a harness call per remaining step to record the same failure
+    over and over. The stubbed output below is the real CLI text (Issue
+    #4006's bug report / the first end-to-end run, Issue #3985)."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        write_plan_step(plan_dir, "step-002")
+        calls: list = []
+
+        def _stub(model, prompt, output_path):
+            calls.append(model)
+            return (
+                1,
+                False,
+                "\"sonnet-5\" isn't described by this version's model catalog; update Claude "
+                "Code, or map it with behavesAs ...\n"
+                '[claude-code:unrecognized_model] {"model":"sonnet-5","query_source":"sdk"}',
+            )
+
+        written = claude_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=_stub)
+
+        check(len(calls) == 1, "unrecognized model: only one harness call is spent", repr(calls))
+        check(len(written) == 1, "unrecognized model: exactly one envelope is written", repr(written))
+        check(written[0]["state"] == "failed", "unrecognized model: state is failed", repr(written))
+        check(
+            written[0]["stop_reason_raw"] == f"unrecognized_model:{MODEL}",
+            "unrecognized model: stop_reason_raw names the configured model id",
+            repr(written),
+        )
+
+
 def test_rate_limited_is_parked() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")
@@ -741,6 +776,19 @@ def test_looks_rate_limited() -> None:
     check(claude_lane._looks_rate_limited("Usage limit reached, try later"), "detects 'usage limit'")
     check(claude_lane._looks_rate_limited("HTTP 429 too many requests"), "detects '429'")
     check(not claude_lane._looks_rate_limited("here are your findings"), "does not false-positive on normal output")
+
+
+def test_looks_like_unrecognized_model() -> None:
+    check(
+        claude_lane._looks_like_unrecognized_model(
+            '[claude-code:unrecognized_model] {"model":"sonnet-5","query_source":"sdk"}'
+        ),
+        "detects the real CLI's '[claude-code:unrecognized_model]' marker",
+    )
+    check(
+        not claude_lane._looks_like_unrecognized_model("here are your findings"),
+        "does not false-positive on normal output",
+    )
 
 
 def test_import_isolation_single_file_layout() -> None:

@@ -83,13 +83,17 @@ Commands:
                        Read-only: never re-runs the planner, a lane, or the consolidator.
 
 CFGMS_SECURITY_REVIEW_LANES (required) is a comma-separated list of harness:model
-pairs, e.g. "claude:sonnet-5" -- see roster.py and
-docs/architecture/security-review-harness.md. A lane that parks, refuses, or fails
-on some steps never blocks any other lane's dispatch or progress, and never
-prevents the consolidator from running against whatever the other lanes produced.
+pairs, e.g. "claude:claude-sonnet-5" (full id; the pinned CLI rejects short
+forms like "sonnet-5") -- see roster.py and
+docs/architecture/security-review-harness.md. To see which model ids the
+pinned `claude` CLI actually recognizes, run `claude --model` interactively
+for its picker, or use the full `claude-<family>-<n>` form directly. A lane
+that parks, refuses, or fails on some steps never blocks any other lane's
+dispatch or progress, and never prevents the consolidator from running
+against whatever the other lanes produced.
 
 CFGMS_SECURITY_REVIEW_ADJUDICATOR (optional) is exactly ONE harness:model pair,
-e.g. "claude:opus-5". When set, after every lane has exited the deterministic
+e.g. "claude:claude-opus-5". When set, after every lane has exited the deterministic
 findings are handed -- findings only, never source -- to that model in a
 read-only investigator container (adjudicate.py, Issue #3984), which applies
 the severity rubric to each finding and assesses cross-step groups; the
@@ -151,7 +155,7 @@ create_sweep_tree() {
   local ref="$1"
 
   if [[ -z "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then
-    echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:sonnet-5\") -- the roster is the only lane-dispatch path" >&2
+    echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:claude-sonnet-5\") -- the roster is the only lane-dispatch path" >&2
     return 1
   fi
 
@@ -711,7 +715,7 @@ dispatch_all_lanes() {
   local sweep_dir="$1"
 
   if [[ -z "${CFGMS_SECURITY_REVIEW_LANES:-}" ]]; then
-    echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:sonnet-5\") -- the roster is the only lane-dispatch path" >&2
+    echo "ERROR: CFGMS_SECURITY_REVIEW_LANES must be set (comma-separated harness:model pairs, e.g. \"claude:claude-sonnet-5\") -- the roster is the only lane-dispatch path" >&2
     return 1
   fi
 

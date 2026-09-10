@@ -252,6 +252,20 @@ def _looks_rate_limited(text: str) -> bool:
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
+# Issue #4006: the pinned CLI rejects a model id outside its catalog with this
+# exact marker on every single invocation --
+# `[claude-code:unrecognized_model] {"model":"sonnet-5","query_source":"sdk"}`
+# was the text the first end-to-end run (Issue #3985) had to reproduce by
+# hand to diagnose `--model sonnet-5`. The model id, not any step's content,
+# is what is broken, so `run_lane` treats this marker as a lane-stopping
+# condition rather than one more `harness_exit_<code>` recorded per step.
+_UNRECOGNIZED_MODEL_MARKER = "unrecognized_model"
+
+
+def _looks_like_unrecognized_model(text: str) -> bool:
+    return _UNRECOGNIZED_MODEL_MARKER in text.lower()
+
+
 def _is_safe_repo_relative_path(value: object) -> bool:
     """True iff `value` is a plain repo-relative path -- never absolute,
     never `../`-shaped. Syntactic guard only; see `_resolve_within_repo` for
@@ -661,6 +675,7 @@ def run_lane(
             stop_reason_raw = None
             harness_output_tail = None
             launch_exc = None
+            unrecognized_model = False
 
             for task_index, task_hypotheses in enumerate(tasks):
                 task_step = dict(step, hypotheses=task_hypotheses, scan_evidence=scan_evidence)
@@ -695,7 +710,18 @@ def run_lane(
                     elif task_state == terminal_state.REFUSED:
                         stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
                     elif task_state == terminal_state.FAILED and exit_code != 0:
-                        stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
+                        # Issue #4006: the CLI rejects the configured model id
+                        # identically on every step -- this overrides whatever
+                        # stop_reason_raw an earlier task in this same step
+                        # already set, and the flag below stops the whole lane
+                        # after this step's envelope is written, so no further
+                        # step spends a harness call to record the same
+                        # rejection over and over.
+                        if _looks_like_unrecognized_model(output_tail):
+                            stop_reason_raw = f"unrecognized_model:{model}"
+                            unrecognized_model = True
+                        else:
+                            stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
                     else:
                         stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
 
@@ -704,6 +730,9 @@ def run_lane(
                         os.remove(stale)
                     except OSError:
                         pass
+
+                if unrecognized_model:
+                    break
 
             if launch_exc is not None:
                 schema.log_event("step_launch_failed", step_id=step_id, error=str(launch_exc))
@@ -751,6 +780,12 @@ def run_lane(
                 stop_reason_raw=envelope.get("stop_reason_raw"),
             )
             written.append(envelope)
+            if unrecognized_model:
+                # Issue #4006: every remaining step would fail on this same
+                # rejected model id -- stop the lane here instead of spending
+                # one harness call per remaining step to record it again.
+                schema.log_event("lane_stopped_unrecognized_model", step_id=step_id, model=model)
+                break
         except Exception as exc:  # noqa: BLE001 -- one bad step is a failed step, never a crashed lane
             schema.log_event("step_unhandled_error", step_id=step_id, error=str(exc))
             harness_runner.remove_step_temp_artifacts(out_dir, step_id)
