@@ -258,6 +258,109 @@ pkill -f "${BIN_DIR}/ollama" 2>/dev/null || true
 rm -rf "$BIN_DIR" "$WORK_HOME"
 rm -f "$LANE_RUN_LOG" "$OLLAMA_CALL_LOG"
 
+# ----------------------------------------------------------------------------
+# Plan-mode prompt transport (Issue #4002): a prompt over Linux's
+# MAX_ARG_STRLEN (131072 bytes) must reach `claude` on stdin, never as an
+# argv element -- `-p "$(cat "$PROMPT_FILE")"` made bash's own `exec` fail
+# with "Argument list too long" before `claude` ever started, for any prompt
+# this large. Both branches of the plan-mode `case` (with and without
+# CFGMS_SECURITY_REVIEW_MODEL) built that same failing argv shape, so both
+# are exercised here.
+#
+# Real /workspace-out is a container-internal bind-mount destination this
+# suite's own (non-root) user cannot create directly, so these tests use
+# investigator-entrypoint.sh's CFGMS_TEST_PROMPT_FILE_PATH /
+# CFGMS_TEST_PLAN_RESULT_PATH overrides to point plan mode at fixture paths
+# this suite controls instead -- the same override-for-testability
+# convention CFGMS_TEST_LANE_SCRIPT_PATH already uses above.
+
+# Stub `claude` binary: captures everything read from stdin to
+# CLAUDE_STDIN_CAPTURE and exits 0. A real `claude` invoked with the fixed
+# pre-#4002 argv shape would never even start -- the shell's own `exec`
+# fails with E2BIG constructing the child's argv -- so this stub only ever
+# runs at all once the prompt is actually piped on stdin.
+make_stub_claude_capturing_stdin() {
+    local dir="$1"
+    cat > "${dir}/claude" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+cat > "${CLAUDE_STDIN_CAPTURE}"
+echo '{"modelUsage":{}}'
+exit 0
+STUB
+    chmod +x "${dir}/claude"
+}
+
+make_large_prompt_file() {
+    # 200000 bytes of 'A' -- comfortably over the 131072-byte MAX_ARG_STRLEN
+    # cap and matching the acceptance criteria's own floor.
+    head -c 200000 /dev/zero | tr '\0' 'A' > "$1"
+}
+
+run_plan_entrypoint() {
+    # run_plan_entrypoint <prompt_file> <result_file> <stdin_capture> [model]
+    local prompt_file="$1" result_file="$2" stdin_capture="$3" model="${4:-}"
+    echo "nameserver 127.0.0.1" > "${WORK_HOME}/resolv.conf"
+    mkdir -p "${WORK_HOME}/.claude"
+    touch "${WORK_HOME}/.claude/.credentials.json"
+    timeout 20 env HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+      CFGMS_TEST_PROMPT_FILE_PATH="$prompt_file" \
+      CFGMS_TEST_PLAN_RESULT_PATH="$result_file" \
+      CFGMS_TEST_RESOLV_CONF_PATH="${WORK_HOME}/resolv.conf" \
+      CFGMS_INVESTIGATOR_DISALLOWED_TOOLS="Bash(curl:*),Bash(wget:*)" \
+      CFGMS_SECURITY_REVIEW_MODEL="$model" \
+      CLAUDE_STDIN_CAPTURE="$stdin_capture" \
+      bash "$ENTRYPOINT" plan
+}
+
+# ----------------------------------------------------------------------------
+echo ""
+echo "--- REQUIRED TEST: plan mode (legacy, no --model) starts claude with a"
+echo "    200000-byte prompt on stdin, never argv (Issue #4002) ---"
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PROMPT_FILE="$(mktemp)"
+RESULT_FILE="$(mktemp)"
+STDIN_CAPTURE="$(mktemp)"
+make_stub_claude_capturing_stdin "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+
+set +e
+out=$(run_plan_entrypoint "$PROMPT_FILE" "$RESULT_FILE" "$STDIN_CAPTURE" "" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "legacy plan mode: entrypoint exits 0 for a 200000-byte prompt"
+assert_not_contains "$out" "Argument list too long" "legacy plan mode: no argv-too-long error"
+received_size="$(wc -c < "$STDIN_CAPTURE" | tr -d ' ')"
+assert_eq "$received_size" "200000" "legacy plan mode: claude receives the full 200000-byte prompt on stdin"
+rm -rf "$BIN_DIR" "$WORK_HOME"
+rm -f "$PROMPT_FILE" "$RESULT_FILE" "$STDIN_CAPTURE"
+
+# ----------------------------------------------------------------------------
+echo ""
+echo "--- REQUIRED TEST: plan mode (CFGMS_SECURITY_REVIEW_MODEL set) starts"
+echo "    claude with a 200000-byte prompt on stdin, never argv (Issue #4002) ---"
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PROMPT_FILE="$(mktemp)"
+RESULT_FILE="$(mktemp)"
+STDIN_CAPTURE="$(mktemp)"
+make_stub_claude_capturing_stdin "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+
+set +e
+out=$(run_plan_entrypoint "$PROMPT_FILE" "$RESULT_FILE" "$STDIN_CAPTURE" "sonnet-5" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "modeled plan mode: entrypoint exits 0 for a 200000-byte prompt"
+assert_not_contains "$out" "Argument list too long" "modeled plan mode: no argv-too-long error"
+received_size="$(wc -c < "$STDIN_CAPTURE" | tr -d ' ')"
+assert_eq "$received_size" "200000" "modeled plan mode: claude receives the full 200000-byte prompt on stdin"
+result_contents="$(cat "$RESULT_FILE" 2>/dev/null || true)"
+assert_contains "$result_contents" "modelUsage" "modeled plan mode: --output-format json result is captured at CFGMS_TEST_PLAN_RESULT_PATH"
+rm -rf "$BIN_DIR" "$WORK_HOME"
+rm -f "$PROMPT_FILE" "$RESULT_FILE" "$STDIN_CAPTURE"
+
 echo ""
 echo "=== Summary: $TESTS_PASSED/$TESTS_RUN passed ==="
 if [[ ${#FAILURES[@]} -gt 0 ]]; then

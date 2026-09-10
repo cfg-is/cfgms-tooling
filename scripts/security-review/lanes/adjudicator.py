@@ -40,10 +40,12 @@ were judged -- and `consolidate.py` renders raw severities plus an entry in
 adjudication is detectable), `prompt_version`, and `harness_identity`.
 
 **Batching.** Findings are handed to the harness in batches whose rendered
-prompt is measured to stay under `MAX_PROMPT_BYTES` (a single argv argument
-on Linux caps at 131072 bytes) and whose count stays at or under
-`BATCH_SIZE`, one harness call per batch; every batch must complete for the
-envelope to be `complete`. The ceiling is absolute: a single finding too
+prompt is measured to stay under `MAX_PROMPT_BYTES` -- an independent,
+tunable ceiling, not an OS argv limit (Issue #4002 moved both harnesses'
+prompts onto stdin, so there is no argv cap for this transport to stay
+under) -- and whose count stays at or under `BATCH_SIZE`, one harness call
+per batch; every batch must complete for the envelope to be `complete`.
+The ceiling is absolute: a single finding too
 large to send whole has its reports capped to the strongest
 `MAX_REPORTS_PER_FINDING` and its text caps halved until it fits (each
 reduction stated in the prompt), and one that still does not fit is listed
@@ -124,13 +126,13 @@ OUTPUT_FILENAME = "adjudication.json"
 RAW_OUTPUT_PREFIX = ".adjudication-raw"
 
 BATCH_SIZE = 40
-# Hard ceiling on one batch's rendered prompt, in UTF-8 bytes. `claude` and
-# `codex` receive the prompt as ONE argv argument, and Linux caps a single
-# argument at MAX_ARG_STRLEN (131072 bytes) -- a prompt over that fails with
-# E2BIG before any model runs. Forty findings alone do not bound bytes (forty
-# findings with two capped reports each rendered to ~235 KB in review), so
-# batching is by measured prompt size, rubric and group overhead included,
-# with the finding count as a secondary cap.
+# Hard ceiling on one batch's rendered prompt, in UTF-8 bytes. Since Issue
+# #4002 moved both `claude` and `codex` onto stdin for the prompt, there is
+# no OS argv cap this constant needs to stay under -- it is an independent,
+# tunable ceiling on batch size. Forty findings alone do not bound bytes
+# (forty findings with two capped reports each rendered to ~235 KB in
+# review), so batching is by measured prompt size, rubric and group overhead
+# included, with the finding count as a secondary cap.
 MAX_PROMPT_BYTES = 100_000
 PROBE_OUTPUT_PATH = "/workspace-out/.adjudication-raw.batch000.json"
 EVIDENCE_MAX_CHARS = 1_500

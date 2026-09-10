@@ -386,7 +386,16 @@ def call_claude_harness(model: str, prompt: str, output_path: str, timeout: floa
 
     `--disallowedTools` is always passed (see `resolve_disallowed_tools`): the
     prompt carries attacker-controllable file bodies, so the tool surface this
-    process grants is a control, not a convenience."""
+    process grants is a control, not a convenience.
+
+    Issue #4002: the prompt is sent on stdin (`input=prompt`, `-p` with no
+    argv value), never as a trailing argv element. Linux caps a single argv
+    string at MAX_ARG_STRLEN (131072 bytes); a step bundling ~13 files
+    routinely builds a prompt over that (166842 bytes measured for a real
+    `pkg/session` step), and `subprocess.run` raised `OSError(E2BIG)` on that
+    exact prompt before this fix -- folded into the synthetic exit code below
+    like any other launch failure, so it looked like an ordinary harness
+    failure rather than a transport limit."""
     env = dict(os.environ)
     env[STEP_OUTPUT_FILE_ENV] = output_path
     disallowed_tools = resolve_disallowed_tools(env)
@@ -400,8 +409,8 @@ def call_claude_harness(model: str, prompt: str, output_path: str, timeout: floa
                 "--model",
                 model,
                 "-p",
-                prompt,
             ],
+            input=prompt,
             env=env,
             capture_output=True,
             text=True,

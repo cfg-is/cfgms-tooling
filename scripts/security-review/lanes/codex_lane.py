@@ -309,6 +309,18 @@ def call_codex_harness(model: str, prompt: str, output_path: str, timeout: float
         mechanism this whole module is built around (see module docstring).
       - `-m/--model` -- the roster's model id, exactly as `claude_lane.py`
         passes `--model`.
+
+    Issue #4002: the prompt is sent on stdin (`input=prompt`), with `-` as
+    the positional prompt argument telling `codex exec` explicitly to read it
+    from there, never as a trailing argv element. Linux caps a single argv
+    string at MAX_ARG_STRLEN (131072 bytes); a step bundling ~13 files
+    routinely builds a prompt over that (166842 bytes measured for a real
+    `pkg/session` step), and `subprocess.run` raised `OSError(E2BIG)` on that
+    exact prompt before this fix -- folded into the synthetic exit code below
+    like any other launch failure, so it looked like an ordinary harness
+    failure rather than a transport limit. Confirmed against the installed
+    CLI: `codex exec - --output-last-message <file>` with the prompt piped on
+    stdin answers correctly for a 200000-byte prompt.
     """
     env = dict(os.environ)
     try:
@@ -323,8 +335,9 @@ def call_codex_harness(model: str, prompt: str, output_path: str, timeout: float
                 "--skip-git-repo-check",
                 "--output-last-message",
                 output_path,
-                prompt,
+                "-",
             ],
+            input=prompt,
             env=env,
             capture_output=True,
             text=True,

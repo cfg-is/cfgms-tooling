@@ -1751,17 +1751,29 @@ commit_harness_fixture_repo "$CONTENT_FIXTURE_REPO"
 echo "DIRTY_WORKING_TREE_MARKER_never_seen" > "${CONTENT_FIXTURE_REPO}/pkg/example/file.go"
 
 # A dedicated claude stub for this test only (never the shared
-# STUB_CLAUDE_BIN_DIR) that logs its own -p prompt argv -- the prompt is
+# STUB_CLAUDE_BIN_DIR) that logs BOTH its argv and its stdin -- the prompt is
 # exactly where claude_lane.py::build_prompt() embeds every file it read via
 # read_step_files(repo_root, ...), so grepping the logged prompt for either
 # marker proves which repo_root the lane actually read from.
+#
+# stdin is logged because that is where the prompt now arrives: since Issue
+# #4002, call_claude_harness() passes `-p` with no argv value and hands the
+# prompt to the binary via `input=prompt` (a real prompt exceeds Linux's
+# MAX_ARG_STRLEN as a single argv string). Logging argv alone would make both
+# checks below vacuous -- the marker would be absent from an empty log, so
+# check_not_contains would "pass" while proving nothing. Both are captured so
+# this test keeps asserting provenance regardless of which transport the lane
+# uses.
 CONTENT_TEST_CLAUDE_BIN="$(mktemp -d)"
 CONTENT_PROMPT_LOG="$(mktemp)"
 cat > "${CONTENT_TEST_CLAUDE_BIN}/claude" <<'CONTENT_STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 output_path="${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
-printf '%s\n' "$*" >> "${CFGMS_TEST_PROMPT_LOG:?}"
+prompt_log="${CFGMS_TEST_PROMPT_LOG:?}"
+printf '%s\n' "$*" >> "$prompt_log"
+cat >> "$prompt_log"
+printf '\n' >> "$prompt_log"
 printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
 CONTENT_STUB
 chmod +x "${CONTENT_TEST_CLAUDE_BIN}/claude"
@@ -1792,6 +1804,12 @@ set -e
 check_eq "content-provenance launch exits 0" "$content_launch_rc" "0"
 
 prompt_seen="$(cat "$CONTENT_PROMPT_LOG" 2>/dev/null || true)"
+# Guard the check_not_contains below against passing vacuously: an empty log
+# (the stub never ran, or the prompt travelled by a route the stub does not
+# capture) contains neither marker and would otherwise read as a pass.
+[[ -n "$prompt_seen" ]] \
+  && ok "the stub captured a non-empty prompt (provenance checks are not vacuous)" \
+  || bad "the stub captured a non-empty prompt (provenance checks are not vacuous)" "prompt log empty"
 check_contains "the lane's prompt embeds the snapshot's (committed) file content" "$prompt_seen" "COMMITTED_SNAPSHOT_MARKER_c3a91f"
 check_not_contains "the lane's prompt never embeds REPO_ROOT's dirty working-tree content" "$prompt_seen" "DIRTY_WORKING_TREE_MARKER_never_seen"
 

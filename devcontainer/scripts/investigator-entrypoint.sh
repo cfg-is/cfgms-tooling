@@ -90,7 +90,16 @@ case "$MODE" in
         exit 1
     fi
 
-    PROMPT_FILE="/workspace-out/.investigator-plan-prompt.md"
+    # CFGMS_TEST_PROMPT_FILE_PATH / CFGMS_TEST_PLAN_RESULT_PATH let
+    # investigator-entrypoint_test.sh point plan mode at fixture paths it
+    # controls, since /workspace-out is a container-internal bind-mount
+    # destination this process's own user cannot create directly outside a
+    # real launch-investigator container. Unset in every real container,
+    # where the launcher's mount always lands at the defaults below. Same
+    # override-for-testability convention CFGMS_TEST_LANE_SCRIPT_PATH and
+    # CFGMS_TEST_RESOLV_CONF_PATH above already use.
+    PROMPT_FILE="${CFGMS_TEST_PROMPT_FILE_PATH:-/workspace-out/.investigator-plan-prompt.md}"
+    PLAN_RESULT_FILE="${CFGMS_TEST_PLAN_RESULT_PATH:-/workspace-out/.investigator-plan-result.json}"
     if [ ! -f "$PROMPT_FILE" ]; then
         echo "ERROR: plan prompt not found at ${PROMPT_FILE}"
         echo "The planner dispatch (story S4) should have written it before launch."
@@ -133,14 +142,22 @@ case "$MODE" in
     # Written to a fixed path under /workspace-out/ -- the only writable
     # mount in plan mode -- instead of only stdout, so
     # finalize_multi_planner() can read it back after the container exits.
+    #
+    # Issue #4002: the prompt is piped on stdin (`-p` with no argv value,
+    # `< "$PROMPT_FILE"`), never `-p "$(cat "$PROMPT_FILE")"`. Linux caps a
+    # single argv string at MAX_ARG_STRLEN (131072 bytes); this repo's own
+    # plan prompt already exceeds it (156037 bytes for develop at 61bba9b8,
+    # 3283 inventory paths), so the old form failed every run on this
+    # repository with "Argument list too long" before `claude` ever started
+    # -- confirmed fixed in the same image by piping instead.
     if [ -n "${CFGMS_SECURITY_REVIEW_MODEL:-}" ]; then
-      exec claude --dangerously-skip-permissions --agent investigator -p "$(cat "$PROMPT_FILE")" \
+      exec claude --dangerously-skip-permissions --agent investigator -p \
         --disallowedTools "$DISALLOWED_TOOLS" \
         --model "$CFGMS_SECURITY_REVIEW_MODEL" \
-        --output-format json > /workspace-out/.investigator-plan-result.json
+        --output-format json < "$PROMPT_FILE" > "$PLAN_RESULT_FILE"
     else
-      exec claude --dangerously-skip-permissions --agent investigator -p "$(cat "$PROMPT_FILE")" \
-        --disallowedTools "$DISALLOWED_TOOLS"
+      exec claude --dangerously-skip-permissions --agent investigator -p \
+        --disallowedTools "$DISALLOWED_TOOLS" < "$PROMPT_FILE"
     fi
     ;;
   *)

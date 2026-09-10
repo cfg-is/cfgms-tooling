@@ -613,6 +613,24 @@ def test_budget_split_invokes_harness_per_task_and_merges_dispositions() -> None
         harness_runner.MAX_BUNDLE_BYTES = original_budget
 
 
+def _make_argv_and_stdin_capturing_stub(bin_dir: str, name: str, argv_path: str, stdin_path: str) -> str:
+    """A stub binary that records its own argv (as JSON) and everything it
+    read from stdin, then exits 0 -- used to prove both the real flag names
+    and the stdin prompt transport (Issue #4002) actually reach the real
+    subprocess, not just an injected `call_harness_fn` stand-in."""
+    stub_path = os.path.join(bin_dir, name)
+    with open(stub_path, "w") as f:
+        f.write(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
+            f"open({stdin_path!r}, 'w').write(sys.stdin.read())\n"
+            "sys.exit(0)\n"
+        )
+    os.chmod(stub_path, 0o755)
+    return stub_path
+
+
 def test_call_codex_harness_reaches_the_real_subprocess() -> None:
     """[REQUIRED TEST] Spawns a real stub `codex` on PATH that records its
     own argv, then calls `call_codex_harness` for real. Proves the real,
@@ -624,15 +642,8 @@ def test_call_codex_harness_reaches_the_real_subprocess() -> None:
     a response at all) would make this fail."""
     with tempfile.TemporaryDirectory() as bin_dir, tempfile.TemporaryDirectory() as work_dir:
         argv_path = os.path.join(work_dir, "argv.json")
-        stub_path = os.path.join(bin_dir, "codex")
-        with open(stub_path, "w") as f:
-            f.write(
-                "#!/usr/bin/env python3\n"
-                "import json, sys\n"
-                f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
-                "sys.exit(0)\n"
-            )
-        os.chmod(stub_path, 0o755)
+        stdin_path = os.path.join(work_dir, "stdin.txt")
+        _make_argv_and_stdin_capturing_stub(bin_dir, "codex", argv_path, stdin_path)
 
         original_path = os.environ.get("PATH", "")
         os.environ["PATH"] = f"{bin_dir}:{original_path}"
@@ -653,7 +664,40 @@ def test_call_codex_harness_reaches_the_real_subprocess() -> None:
         check("--output-last-message" in argv, "real invocation passes --output-last-message", repr(argv))
         check("--model" in argv and argv[argv.index("--model") + 1] == MODEL,
               "real invocation passes --model", repr(argv))
-        check(argv[-1] == "prompt body", "prompt is passed positionally, last", repr(argv))
+        check(argv[-1] == "-", "the positional prompt argument is '-', telling codex exec to read stdin", repr(argv))
+        check("prompt body" not in argv, "the prompt itself never appears in argv", repr(argv))
+        with open(stdin_path, "r") as f:
+            check(f.read() == "prompt body", "the prompt is delivered on stdin instead")
+
+
+def test_large_prompt_reaches_harness_via_stdin() -> None:
+    """[REQUIRED TEST] (Issue #4002) A 200000-byte prompt -- well over Linux's
+    131072-byte MAX_ARG_STRLEN single-argv-argument cap -- must reach the real
+    `codex` subprocess intact. Before this fix, passing the prompt as the
+    trailing positional argv element made `subprocess.run` raise
+    `OSError(E2BIG)` on any prompt this large (166842 bytes was enough to trip
+    it on a real `pkg/session` step), which this lane folded into a synthetic
+    non-zero exit code -- so the step silently failed rather than reviewing
+    anything."""
+    with tempfile.TemporaryDirectory() as bin_dir, tempfile.TemporaryDirectory() as work_dir:
+        argv_path = os.path.join(work_dir, "argv.json")
+        stdin_path = os.path.join(work_dir, "stdin.txt")
+        _make_argv_and_stdin_capturing_stub(bin_dir, "codex", argv_path, stdin_path)
+
+        large_prompt = "B" * 200_000
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{original_path}"
+        try:
+            exit_code, rate_limited, _output_tail = codex_lane.call_codex_harness(
+                MODEL, large_prompt, os.path.join(work_dir, "raw.json")
+            )
+        finally:
+            os.environ["PATH"] = original_path
+
+        check(exit_code == 0 and not rate_limited, "a 200000-byte prompt launches without E2BIG", repr(exit_code))
+        with open(stdin_path, "r") as f:
+            received = f.read()
+        check(received == large_prompt, "the full 200000-byte prompt is delivered on stdin, byte for byte", str(len(received)))
 
 
 def test_default_lane_id_and_model() -> None:
