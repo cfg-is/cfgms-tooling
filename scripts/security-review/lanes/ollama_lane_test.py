@@ -151,6 +151,34 @@ def stub_ollama_on_path(stdout_text: str, exit_code: int = 0):
             os.environ["PATH"] = original_path
 
 
+@contextlib.contextmanager
+def stub_ollama_recording_argv(stdout_text: str, exit_code: int = 0):
+    """Like `stub_ollama_on_path`, but the stub also records the argv it was
+    invoked with to a file, so a test can assert exactly which flags
+    `call_ollama_harness` passed to `ollama run` -- not just what it printed.
+    Yields the path to that file (written after the subprocess exits)."""
+    with tempfile.TemporaryDirectory() as bin_dir:
+        argv_path = os.path.join(bin_dir, "argv.json")
+        stub_path = os.path.join(bin_dir, "ollama")
+        with open(stub_path, "w") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                f"with open({argv_path!r}, 'w') as out:\n"
+                "    json.dump(sys.argv[1:], out)\n"
+                f"sys.stdout.write({stdout_text!r})\n"
+                f"sys.exit({exit_code})\n"
+            )
+        os.chmod(stub_path, 0o755)
+
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{original_path}"
+        try:
+            yield argv_path
+        finally:
+            os.environ["PATH"] = original_path
+
+
 def test_complete_clean_sweep() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")
@@ -267,6 +295,122 @@ def test_prose_surrounded_findings_object_is_extracted_and_completes() -> None:
         check(
             os.path.isfile(os.path.join(out_dir, "step-001.findings.json")),
             "prose-surrounded: findings.json written to disk",
+        )
+
+
+def test_call_ollama_harness_passes_nowordwrap_hidethinking_and_format_json() -> None:
+    """[REQUIRED TEST] Issue #4014. The pinned client (0.33.3) renders
+    `ollama run`'s output as a terminal would even when stdout is a pipe --
+    word-wrapping at a fixed column, duplicating the cut word fragment at
+    every wrap, and prefixing the answer with thinking text -- which
+    corrupts the printed JSON before extraction ever sees it. Every
+    invocation must ask the CLI never to render at all: `--nowordwrap`,
+    `--hidethinking`, and `--format json`, not just some of them."""
+    with tempfile.TemporaryDirectory() as out_dir:
+        with stub_ollama_recording_argv('{"findings": []}\n') as argv_path:
+            exit_code, _ = ollama_lane.call_ollama_harness(
+                MODEL, "prompt text", os.path.join(out_dir, "raw.json")
+            )
+            with open(argv_path) as f:
+                argv = json.load(f)
+        check(exit_code == 0, "flags: stub call still succeeds", exit_code)
+        check(argv[0] == "run", "flags: first arg is 'run'", repr(argv))
+        check(argv[1] == MODEL, "flags: model is the second arg", repr(argv))
+        for flag in ("--nowordwrap", "--hidethinking", "--format"):
+            check(flag in argv, f"flags: {flag} is passed to ollama run", repr(argv))
+        check(
+            argv[argv.index("--format") + 1] == "json",
+            "flags: --format is followed by 'json'",
+            repr(argv),
+        )
+
+
+def test_large_json_answer_with_long_lines_parses() -> None:
+    """[REQUIRED TEST] Acceptance criterion (Issue #4014): the lane never
+    depends on `ollama run`'s terminal rendering, so a large answer made of
+    long, unwrapped lines must still parse. Reproduces the scale of the
+    #3985 sweep's own measurement (200490 bytes of stdout) with one very
+    long `evidence` string standing in for a long unwrapped line."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        long_evidence = "A" * 200_000
+        payload = {"findings": [good_finding(evidence=long_evidence)], "dispositions": []}
+        stdout_text = json.dumps(payload)
+        check(len(stdout_text) > 200_000, "large answer: fixture is at least 200 KB", len(stdout_text))
+        with stub_ollama_on_path(stdout_text, exit_code=0):
+            written = ollama_lane.run_lane(
+                plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+                call_harness_fn=ollama_lane.call_ollama_harness,
+            )
+        check(len(written) == 1, "large answer: one envelope written", repr(written)[:200])
+        check(written[0]["state"] == "complete", "large answer: state is complete", repr(written)[:200])
+        check(
+            len(written[0].get("findings", [])) == 1,
+            "large answer: the finding survives a 200 KB, single-line answer",
+        )
+
+
+def test_thinking_text_leaked_before_object_is_still_extracted() -> None:
+    """[REQUIRED TEST] Issue #4014. `--hidethinking` is best-effort, not a
+    guarantee this lane trusts blindly. If a reasoning model's thinking text
+    still leaks onto stdout ahead of the answer, `_extract_json_object` must
+    still find the real object -- the step must complete, not fail, over a
+    prefix the lane already tolerates prose around."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        payload = {
+            "findings": [good_finding()],
+            "dispositions": [
+                {"hypothesis_id": "h1", "disposition": "investigated", "summary": "reviewed h1"}
+            ],
+        }
+        stdout_text = (
+            "Thinking...\n"
+            "I should check the scope for injection issues, then report findings.\n"
+            "...done thinking.\n\n"
+            f"{json.dumps(payload)}\n"
+        )
+        with stub_ollama_on_path(stdout_text, exit_code=0):
+            written = ollama_lane.run_lane(
+                plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+                call_harness_fn=ollama_lane.call_ollama_harness,
+            )
+        check(
+            written[0]["state"] == "complete",
+            "thinking leak: state is complete despite a leaked prefix",
+            repr(written),
+        )
+        check(
+            len(written[0].get("findings", [])) == 1,
+            "thinking leak: the real finding is extracted",
+            repr(written),
+        )
+
+
+def test_thinking_text_with_no_json_object_fails_closed() -> None:
+    """[REQUIRED TEST] Acceptance criterion (Issue #4014): a step with no
+    extractable JSON is still `failed`, never `refused` or `complete` -- even
+    when the stdout that yielded no object is thinking text (a model that
+    ran out of budget mid-reasoning and printed no answer at all)."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        stdout_text = (
+            "Thinking...\n"
+            "Let me examine the scope carefully before answering...\n"
+        )
+        with stub_ollama_on_path(stdout_text, exit_code=0):
+            written = ollama_lane.run_lane(
+                plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+                call_harness_fn=ollama_lane.call_ollama_harness,
+            )
+        state = written[0]["state"] if written else None
+        check(state == "failed", "thinking-only: state is failed", repr(written))
+        check(state != "refused", "thinking-only: state is never refused", repr(written))
+        check(state != "complete", "thinking-only: state is never complete", repr(written))
+        check(
+            not os.path.isfile(os.path.join(out_dir, "step-001.findings.json")),
+            "thinking-only: no findings.json created for this step",
+            repr(sorted(os.listdir(out_dir))),
         )
 
 

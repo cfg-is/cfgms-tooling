@@ -11,7 +11,7 @@ C3), and reads/enriches plan steps identically. It differs from the other
 three in exactly one place -- how a raw response is captured -- because
 `ollama run <model>` is a plain stdin/stdout text completion with no tool
 loop, no file-writing flag, and no sandbox flag at all (confirmed against the
-installed CLI, `ollama` 0.32.1, while writing this story):
+installed CLI, `ollama` 0.33.3, while writing this story):
 
 **No file, no tool loop -- prompt on stdin, findings extracted from
 stdout.** `claude`/`codex`/`opencode` are each agentic harnesses with a tool
@@ -40,16 +40,29 @@ synthetic failure, exactly as `claude_lane.py::call_claude_harness` folds a
 transport-level launch failure into one) and the findings path is left
 unwritten, so `classify()` reaches `failed`, never `complete` or `refused`.
 
-**Tolerating prose around the JSON.** There is no `--format json` reliance
-here (Ollama's structured-output support is a schema-constrained generation
-feature, not a guarantee that a *plain-text* prompt like this lane's gets a
-bare-JSON answer back) and no tool use, so the prompt instructs the model to
-emit the object and nothing else, but the lane does not trust that
-instruction was followed -- `_extract_json_object` scans stdout for every
-top-level `{...}` that parses as a JSON object, tolerating prose before,
-between, or after them, mirroring the "extract, don't assume bare JSON"
-posture `codex_lane.py`'s `--output-last-message` capture already needs (a
-CLI turn's final message is prose-shaped too). A model that echoes an
+**Never the terminal-rendered path (Issue #4014).** `ollama run <model>`
+renders its output as a terminal would even when stdout is a pipe -- with
+the pinned client (0.33.3) it word-wraps at a fixed column and repeats the
+cut word fragment at the start of the next line at every wrap
+(`findings\nfindings`), and prefixes the answer with the model's thinking
+text -- both of which corrupt the printed JSON before it ever reaches
+`_extract_json_object`. `call_ollama_harness` passes `--nowordwrap` (no wrap,
+no duplicated fragment), `--hidethinking` (no thinking-text prefix) and
+`--format json` (the daemon returns a JSON-formatted answer instead of
+free-form prose that merely happens to contain JSON) to `ollama run`, so the
+answer is never terminal-rendered.
+
+**Tolerating prose around the JSON anyway.** Those three flags are a CLI
+contract, not a guarantee this lane trusts blindly -- `--hidethinking` is
+best-effort against a reasoning model's own thinking-text prefix, and
+`--format json` does not stop a model from echoing an illustrative example
+of the output shape before its real answer. So the prompt instructs the
+model to emit the object and nothing else, but the lane does not trust that
+instruction was followed either -- `_extract_json_object` scans stdout for
+every top-level `{...}` that parses as a JSON object, tolerating prose
+before, between, or after them, mirroring the "extract, don't assume bare
+JSON" posture `codex_lane.py`'s `--output-last-message` capture already needs
+(a CLI turn's final message is prose-shaped too). A model that echoes an
 illustrative example of the output shape before giving its real answer
 produces more than one such object; the *last* one carrying a `findings` or
 `dispositions` key is treated as the answer, never the first (see
@@ -310,12 +323,16 @@ def _extract_json_object(text: str) -> "dict | None":
     """Best-effort extraction of the answer's top-level JSON object embedded
     in `text`, tolerating prose before, between, and after it.
 
-    `ollama run` has no file-writing tool and no structured-output guarantee
-    against a plain-text prompt, so unlike the other three lanes this module
-    has no assurance stdout is bare JSON, and no assurance the model prints
-    only one JSON-shaped object -- a model asked to emit a findings object
-    will sometimes echo an illustrative example of the shape before giving
-    its real answer. Scans every `{` in `text` and attempts
+    `call_ollama_harness` passes `--format json` (Issue #4014), so the
+    printed response is expected to be exactly one JSON document with no
+    surrounding prose -- but that is the CLI's contract, not a guarantee this
+    module trusts blindly: `--hidethinking` is best-effort against a
+    reasoning model's thinking-text prefix, and a model asked to emit a
+    findings object will sometimes echo an illustrative example of the shape
+    before giving its real answer regardless of the requested format. This
+    function makes no assumption stdout is bare JSON, and no assumption the
+    model prints only one JSON-shaped object. Scans every `{` in `text` and
+    attempts
     `json.JSONDecoder.raw_decode` from that position, collecting every result
     that decodes to a `dict` (a `{` that is not the start of valid JSON -- a
     literal brace inside prose -- or that decodes to something other than an
@@ -383,6 +400,23 @@ def call_ollama_harness(
     controls in play, exactly as for every declared file this lane embeds in
     the prompt rather than letting the model fetch itself.
 
+    **Never the terminal-rendered path (Issue #4014).** The pinned client
+    (0.33.3) renders `ollama run`'s output as a terminal would even when
+    stdout is a pipe: it word-wraps at a fixed column and, at every wrap,
+    repeats the cut word fragment at the start of the next line
+    (`findings\\nfindings`), and it prefixes the answer with the model's
+    thinking text. A wrap-duplicated fragment breaks `json.JSONDecoder`
+    mid-token (`Expecting value` at the duplicated piece), so a real,
+    successful call was previously recorded `failed` after the fact --
+    `_extract_json_object` had nothing decodable to find. `--nowordwrap`
+    turns off that rendering at the source (no wrap, no duplication);
+    `--hidethinking` drops the thinking-text prefix from stdout;
+    `--format json` asks the daemon for a JSON-formatted answer, so the
+    printed response is not free-form prose that merely happens to contain
+    JSON. None of the three is a substitute for the others: `--format json`
+    alone would still be word-wrapped and thinking-prefixed without the
+    other two flags.
+
     **The exit-0-but-not-signed-in case.** When `_extract_json_object` finds
     no JSON object anywhere in stdout, this function never reports the
     subprocess's own exit code (even when it was `0`) -- it reports a
@@ -399,7 +433,7 @@ def call_ollama_harness(
     """
     try:
         result = subprocess.run(
-            ["ollama", "run", model],
+            ["ollama", "run", model, "--nowordwrap", "--hidethinking", "--format", "json"],
             input=prompt,
             capture_output=True,
             text=True,
