@@ -130,6 +130,20 @@ CONTEXT_FILENAME = ".plan-context.json"
 FAILURE_MARKER_FILENAME = "PLANNING_FAILED"
 STEP_FILENAME_RE = re.compile(r"^step-(\d{3,})\.json$")
 
+# Written under a planner's own `plan/` directory (`<sweep_dir>/plan/` for
+# the legacy single planner, `<sweep_dir>/planners/<lane_dir_name>/plan/` per
+# roster entry) by `security-review.sh`'s `dispatch_planner()` after `docker
+# wait` returns (Issue #4009): `{"container_id": ..., "exit_code": ...,
+# "stderr_tail": ...}` for a container whose exit code was actually observed.
+# `finalize()`/`finalize_multi_planner()` read it back -- see
+# `_container_failure_error()` -- to fold a non-zero exit code and the tail
+# of its logs into `PLANNING_FAILED` when zero steps survive, so an operator
+# can tell a model that legitimately produced nothing (clean exit) apart from
+# a container that never got the chance to (a broken entrypoint, a bad argv).
+# Absent on an older sweep, or one whose planner was never launched at all
+# (`prepare` failed before dispatch) -- never written for those.
+PLANNER_CONTAINER_FILENAME = ".planner-container.json"
+
 # Sub-directory of a sweep (or a multi-planner lane's own sub-sweep-dir) that
 # `metadata.write_bundle()` (#3978) writes into, and that `agent-dispatch.sh
 # launch-investigator --mode plan` mounts read-only at /workspace as of Issue
@@ -1243,6 +1257,36 @@ def _discover_step_files(plan_dir: str) -> list[str]:
     return sorted(f for f in os.listdir(plan_dir) if STEP_FILENAME_RE.match(f))
 
 
+def _read_planner_container_result(plan_dir: str) -> dict | None:
+    """Read `<plan_dir>/PLANNER_CONTAINER_FILENAME` (Issue #4009), or `None`
+    when it is absent, unreadable, or not a JSON object -- an older sweep, or
+    one whose planner container's exit code was never observed."""
+    path = os.path.join(plan_dir, PLANNER_CONTAINER_FILENAME)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _container_failure_error(plan_dir: str) -> str | None:
+    """One error string naming the planner container's exit code and the
+    tail of its logs (Issue #4009), or `None` when no container-result
+    record exists for `plan_dir` or it shows a clean (zero) exit -- a model
+    that legitimately produced no steps is not a container failure and must
+    not be reported as one."""
+    result = _read_planner_container_result(plan_dir)
+    if not result:
+        return None
+    exit_code = result.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code == 0:
+        return None
+    stderr_tail = (result.get("stderr_tail") or "").strip()
+    detail = f": {stderr_tail}" if stderr_tail else ""
+    return f"planner container exited {exit_code}{detail}"
+
+
 def _write_failure_marker(plan_dir: str, errors: list[str]) -> None:
     marker_path = os.path.join(plan_dir, FAILURE_MARKER_FILENAME)
     body = "Planning failed -- no step-NNN.json file under this sweep's plan/\n" \
@@ -1363,6 +1407,14 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     changes this function's own return value or aborts the sweep -- it is a
     visibility signal `consolidate.py` surfaces in `## Incomplete`, not a
     validation failure like a malformed step.
+
+    When zero step files exist, also folds the planner container's own exit
+    code and log tail into `errors` (Issue #4009) if `security-review.sh`'s
+    `dispatch_planner()` recorded one at `plan/PLANNER_CONTAINER_FILENAME` --
+    see `_container_failure_error()`. A clean (zero) exit adds nothing: a
+    model that legitimately produced no steps is a model refusal, not a
+    container failure, and the two must read differently in
+    `plan/PLANNING_FAILED`.
     """
     plan_dir = os.path.join(sweep_dir, "plan")
     filenames = _discover_step_files(plan_dir)
@@ -1377,6 +1429,9 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
 
     if not filenames:
         errors.append("no step-NNN.json files were produced")
+        container_error = _container_failure_error(plan_dir)
+        if container_error:
+            errors.append(container_error)
         _write_failure_marker(plan_dir, errors)
         return False, errors
 
@@ -1608,6 +1663,11 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
 
     if not candidates:
         errors.append("no step-NNN.json files survived validation across any configured planner")
+        for lane in planners:
+            lane_plan_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan")
+            container_error = _container_failure_error(lane_plan_dir)
+            if container_error:
+                errors.append(f"{lane.lane_dir_name}: {container_error}")
         _write_failure_marker(plan_dir, errors)
         _write_rejected_proposals(plan_dir, rejected)
         return False, errors

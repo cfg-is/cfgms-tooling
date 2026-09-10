@@ -419,6 +419,88 @@ def test_planning_failed_marker_reports_coverage_cannot_be_computed():
         )
 
 
+def test_planning_failed_with_container_exit_code_names_it_in_incomplete():
+    # Issue #4009: a planner container that exited non-zero -- recorded on
+    # its dispatch_report.json entry as container_exit_code/
+    # container_stderr_tail by record_planner_dispatch_outcome() reading
+    # security-review.sh's .planner-container.json sidecar back -- must be
+    # named by exit code and stderr tail directly under ## Incomplete, not
+    # just the bare "Planning did not produce a usable frozen plan" that
+    # cannot be told apart from a model that cleanly declined to write one.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        os.makedirs(os.path.join(sweep, "plan"))
+        with open(os.path.join(sweep, "plan", "PLANNING_FAILED"), "w") as f:
+            f.write("Planning failed -- no step-NNN.json files were produced.\n")
+        write_dispatch_report(
+            sweep,
+            planners=[
+                {
+                    "requested_harness": "claude",
+                    "requested_model": "",
+                    "passed_harness": "claude",
+                    "passed_model": "",
+                    "resolved_model": "unknown",
+                    "outcome": "container_failed",
+                    "container_exit_code": 126,
+                    "container_stderr_tail": "bash: /usr/local/bin/investigator-entrypoint.sh: Argument list too long",
+                }
+            ],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(report["plan_failed"] is True, "consolidate: PLANNING_FAILED with a container failure is still plan_failed", str(report))
+        md = consolidate.render_markdown(report)
+        check("## Incomplete" in md, "consolidate.md: renders the Incomplete section", md)
+        check("126" in md, "consolidate.md: Incomplete section names the container's exit code", md)
+        check(
+            "Argument list too long" in md,
+            "consolidate.md: Incomplete section shows the container's stderr tail",
+            md,
+        )
+        check(
+            "container_failed" in md,
+            "consolidate.md: the Dispatch section still shows the raw container_failed outcome",
+            md,
+        )
+        check(
+            "outcome: dispatched" not in md.lower(),
+            "consolidate.md: a container that exited non-zero is never shown as dispatched",
+            md,
+        )
+
+
+def test_planning_failed_without_container_exit_code_has_no_exit_code_line():
+    # A plan can fail for reasons unrelated to a container crash (e.g. every
+    # proposed step was schema-invalid) -- when dispatch_report.json's
+    # planner entry carries no container_exit_code at all, no exit-code
+    # bullet must be fabricated for it.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        os.makedirs(os.path.join(sweep, "plan"))
+        with open(os.path.join(sweep, "plan", "PLANNING_FAILED"), "w") as f:
+            f.write("Planning failed -- no step-NNN.json files were produced.\n")
+        write_dispatch_report(
+            sweep,
+            planners=[
+                {
+                    "requested_harness": "claude",
+                    "requested_model": "",
+                    "passed_harness": "claude",
+                    "passed_model": "",
+                    "resolved_model": "unknown",
+                    "outcome": "dispatched",
+                }
+            ],
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(
+            "container exited" not in md,
+            "consolidate.md: no fabricated container-exit bullet when none was recorded",
+            md,
+        )
+
+
 def test_valid_plan_but_zero_lanes_shows_no_lane_output():
     # A plan exists and is valid, but no lane has been dispatched yet. This
     # is a legitimate mid-sweep state, distinct from a failed plan.

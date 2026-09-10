@@ -484,7 +484,14 @@ cat > "${FAKEBIN}/docker" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
-  wait) exit 0 ;;
+  # This stub's "container job" always runs synchronously inside `docker run`
+  # itself (below), so by the time anything calls `wait` the simulated
+  # container has already "exited" cleanly -- 0, matching a real successful
+  # run, exercised by dispatch_planner()'s own exit-code capture (Issue
+  # #4009) on every case in this file that does not deliberately fail a
+  # planner container.
+  wait) echo 0; exit 0 ;;
+  logs) exit 0 ;;
   ps) echo ""; exit 0 ;;
 esac
 if [[ "${1:-}" != "run" ]]; then exit 0; fi
@@ -1418,7 +1425,8 @@ STATE_DIR="${DOCKER_STATE_DIR:?}"
 printf '%s\n' "$*" >> "${DOCKER_CALL_LOG:-/dev/null}"
 
 case "${1:-}" in
-  wait) exit 0 ;;
+  wait) echo 0; exit 0 ;;
+  logs) exit 0 ;;
   ps)
     name=""
     for a in "$@"; do
@@ -1832,8 +1840,10 @@ case "\${1:-}" in
   wait)
     cid="\$2"
     while [ ! -f "${MP_SANDBOX}/exited-\${cid}" ]; do sleep 0.02; done
+    echo 0
     exit 0
     ;;
+  logs) exit 0 ;;
 esac
 if [ "\${1:-}" != "run" ]; then exit 0; fi
 shift
@@ -1947,6 +1957,94 @@ check_contains "dispatch_report.json's planner entries record outcome dispatched
 # above) -- restore them before rm -rf can unlink anything under here.
 chmod -R u+w "$MP_DIR" 2>/dev/null || true
 rm -rf "$MP_DIR"
+
+# ----------------------------------------------------------------------------
+# REQUIRED TEST (Issue #4009) -- a planner container that exits non-zero
+# (Issue #3985's real first run: exit 126, "Argument list too long") must
+# leave its exit code and stderr tail in the sweep tree, dispatch_report.json
+# must say container_failed rather than dispatched for it, and the
+# consolidated report's Incomplete section must show both instead of the
+# bare "no step-NNN.json files were produced" an operator cannot tell apart
+# from a model that cleanly declined to write a plan. Self-contained: its own
+# sandbox and docker stub, since the shared stub's plan-mode "container job"
+# always writes step files and exits cleanly.
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "== REQUIRED TEST — a planner container that exits non-zero leaves its exit"
+echo "   code and stderr tail in the sweep tree, dispatch_report.json says"
+echo "   container_failed instead of dispatched, and the consolidated report's"
+echo "   Incomplete section shows both (Issue #4009) =="
+CF_DIR="$(mktemp -d)"
+CF_SANDBOX="${CF_DIR}/sandbox"
+CF_FAKEBIN="${CF_DIR}/bin"
+mkdir -p "${CF_SANDBOX}/HOME/.claude" "$CF_FAKEBIN"
+echo '{}' > "${CF_SANDBOX}/HOME/.claude/.credentials.json"
+
+# Docker stub dedicated to this test: the plan-mode container crashes
+# instantly -- a broken entrypoint argv -- and never writes a single
+# step-*.json file. `docker wait` reports exit code 126 and `docker logs`
+# carries the stderr a real crashed container leaves behind for `docker
+# logs` to show before `cleanup` reaps it.
+cat > "${CF_FAKEBIN}/docker" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  wait) echo 126; exit 0 ;;
+  logs) echo "bash: /usr/local/bin/investigator-entrypoint.sh: Argument list too long" >&2; exit 0 ;;
+  ps) echo ""; exit 0 ;;
+esac
+if [[ "${1:-}" != "run" ]]; then exit 0; fi
+echo "cid-planner-crash-$RANDOM"
+STUB
+chmod +x "${CF_FAKEBIN}/docker"
+
+set +e
+CF_OUT=$(PATH="${CF_FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${CF_SANDBOX}/ledger" \
+  HOME="${CF_SANDBOX}/HOME" \
+  CFGMS_SECURITY_REVIEW_BASE="${CF_SANDBOX}/base" \
+  CFGMS_SECURITY_REVIEW_LANES="claude:crash-test" \
+  "$CLI" launch HEAD 2>"${CF_SANDBOX}/launch.err")
+cf_launch_rc=$?
+set -e
+
+if [[ "$cf_launch_rc" -ne 0 ]]; then
+  ok "launch exits non-zero when the planner container exited non-zero"
+else
+  bad "launch exits non-zero when the planner container exited non-zero" "exited 0"
+fi
+check_not_contains "no report path is printed as if the sweep completed cleanly" "$CF_OUT" "report/consolidated.md"
+
+CF_SWEEP_DIR="$(find "${CF_SANDBOX}/base" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+if [[ -n "$CF_SWEEP_DIR" ]]; then ok "a sweep directory was created despite the failure"; else bad "a sweep directory was created despite the failure" "none found"; fi
+
+CF_CONTAINER_JSON="$(cat "${CF_SWEEP_DIR}/plan/.planner-container.json" 2>/dev/null || true)"
+check_contains "plan/.planner-container.json records the container's exit code" "$CF_CONTAINER_JSON" '"exit_code": 126'
+check_contains "plan/.planner-container.json records the container's stderr tail" "$CF_CONTAINER_JSON" "Argument list too long"
+
+CF_DISPATCH="$(cat "${CF_SWEEP_DIR}/dispatch_report.json" 2>/dev/null || true)"
+CF_DISPATCH_PLANNERS="$(python3 -c "
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1])).get('planners', [])))
+" "${CF_SWEEP_DIR}/dispatch_report.json" 2>/dev/null || true)"
+check_contains "dispatch_report.json's planner entry says container_failed" "$CF_DISPATCH_PLANNERS" '"outcome": "container_failed"'
+check_not_contains "dispatch_report.json's planner entry never says dispatched" "$CF_DISPATCH_PLANNERS" '"outcome": "dispatched"'
+check_contains "dispatch_report.json's planner entry records the exit code" "$CF_DISPATCH" '"container_exit_code": 126'
+check_contains "dispatch_report.json's planner entry records the stderr tail" "$CF_DISPATCH" "Argument list too long"
+
+CF_MARKER="$(cat "${CF_SWEEP_DIR}/plan/PLANNING_FAILED" 2>/dev/null || true)"
+check_contains "plan/PLANNING_FAILED names the exit code" "$CF_MARKER" "126"
+check_contains "plan/PLANNING_FAILED carries the stderr tail" "$CF_MARKER" "Argument list too long"
+
+CF_REPORT="$(cat "${CF_SWEEP_DIR}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "report: Incomplete section names the container's exit code" "$CF_REPORT" "126"
+check_contains "report: Incomplete section shows the stderr tail" "$CF_REPORT" "Argument list too long"
+
+chmod -R u+w "$CF_DIR" 2>/dev/null || true
+rm -rf "$CF_DIR"
 
 # ----------------------------------------------------------------------------
 # REQUIRED TESTS (Issue #3984) -- the adjudication stage. Two finder lanes

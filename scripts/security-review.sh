@@ -261,13 +261,12 @@ verify_snapshot() {
 # describing the one hardcoded planner (harness "claude", no configured
 # model -- that call never passes --harness/--model to begin with).
 #
-# <outcome> is dispatched / credential_unavailable / launch_failed, applied
-# to every entry in this call: a multi-planner `planner.py launch` reports
-# one aggregated success/failure for the whole roster (see launch()'s own
-# docstring), not a per-entry result, so this is the finest granularity
-# available without changing that contract. Every configured planner still
-# gets a record -- never omitted -- even though a real per-entry outcome
-# is future work.
+# <outcome> is dispatched / credential_unavailable / launch_failed /
+# container_failed, the DEFAULT applied to every entry in this call -- a
+# multi-planner `planner.py launch` reports one aggregated success/failure
+# for the whole roster (see launch()'s own docstring), not a per-entry
+# result, so this is the finest granularity the launch call itself can give.
+# Every configured planner still gets a record -- never omitted.
 #
 # Each <roster-line> is one "harness<TAB>model<TAB>lane_dir_name" line as
 # roster.py prints it. resolved_model is read back from planner.py's own
@@ -278,6 +277,21 @@ verify_snapshot() {
 # passed_harness/passed_model equal requested_harness/requested_model: there
 # is no transformation between "configured" and "passed to the executable"
 # anywhere in this script.
+#
+# Per-entry override (Issue #4009): after the launch call itself succeeds,
+# `dispatch_planner()` observes each launched container's own exit code
+# directly (`docker wait`) and records it at that entry's own plan directory
+# (`record_planner_container_result()`) -- a granularity the launch call's
+# own return value cannot express, since `launch()` only reports "every
+# container started" or "one failed to start", never "container N crashed
+# after starting". This function re-derives that per-entry outcome itself,
+# by reading each entry's own PLANNER_CONTAINER_FILENAME sidecar back (legacy:
+# <sweep_dir>/plan/; roster: <sweep_dir>/planners/<lane_dir_name>/plan/) --
+# never trusting a value threaded through <roster-line>, so a caller cannot
+# desync the two. A record with a non-zero exit_code overrides <outcome> to
+# "container_failed" for that entry alone and the entry also carries the
+# observed container_exit_code/container_stderr_tail; every other entry, and
+# the legacy single-planner entry, keeps the passed-in <outcome> unchanged.
 record_planner_dispatch_outcome() {
   local sweep_dir="$1" outcome="$2"; shift 2
   python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" "$outcome" "$@" <<'PYEOF'
@@ -298,28 +312,54 @@ try:
 except (OSError, ValueError):
     resolved = {}
 
+
+def container_result(plan_dir):
+    try:
+        with open(os.path.join(plan_dir, ".planner-container.json")) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def apply_container_result(entry, plan_dir):
+    result = container_result(plan_dir)
+    if not result:
+        return
+    exit_code = result.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code == 0:
+        return
+    entry["outcome"] = "container_failed"
+    entry["container_exit_code"] = exit_code
+    entry["container_stderr_tail"] = result.get("stderr_tail", "")
+
+
 roster_lines = [line for line in sys.argv[4:] if line]
 entries = []
 if roster_lines:
     for raw in roster_lines:
         harness, model, lane_dir_name = raw.split("\t")
-        entries.append({
+        entry = {
             "requested_harness": harness,
             "requested_model": model,
             "passed_harness": harness,
             "passed_model": model,
             "resolved_model": resolved.get(lane_dir_name, "unknown"),
             "outcome": outcome,
-        })
+        }
+        apply_container_result(entry, os.path.join(sweep_dir, "planners", lane_dir_name, "plan"))
+        entries.append(entry)
 else:
-    entries.append({
+    entry = {
         "requested_harness": "claude",
         "requested_model": "",
         "passed_harness": "claude",
         "passed_model": "",
         "resolved_model": "unknown",
         "outcome": outcome,
-    })
+    }
+    apply_container_result(entry, os.path.join(sweep_dir, "plan"))
+    entries.append(entry)
 
 report_path = os.path.join(sweep_dir, "dispatch_report.json")
 try:
@@ -398,13 +438,49 @@ verify_bundle() {
   return 0
 }
 
+# record_planner_container_result <plan_dir> <container_id> <exit_code> <stderr_tail>
+# Writes <plan_dir>/.planner-container.json (Issue #4009): the planner
+# container's own exit code, as `docker wait` reported it, and the last 30
+# lines of `docker logs` -- the same tail length `agent-dispatch.sh
+# inspect-detail`/`inspect-container` already use for a running agent.
+# `dispatch_planner()`'s own `docker wait` previously discarded this
+# entirely, so a container that started successfully (a real `docker run`
+# succeeded) but then crashed inside -- a broken entrypoint, an argv the
+# shell rejected -- left no trace anywhere in the sweep tree once `cleanup`
+# reaped it; an operator reading a sweep whose planner produced zero
+# step-*.json files had no way to tell that apart from a model that cleanly
+# declined to write a plan. `record_planner_dispatch_outcome()` reads this
+# sidecar back to override that entry's `dispatch_report.json` outcome to
+# `container_failed`, and `planner.py finalize()`/`finalize_multi_planner()`
+# read it to fold the exit code and log tail into `plan/PLANNING_FAILED`.
+record_planner_container_result() {
+  local plan_dir="$1" container_id="$2" exit_code="$3" stderr_tail="$4"
+  mkdir -p "$plan_dir"
+  python3 - "$SECURITY_REVIEW_DIR" "$plan_dir" "$container_id" "$exit_code" "$stderr_tail" <<'PYEOF'
+import os
+import sys
+
+sec_dir, plan_dir, container_id, exit_code, stderr_tail = sys.argv[1:6]
+sys.path.insert(0, sec_dir)
+import atomic_write  # noqa: E402
+
+atomic_write.write_json_atomic(
+    os.path.join(plan_dir, ".planner-container.json"),
+    {
+        "container_id": container_id,
+        "exit_code": int(exit_code),
+        "stderr_tail": stderr_tail,
+    },
+)
+PYEOF
+}
+
 # dispatch_planner <sweep_dir> <commit_sha> [<scope_file>]
 # prepare() -> verify_bundle() -> launch() -> wait for the container to exit
-# -> finalize(). A `prepare` or `finalize` failure is logged and treated as
-# non-fatal to the overall launch/resume: a broken plan leaves the lanes
-# nothing to do (they will simply find zero outstanding steps), and the
-# consolidator still runs and renders that state visibly rather than the
-# whole command aborting.
+# -> finalize(). A `prepare` failure is logged and treated as non-fatal to
+# the overall launch/resume: a broken plan leaves the lanes nothing to do
+# (they will simply find zero outstanding steps), and the consolidator still
+# runs and renders that state visibly rather than the whole command aborting.
 #
 # `scope_file`, when non-empty, is forwarded to `planner.py prepare` as
 # `--scope-file` (Issue #3979) -- the operator-supplied prose
@@ -421,6 +497,13 @@ verify_bundle() {
 # or anything else launch-investigator can fail on. Returns 1 for the latter
 # so the caller can propagate a non-zero final exit code instead of silently
 # reporting the sweep as having completed cleanly.
+#
+# A container that launches successfully (`launch` reports "dispatched") but
+# then exits non-zero is a third, distinct failure (Issue #4009): unlike
+# `launch_failed`, `finalize()` still runs -- its own `plan/PLANNING_FAILED`
+# gains the exit code and log tail `record_planner_container_result()`
+# recorded below -- but this function still returns 1, exactly like
+# `launch_failed`, so the caller does not report the sweep as clean either.
 dispatch_planner() {
   local sweep_dir="$1" commit_sha="$2" scope_file="${3:-}"
 
@@ -474,11 +557,49 @@ dispatch_planner() {
   # the old `tail -n1` here waited on only the last of those, letting
   # finalize() run while an earlier planner's container might still be
   # writing into its own plan/ directory.
-  local container_id
+  #
+  # Also records each container's own exit code and log tail (Issue #4009).
+  # `container_ids` is in the same order `planner_roster_lines` is: `launch()`
+  # only returns rc=0 (this function's "dispatched" outcome, the only case
+  # this block runs at all) once EVERY roster entry's own launch-investigator
+  # call has itself returned 0, in roster-list order -- see `launch()`'s own
+  # docstring -- so a length mismatch here can only mean that invariant broke,
+  # guarded against below (`roster_ok`) rather than assumed blindly; on a
+  # mismatch the per-container sidecar still gets written, just without a
+  # roster-entry-specific plan directory to key it to.
+  local container_ids=()
   while IFS= read -r container_id; do
     [[ -n "$container_id" ]] || continue
-    docker wait "$container_id" >/dev/null 2>&1 || true
+    container_ids+=("$container_id")
   done < <(printf '%s\n' "$launch_output" | sed -n 's/^LAUNCHED_INVESTIGATOR:plan://p')
+
+  if [[ "$outcome" == "dispatched" ]]; then
+    local roster_ok=0
+    [[ ${#planner_roster_lines[@]} -gt 0 ]] && [[ ${#planner_roster_lines[@]} -eq ${#container_ids[@]} ]] && roster_ok=1
+
+    local i=0 any_container_failed=0
+    for container_id in "${container_ids[@]}"; do
+      local exit_code
+      exit_code="$(docker wait "$container_id" 2>/dev/null)" || exit_code=""
+
+      if [[ "$exit_code" =~ ^[0-9]+$ ]]; then
+        local plan_dir="${sweep_dir}/plan"
+        if [[ "$roster_ok" -eq 1 ]]; then
+          local lane_dir_name
+          lane_dir_name="$(printf '%s' "${planner_roster_lines[$i]}" | cut -f3)"
+          plan_dir="${sweep_dir}/planners/${lane_dir_name}/plan"
+        fi
+
+        local stderr_tail
+        stderr_tail="$(docker logs --tail 30 "$container_id" 2>&1 || true)"
+        record_planner_container_result "$plan_dir" "$container_id" "$exit_code" "$stderr_tail"
+        [[ "$exit_code" != "0" ]] && any_container_failed=1
+      fi
+      i=$((i + 1))
+    done
+
+    [[ "$any_container_failed" -eq 1 ]] && outcome="container_failed"
+  fi
 
   record_planner_dispatch_outcome "$sweep_dir" "$outcome" "${planner_roster_lines[@]:-}"
 
@@ -490,11 +611,16 @@ dispatch_planner() {
     echo "ERROR: planner launch failed: ${launch_output}" >&2
     return 1
   fi
+  if [[ "$outcome" == "container_failed" ]]; then
+    echo "ERROR: a planner container exited non-zero; see plan/.planner-container.json (or planners/<lane>/plan/.planner-container.json) for its exit code and log tail" >&2
+  fi
 
   local finalize_output
   if ! finalize_output=$(python3 "${SECURITY_REVIEW_DIR}/planner.py" finalize "$sweep_dir" 2>&1); then
     echo "WARNING: planning failed for ${sweep_dir}: ${finalize_output}" >&2
   fi
+
+  [[ "$outcome" == "container_failed" ]] && return 1
   return 0
 }
 

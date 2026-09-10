@@ -1222,6 +1222,30 @@ def _adjudication_incomplete_lines(adjudication: dict) -> list[str]:
     return lines
 
 
+def _planner_container_failure_lines(dispatch: dict) -> list[str]:
+    """One bullet per `dispatch_report.json` planner entry that recorded a
+    non-zero container exit code (Issue #4009's `container_exit_code`/
+    `container_stderr_tail`, written by `record_planner_dispatch_outcome()`
+    reading `security-review.sh`'s own `.planner-container.json` sidecar
+    back). Names the exit code and the stderr tail directly, rather than the
+    reader having to cross-reference `## Dispatch`'s bare `container_failed`
+    outcome string against a file on disk -- a broken planner entrypoint and
+    a model that cleanly declined to write a plan must read differently
+    here."""
+    lines = []
+    for entry in dispatch.get("planners", []):
+        exit_code = entry.get("container_exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            continue
+        identity = _dispatch_identity(entry)
+        stderr_tail = entry.get("container_stderr_tail") or ""
+        lines.append(
+            f"- Planner `{_md_escape_inline(identity)}` container exited "
+            f"**{exit_code}**: {_md_escape_inline(stderr_tail)}"
+        )
+    return lines
+
+
 def _incomplete_lines(report: dict) -> list[str]:
     """One bullet per concrete gap behind a `False` `_sweep_complete()`,
     named by lane where a lane is the relevant unit -- never a bare "this
@@ -1230,7 +1254,7 @@ def _incomplete_lines(report: dict) -> list[str]:
         return [
             "- **Planning did not produce a usable frozen plan** for this "
             "sweep; see `## Coverage` above."
-        ]
+        ] + _planner_container_failure_lines(report.get("dispatch") or {})
     if not report.get("lanes"):
         return [
             "- **No lane has produced any output for this sweep yet**; see "
@@ -1435,9 +1459,15 @@ def render_markdown(report: dict) -> str:
         for kind, entry in unavailable:
             identity = _dispatch_identity(entry)
             outcome = entry.get("outcome", "unknown")
+            exit_code = entry.get("container_exit_code")
+            exit_suffix = (
+                f" (exit {exit_code})"
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                else ""
+            )
             lines.append(
                 f"- **UNAVAILABLE** — {kind} `{_md_escape_inline(identity)}`: "
-                f"{_md_escape_inline(outcome)}"
+                f"{_md_escape_inline(outcome)}{exit_suffix}"
             )
         for item in rejected_proposals:
             filename = item.get("filename", "unknown") if isinstance(item, dict) else "unknown"

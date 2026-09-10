@@ -834,6 +834,61 @@ def test_finalize_fails_closed_on_zero_steps():
         check(os.path.isfile(os.path.join(sweep_dir, "plan", planner.FAILURE_MARKER_FILENAME)), "finalize: writes the PLANNING_FAILED marker")
 
 
+def test_finalize_zero_steps_includes_container_exit_code_and_stderr():
+    # Issue #4009: a planner container that exited non-zero (a broken
+    # entrypoint, a bad argv) must leave its exit code and stderr tail in
+    # PLANNING_FAILED, not just "no step-NNN.json files were produced" --
+    # that message alone cannot be told apart from a model that cleanly
+    # declined to write any plan.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        with open(os.path.join(plan_dir, planner.PLANNER_CONTAINER_FILENAME), "w") as f:
+            json.dump({
+                "container_id": "abc123",
+                "exit_code": 126,
+                "stderr_tail": "bash: /usr/local/bin/investigator-entrypoint.sh: Argument list too long",
+            }, f)
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is False, "finalize: zero step files with a recorded container failure still fails closed")
+        check(any("126" in e for e in errors), "finalize: reports the container's exit code", str(errors))
+        check(
+            any("Argument list too long" in e for e in errors),
+            "finalize: reports the container's stderr tail",
+            str(errors),
+        )
+        marker_path = os.path.join(plan_dir, planner.FAILURE_MARKER_FILENAME)
+        check(os.path.isfile(marker_path), "finalize: writes the PLANNING_FAILED marker")
+        with open(marker_path) as f:
+            marker_body = f.read()
+        check("126" in marker_body, "finalize: PLANNING_FAILED itself names the exit code", marker_body)
+        check(
+            "Argument list too long" in marker_body,
+            "finalize: PLANNING_FAILED itself carries the stderr tail",
+            marker_body,
+        )
+
+
+def test_finalize_zero_steps_with_clean_container_exit_reports_no_container_failure():
+    # A container that ran and exited 0 but still produced zero steps is a
+    # model refusing to write a plan -- not a container failure -- so no
+    # "planner container exited" line must appear for it.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir = os.path.join(sweep_dir, "plan")
+        os.makedirs(plan_dir)
+        with open(os.path.join(plan_dir, planner.PLANNER_CONTAINER_FILENAME), "w") as f:
+            json.dump({"container_id": "abc123", "exit_code": 0, "stderr_tail": ""}, f)
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is False, "finalize: zero step files is still a failure on a clean container exit")
+        check(
+            not any("planner container exited" in e for e in errors),
+            "finalize: a clean container exit is never reported as a container failure",
+            str(errors),
+        )
+
+
 def test_finalize_excludes_only_the_invalid_step_keeps_valid_ones_on_disk():
     # REQUIRED TEST: per-step exclusion, never an all-or-nothing wipe.
     # Reverting to the old all-or-nothing deletion (deleting every step file
@@ -2751,6 +2806,38 @@ def test_finalize_multi_planner_writes_coverage_json_over_the_merged_plan():
             coverage["g2"]["unassigned_files"] == ["pkg/bar/bar.go"],
             "finalize_multi_planner: G-2 is computed over the merged plan actually written to disk",
             str(coverage),
+        )
+
+
+def test_finalize_multi_planner_zero_candidates_includes_per_lane_container_errors():
+    # Issue #4009: the same enrichment as finalize()'s zero-steps branch, but
+    # per roster entry -- only the lane whose own container actually failed
+    # names an exit code; the other lane's clean exit contributes nothing.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,claude:sonnet-5")
+
+        failed_plan_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, "claude-fable-5-1", "plan")
+        os.makedirs(failed_plan_dir, exist_ok=True)
+        with open(os.path.join(failed_plan_dir, planner.PLANNER_CONTAINER_FILENAME), "w") as f:
+            json.dump({"container_id": "cid-a", "exit_code": 1, "stderr_tail": "agent 'investigator' not found"}, f)
+
+        clean_plan_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, "claude-sonnet-5", "plan")
+        os.makedirs(clean_plan_dir, exist_ok=True)
+        with open(os.path.join(clean_plan_dir, planner.PLANNER_CONTAINER_FILENAME), "w") as f:
+            json.dump({"container_id": "cid-b", "exit_code": 0, "stderr_tail": ""}, f)
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is False, "finalize_multi_planner: zero candidates across every lane still fails closed")
+        check(
+            any("claude-fable-5-1" in e and "1" in e and "agent 'investigator' not found" in e for e in errors),
+            "finalize_multi_planner: names the failed lane's own exit code and stderr tail",
+            str(errors),
+        )
+        check(
+            not any("claude-sonnet-5" in e and "planner container exited" in e for e in errors),
+            "finalize_multi_planner: the cleanly-exited lane is never reported as a container failure",
+            str(errors),
         )
 
 
