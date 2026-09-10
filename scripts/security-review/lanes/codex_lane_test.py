@@ -396,6 +396,52 @@ def test_subprocess_launch_exception_is_failed() -> None:
         )
 
 
+def test_unsupported_model_stops_the_lane_after_one_step() -> None:
+    """[REQUIRED TEST] (Issue #4007) A model id a ChatGPT-account session
+    rejects (e.g. `gpt-5-codex`, the old roster example -- see
+    `.env.local.example`) is not a per-step transient failure: every step
+    would hit the exact same rejection, so the lane must record one `failed`
+    step naming the model id and make no further harness calls, instead of
+    repeating the same failed call once per remaining step."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        write_plan_step(plan_dir, "step-002")
+        calls: list = []
+
+        def stub(model, prompt, output_path):
+            calls.append(model)
+            tail = (
+                '{"type":"error","status":400,"error":{"type":"invalid_request_error",'
+                f'"message":"The \'{model}\' model is not supported when using Codex '
+                'with a ChatGPT account."}}'
+            )
+            return 1, False, tail
+
+        written = codex_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL, call_harness_fn=stub)
+
+        check(len(calls) == 1, "unsupported model: exactly one harness call made", repr(calls))
+        check(len(written) == 1, "unsupported model: exactly one step envelope written", repr(written))
+        check(written[0]["state"] == "failed", "unsupported model: state is failed", repr(written))
+        check(
+            MODEL in written[0]["stop_reason_raw"],
+            "unsupported model: stop_reason_raw names the model id",
+            repr(written),
+        )
+
+
+def test_looks_unsupported_model() -> None:
+    check(
+        codex_lane._looks_unsupported_model(
+            "The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."
+        ),
+        "detects the ChatGPT-account model rejection",
+    )
+    check(
+        not codex_lane._looks_unsupported_model("here are your findings"),
+        "does not false-positive on normal output",
+    )
+
+
 def test_rate_limited_is_parked() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")

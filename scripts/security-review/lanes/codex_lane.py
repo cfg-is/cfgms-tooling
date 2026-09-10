@@ -154,6 +154,27 @@ def _looks_rate_limited(text: str) -> bool:
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
+# Issue #4007: the harness authenticates `codex` with a ChatGPT-account
+# subscription session (never an API key -- see module docstring), and that
+# account type rejects some model ids outright with this exact API error
+# text, e.g. `gpt-5-codex` (the old roster example in `.env.local.example`):
+#     {"type":"error","status":400,"error":{"type":"invalid_request_error",
+#     "message":"The 'gpt-5-codex' model is not supported when using Codex
+#     with a ChatGPT account."}}
+# Unlike every other non-complete condition this lane classifies, this one
+# is not a per-step, per-attempt failure -- every remaining step would hit
+# the identical rejection, since it is a property of the (model, account)
+# pair, not of any step's content. `run_lane` below uses this to stop the
+# lane after the first step instead of repeating the same failed call once
+# per remaining step.
+_UNSUPPORTED_MODEL_MARKERS = ("not supported when using codex with a chatgpt account",)
+
+
+def _looks_unsupported_model(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _UNSUPPORTED_MODEL_MARKERS)
+
+
 def _is_safe_repo_relative_path(value: object) -> bool:
     """True iff `value` is a plain repo-relative path -- never absolute,
     never `../`-shaped. Syntactic guard only; see `_resolve_within_repo` for
@@ -577,6 +598,7 @@ def run_lane(
             stop_reason_raw = None
             harness_output_tail = None
             launch_exc = None
+            unsupported_model = False
 
             for task_index, task_hypotheses in enumerate(tasks):
                 task_step = dict(step, hypotheses=task_hypotheses, scan_evidence=scan_evidence)
@@ -611,7 +633,19 @@ def run_lane(
                     elif task_state == terminal_state.REFUSED:
                         stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
                     elif task_state == terminal_state.FAILED and exit_code != 0:
-                        stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
+                        # Issue #4007: the ChatGPT-account session rejects
+                        # the configured model id identically on every step
+                        # -- this overrides whatever stop_reason_raw an
+                        # earlier task in this same step already set, and the
+                        # flag below stops the whole lane after this step's
+                        # envelope is written, so no further step spends a
+                        # harness call to record the same rejection over and
+                        # over.
+                        if _looks_unsupported_model(output_tail):
+                            stop_reason_raw = f"model_not_supported:{model}"
+                            unsupported_model = True
+                        else:
+                            stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
                     else:
                         stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
 
@@ -620,6 +654,9 @@ def run_lane(
                         os.remove(stale)
                     except OSError:
                         pass
+
+                if unsupported_model:
+                    break
 
             if launch_exc is not None:
                 schema.log_event("step_launch_failed", step_id=step_id, error=str(launch_exc))
@@ -667,6 +704,13 @@ def run_lane(
                 stop_reason_raw=envelope.get("stop_reason_raw"),
             )
             written.append(envelope)
+            if unsupported_model:
+                # Issue #4007: this is a property of the (model, account)
+                # pair, not of this step -- every remaining step would fail
+                # identically, so stop here rather than burning one harness
+                # call per remaining step on the same rejection.
+                schema.log_event("lane_stopped_unsupported_model", step_id=step_id, model=model)
+                break
         except Exception as exc:  # noqa: BLE001 -- one bad step is a failed step, never a crashed lane
             schema.log_event("step_unhandled_error", step_id=step_id, error=str(exc))
             harness_runner.remove_step_temp_artifacts(out_dir, step_id)
