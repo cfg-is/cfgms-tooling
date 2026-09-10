@@ -80,7 +80,7 @@ Which lanes run, and against which models, is controlled entirely by one environ
 `.env.local.example`:
 
 ```bash
-CFGMS_SECURITY_REVIEW_LANES=claude:sonnet-5,codex:gpt-5-codex,opencode:qwen3-coder,opencode:glm-4.6,ollama:glm-5.3-flash:cloud
+CFGMS_SECURITY_REVIEW_LANES=claude:claude-sonnet-5,codex:gpt-5.6-terra,opencode:qwen3-coder,opencode:glm-4.6,ollama:glm-5.3-flash:cloud
 ```
 
 A comma-separated list of `harness:model` pairs. Every entry runs at every step (fan-out, not a
@@ -96,15 +96,30 @@ read-only credential mount, never an OS-keychain API key):
 
 | Harness | Model examples | Landed by |
 |---|---|---|
-| `claude` | `sonnet-5` | switchover cutover (#3933/#3934) |
-| `codex` | `gpt-5-codex` | Codex lane runner (#3935) |
+| `claude` | `claude-sonnet-5` (the full id; the short `sonnet-5` is not in the pinned CLI's catalog) | switchover cutover (#3933/#3934) |
+| `codex` | `gpt-5.6-terra` (list the account's ids with `codex debug models`; `gpt-5-codex` is rejected for a ChatGPT-account session) | Codex lane runner (#3935) |
 | `opencode` | `qwen3-coder`, `glm-4.6` (OpenCode Zen catalog) | OpenCode lane runner (#3936) |
 | `ollama` | `glm-5.3-flash:cloud` (Ollama Cloud only — never a local/GPU model) | Ollama Cloud lane runner (#3976) |
 
-**`ollama` needs an `ollama signin` session on the host** before it can be used — the operator's
-own Cloud subscription keypair (`~/.ollama/id_ed25519`), the same "subscription session, never an
-API key" contract every other harness follows. Without it, `--harness ollama` fails closed as a
+**`ollama` needs the key at `~/.ollama/id_ed25519` to be signed in to Ollama Cloud** before it
+can be used — the operator's own Cloud subscription keypair, the same "subscription session, never
+an API key" contract every other harness follows. On a host where Ollama runs as a systemd service,
+`ollama signin` signs in the *service user's* key (`/usr/share/ollama/.ollama/id_ed25519`), not the
+key the lane mounts. Connect the user key instead: run `ollama signin` inside a container that
+mounts the same two key files the lane mounts, and open the URL it prints (it says "already
+signed in" once the key is connected):
+
+```bash
+docker run --rm --cap-add NET_ADMIN -e CFGMS_SECURITY_REVIEW_HARNESS=ollama \
+  -v "$HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro" \
+  -v "$HOME/.ollama/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro" \
+  --entrypoint bash cfg-agent:latest \
+  -c 'init-firewall.sh >/dev/null && (ollama serve >/tmp/ollama-serve.log 2>&1 &) && sleep 3 && ollama signin'
+```
+
+Without the key file, `--harness ollama` fails closed as a
 recorded, skippable `credential_unavailable` dispatch outcome; every other roster lane still runs.
+With a key file that is not signed in, the lane dispatches and every step records `failed`.
 
 Every roster entry dispatches through `.claude/scripts/agent-dispatch.sh launch-investigator`
 (Issue #3903): one short-lived, read-only container per lane per invocation — `/workspace`
@@ -117,7 +132,7 @@ variable naming exactly one `harness:model` pair — the frontier model that jud
 the finder lanes are done:
 
 ```bash
-CFGMS_SECURITY_REVIEW_ADJUDICATOR=claude:opus-5
+CFGMS_SECURITY_REVIEW_ADJUDICATOR=claude:claude-opus-5
 ```
 
 After every lane container has exited, `launch`/`resume` hand that model the de-duplicated
@@ -230,7 +245,7 @@ whether the adjudicator ran: not configured, skipped (no findings), complete (wi
 not complete (with the state and reason, also listed under `## Incomplete`). Then every finding's
 first line is one of two shapes, and the word in the parentheses is the whole distinction:
 
-- `Severity (adjudicated): **high** — by `claude` / `opus-5`; lanes reported lane-a=low,
+- `Severity (adjudicated): **high** — by `claude` / `claude-opus-5`; lanes reported lane-a=low,
   lane-b=critical. Rationale: ...` — a frontier model applied the rubric to the lanes' reports and
   this is its call. Act on it, and use the lane values beside it to see what it overruled.
 - `Severity (raw): **DISAGREEMENT** low → critical — lanes reported ...; not adjudicated (why)`,
