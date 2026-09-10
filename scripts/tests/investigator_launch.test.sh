@@ -119,13 +119,33 @@ echo "== REQUIRED TEST evidence — planner mode passes --disallowedTools =="
 # the literal contiguous phrase — matching how agent-dispatch.sh constructs it
 # to avoid tripping the "No raw 'gh issue create' in pipeline scripts" CI gate
 # (label-decommission-gate.yml) on this legitimate blocklist reference.
-check_contains "disallowed tools list blocks Edit/Write/MultiEdit/NotebookEdit/Read/Grep" "$launch_block" 'inv_disallowed="Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"'
+check_contains "disallowed tools list blocks Edit/Write/NotebookEdit/Read/Grep" "$launch_block" 'inv_disallowed="Edit,Write,NotebookEdit,Read,Grep,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"'
 check_contains "disallowed tools list refuses curl" "$launch_block" 'Bash(curl:*)'
 check_contains "disallowed tools list refuses wget" "$launch_block" 'Bash(wget:*)'
 check_contains "gh issue verb is defined via a variable, not inlined" "$launch_block" 'inv_gh_issue_verb="issue"'
 check_contains "disallowed tools list is forwarded to the container as an env var" "$launch_block" 'CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=${inv_disallowed}'
+# MultiEdit is not a tool name the pinned claude CLI (2.1.258) recognizes --
+# it prints "Permission deny rule \"MultiEdit\" matches no known tool" at every
+# investigator start (Issue #4013). Edit already covers the same capability,
+# so this is a stale-entry removal, not a denial-coverage change.
+check_not_contains "disallowed tools list never lists the unknown MultiEdit tool name" "$launch_block_code" 'MultiEdit'
 entrypoint_src="$(cat "$ENTRYPOINT")"
 check_contains "investigator-entrypoint.sh passes --disallowedTools to claude in plan mode" "$entrypoint_src" '--disallowedTools "$DISALLOWED_TOOLS"'
+
+if command -v claude >/dev/null 2>&1; then
+  echo ""
+  echo "== REQUIRED TEST evidence (Issue #4013) — the rendered disallowed-tools"
+  echo "   list contains no rule name the pinned claude CLI rejects as unknown"
+  echo "   (empirical check against the real installed binary, not a fixture) =="
+  inv_disallowed_line="$(grep -m1 '^ *inv_disallowed=' "$DISPATCH")"
+  inv_gh_issue_verb="issue"
+  eval "$inv_disallowed_line"
+  claude_unknown_tool_out="$(claude --disallowedTools "$inv_disallowed" --print "say hi" --dangerously-skip-permissions 2>&1 >/dev/null || true)"
+  check_not_contains "pinned claude CLI accepts every rule in inv_disallowed with no 'matches no known tool' warning" "$claude_unknown_tool_out" "matches no known tool"
+else
+  echo ""
+  echo "== SKIPPED — claude CLI not on PATH; empirical unknown-tool check requires the pinned binary =="
+fi
 
 echo ""
 echo "== REQUIRED TEST evidence — planner mode loads the investigator agent profile"
@@ -323,8 +343,9 @@ check_not_contains "plan mode never mounts the snapshot dir anywhere at all" "$r
 check_not_contains "rendered docker run has no GH_TOKEN" "$run_call" "GH_TOKEN"
 check_contains "rendered docker run mounts plan/ as /workspace-out:rw" "$run_call" "${SWEEP_DIR}/plan:/workspace-out:rw"
 check_not_contains "rendered docker run does not mount the bare sweep dir" "$run_call" "${SWEEP_DIR}:/workspace"
-check_contains "rendered docker run carries the disallowed-tools env var" "$run_call" "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=Edit,Write,MultiEdit"
+check_contains "rendered docker run carries the disallowed-tools env var" "$run_call" "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS=Edit,Write,NotebookEdit"
 check_contains "rendered disallowed-tools env var denies Read" "$run_call" "NotebookEdit,Read,Grep,Bash(curl:*)"
+check_not_contains "rendered disallowed-tools env var never lists the unknown MultiEdit tool name" "$run_call" "MultiEdit"
 check_contains "rendered docker run grants NET_ADMIN" "$run_call" "--cap-add NET_ADMIN"
 check_contains "rendered disallowed-tools env var refuses curl" "$run_call" "Bash(curl:*)"
 check_contains "rendered disallowed-tools env var refuses wget" "$run_call" "Bash(wget:*)"

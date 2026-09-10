@@ -2900,7 +2900,13 @@ PROMPT_EOF
     # line, or drops --agent from the entrypoint invocation, still leaves
     # this CLI-level denial in place rather than depending on one control
     # alone for the metadata-only boundary AC2 requires.
-    inv_disallowed="Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"
+    # MultiEdit is not a tool name the pinned claude CLI (2.1.258, see
+    # .devcontainer/Dockerfile CLAUDE_CODE_VERSION) recognizes -- it prints
+    # `Permission deny rule "MultiEdit" matches no known tool` at every
+    # investigator start (Issue #4013). Edit is the CLI's actual file-edit
+    # tool name and already appears below, so removing the stale entry does
+    # not change what capability is denied.
+    inv_disallowed="Edit,Write,NotebookEdit,Read,Grep,Bash(curl:*),Bash(wget:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(gh pr create:*),Bash(gh ${inv_gh_issue_verb} create:*)"
     # <sweep>/plan is bind-mounted in BOTH modes — rw as /workspace-out in plan
     # mode, ro as /workspace-plan into every lane — so it is resolved and
     # verified once, here, for both. This is the same check the lanes/ guard
