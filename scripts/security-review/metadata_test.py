@@ -373,7 +373,23 @@ import (
 func registerFixtureBadRoutes(s *Server, api *mux.Router) {
 \tfixture := api.PathPrefix("/fixture").Subrouter()
 \tfixture.Handle("/good", s.requirePermission("fixture", "read")(http.HandlerFunc(s.handleFixtureGood))).Methods("GET")
-\tfixture.Handle("/bad/{id:.+}", s.requirePermission("fixture", "read")(http.HandlerFunc(s.handleFixtureBad))).Methods("GET")
+\tfixture.Handle("/bad/{id:\x01bad}", s.requirePermission("fixture", "read")(http.HandlerFunc(s.handleFixtureBad))).Methods("GET")
+}
+"""
+
+FIXTURE_ROUTE_FILE_WITH_REGEX_PARAM = """\
+package api
+
+import (
+\t"net/http"
+
+\t"github.com/gorilla/mux"
+)
+
+func registerFixtureEntityRoutes(s *Server, api *mux.Router) {
+\tentities := api.PathPrefix("/entities").Subrouter()
+\tentities.Handle("/{eid:.+}", http.HandlerFunc(s.handleGetEntity)).Methods("GET")
+\tentities.Handle("/{eid:.+}/edges", http.HandlerFunc(s.handleGetEdges)).Methods("GET")
 }
 """
 
@@ -680,7 +696,10 @@ def test_routes_tsv_renders_none_for_unguarded_route_and_the_guard_for_guarded()
 
 def test_route_value_outside_accepted_shape_is_dropped_and_logged():
     # REQUIRED TEST: route values are file-content-derived and are the
-    # highest-taint text this module has ever rendered.
+    # highest-taint text this module has ever rendered. A control character is
+    # outside the accepted shape regardless of what else surrounds it (unlike
+    # a `.+` mux regex suffix, which Issue #4010 moved into the accepted shape
+    # -- see test_route_with_regex_path_param_is_kept).
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
         sha = init_repo_with_commit(
             repo, {"features/controller/api/routes_bad.go": FIXTURE_ROUTE_FILE_WITH_BAD_SHAPE}
@@ -697,8 +716,8 @@ def test_route_value_outside_accepted_shape_is_dropped_and_logged():
         paths = [r[1] for r in rows]
         check("/api/v1/fixture/good" in paths, "03-routes.tsv: the well-shaped row is emitted", str(paths))
         check(
-            not any("id:.+" in p for p in paths),
-            "03-routes.tsv: the out-of-shape route path is dropped, never emitted",
+            not any("\x01" in p for p in paths),
+            "03-routes.tsv: a route path carrying a control character is dropped, never emitted",
             str(paths),
         )
         drops = [
@@ -706,6 +725,43 @@ def test_route_value_outside_accepted_shape_is_dropped_and_logged():
             if l.strip() and json.loads(l).get("event") == "prompt_unsafe_route_value_dropped"
         ]
         check(len(drops) >= 1, "write_bundle: the dropped route value is logged", buf.getvalue())
+
+
+def test_route_with_regex_path_param_is_kept():
+    # REQUIRED TEST (Issue #4010): a gorilla/mux route with a `{name:.+}`
+    # regex path param -- the shape used by every multi-tenant and entity
+    # route on develop -- must survive into 03-routes.tsv rather than being
+    # dropped as `prompt_unsafe_route_value_dropped`.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
+        sha = init_repo_with_commit(
+            repo, {"features/controller/api/routes_entities_fixture.go": FIXTURE_ROUTE_FILE_WITH_REGEX_PARAM}
+        )
+        dest = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        write_file(scope_path, "scope\n")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
+
+        rows = tsv_rows(read_bundle_text(dest, "03-routes.tsv"))
+        paths = [r[1] for r in rows]
+        check(
+            "/api/v1/entities/{eid:.+}" in paths,
+            "03-routes.tsv: a bare {name:.+} regex path param route is kept",
+            str(paths),
+        )
+        check(
+            "/api/v1/entities/{eid:.+}/edges" in paths,
+            "03-routes.tsv: a {name:.+} regex path param sub-route is kept",
+            str(paths),
+        )
+
+        drops = [
+            json.loads(l) for l in buf.getvalue().splitlines()
+            if l.strip() and json.loads(l).get("event") == "prompt_unsafe_route_value_dropped"
+        ]
+        check(len(drops) == 0, "write_bundle: no route value drop logged for a .+ regex path param", buf.getvalue())
 
 
 def test_config_surface_carries_only_names_and_counts_never_values():

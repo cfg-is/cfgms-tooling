@@ -385,7 +385,7 @@ BARE_HANDLER_RE = re.compile(r'^([A-Za-z0-9_.]+)\s*$')
 METHODS_ARG_RE = re.compile(r'"([A-Za-z]+)"')
 ROUTE_PATH_LITERAL_RE = re.compile(r'\s*"((?:[^"\\]|\\.)*)"')
 
-ROUTE_PATH_SHAPE_RE = re.compile(r'^[A-Za-z0-9/_{}.:*-]{1,256}$')
+ROUTE_PATH_SHAPE_RE = re.compile(r'^[A-Za-z0-9/_{}.:*+-]{1,256}$')
 HANDLER_SYMBOL_SHAPE_RE = re.compile(r'^[A-Za-z0-9_.]{1,128}$')
 METHOD_SHAPE_RE = re.compile(r'^[A-Z]{3,7}$')
 
