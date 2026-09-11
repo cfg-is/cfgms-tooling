@@ -122,11 +122,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import basedir  # noqa: E402
 import metadata  # noqa: E402
+import partition  # noqa: E402
 import roster  # noqa: E402
 import schema  # noqa: E402
 
 PROMPT_FILENAME = ".investigator-plan-prompt.md"
 CONTEXT_FILENAME = ".plan-context.json"
+
+# Written under `<sweep_dir>/plan/` by `prepare()` (Issue #4056 AC10): the
+# deterministic step partition (`partition.partition()`) computed over this
+# sweep's own bundle -- the steps, their ids, scopes and files, with no
+# hypotheses. This is the shared spine two planners' contributions (or the
+# same planner run months apart) can be diffed against, and it is the source
+# `finalize()`/`finalize_multi_planner()` inject a step's `axis`/`scope`/
+# `files` from (AC6) -- positionally, by a step file's place in sorted
+# filename order, since the on-disk `step-NNN.json` naming stays sequential
+# (unchanged from before this story) while this file's own `step_id` per
+# entry is a content digest (AC5), not a counter.
+PARTITION_FILENAME = "partition.json"
 FAILURE_MARKER_FILENAME = "PLANNING_FAILED"
 STEP_FILENAME_RE = re.compile(r"^step-(\d{3,})\.json$")
 
@@ -494,6 +507,31 @@ def _read_bundle_scope_paths(bundle_dir: str) -> "list[str] | None":
     return scope_paths
 
 
+def _render_partition_steps_block(steps: "list[dict]") -> str:
+    """Render the harness's own deterministic partition (Issue #4056 AC6) as
+    the fixed list of steps the planner model is assigned -- never asked to
+    invent. Each step's `files` were already re-checked against
+    `metadata._prompt_safe()` by `partition._read_tree_rows()`, so they are
+    safe to render the same way `_read_bundle_tree_paths()`'s output is."""
+    if not steps:
+        return "  (no steps -- this bundle has nothing to review)"
+    blocks = []
+    for index, step in enumerate(steps, start=1):
+        filename = f"step-{index:03d}.json"
+        files_block = "\n".join(f"{metadata.ENTRY_PREFIX}{p}" for p in step["files"]) or "  (none)"
+        axis_note = (
+            f"axis: boundary (configuration key `{step['config_key']}`, spans more than one "
+            "top-level subtree by design -- see the bounded-scope note below)"
+            if step["axis"] == partition.AXIS_BOUNDARY
+            else "axis: directory"
+        )
+        blocks.append(
+            f"Step {index} -- write your hypotheses to `/workspace-out/{filename}` ({axis_note})\n"
+            f"files:\n{files_block}"
+        )
+    return "\n\n".join(blocks)
+
+
 def build_prompt(bundle_dir: str, sweep_id: str) -> str:
     """Assemble the full text handed to `claude -p` in plan mode.
 
@@ -501,27 +539,32 @@ def build_prompt(bundle_dir: str, sweep_id: str) -> str:
     description of the repository the model receives -- no file contents,
     ever, and no value able to emit a newline, so the payload cannot escape
     the delimiters it is placed between (`_read_bundle_tree_paths()` enforces
-    that; this function relies on it). Everything else here is fixed
-    instructional text: the step-plan schema, the bounded-scope rule, and the
-    Bash-heredoc write mechanism the model must use because `Write` is not
-    among its `Bash, Glob` tools.
+    that; this function relies on it).
+
+    Since Issue #4056 (AC6), the step partition itself is no longer the
+    model's job: `partition.partition(bundle_dir)` computes it deterministically
+    from the same bundle, and this prompt presents that fixed list of steps --
+    each with its own assigned `files` -- asking the model only for
+    hypotheses. The model is never asked to choose `scope` or `files`;
+    `finalize()` injects both from the partition afterward, exactly as it
+    already injects `sweep_id`/`commit_sha`/`planners`, and rejects a
+    model-supplied value that disagrees (Issue #4056 AC6). Everything else
+    here is fixed instructional text: the required hypothesis form (AC9), the
+    absence-shaped-hypothesis requirement (AC8), and the Bash-heredoc write
+    mechanism the model must use because `Write` is not among its
+    `Bash, Glob` tools.
 
     Since Issue #4012, the inventory embedded below may itself already be
     bounded to one or more operator-chosen subtrees (`security-review.sh
     launch <ref> --path <subtree>`, plumbed through `metadata.write_bundle()`'s
     `paths` filter) rather than the full repository. `_read_bundle_scope_paths()`
     reads that back from the bundle's own `MANIFEST.json` so the prompt can
-    say so explicitly -- a planner that is not told its inventory is already
-    bounded has no way to distinguish "this small file list is the whole
-    repository" from "this is a slice", and the two call for different
-    partitioning judgment.
+    say so explicitly.
 
     Since Issue #3979, `/workspace` in plan mode is the bundle directory
     itself, not a repository checkout -- there is no source tree left for
     `Glob` to discover files in, so this prompt no longer instructs the model
-    to run it. A step's `files` are instead drawn directly from the path list
-    embedded below, which is exactly why the bundle emits a full file
-    inventory rather than directory names alone.
+    to run it.
 
     The model is deliberately never asked for `sweep_id`, `commit_sha`,
     `planners`, or a hypothesis's own `planner` field -- `finalize()` injects
@@ -538,15 +581,16 @@ def build_prompt(bundle_dir: str, sweep_id: str) -> str:
         scope_list = ", ".join(f"`{p}`" for p in scope_paths)
         scope_line = (
             f"This is a BOUNDED sweep, not a full-repository review: the inventory below is "
-            f"scoped to {scope_list} only. Partition and propose steps only within this scope -- "
-            f"there is nothing outside it for you to cover."
+            f"scoped to {scope_list} only. There is nothing outside it for you to cover."
         )
     else:
         scope_line = (
             "This sweep covers the full repository -- the inventory below is not bounded to any "
             "subtree."
         )
-    return f"""You are the metadata-only step planner for security-review sweep `{sweep_id}`.
+    partition_steps = partition.partition(bundle_dir)
+    steps_block = _render_partition_steps_block(partition_steps)
+    return f"""You are a hypothesis writer for security-review sweep `{sweep_id}`.
 
 {scope_line}
 
@@ -555,28 +599,43 @@ You have been given the file inventory below, read from the bundle's
 deliberately does NOT contain the contents of any source file, and there is no repository
 checkout mounted in this container for you to read one from even if you wanted to: `/workspace`
 here is the bundle itself, not a checkout. Do not attempt to read any file's contents (via `cat`,
-`git show`, or any other command) to learn more than what is given here: your job is to partition
-this inventory into bounded review steps, not to review any code yourself.
+`git show`, or any other command) to learn more than what is given here.
 
 --- REPOSITORY METADATA (paths only) ---
 {payload}--- END REPOSITORY METADATA ---
 
-Partition the file inventory above into review steps. Each step names ONE bounded scope that a
-later review pass will read in full. Default to one step per top-level package directory (group
-paths that share the same directory); you may combine multiple small packages into one step, or
-split a large directory into more than one step, but {BOUNDED_SCOPE_RULE}
+This sweep has already been partitioned into the review steps below, deterministically, by the
+harness itself -- not by you. Each step's files were assigned from the file inventory above.
+Do not add, remove, rename, or resize a step, and do not choose different files for one: they are
+enforced underneath you, and a step file whose `scope` or `files` disagrees with what is given
+below is rejected outright rather than silently corrected. Your only job for each step is to
+write hypotheses.
+
+A directory-axis step's files always share one top-level repository subtree ({BOUNDED_SCOPE_RULE}
+-- informational only here, since you are not choosing scope). A boundary-axis step is the
+deliberate exception: it collects every file that reads or writes one configuration key,
+regardless of which subtree each file lives in, because that is exactly the shape of evidence a
+directory-bounded step can never see on its own -- a caller that assumes the callee validates
+something, and a callee that assumes the caller already did.
+
+{steps_block}
 
 For each step, propose one or more concrete hypotheses about what a later review pass should
-investigate in that scope. A hypothesis is a specific, falsifiable claim about a security
-property -- not a restatement of the scope's name, and not "review this code for bugs." Base
-each hypothesis only on what the file inventory (paths, directory names) suggests the code might
-do; you have not read any file's contents, so ground every hypothesis in that, not in invented
-specifics.
+investigate in that step's files. A hypothesis has exactly one required form: a falsifiable claim
+about specific code, paired with the evidence that would confirm or refute it -- never a broad
+security property. Good: "the certificate expiry check at the point where the chain is validated
+may compare against a clock value that is never re-read per request, so a certificate that expired
+after process start could still validate" -- specific, and `required_evidence` names exactly what
+to look for. Bad: "certificate validation is correct" -- a broad property no single bounded step
+can close, which is why a hypothesis phrased this way tends to resolve `inconclusive`, the least
+useful disposition a finder lane can report. Base every hypothesis only on what the file inventory
+(paths, directory names) suggests the code might do; you have not read any file's contents, so
+ground every hypothesis in that, not in invented specifics.
 
-For each step, populate `files` with the repository-relative paths from the inventory above that
-fall inside the scope you chose -- copy each path verbatim from the list above, never invent or
-guess one. There is no `Glob` step here: the inventory above is already the complete,
-authoritative file list for this commit, so there is nothing left to discover on disk.
+Every step must include at least one hypothesis of the absence-shaped form: what check should
+exist among this step's files and does not -- a missing authorization call, an unregistered
+revocation path, a handler nobody wired. A list of files that exist points at nothing that is
+missing unless you name it yourself.
 
 Write each step as its own JSON file. Because your tools are `Bash` and `Glob` only (no `Write`),
 create each file with a Bash heredoc, for example:
@@ -584,41 +643,41 @@ create each file with a Bash heredoc, for example:
     cat > /workspace-out/step-001.json <<'JSON'
     {{
       "step_id": "step-001",
-      "scope": ["pkg/example/thing.go", "pkg/example/other.go"],
       "hypotheses": [
         {{
           "id": "h1",
-          "objective": "what security property or vulnerability class is being investigated",
+          "objective": "a falsifiable claim about specific code in this step's files",
           "required_evidence": "what evidence in the code would confirm or refute this"
+        }},
+        {{
+          "id": "h2",
+          "objective": "what check should exist among this step's files and does not",
+          "required_evidence": "what evidence would confirm the check is genuinely absent"
         }}
-      ],
-      "files": ["pkg/example/thing.go", "pkg/example/other.go"]
+      ]
     }}
     JSON
 
 Rules for every step file:
-- File name: `step-NNN.json` (zero-padded, starting at 001), written directly under
-  `/workspace-out/` -- your only writable directory.
+- File name: `step-NNN.json` (zero-padded, matching the step's own number above), written
+  directly under `/workspace-out/` -- your only writable directory.
 - `step_id`: must exactly match the file's own name without the `.json` suffix (e.g.
   `step-001` for `step-001.json`).
-- `scope`: a JSON array of the repository-relative paths (or a single package directory path)
-  this step covers. Every path must come from the metadata above, and every path in a single
-  step's scope must resolve to the same top-level subtree (see the bounded-scope rule above).
-- `hypotheses`: a JSON array of at least one hypothesis object. Each entry has:
+- `hypotheses`: a JSON array of at least one hypothesis object, including at least one
+  absence-shaped one (see above). Each entry has:
   - `id`: a short identifier unique within this step's own hypotheses list (e.g. `h1`, `h2`) --
     it does not need to be unique across steps or across other planners.
-  - `objective`: what security property or vulnerability class is being investigated in this
-    scope.
+  - `objective`: the falsifiable claim -- see the required form above.
   - `required_evidence`: what evidence in the code would confirm or refute this hypothesis.
   - Do NOT include a `planner` field on any hypothesis -- it is filled in for you, exactly like
     `sweep_id`/`commit_sha`/`planners` at the step level.
-- `files`: a JSON array of the repository-relative file paths inside this step's scope, copied
-  verbatim from the file inventory above -- may be empty if the scope names files directly
-  rather than a directory.
-- Do NOT include `sweep_id`, `commit_sha`, or `planners` -- these are filled in for you.
+- Do NOT include `scope`, `files`, `sweep_id`, `commit_sha`, or `planners` -- these are filled in
+  for you from the harness's own partition above. If you include `scope` or `files` anyway, they
+  must exactly match the step's assignment above, or the entire step is rejected.
 
-Write one file per step. Do not write anything else, anywhere else. When you are done, stop --
-do not summarize your work in chat, since nothing you say outside these files is read by anyone.
+Write one file per step listed above. Do not write anything else, anywhere else. When you are
+done, stop -- do not summarize your work in chat, since nothing you say outside these files is
+read by anyone.
 """
 
 
@@ -682,6 +741,16 @@ def prepare(
 
     plan_dir = os.path.join(sweep_dir, "plan")
     os.makedirs(plan_dir, exist_ok=True)
+
+    # Issue #4056 AC10: record the deterministic partition itself, separately
+    # from any planner's hypotheses, so two planners' contributions can be
+    # diffed against a shared spine. Written from the SAME bundle build_prompt()
+    # just partitioned above, so the prompt's assigned steps and this file
+    # never disagree.
+    atomic_write.write_json_atomic(
+        os.path.join(plan_dir, PARTITION_FILENAME), partition.partition(bundle_dir)
+    )
+
     prompt_path = os.path.join(plan_dir, PROMPT_FILENAME)
     atomic_write.write_text_atomic(prompt_path, prompt)
 
@@ -1017,7 +1086,11 @@ BOUNDED_SCOPE_RULE = (
     "different subtrees, not one. A file with no directory component at all -- one that sits "
     "directly in the repository root, such as `Makefile`, `go.mod`, or `.gitleaks.toml` -- is the "
     "one exception: every such file belongs to a single shared repository-root subtree, so any "
-    "number of root-level files may be grouped into one step."
+    "number of root-level files may be grouped into one step. This rule applies to a step's "
+    "`axis: \"directory\"` scope only (Issue #4056): an `axis: \"boundary\"` step is a deliberate, "
+    "harness-computed exception spanning exactly the files that reference one configuration key "
+    "regardless of which subtree they live in, bounded instead by a non-test line-count budget "
+    "(see `partition.MAX_STEP_NON_TEST_LOC`)."
 )
 
 
@@ -1128,26 +1201,106 @@ def _repository_root_files(sweep_dir: str) -> "frozenset[str]":
     return frozenset(p for p in paths if os.sep not in p and "/" not in p)
 
 
+def _bundle_tree_index(sweep_dir: str) -> "dict[str, dict] | None":
+    """`path -> {"loc": int, "tier": str}` drawn from the sweep's own
+    `<sweep_dir>/bundle/01-tree.tsv` (Issue #4056), for `validate_step()`'s
+    `axis: "boundary"` non-test loc-budget check. `None` -- never raises --
+    when the bundle tree listing is absent or unparseable, matching
+    `evaluate_coverage()`'s own tolerant posture toward the same file:
+    `validate_step()` treats a missing index as "nothing to check the
+    boundary-axis budget against", never as a reason to fail closed on every
+    step.
+    """
+    bundle_dir = os.path.join(sweep_dir, BUNDLE_SUBDIR)
+    tiers, reason = _read_bundle_tree_tiers(bundle_dir)
+    if reason is not None:
+        return None
+    try:
+        paths = _read_bundle_tree_paths(bundle_dir)
+    except PlannerError:
+        return None
+    loc_path = os.path.join(bundle_dir, TREE_ARTIFACT_NAME)
+    try:
+        with open(loc_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    lines = text.split("\n")
+    if not lines or lines[0].split("\t") != list(metadata.TREE_HEADER):
+        return None
+    path_index = metadata.TREE_HEADER.index("path")
+    loc_index = metadata.TREE_HEADER.index("loc")
+    known_paths = frozenset(paths)
+    index: dict[str, dict] = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != len(metadata.TREE_HEADER):
+            continue
+        path = fields[path_index]
+        if path not in known_paths:
+            continue
+        try:
+            loc = int(fields[loc_index])
+        except ValueError:
+            continue
+        index[path] = {"loc": loc, "tier": tiers.get(path)}
+    return index
+
+
+VALID_AXES = frozenset({partition.AXIS_DIRECTORY, partition.AXIS_BOUNDARY})
+
+
 def validate_step(
-    data: object, filename: str, root_files: "frozenset[str] | None" = None
+    data: object,
+    filename: str,
+    root_files: "frozenset[str] | None" = None,
+    tree_index: "dict[str, dict] | None" = None,
 ) -> list[str]:
     """Return validation errors for one parsed `step-NNN.json` payload; empty
     means valid. Never raises -- a caller checks `errors == []`.
 
     Field-shape validation (all seven required fields) is delegated to the
     shared `schema.validate_plan_step()` -- the one place this shape is
-    defined, per C1. This function layers on the two checks that only make
-    sense with the file name in hand: `step_id` must match the file it lives
-    in, and `scope` must resolve to exactly one bounded top-level subtree
-    (`_scope_boundary()`, enforcing `BOUNDED_SCOPE_RULE` -- the same text
-    `build_prompt()` gives the planning model, so the instruction and its
-    enforcement cannot drift apart).
+    defined, per C1. This function layers on the checks that only make sense
+    with the file name (and, since Issue #4056, the bundle's own tree data)
+    in hand: `step_id` must match the file it lives in, and `scope` must be
+    bounded -- how, depends on the step's own `axis` field (Issue #4056 AC4a):
+
+    The branch below tests which bound applies, not which axis is exempt --
+    `axis == AXIS_DIRECTORY` (or no `axis` at all) gets the subtree rule;
+    everything else defaults to the `loc` budget. A future axis value (e.g.
+    the planned scenario-keyed axis) therefore lands on a bound automatically,
+    from `VALID_AXES` growing, rather than needing a second edit to this
+    function's condition.
+
+    - `axis: "directory"` (or no `axis` at all -- the pre-#4056 shape): scope
+      must resolve to exactly one bounded top-level subtree (`_scope_boundary()`,
+      enforcing `BOUNDED_SCOPE_RULE` -- the same text `build_prompt()` gives
+      the planning model, so the instruction and its enforcement cannot drift
+      apart).
+    - any other axis (today, only `"boundary"`): EXEMPT from
+      `_scope_boundary()` -- a boundary-axis step is deliberately allowed to
+      span more than one top-level subtree, since spanning the boundary is
+      the entire point (AC4). It is bounded instead by
+      `partition.MAX_STEP_NON_TEST_LOC` over its `tree_index`-derived
+      non-test `loc`, the same size bound `partition.py`'s own
+      `_split_by_loc_budget()` enforces when it computes the step in the
+      first place -- so this function never accepts an unbounded step on
+      either axis, only bounds it by a different property.
 
     `root_files` is the sweep's repository-root file inventory
     (`_repository_root_files()`), passed straight through to
     `_scope_boundary()`; omitting it means no single-segment path is treated
     as a repository-root file, which rejects more than it accepts and never
-    the reverse. `finalize()` and `finalize_multi_planner()` always supply it.
+    the reverse. `tree_index` (Issue #4056) is `path -> {"loc": int, "tier":
+    str}` drawn from the bundle's own `01-tree.tsv`; a step bounded by the
+    `loc` budget with no `tree_index` to check it against is REJECTED, not
+    skipped -- the directory axis already fails closed when its own
+    inventory (`root_files`) is missing, and the budget-bounded branch must
+    fail in the same direction rather than accept a step it cannot measure.
+    `finalize()` and `finalize_multi_planner()` always supply both.
     """
     if not isinstance(data, dict):
         return [f"{filename}: step must be a JSON object"]
@@ -1162,20 +1315,47 @@ def validate_step(
                 f"{filename}: step_id {step_id!r} does not match the file name {expected_id!r}"
             )
 
+    axis = data.get("axis")
+    if axis is not None and axis not in VALID_AXES:
+        errors.append(
+            f"{filename}: field axis must be one of {sorted(VALID_AXES)}, got {axis!r}"
+        )
+
     if "scope" in data:
         paths = _scope_paths(data["scope"])
         if paths is not None:
-            boundaries = {_scope_boundary(p, root_files) for p in paths}
-            if None in boundaries:
-                errors.append(
-                    f"{filename}: scope contains a path that is excluded or invalid "
-                    f"(absolute, path-traversal, or an explicitly denylisted subtree): {paths!r}"
-                )
-            elif len(boundaries) > 1:
-                errors.append(
-                    f"{filename}: scope spans more than one top-level subtree "
-                    f"({sorted(boundaries)}): {BOUNDED_SCOPE_RULE}"
-                )
+            if axis == partition.AXIS_DIRECTORY or axis is None:
+                boundaries = {_scope_boundary(p, root_files) for p in paths}
+                if None in boundaries:
+                    errors.append(
+                        f"{filename}: scope contains a path that is excluded or invalid "
+                        f"(absolute, path-traversal, or an explicitly denylisted subtree): {paths!r}"
+                    )
+                elif len(boundaries) > 1:
+                    errors.append(
+                        f"{filename}: scope spans more than one top-level subtree "
+                        f"({sorted(boundaries)}): {BOUNDED_SCOPE_RULE}"
+                    )
+            else:
+                if tree_index is None:
+                    errors.append(
+                        f"{filename}: axis:{axis} step's non-test loc cannot be checked against "
+                        f"the {partition.MAX_STEP_NON_TEST_LOC}-line budget "
+                        f"(partition.MAX_STEP_NON_TEST_LOC) without a bundle tree index -- "
+                        f"rejecting rather than accepting a step whose size cannot be measured"
+                    )
+                else:
+                    non_test_loc = sum(
+                        tree_index[p]["loc"]
+                        for p in paths
+                        if p in tree_index and tree_index[p].get("tier") != "test"
+                    )
+                    if non_test_loc > partition.MAX_STEP_NON_TEST_LOC:
+                        errors.append(
+                            f"{filename}: axis:{axis} step's non-test loc ({non_test_loc}) "
+                            f"exceeds the {partition.MAX_STEP_NON_TEST_LOC}-line budget "
+                            f"(partition.MAX_STEP_NON_TEST_LOC): {BOUNDED_SCOPE_RULE}"
+                        )
 
     return errors
 
@@ -1357,14 +1537,20 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
     planner's own numbering, so two planners that both happened to call
     something `step-001` can never collide.
 
-    `sweep_id`/`commit_sha`/`description` are taken from the first proposal
-    seen for a scope. Every candidate passed in must already carry the same
-    `sweep_id`/`commit_sha` -- both are injected from the one sweep-wide
-    `.plan-context.json` sidecar before any step reaches this function -- so
-    there is no real conflict to resolve between proposals, only an
-    arbitrary pick between identical values. `description` is optional
-    backward-readable context, never load-bearing, so an arbitrary pick
-    between proposals is fine there too.
+    `sweep_id`/`commit_sha`/`description`/`axis` are taken from the first
+    proposal seen for a scope. Every candidate passed in must already carry
+    the same `sweep_id`/`commit_sha` -- both are injected from the one
+    sweep-wide `.plan-context.json` sidecar before any step reaches this
+    function -- so there is no real conflict to resolve between proposals,
+    only an arbitrary pick between identical values. `description` is
+    optional backward-readable context, never load-bearing, so an arbitrary
+    pick between proposals is fine there too. `axis` (Issue #4056 AC4a) is
+    harness-injected identically onto every proposal for the same scope by
+    `finalize()`/`finalize_multi_planner()` before this function ever runs,
+    so it too is never a real conflict -- but it must still be carried
+    through explicitly: without it, a merged `axis: "boundary"` step would
+    silently lose its marker and be rejected by a post-merge
+    `validate_step()` call as if it were an ordinary directory-axis step.
 
     Callers are expected to have already run each input step through
     `validate_step()`; this function does no validation of its own and
@@ -1384,6 +1570,7 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
                 "commit_sha": step.get("commit_sha"),
                 "scope": step.get("scope"),
                 "description": step.get("description"),
+                "axis": step.get("axis"),
                 "files": [],
                 "planners": [],
                 "hypotheses": [],
@@ -1402,18 +1589,19 @@ def merge_steps_by_scope(steps: "list[dict]") -> "list[dict]":
     merged_steps: list[dict] = []
     for index, key in enumerate(order, start=1):
         g = groups[key]
-        merged_steps.append(
-            {
-                "step_id": f"step-{index:03d}",
-                "sweep_id": g["sweep_id"],
-                "commit_sha": g["commit_sha"],
-                "scope": g["scope"],
-                "description": g["description"],
-                "files": g["files"],
-                "planners": g["planners"],
-                "hypotheses": _merge_hypotheses(g["hypotheses"]),
-            }
-        )
+        merged_step = {
+            "step_id": f"step-{index:03d}",
+            "sweep_id": g["sweep_id"],
+            "commit_sha": g["commit_sha"],
+            "scope": g["scope"],
+            "description": g["description"],
+            "files": g["files"],
+            "planners": g["planners"],
+            "hypotheses": _merge_hypotheses(g["hypotheses"]),
+        }
+        if g.get("axis") is not None:
+            merged_step["axis"] = g["axis"]
+        merged_steps.append(merged_step)
     return merged_steps
 
 
@@ -1540,6 +1728,57 @@ def _inject_hypothesis_provenance(data: dict, planner_id: str) -> None:
             hypothesis.pop("original_id", None)
 
 
+def _read_partition(sweep_dir: str) -> "list[dict] | None":
+    """Read `<sweep_dir>/plan/PARTITION_FILENAME` (Issue #4056 AC6/AC10), the
+    deterministic step partition `prepare()` wrote for this sweep. Returns
+    `None` when absent or malformed -- an older sweep, or a hand-built test
+    fixture that never called `prepare()` -- in which case `finalize()` /
+    `finalize_multi_planner()` fall back to validating whatever `scope`/
+    `files` a step already carries, exactly as they did before this story.
+    Every sweep `prepare()` actually produces always has one.
+    """
+    path = os.path.join(sweep_dir, "plan", PARTITION_FILENAME)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, list) or not all(isinstance(entry, dict) for entry in data):
+        return None
+    return data
+
+
+def _inject_partition_fields(data: dict, partition_step: dict, filename: str) -> "str | None":
+    """Overwrite `data`'s `axis`/`scope`/`files` from `partition_step` (Issue
+    #4056 AC6) -- the harness's own computed identity for the step assigned
+    to this filename's position, never trusted from the model.
+
+    Returns an error string, injecting nothing, when the model supplied its
+    own `scope` or `files` that disagree with the assigned value: a step the
+    model was never instructed to source its own scope/files for producing a
+    mismatched one signals something went wrong (a stale prompt, a confused
+    model), so the step is rejected rather than silently overwritten. Absent
+    or agreeing `scope`/`files` inject cleanly and return `None`.
+    """
+    for field in ("scope", "files"):
+        if field not in data:
+            continue
+        model_paths = _scope_paths(data[field])
+        if model_paths is None:
+            continue
+        assigned_paths = partition_step.get(field) or []
+        if sorted(set(model_paths)) != sorted(set(assigned_paths)):
+            return (
+                f"{filename}: model-supplied {field} disagrees with the harness-assigned "
+                "partition step -- a step's scope and files are computed by the harness, never "
+                "chosen by the model (Issue #4056)"
+            )
+    data["axis"] = partition_step.get("axis")
+    data["scope"] = partition_step.get("scope")
+    data["files"] = partition_step.get("files")
+    return None
+
+
 def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     """Validate whatever `step-*.json` files exist under `<sweep_dir>/plan/`.
 
@@ -1586,6 +1825,8 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     filenames = _discover_step_files(plan_dir)
     context = _read_sweep_context(sweep_dir)
     root_files = _repository_root_files(sweep_dir)
+    tree_index = _bundle_tree_index(sweep_dir)
+    partition_steps = _read_partition(sweep_dir)
 
     errors: list[str] = []
     excluded: list[str] = []
@@ -1622,7 +1863,7 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
         _write_rejected_proposals(plan_dir, rejected)
         return False, errors
 
-    for filename in filenames:
+    for index, filename in enumerate(filenames):
         path = os.path.join(plan_dir, filename)
         try:
             with open(path, "r") as f:
@@ -1643,7 +1884,35 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
             data["planners"] = [PLANNER_ID]
             _inject_hypothesis_provenance(data, PLANNER_ID)
 
-        step_errors = validate_step(data, filename, root_files)
+            # Issue #4056 AC6: when this sweep has a harness-computed
+            # partition (every sweep prepare() actually produces one -- see
+            # _read_partition()'s docstring for the tolerant-fallback case),
+            # a step file's position in sorted filename order is matched
+            # against that same position in the partition, and its
+            # axis/scope/files are injected from there, never chosen by the
+            # model. A filename with no corresponding partition entry (the
+            # model wrote more step files than the harness assigned steps)
+            # is rejected outright.
+            if partition_steps is not None:
+                if index >= len(partition_steps):
+                    reason = (
+                        f"no partition step assigned at this position -- the harness computed "
+                        f"only {len(partition_steps)} step(s)"
+                    )
+                    schema.log_event("invalid_plan_step", filename=filename, errors=[reason])
+                    errors.append(f"{filename}: {reason}")
+                    rejected.append({"filename": filename, "error": reason})
+                    excluded.append(filename)
+                    continue
+                disagreement = _inject_partition_fields(data, partition_steps[index], filename)
+                if disagreement:
+                    schema.log_event("invalid_plan_step", filename=filename, errors=[disagreement])
+                    errors.append(disagreement)
+                    rejected.append({"filename": filename, "error": disagreement})
+                    excluded.append(filename)
+                    continue
+
+        step_errors = validate_step(data, filename, root_files, tree_index)
         if step_errors:
             schema.log_event("invalid_plan_step", filename=filename, errors=step_errors)
             errors.extend(step_errors)
@@ -1850,6 +2119,8 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
 
     context = _read_sweep_context(sweep_dir)
     root_files = _repository_root_files(sweep_dir)
+    tree_index = _bundle_tree_index(sweep_dir)
+    partition_steps = _read_partition(sweep_dir)
 
     errors: list[str] = []
 
@@ -1867,7 +2138,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     rejected: list[dict] = []
     for lane in planners:
         lane_plan_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan")
-        for filename in _discover_step_files(lane_plan_dir):
+        for index, filename in enumerate(_discover_step_files(lane_plan_dir)):
             path = os.path.join(lane_plan_dir, filename)
             label = f"{lane.lane_dir_name}/{filename}"
             try:
@@ -1885,7 +2156,30 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
                 data["planners"] = [lane.lane_dir_name]
                 _inject_hypothesis_provenance(data, lane.lane_dir_name)
 
-            step_errors = validate_step(data, filename, root_files)
+                # Issue #4056 AC6: same positional injection finalize() applies
+                # for the single-planner path, against the ONE shared partition
+                # every lane was handed the same steps from -- this is what
+                # makes merge_steps_by_scope() genuinely merge across planners
+                # rather than depend on two models happening to choose the
+                # same scope.
+                if partition_steps is not None:
+                    if index >= len(partition_steps):
+                        reason = (
+                            f"no partition step assigned at this position -- the harness "
+                            f"computed only {len(partition_steps)} step(s)"
+                        )
+                        schema.log_event("invalid_plan_step", filename=label, errors=[reason])
+                        errors.append(f"{label}: {reason}")
+                        rejected.append({"filename": label, "error": reason})
+                        continue
+                    disagreement = _inject_partition_fields(data, partition_steps[index], label)
+                    if disagreement:
+                        schema.log_event("invalid_plan_step", filename=label, errors=[disagreement])
+                        errors.append(disagreement)
+                        rejected.append({"filename": label, "error": disagreement})
+                        continue
+
+            step_errors = validate_step(data, filename, root_files, tree_index)
             if step_errors:
                 schema.log_event("invalid_plan_step", filename=label, errors=step_errors)
                 errors.extend(f"{lane.lane_dir_name}/{e}" for e in step_errors)
@@ -1916,7 +2210,7 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     written_steps: list[dict] = []
     for step in merged:
         step_filename = f"{step['step_id']}.json"
-        step_errors = validate_step(step, step_filename, root_files)
+        step_errors = validate_step(step, step_filename, root_files, tree_index)
         if step_errors:
             # Unreachable in practice: every candidate already validated
             # individually, and merging only unions `files`/`planners`

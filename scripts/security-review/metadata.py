@@ -505,7 +505,7 @@ SCOPE_FILE_MAX_BYTES = 300_000
 
 TREE_HEADER = ("path", "lang", "loc", "sha256_12", "tier")
 ROUTES_HEADER = ("method", "path", "handler_file", "handler_symbol", "auth_middleware", "framework")
-CONFIG_HEADER = ("key", "source", "referenced_in_count", "has_default", "tier")
+CONFIG_HEADER = ("key", "source", "referenced_in_count", "referencing_files", "has_default", "tier")
 
 
 def _is_denied(path: str) -> bool:
@@ -770,6 +770,20 @@ def _extract_config_surface(
     claiming `"false"` when the extractor simply did not look would repeat
     the kind of overclaim this story exists to correct. The column exists so
     a later story can fill it in without changing the artifact's shape.
+
+    `referencing_files` (Issue #4056 AC4b) is the full `occurrences[key]` set
+    this function already builds, rendered as a stable, sorted, `|`-separated
+    list -- restoring what earlier versions of this function computed and
+    then discarded, emitting only a count. It is the data source for the
+    security-review harness's deterministic partitioner
+    (`partition.py`)'s boundary axis: a configuration key referenced from two
+    different top-level subtrees is exactly the cross-package evidence the
+    directory axis cannot see. Each referencing path is re-checked against
+    `_prompt_safe()` before being joined in -- the same per-value shape-check
+    discipline every other bundle-row field in this module applies -- and a
+    path failing it is dropped from the joined list (logged), never emitted
+    partially or escaped in place; `referenced_in_count` still reflects the
+    full, pre-filter occurrence count.
     """
     occurrences: dict[str, set[str]] = {}
     for path in files:
@@ -794,10 +808,18 @@ def _extract_config_surface(
             continue
         referencing_files = sorted(occurrences[key])
         tier = path_to_tier.get(referencing_files[0], UNKNOWN_TIER)
+        safe_referencing_files = [p for p in referencing_files if _prompt_safe(p)]
+        if len(safe_referencing_files) != len(referencing_files):
+            schema.log_event(
+                "prompt_unsafe_config_referencing_file_dropped",
+                commit_sha=commit_sha,
+                key=key,
+            )
         rows.append({
             "key": key,
             "source": "env",
             "referenced_in_count": str(len(referencing_files)),
+            "referencing_files": "|".join(safe_referencing_files),
             "has_default": "unknown",
             "tier": tier,
         })

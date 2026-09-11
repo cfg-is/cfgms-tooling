@@ -135,13 +135,18 @@ default-deny behind a per-harness DNS allowlist. `docs/architecture/security-rev
 is the full architecture reference if you need more than this summary.
 
 **The planner roster (`CFGMS_SECURITY_REVIEW_PLANNERS`) is claude and codex only (Issue #4041).**
-It takes the same comma-separated `harness:model` shape as the lane roster, and each entry plans
-independently over the same bundle; the steps then merge by scope. But only two of the four
-harnesses can actually plan. `opencode` passes its prompt as an argv element and a plan prompt for
-this repository is ~156 KB, over Linux's 131072-byte argv cap; `ollama run` has no tool surface
-with which to write a step file. Naming either one fails closed by name before its container is
-dispatched, and never silently falls back to `claude`. Finder lanes are unaffected — all four
-harnesses work there.
+It takes the same comma-separated `harness:model` shape as the lane roster. Configuring more than
+one entry is a **benchmarking mode, not the normal path** (Issue #4056) — the default remains one
+planner. Since #4056, the step partition itself is computed deterministically by the harness
+(`partition.py`), never by the planner model: every configured entry is handed the identical set of
+steps (each with its own already-assigned files) and asked only for hypotheses, so the point of
+running more than one is comparing what different models notice about the same partition, not
+generating a second, differently-shaped plan. The steps then merge by scope, which is now identical
+by construction across planners. But only two of the four harnesses can actually plan. `opencode`
+passes its prompt as an argv element and a plan prompt for this repository is ~156 KB, over Linux's
+131072-byte argv cap; `ollama run` has no tool surface with which to write a step file. Naming
+either one fails closed by name before its container is dispatched, and never silently falls back
+to `claude`. Finder lanes are unaffected — all four harnesses work there.
 
 A codex planner reports no resolved-model record, so the sweep records its resolved model as
 `unknown` rather than echoing back what was requested.

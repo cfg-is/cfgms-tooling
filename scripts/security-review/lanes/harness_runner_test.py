@@ -67,6 +67,24 @@ def test_system_prompt_is_a_single_nonempty_string_constant():
     )
 
 
+def test_system_prompt_states_scope_bounds_the_question_not_the_reading():
+    # Issue #4056 AC7: a finder lane mounts the whole snapshot, so it already
+    # may read a file outside its step -- the shared preamble must say so
+    # explicitly rather than leaving a lane to assume it is fenced when it
+    # is not.
+    check(
+        "bounds the QUESTION" in harness_runner.SYSTEM_PROMPT,
+        "SYSTEM_PROMPT: states that scope bounds the question, not what may be read",
+        harness_runner.SYSTEM_PROMPT,
+    )
+    check(
+        "report only findings whose" in harness_runner.SYSTEM_PROMPT
+        and "own scope" in harness_runner.SYSTEM_PROMPT,
+        "SYSTEM_PROMPT: still requires the reported defect to live in the lane's own scope",
+        harness_runner.SYSTEM_PROMPT,
+    )
+
+
 def test_output_schema_description_is_a_single_nonempty_string_constant():
     check(
         isinstance(harness_runner.OUTPUT_SCHEMA_DESCRIPTION, str)

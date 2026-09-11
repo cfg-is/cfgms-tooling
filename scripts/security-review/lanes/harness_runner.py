@@ -126,9 +126,12 @@ SYSTEM_PROMPT = (
     "findings to avoid returning an empty list -- a genuinely clean review "
     "returns an empty findings array. A hypothesis you investigated and found "
     "nothing for is not a hypothesis you skipped: mark it 'investigated', never "
-    "'not_attempted'. Write your findings to the output file named in your "
-    "instructions, in exactly the shape described below, and nothing else -- no "
-    "prose before or after it."
+    "'not_attempted'. Your step's scope bounds the QUESTION you are answering, not "
+    "what you may read: you may follow a call, an interface, or a caller outside "
+    "your step's own files to gather evidence, but report only findings whose "
+    "defect lives inside your step's own scope. Write your findings to the output "
+    "file named in your instructions, in exactly the shape described below, and "
+    "nothing else -- no prose before or after it."
 )
 
 # The single output-schema description every harness's lane runner sends,

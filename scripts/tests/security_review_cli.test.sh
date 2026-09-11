@@ -38,6 +38,12 @@
 # `step-NNN.json` via a `Bash` heredoc -- there is no shared Python lane-
 # runner module in that path for a real-execution rewrite to exercise, so
 # plan mode keeps the same job-simulation this file has always used for it.
+# What that simulation writes is the model's half of the post-Issue-#4056
+# contract and nothing more: hypotheses for each step the harness's own
+# partition assigned (`plan/partition.json`, written by the real
+# `planner.prepare()`), never a scope, a file list, or a step count of its
+# own -- all three now belong to the harness, and `planner.finalize()`
+# rejects a plan step that supplies them.
 #
 # Every lane-mode case in this file dispatches through
 # CFGMS_SECURITY_REVIEW_LANES (Issue #3933 made the roster the only
@@ -410,6 +416,31 @@ live_methodology="$(sha256sum "${REPO_ROOT}/docs/security-review/methodology.md"
 check_eq "the fixture repo's HEAD commit carries this checkout's live methodology.md (harness_runner loads it from there)" \
   "$fixture_committed_methodology" "$live_methodology"
 
+# The scope every launch below is bounded to, and with it the step count.
+#
+# Since Issue #4056 the harness -- not the planner model -- decides how many
+# steps a sweep has: partition.py cuts the BUNDLE's whole file inventory by
+# directory, so an unbounded launch against this fixture repo would partition
+# its copy of .claude/.devcontainer/docs (scaffolding the lane's snapshot
+# needs, never this file's reviewed content -- see seed_harness_fixture_repo)
+# into ~70 steps and run every one of them through every lane. `--path`
+# (Issue #4012) bounds the bundle to the fixture's two reviewable files, which
+# is what the step count below actually is:
+#
+#   --path pkg          -> 2 steps: step-001 = pkg/example/file.go,
+#                                   step-002 = pkg/other/file.go
+#   --path pkg/example  -> 1 step:  step-001 = pkg/example/file.go
+#
+# Both fixture business-tier files are in scope under FIXTURE_SCOPE, and only
+# pkg/example/file.go is in the bundle at all under FIXTURE_SCOPE_ONE_STEP, so
+# every sweep below satisfies the #3980 G-2 coverage gate over its own bundle
+# tree and none renders "## Incomplete" for a coverage gap unrelated to what
+# the case itself exercises. The snapshot is NOT bounded by --path (it stays a
+# full `git archive` of the commit), so the lane's own harness imports and the
+# snapshot-verification cases are untouched by this.
+FIXTURE_SCOPE=(--path pkg)
+FIXTURE_SCOPE_ONE_STEP=(--path pkg/example)
+
 # Stub harness CLI binary (Issue #3934) -- the ONLY thing lane mode stubs.
 # Reads the same env var contract claude_lane.py::call_claude_harness sets
 # for a real `claude` invocation (CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE) and
@@ -529,30 +560,56 @@ if [[ "$mode" == "plan" ]]; then
   # Plan mode is out of scope for the real-execution rewrite (see this
   # file's header) -- the real container execs `claude -p <prompt>` directly
   # under a Bash/Glob-only tool profile, never a Python lane entrypoint.
-  n_steps="${STUB_PLAN_STEP_COUNT:-2}"
-  for i in $(seq 1 "$n_steps"); do
-    step_id=$(printf "step-%03d" "$i")
-    step_file="${out_dir}/${step_id}.json"
-    [[ -f "$step_file" ]] && continue
-    # The fields the plan prompt actually asks the model for
-    # (step_id/scope/hypotheses/files). sweep_id, commit_sha, planners, and
-    # each hypothesis's own `planner` field are deliberately absent:
-    # planner.py's prompt never asks for them and planner.finalize() injects
-    # all of them from the sweep's own context sidecar, so a real plan-mode
-    # container never writes them either. A step missing `files` or
-    # `hypotheses` is rejected by schema.validate_plan_step() -- the shared
-    # C1 shape every lane reads -- and finalize() would drop it.
-    # Both fixture business-tier files are always named in `files` (never
-    # `scope`, which must stay a single bounded subtree) so every stub-
-    # generated plan, regardless of step count, satisfies the #3980 G-2
-    # coverage gate over this fixture repo's tree -- otherwise pkg/other/
-    # file.go (created by seed_harness_fixture_repo for the dedicated
-    # multi-planner merge test below) would sit permanently uncovered here
-    # and every single-planner sweep in this file would render "## Incomplete"
-    # for a coverage gap unrelated to whatever the test itself exercises.
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go","pkg/other/file.go"]}' \
-      "$step_id" > "$step_file"
-  done
+  #
+  # Since Issue #4056 the model no longer decides the partition: the harness
+  # computes it (partition.py), planner.prepare() writes it to
+  # <sweep_dir>/plan/partition.json -- the very directory bind-mounted here
+  # as /workspace-out -- and renders that fixed step list into the prompt.
+  # A plan-mode model is therefore assigned its steps and asked only for
+  # hypotheses: it writes one step-NNN.json per assigned step carrying
+  # `step_id` + `hypotheses` and NOTHING else, because finalize() injects
+  # axis/scope/files from the partition and rejects outright any
+  # model-supplied scope/files that disagrees with the assignment. This stub
+  # reproduces exactly that contract, reading its assignment from the same
+  # partition.json the real prepare() wrote instead of inventing a step
+  # count and a scope of its own (which is what it did before #4056, and
+  # which finalize() now rejects). How many steps a sweep has is
+  # consequently a property of the bundle's scope, not of this stub -- see
+  # FIXTURE_SCOPE / FIXTURE_SCOPE_ONE_STEP below.
+  #
+  # sweep_id, commit_sha, planners and each hypothesis's own `planner` field
+  # stay deliberately absent for the same reason they always were:
+  # planner.py's prompt never asks for them and finalize() injects them from
+  # the sweep's own context sidecar, so a real plan-mode container never
+  # writes them either.
+  python3 - "$out_dir" <<'PLAN_STUB_PY'
+import json
+import os
+import sys
+
+out_dir = sys.argv[1]
+with open(os.path.join(out_dir, "partition.json"), "r", encoding="utf-8") as f:
+    assigned = json.load(f)
+for number, _assigned_step in enumerate(assigned, start=1):
+    step_id = "step-%03d" % number
+    step_file = os.path.join(out_dir, step_id + ".json")
+    if os.path.exists(step_file):
+        continue
+    with open(step_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "step_id": step_id,
+                "hypotheses": [
+                    {
+                        "id": "h1",
+                        "objective": "stub objective",
+                        "required_evidence": "stub evidence",
+                    }
+                ],
+            },
+            f,
+        )
+PLAN_STUB_PY
 else
   # REAL lane execution (Issue #3934): spawn the real, unmodified lane
   # entrypoint against the real host paths, with only the harness CLI binary
@@ -651,7 +708,7 @@ echo "== REQUIRED evidence — launch creates the sweep tree, runs the planner, 
 echo "   three lanes, runs the consolidator, and prints the report path (AC1) =="
 SUB1="${SANDBOX}/case1"
 setup_sub_sandbox "$SUB1"
-launch_out=$(run_cli "$SUB1" launch HEAD 2>"${SUB1}/stderr.log")
+launch_out=$(run_cli "$SUB1" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB1}/stderr.log")
 launch_rc=$?
 check_eq "launch exits 0 on a clean sweep" "$launch_rc" "0"
 check_contains "launch prints the consolidated report path" "$launch_out" "report/consolidated.md"
@@ -693,7 +750,7 @@ SUB_SCOPE="${SANDBOX}/case-scope-file"
 setup_sub_sandbox "$SUB_SCOPE"
 SCOPE_FILE_FIXTURE="${SUB_SCOPE}/scope.md"
 printf 'Reviewing pkg/example for tenant-scoping regressions.\n' > "$SCOPE_FILE_FIXTURE"
-scope_launch_out=$(run_cli "$SUB_SCOPE" launch HEAD --scope-file "$SCOPE_FILE_FIXTURE" 2>"${SUB_SCOPE}/stderr.log")
+scope_launch_out=$(run_cli "$SUB_SCOPE" launch HEAD --scope-file "$SCOPE_FILE_FIXTURE" "${FIXTURE_SCOPE[@]}" 2>"${SUB_SCOPE}/stderr.log")
 scope_launch_rc=$?
 check_eq "launch --scope-file exits 0" "$scope_launch_rc" "0"
 SWEEP_DIR_SCOPE="$(dirname "$(dirname "$scope_launch_out")")"
@@ -771,10 +828,10 @@ check_contains "status reports steps discovered" "$status_out" "Steps discovered
 check_contains "status lists the claude-model-a lane" "$status_out" "claude-model-a"
 check_contains "status shows 2/2 complete for claude-model-a lane" "$status_out" "2/2"
 # The G-2/G-3 gate block (Issue #3980) against the coverage.json the REAL
-# planner.finalize() wrote for this sweep: both fixture code-tier files are
-# named by every stub plan step and the fixture tree carries no
-# entrypoint/security-tier path, so a correctly-rendered gate block reads
-# PASS/PASS here.
+# planner.finalize() wrote for this sweep: the harness's own partition
+# assigns each of the two in-scope code-tier files to a step of its own, and
+# the bounded fixture tree carries no entrypoint/security-tier path, so a
+# correctly-rendered gate block reads PASS/PASS here.
 check_contains "status renders the G-2 gate as PASS for a fully covered plan" \
   "$status_out" "Coverage gate G-2 (every code-tier file reviewed):        PASS"
 check_contains "status renders the G-3 gate as PASS for a fully covered plan" \
@@ -852,17 +909,18 @@ check_contains "status renders G-2 as FAIL with the unassigned-file count" \
 check_contains "a G-2 failure leaves G-3 rendered independently as PASS" \
   "$g2_status_out" "Coverage gate G-3 (entrypoint/security reviewed twice):   PASS"
 
-# --- G-3 FAIL: a covered file whose tier makes it high-risk, reviewed by two
-# --- steps that ask the same question ---------------------------------------
+# --- G-3 FAIL: a covered file whose tier makes it high-risk, but which only
+# --- one step reviews --------------------------------------------------------
 GATE_G3_ID="gate-g3-fail"
 GATE_G3_DIR="$(clone_sweep_for_gates "$GATE_G3_ID")"
 python3 - "${GATE_G3_DIR}/bundle/01-tree.tsv" <<'PYEOF'
 import sys
 
-# Reclassify the file every stub plan step already covers from business to
-# security tier: it stays assigned (G-2 still passes) but is now a
-# HIGH_RISK_TIERS path reviewed by two steps whose hypotheses are identical,
-# which is exactly the G-3 shortfall.
+# Reclassify the file this sweep's first partition step covers from business
+# to security tier: it stays assigned (G-2 still passes) but is now a
+# HIGH_RISK_TIERS path that only one step reviews, which is exactly the G-3
+# shortfall (no configuration key in this bundle puts it on the boundary
+# axis for a second look).
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
     lines = f.read().split("\n")
@@ -942,7 +1000,7 @@ echo "== REQUIRED TEST — resume completes only missing steps, never re-runs or
 echo "   overwrites a completed one (AC5) =="
 SUB2="${SANDBOX}/case2"
 setup_sub_sandbox "$SUB2"
-launch2_out=$(STUB_PLAN_STEP_COUNT=2 run_cli "$SUB2" launch HEAD 2>"${SUB2}/stderr.log")
+launch2_out=$(run_cli "$SUB2" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB2}/stderr.log")
 SWEEP_DIR_2="$(dirname "$(dirname "$launch2_out")")"
 
 # Simulate "killed mid-run": step-002 never finished for any lane. step-001
@@ -989,7 +1047,7 @@ echo "== REQUIRED TEST — a lane whose steps are all parked does not block the 
 echo "   two lanes, and consolidation still runs against what they produced (AC6) =="
 SUB3="${SANDBOX}/case3"
 setup_sub_sandbox "$SUB3"
-launch3_out=$(STUB_PLAN_STEP_COUNT=2 STUB_OUTCOME_CLAUDE_MODEL_B=parked run_cli "$SUB3" launch HEAD 2>"${SUB3}/stderr.log")
+launch3_out=$(STUB_OUTCOME_CLAUDE_MODEL_B=parked run_cli "$SUB3" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB3}/stderr.log")
 launch3_rc=$?
 check_eq "launch exits 0 even though one lane parked" "$launch3_rc" "0"
 SWEEP_DIR_3="$(dirname "$(dirname "$launch3_out")")"
@@ -1071,8 +1129,7 @@ setup_sub_sandbox "$SUB_ROSTER"
 
 roster_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:stubmodel" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
-  STUB_PLAN_STEP_COUNT=2 \
-  run_cli "$SUB_ROSTER" launch HEAD 2>"${SUB_ROSTER}/stderr.log")
+  run_cli "$SUB_ROSTER" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_ROSTER}/stderr.log")
 roster_rc=$?
 check_eq "roster-path launch exits 0" "$roster_rc" "0"
 SWEEP_DIR_ROSTER="$(dirname "$(dirname "$roster_out")")"
@@ -1171,8 +1228,7 @@ chmod +x "${TWOHARNESS_BIN_DIR}/claude" "${TWOHARNESS_BIN_DIR}/codex"
 twoharness_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x,codex:model-y" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
   STUB_CLAUDE_BIN_DIR="$TWOHARNESS_BIN_DIR" \
-  STUB_PLAN_STEP_COUNT=2 \
-  run_cli "$SUB_TWOHARNESS" launch HEAD 2>"${SUB_TWOHARNESS}/stderr.log")
+  run_cli "$SUB_TWOHARNESS" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_TWOHARNESS}/stderr.log")
 twoharness_rc=$?
 check_eq "two-harness roster launch exits 0" "$twoharness_rc" "0"
 SWEEP_DIR_TWOHARNESS="$(dirname "$(dirname "$twoharness_out")")"
@@ -1212,8 +1268,7 @@ setup_sub_sandbox "$SUB_PARTIAL_CRED"
 
 partial_cred_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-a,codex:model-z" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
-  STUB_PLAN_STEP_COUNT=2 \
-  run_cli "$SUB_PARTIAL_CRED" launch HEAD 2>"${SUB_PARTIAL_CRED}/stderr.log")
+  run_cli "$SUB_PARTIAL_CRED" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_PARTIAL_CRED}/stderr.log")
 partial_cred_rc=$?
 check_eq "launch exits 0 when only the codex lane's credential is missing (a documented skip, not a real failure)" "$partial_cred_rc" "0"
 SWEEP_DIR_PARTIAL_CRED="$(dirname "$(dirname "$partial_cred_out")")"
@@ -1337,8 +1392,7 @@ chmod +x "${TWOMODEL_BIN_DIR}/opencode"
 twomodel_out=$(CFGMS_SECURITY_REVIEW_LANES="opencode:model-qwen,opencode:model-glm" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOMODEL_ENTRYPOINT_DIR" \
   STUB_CLAUDE_BIN_DIR="$TWOMODEL_BIN_DIR" \
-  STUB_PLAN_STEP_COUNT=2 \
-  run_cli "$SUB_TWOMODEL" launch HEAD 2>"${SUB_TWOMODEL}/stderr.log")
+  run_cli "$SUB_TWOMODEL" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_TWOMODEL}/stderr.log")
 twomodel_rc=$?
 check_eq "opencode two-model roster launch exits 0" "$twomodel_rc" "0"
 SWEEP_DIR_TWOMODEL="$(dirname "$(dirname "$twomodel_out")")"
@@ -1425,8 +1479,7 @@ chmod +x "${OLLAMA_BIN_DIR}/claude" "${OLLAMA_BIN_DIR}/ollama"
 ollama_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x,ollama:model-y:cloud" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$OLLAMA_ENTRYPOINT_DIR" \
   STUB_CLAUDE_BIN_DIR="$OLLAMA_BIN_DIR" \
-  STUB_PLAN_STEP_COUNT=2 \
-  run_cli "$SUB_OLLAMA" launch HEAD 2>"${SUB_OLLAMA}/stderr.log")
+  run_cli "$SUB_OLLAMA" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_OLLAMA}/stderr.log")
 ollama_rc=$?
 check_eq "ollama roster launch exits 0" "$ollama_rc" "0"
 SWEEP_DIR_OLLAMA="$(dirname "$(dirname "$ollama_out")")"
@@ -1562,22 +1615,37 @@ if [[ -n "${STUB_FORCE_RUNNING_MODE:-}" && "$mode" == "$STUB_FORCE_RUNNING_MODE"
 fi
 
 if [[ "$mode" == "plan" ]]; then
-  n_steps="${STUB_PLAN_STEP_COUNT:-2}"
-  for i in $(seq 1 "$n_steps"); do
-    step_id=$(printf "step-%03d" "$i")
-    step_file="${out_dir}/${step_id}.json"
-    [[ -f "$step_file" ]] && continue
-    # Both fixture business-tier files are always named in `files` (never
-    # `scope`, which must stay a single bounded subtree) so every stub-
-    # generated plan, regardless of step count, satisfies the #3980 G-2
-    # coverage gate over this fixture repo's tree -- otherwise pkg/other/
-    # file.go (created by seed_harness_fixture_repo for the dedicated
-    # multi-planner merge test below) would sit permanently uncovered here
-    # and every single-planner sweep in this file would render "## Incomplete"
-    # for a coverage gap unrelated to whatever the test itself exercises.
-    printf '{"step_id":"%s","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub objective","required_evidence":"stub evidence"}],"files":["pkg/example/file.go","pkg/other/file.go"]}' \
-      "$step_id" > "$step_file"
-  done
+  # Same post-#4056 plan-mode contract the shared FAKEBIN stub above
+  # documents at length: the harness assigns the steps (plan/partition.json,
+  # mounted here as /workspace-out) and the model writes hypotheses only.
+  python3 - "$out_dir" <<'PLAN_STUB_PY'
+import json
+import os
+import sys
+
+out_dir = sys.argv[1]
+with open(os.path.join(out_dir, "partition.json"), "r", encoding="utf-8") as f:
+    assigned = json.load(f)
+for number, _assigned_step in enumerate(assigned, start=1):
+    step_id = "step-%03d" % number
+    step_file = os.path.join(out_dir, step_id + ".json")
+    if os.path.exists(step_file):
+        continue
+    with open(step_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "step_id": step_id,
+                "hypotheses": [
+                    {
+                        "id": "h1",
+                        "objective": "stub objective",
+                        "required_evidence": "stub evidence",
+                    }
+                ],
+            },
+            f,
+        )
+PLAN_STUB_PY
 else
   # REAL lane execution (Issue #3934), same as the shared FAKEBIN stub above.
   var_name="STUB_OUTCOME_$(printf '%s' "$mode" | tr 'a-z-' 'A-Z_')"
@@ -1621,7 +1689,7 @@ echo ""
 echo "== REQUIRED TEST — launch immediately followed by resume actually re-dispatches a"
 echo "   lane whose investigator container already exited: resume is not a no-op (Issue #3930) =="
 : > "${SANDBOX2}/docker_calls.log"
-launch4_out=$(STUB_PLAN_STEP_COUNT=2 run_cli2 "$SANDBOX2" launch HEAD 2>"${SANDBOX2}/stderr1.log")
+launch4_out=$(run_cli2 "$SANDBOX2" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SANDBOX2}/stderr1.log")
 launch4_rc=$?
 check_eq "launch against the persistent-container stub exits 0" "$launch4_rc" "0"
 SWEEP_DIR_4="$(dirname "$(dirname "$launch4_out")")"
@@ -1675,8 +1743,7 @@ mkdir -p "${SANDBOX5}/HOME/.claude" "${SANDBOX5}/docker-state"
 echo '{}' > "${SANDBOX5}/HOME/.claude/.credentials.json"
 : > "${SANDBOX5}/docker_calls.log"
 set +e
-fail_out=$(STUB_PLAN_STEP_COUNT=2 \
-  STUB_FORCE_RUNNING_MODE="claude-model-b" \
+fail_out=$(STUB_FORCE_RUNNING_MODE="claude-model-b" \
   PATH="${FAKEBIN2}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$HARNESS_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
@@ -1688,7 +1755,7 @@ fail_out=$(STUB_PLAN_STEP_COUNT=2 \
   STUB_CLAUDE_BIN_DIR="$STUB_CLAUDE_BIN_DIR" \
   CFGMS_SECURITY_REVIEW_LANES="$DEFAULT_ROSTER" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
-  "$CLI" launch HEAD 2>&1)
+  "$CLI" launch HEAD "${FIXTURE_SCOPE[@]}" 2>&1)
 fail_rc=$?
 set -e
 if [[ "$fail_rc" -ne 0 ]]; then
@@ -1717,8 +1784,7 @@ echo '{}' > "${SANDBOX7}/HOME/.claude/.credentials.json"
 cp "$CLAUDE_LANE_SCRIPT" "${SANDBOX7}/lane-entrypoints/claude_lane.py"
 : > "${SANDBOX7}/docker_calls.log"
 set +e
-roster_fail_out=$(STUB_PLAN_STEP_COUNT=2 \
-  STUB_FORCE_RUNNING_MODE="claude-stubmodel" \
+roster_fail_out=$(STUB_FORCE_RUNNING_MODE="claude-stubmodel" \
   CFGMS_SECURITY_REVIEW_LANES="claude:stubmodel" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="${SANDBOX7}/lane-entrypoints" \
   PATH="${FAKEBIN2}:${PATH}" \
@@ -1730,7 +1796,7 @@ roster_fail_out=$(STUB_PLAN_STEP_COUNT=2 \
   DOCKER_CALL_LOG="${SANDBOX7}/docker_calls.log" \
   DOCKER_STATE_DIR="${SANDBOX7}/docker-state" \
   STUB_CLAUDE_BIN_DIR="$STUB_CLAUDE_BIN_DIR" \
-  "$CLI" launch HEAD 2>&1)
+  "$CLI" launch HEAD "${FIXTURE_SCOPE[@]}" 2>&1)
 roster_fail_rc=$?
 set -e
 if [[ "$roster_fail_rc" -ne 0 ]]; then
@@ -1756,7 +1822,7 @@ echo "   closed: exits non-zero, prints the tampered path, and dispatches no"
 echo "   lane or planner container at all (Issue #3952, epic #3950's D1) =="
 SUB_TAMPER="${SANDBOX}/case-tamper"
 setup_sub_sandbox "$SUB_TAMPER"
-tamper_launch_out=$(run_cli "$SUB_TAMPER" launch HEAD 2>"${SUB_TAMPER}/stderr.log")
+tamper_launch_out=$(run_cli "$SUB_TAMPER" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_TAMPER}/stderr.log")
 tamper_launch_rc=$?
 check_eq "launch exits 0 before any tampering" "$tamper_launch_rc" "0"
 SWEEP_DIR_TAMPER="$(dirname "$(dirname "$tamper_launch_out")")"
@@ -1854,8 +1920,7 @@ echo '{}' > "${SUB_CONTENT}/HOME/.claude/.credentials.json"
 : > "${SUB_CONTENT}/lane_run.log"
 
 set +e
-content_launch_out=$(STUB_PLAN_STEP_COUNT=1 \
-  PATH="${FAKEBIN}:${PATH}" \
+content_launch_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$CONTENT_FIXTURE_REPO" \
   CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
   CFGMS_AGENT_LEDGER_DIR="${SUB_CONTENT}/ledger" \
@@ -1867,7 +1932,7 @@ content_launch_out=$(STUB_PLAN_STEP_COUNT=1 \
   CFGMS_TEST_PROMPT_LOG="$CONTENT_PROMPT_LOG" \
   CFGMS_SECURITY_REVIEW_LANES="claude:content-check" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$ROSTER_ENTRYPOINT_DIR" \
-  "$CLI" launch HEAD 2>"${SUB_CONTENT}/stderr.log")
+  "$CLI" launch HEAD "${FIXTURE_SCOPE_ONE_STEP[@]}" 2>"${SUB_CONTENT}/stderr.log")
 content_launch_rc=$?
 set -e
 check_eq "content-provenance launch exits 0" "$content_launch_rc" "0"
@@ -1962,12 +2027,24 @@ if [ "\$lane_dir_name" = "claude-model-a" ]; then
   # immediately, exactly like a real detached container does.
   (
     while [ ! -f "${MP_SANDBOX}/release-model-a" ]; do sleep 0.02; done
-    printf '{"step_id":"step-001","scope":["pkg/example/file.go"],"hypotheses":[{"id":"h1","objective":"stub-a objective","required_evidence":"stub-a evidence"}],"files":["pkg/example/file.go"]}' > "\${out_dir}/step-001.json"
+    # Post-#4056 plan-mode contract (same one the shared FAKEBIN stub above
+    # documents): both steps were ASSIGNED to both planners by the harness's
+    # own partition, so each planner writes hypotheses only and
+    # finalize_multi_planner() injects the identical scope/files onto both
+    # planners' copies of a step -- which is what makes the merge below a
+    # genuine merge rather than two models happening to pick one scope.
+    # Hardcoded here rather than read from plan/partition.json (the way the
+    # shared stub reads it) because a multi-planner container's own
+    # /workspace-out is its per-planner sub-sweep plan dir, which carries
+    # only the prompt copy planner.launch() puts there.
+    printf '{"step_id":"step-001","hypotheses":[{"id":"h1","objective":"stub-a objective","required_evidence":"stub-a evidence"}]}' > "\${out_dir}/step-001.json"
+    printf '{"step_id":"step-002","hypotheses":[{"id":"h1","objective":"stub-a objective","required_evidence":"stub-a evidence"}]}' > "\${out_dir}/step-002.json"
     touch "${MP_SANDBOX}/exited-\${cid}"
   ) >/dev/null 2>&1 &
   disown
 elif [ "\$lane_dir_name" = "claude-model-b" ]; then
-  printf '{"step_id":"step-001","scope":["pkg/other/file.go"],"hypotheses":[{"id":"h1","objective":"stub-b objective","required_evidence":"stub-b evidence"}],"files":["pkg/other/file.go"]}' > "\${out_dir}/step-001.json"
+  printf '{"step_id":"step-001","hypotheses":[{"id":"h1","objective":"stub-b objective","required_evidence":"stub-b evidence"}]}' > "\${out_dir}/step-001.json"
+  printf '{"step_id":"step-002","hypotheses":[{"id":"h1","objective":"stub-b objective","required_evidence":"stub-b evidence"}]}' > "\${out_dir}/step-002.json"
   touch "${MP_SANDBOX}/exited-\${cid}"
 else
   touch "${MP_SANDBOX}/exited-\${cid}"
@@ -1985,7 +2062,7 @@ PATH="${MP_FAKEBIN}:${PATH}" \
   CFGMS_SECURITY_REVIEW_BASE="${MP_SANDBOX}/base" \
   CFGMS_SECURITY_REVIEW_LANES="claude:stub-model" \
   CFGMS_SECURITY_REVIEW_PLANNERS="claude:model-a,claude:model-b" \
-  "$CLI" launch HEAD >"${MP_SANDBOX}/launch.out" 2>"${MP_SANDBOX}/launch.err" &
+  "$CLI" launch HEAD "${FIXTURE_SCOPE[@]}" >"${MP_SANDBOX}/launch.out" 2>"${MP_SANDBOX}/launch.err" &
 MP_LAUNCH_PID=$!
 set -e
 
@@ -2029,8 +2106,14 @@ check_eq "launch exits 0 once both planners have exited" "$mp_launch_rc" "0"
 check_contains "the merged plan/step-*.json now exists after BOTH planners exited" \
   "$(compgen -G "${MP_SWEEP_DIR}/plan/step-*.json" 2>/dev/null || true)" "step-"
 mp_merged_files="$(cat "${MP_SWEEP_DIR}"/plan/step-*.json 2>/dev/null)"
-check_contains "the merged plan includes claude-model-a's contribution" "$mp_merged_files" "pkg/example/file.go"
-check_contains "the merged plan includes claude-model-b's contribution" "$mp_merged_files" "pkg/other/file.go"
+# Since Issue #4056 a planner's contribution IS its hypotheses -- scope and
+# files come from the harness's own partition, identically for both planners
+# -- so this asserts on each planner's own objective text, the only thing
+# either model actually wrote.
+check_contains "the merged plan includes claude-model-a's contribution" "$mp_merged_files" "stub-a objective"
+check_contains "the merged plan includes claude-model-b's contribution" "$mp_merged_files" "stub-b objective"
+check_contains "the merged plan carries the partition's own scope for the first step" "$mp_merged_files" "pkg/example/file.go"
+check_contains "the merged plan carries the partition's own scope for the second step" "$mp_merged_files" "pkg/other/file.go"
 
 MP_DISPATCH_REPORT="${MP_SWEEP_DIR}/dispatch_report.json"
 [[ -f "$MP_DISPATCH_REPORT" ]] \
@@ -2100,7 +2183,7 @@ CF_OUT=$(PATH="${CF_FAKEBIN}:${PATH}" \
   HOME="${CF_SANDBOX}/HOME" \
   CFGMS_SECURITY_REVIEW_BASE="${CF_SANDBOX}/base" \
   CFGMS_SECURITY_REVIEW_LANES="claude:crash-test" \
-  "$CLI" launch HEAD 2>"${CF_SANDBOX}/launch.err")
+  "$CLI" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${CF_SANDBOX}/launch.err")
 cf_launch_rc=$?
 set -e
 
@@ -2160,8 +2243,7 @@ adj_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
   STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
   CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:judge" \
   STUB_OUTCOME_ADJUDICATOR=adjudication \
-  STUB_PLAN_STEP_COUNT=1 \
-  run_cli "$SUB_ADJ" launch HEAD 2>"${SUB_ADJ}/stderr.log")
+  run_cli "$SUB_ADJ" launch HEAD "${FIXTURE_SCOPE_ONE_STEP[@]}" 2>"${SUB_ADJ}/stderr.log")
 adj_rc=$?
 check_eq "adjudicated launch exits 0" "$adj_rc" "0"
 SWEEP_DIR_ADJ="$(dirname "$(dirname "$adj_out")")"
@@ -2213,8 +2295,7 @@ adjf_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
   STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
   CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:judge" \
   STUB_OUTCOME_ADJUDICATOR=failed \
-  STUB_PLAN_STEP_COUNT=1 \
-  run_cli "$SUB_ADJF" launch HEAD 2>"${SUB_ADJF}/stderr.log")
+  run_cli "$SUB_ADJF" launch HEAD "${FIXTURE_SCOPE_ONE_STEP[@]}" 2>"${SUB_ADJF}/stderr.log")
 adjf_rc=$?
 check_eq "a failed adjudicator is a recorded lane-shaped failure, not a dispatch failure: launch exits 0" "$adjf_rc" "0"
 SWEEP_DIR_ADJF="$(dirname "$(dirname "$adjf_out")")"
@@ -2236,8 +2317,7 @@ setup_sub_sandbox "$SUB_ADJN"
 adjn_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
   STUB_OUTCOME_CLAUDE_LOW=finding_low \
   STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
-  STUB_PLAN_STEP_COUNT=1 \
-  run_cli "$SUB_ADJN" launch HEAD 2>"${SUB_ADJN}/stderr.log")
+  run_cli "$SUB_ADJN" launch HEAD "${FIXTURE_SCOPE_ONE_STEP[@]}" 2>"${SUB_ADJN}/stderr.log")
 adjn_rc=$?
 check_eq "launch without an adjudicator exits 0" "$adjn_rc" "0"
 SWEEP_DIR_ADJN="$(dirname "$(dirname "$adjn_out")")"
@@ -2259,8 +2339,7 @@ setup_sub_sandbox "$SUB_ADJZ"
 adjz_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-a" \
   CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:judge" \
   STUB_OUTCOME_ADJUDICATOR=adjudication \
-  STUB_PLAN_STEP_COUNT=1 \
-  run_cli "$SUB_ADJZ" launch HEAD 2>"${SUB_ADJZ}/stderr.log")
+  run_cli "$SUB_ADJZ" launch HEAD "${FIXTURE_SCOPE_ONE_STEP[@]}" 2>"${SUB_ADJZ}/stderr.log")
 adjz_rc=$?
 check_eq "launch with nothing to adjudicate exits 0" "$adjz_rc" "0"
 SWEEP_DIR_ADJZ="$(dirname "$(dirname "$adjz_out")")"
@@ -2282,8 +2361,7 @@ adjm_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:low,claude:crit" \
   STUB_OUTCOME_CLAUDE_LOW=finding_low \
   STUB_OUTCOME_CLAUDE_CRIT=finding_critical \
   CFGMS_SECURITY_REVIEW_ADJUDICATOR="claude:a,claude:b" \
-  STUB_PLAN_STEP_COUNT=1 \
-  run_cli "$SUB_ADJM" launch HEAD 2>&1)
+  run_cli "$SUB_ADJM" launch HEAD "${FIXTURE_SCOPE_ONE_STEP[@]}" 2>&1)
 adjm_rc=$?
 set -e
 if [[ "$adjm_rc" -ne 0 ]]; then ok "launch exits non-zero for a two-entry adjudicator value"; else bad "launch exits non-zero for a two-entry adjudicator value" "exited 0"; fi

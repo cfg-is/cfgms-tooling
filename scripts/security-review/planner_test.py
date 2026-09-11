@@ -211,7 +211,7 @@ def test_build_prompt_metadata_block_cannot_be_escaped_by_a_crafted_path_via_rea
 
         after_block = prompt.split("--- END REPOSITORY METADATA ---", 1)[1]
         check(
-            after_block.lstrip().startswith("Partition the file inventory above"),
+            after_block.lstrip().startswith("This sweep has already been partitioned"),
             "build_prompt: the real instructional body directly follows the closing delimiter",
             repr(after_block[:120]),
         )
@@ -287,6 +287,68 @@ def test_build_prompt_no_longer_instructs_glob_and_names_the_tree_artifact():
         prompt,
     )
     check("pkg/foo/foo.go" in prompt, "build_prompt: the bundle's file inventory is embedded verbatim")
+
+
+def test_build_prompt_presents_assigned_steps_and_never_asks_for_scope():
+    # AC6: the model no longer chooses scope or files -- the prompt presents
+    # the harness's own partition and forbids a disagreeing scope/files.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        _write_tree_tsv(bundle_dir, [
+            ("pkg/foo/foo.go", "go", "1", "abcdef123456", "business"),
+            ("pkg/bar/bar.go", "go", "1", "abcdef123457", "business"),
+        ])
+        prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
+    check(
+        "already been partitioned" in prompt and "not by you" in prompt,
+        "build_prompt: states the partition is the harness's own, not the model's job",
+        prompt,
+    )
+    check(
+        "Do NOT include `scope`, `files`" in prompt,
+        "build_prompt: instructs the model not to supply scope or files",
+        prompt,
+    )
+    check(
+        "rejected" in prompt,
+        "build_prompt: states a disagreeing model-supplied scope/files is rejected",
+        prompt,
+    )
+    check("pkg/foo/foo.go" in prompt and "pkg/bar/bar.go" in prompt, "build_prompt: both assigned steps' files are listed")
+
+
+def test_prompt_requires_falsifiable_hypothesis_form():
+    # [REQUIRED TEST] (Issue #4056 AC9/AC12): the prompt states the one
+    # required hypothesis form -- a falsifiable claim about specific code
+    # paired with evidence, never a broad security property -- with one
+    # worked example of each shape, good and bad. Reverting this prompt text
+    # must fail this test.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
+        prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
+    check(
+        "falsifiable claim" in prompt,
+        "build_prompt: states the required hypothesis form is a falsifiable claim about specific code",
+        prompt,
+    )
+    check("Good:" in prompt and "Bad:" in prompt, "build_prompt: gives one worked example of each shape, good and bad", prompt)
+    check(
+        "inconclusive" in prompt,
+        "build_prompt: explains why a broad property tends to resolve inconclusive",
+        prompt,
+    )
+
+
+def test_prompt_requires_one_absence_shaped_hypothesis_per_step():
+    # AC8: every step carries one absence-shaped hypothesis -- what check
+    # should exist and does not.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
+        prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
+    check(
+        "absence-shaped" in prompt and "what check should exist" in prompt,
+        "build_prompt: requires at least one absence-shaped hypothesis per step",
+        prompt,
+    )
 
 
 # --- Issue #4012: --path subtree scope filter --------------------------------
@@ -443,6 +505,115 @@ def test_prepare_writes_prompt_file_under_plan_dir():
         check(
             os.path.isfile(os.path.join(sweep_dir, "bundle", "MANIFEST.json")),
             "prepare: the bundle includes MANIFEST.json",
+        )
+
+
+def test_prepare_writes_partition_json():
+    # AC10: the partition is recorded separately from any planner's output,
+    # with no hypotheses.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+
+        partition_path = os.path.join(sweep_dir, "plan", planner.PARTITION_FILENAME)
+        check(os.path.isfile(partition_path), "prepare: writes plan/partition.json")
+        with open(partition_path) as f:
+            steps = json.load(f)
+        check(isinstance(steps, list) and len(steps) > 0, "prepare: partition.json holds a non-empty list of steps", str(steps))
+        check(
+            all("hypotheses" not in s for s in steps),
+            "prepare: partition.json carries no hypotheses -- those are the planner model's own contribution",
+            str(steps),
+        )
+        check(
+            all({"step_id", "axis", "scope", "files"} <= set(s.keys()) for s in steps),
+            "prepare: every partition step has step_id/axis/scope/files",
+            str(steps),
+        )
+
+
+def test_finalize_injects_scope_and_files_from_the_partition():
+    # AC6: finalize() injects scope and files from the harness's own
+    # partition -- a model that writes hypotheses only (the new contract)
+    # still ends up with a fully valid, harness-assigned scope/files.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        plan_dir = os.path.join(sweep_dir, "plan")
+        with open(os.path.join(plan_dir, planner.PARTITION_FILENAME)) as f:
+            partition_steps = json.load(f)
+
+        for index, step in enumerate(partition_steps, start=1):
+            write_step(
+                plan_dir, f"step-{index:03d}.json",
+                {"step_id": f"step-{index:03d}", "hypotheses": [valid_hypothesis()]},
+            )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: a plan with hypotheses only (no scope/files) is accepted end-to-end", str(errors))
+
+        for index, step in enumerate(partition_steps, start=1):
+            with open(os.path.join(plan_dir, f"step-{index:03d}.json")) as f:
+                written = json.load(f)
+            check(
+                written["scope"] == step["scope"] and written["files"] == step["files"],
+                f"finalize: step-{index:03d}.json's scope/files come from the partition, not the model",
+                str(written),
+            )
+            check(written["axis"] == step["axis"], f"finalize: step-{index:03d}.json's axis comes from the partition", str(written))
+
+
+def test_finalize_rejects_a_step_whose_scope_disagrees_with_the_partition():
+    # AC6: a model-supplied scope/files that disagrees with the harness's
+    # assigned partition step is rejected outright, never silently corrected.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        plan_dir = os.path.join(sweep_dir, "plan")
+
+        write_step(
+            plan_dir, "step-001.json",
+            {
+                "step_id": "step-001",
+                "scope": ["this/does/not/match.go"],
+                "files": ["this/does/not/match.go"],
+                "hypotheses": [valid_hypothesis()],
+            },
+        )
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(
+            not os.path.exists(os.path.join(plan_dir, "step-001.json")),
+            "finalize: the disagreeing step file is removed",
+        )
+        check(
+            any("disagrees with the harness-assigned" in e for e in errors),
+            "finalize: the rejection names the disagreement",
+            str(errors),
+        )
+
+
+def test_finalize_rejects_a_step_position_with_no_partition_entry():
+    # AC6: a model that writes more step files than the harness assigned
+    # steps has nowhere for the extra file to be positionally matched.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        plan_dir = os.path.join(sweep_dir, "plan")
+        with open(os.path.join(plan_dir, planner.PARTITION_FILENAME)) as f:
+            partition_steps = json.load(f)
+        check(len(partition_steps) == 1, "sanity: this fixture's bundle produces exactly one partition step", str(partition_steps))
+
+        write_step(plan_dir, "step-001.json", {"step_id": "step-001", "hypotheses": [valid_hypothesis()]})
+        write_step(plan_dir, "step-002.json", {"step_id": "step-002", "hypotheses": [valid_hypothesis()]})
+
+        ok, errors = planner.finalize(sweep_dir)
+        check(ok is True, "finalize: the one valid step still survives", str(errors))
+        check(not os.path.exists(os.path.join(plan_dir, "step-002.json")), "finalize: the extra step with no partition entry is removed")
+        check(
+            any("no partition step assigned at this position" in e for e in errors),
+            "finalize: the rejection names the missing partition entry",
+            str(errors),
         )
 
 
@@ -838,6 +1009,78 @@ def test_validate_step_accepts_scope_as_single_package_path_string():
     check(errors == [], "validate_step: scope may be a single package-path string, not only a list", str(errors))
 
 
+def test_validate_step_bounded_scope_applies_to_directory_axis_only():
+    # [REQUIRED TEST] (Issue #4056 AC4a): an axis:boundary step spanning two
+    # top-level subtrees validates, the same scope on an axis:directory step
+    # is rejected, and a boundary step over the loc budget is rejected.
+    spanning_scope = ["pkg/storage/interfaces/store.go", "features/controller/api/handler.go"]
+    tree_index = {
+        "pkg/storage/interfaces/store.go": {"loc": 10, "tier": "business"},
+        "features/controller/api/handler.go": {"loc": 10, "tier": "business"},
+    }
+
+    boundary_step = valid_step("step-001", spanning_scope, files=spanning_scope)
+    boundary_step["axis"] = "boundary"
+    errors = planner.validate_step(boundary_step, "step-001.json", tree_index=tree_index)
+    check(errors == [], "validate_step: an axis:boundary step spanning two top-level subtrees validates", str(errors))
+
+    directory_step = valid_step("step-001", spanning_scope, files=spanning_scope)
+    directory_step["axis"] = "directory"
+    errors2 = planner.validate_step(directory_step, "step-001.json", tree_index=tree_index)
+    check(
+        len(errors2) == 1 and "spans more than one" in errors2[0],
+        "validate_step: the identical scope on an axis:directory step is still rejected",
+        str(errors2),
+    )
+
+    no_axis_step = valid_step("step-001", spanning_scope, files=spanning_scope)
+    errors2b = planner.validate_step(no_axis_step, "step-001.json", tree_index=tree_index)
+    check(
+        len(errors2b) == 1 and "spans more than one" in errors2b[0],
+        "validate_step: a step with no axis field at all keeps the pre-#4056 bounded-scope behavior",
+        str(errors2b),
+    )
+
+    big_scope = ["pkg/big/a.go"]
+    over_budget_step = valid_step("step-001", big_scope, files=big_scope)
+    over_budget_step["axis"] = "boundary"
+    big_tree_index = {"pkg/big/a.go": {"loc": planner.partition.MAX_STEP_NON_TEST_LOC + 1, "tier": "business"}}
+    errors3 = planner.validate_step(over_budget_step, "step-001.json", tree_index=big_tree_index)
+    check(
+        len(errors3) == 1 and "budget" in errors3[0],
+        "validate_step: an axis:boundary step over the loc budget is rejected",
+        str(errors3),
+    )
+
+
+def test_validate_step_boundary_axis_rejected_when_tree_index_missing():
+    # PR #4061 review finding: a budget-bounded axis (today, "boundary")
+    # with no tree_index to measure it against must be REJECTED, matching
+    # the "reject more, never less" direction the directory axis already
+    # takes when root_files is missing -- not silently accepted as
+    # unbounded.
+    spanning_scope = ["pkg/storage/interfaces/store.go", "features/controller/api/handler.go"]
+    step = valid_step("step-001", spanning_scope, files=spanning_scope)
+    step["axis"] = "boundary"
+    errors = planner.validate_step(step, "step-001.json", tree_index=None)
+    check(
+        len(errors) == 1 and "cannot be checked" in errors[0],
+        "validate_step: an axis:boundary step with no tree_index is rejected, not skipped",
+        str(errors),
+    )
+
+
+def test_validate_step_rejects_an_unknown_axis_value():
+    step = valid_step("step-001", ["pkg/foo/foo.go"], files=["pkg/foo/foo.go"])
+    step["axis"] = "sideways"
+    errors = planner.validate_step(step, "step-001.json")
+    check(
+        any("field axis" in e for e in errors),
+        "validate_step: an axis value outside directory/boundary is rejected",
+        str(errors),
+    )
+
+
 def test_validate_step_requires_step_id_to_match_filename():
     step = valid_step("step-999", ["pkg/foo/bar.go"])
     errors = planner.validate_step(step, "step-001.json")
@@ -1157,9 +1400,7 @@ def test_finalize_injects_sweep_context_never_trusting_model_supplied_values():
             "step-001.json",
             {
                 "step_id": "step-001",
-                "scope": ["pkg/a/a.go"],
                 "description": "reviews pkg/a",
-                "files": ["pkg/a/a.go"],
                 "hypotheses": [
                     {
                         "id": "h1",
@@ -1245,9 +1486,7 @@ def test_finalize_ignores_a_context_sidecar_planted_inside_plan_dir():
             "step-001.json",
             {
                 "step_id": "step-001",
-                "scope": ["pkg/a/a.go"],
                 "description": "reviews pkg/a",
-                "files": ["pkg/a/a.go"],
                 "hypotheses": [
                     {
                         "id": "h1",
@@ -1663,6 +1902,37 @@ def test_merge_steps_by_scope_is_idempotent_on_an_already_merged_list():
     once = planner.merge_steps_by_scope([step])
     twice = planner.merge_steps_by_scope(once)
     check(once == twice, "merge_steps_by_scope: merging an already-merged list changes nothing", str((once, twice)))
+
+
+def test_merge_steps_by_scope_preserves_axis():
+    # [REQUIRED TEST] (Issue #4056 AC4a): merge_steps_by_scope() rebuilds the
+    # merged step field by field and keeps only the fields it names -- a
+    # boundary step would silently lose its axis marker on merge and then be
+    # rejected by a post-merge validate_step() call as if it were an ordinary
+    # directory-axis step, if axis were not carried through explicitly.
+    spanning_scope = ["pkg/ha/config.go", "features/controller/config/config.go"]
+    step_a = valid_step(
+        "step-001", scope=spanning_scope, files=["pkg/ha/config.go"], planners=["planner-a"],
+    )
+    step_a["axis"] = "boundary"
+    step_b = valid_step(
+        "step-001",
+        scope=list(reversed(spanning_scope)),
+        files=["features/controller/config/config.go"],
+        planners=["planner-b"],
+    )
+    step_b["axis"] = "boundary"
+
+    merged = planner.merge_steps_by_scope([step_a, step_b])
+    check(len(merged) == 1, "merge_steps_by_scope: the two boundary proposals still merge into one step", str(merged))
+    if merged:
+        check(merged[0].get("axis") == "boundary", "merge_steps_by_scope: axis survives the merge", str(merged[0]))
+
+
+def test_merge_steps_by_scope_omits_axis_when_no_proposal_carried_one():
+    step = valid_step("step-001", scope=["pkg/a/a.go"], files=["pkg/a/a.go"])
+    merged = planner.merge_steps_by_scope([step])
+    check("axis" not in merged[0], "merge_steps_by_scope: a legacy step with no axis field merges without inventing one", str(merged[0]))
 
 
 def test_merge_steps_by_scope_unions_hypotheses_from_two_planners_with_colliding_ids():
@@ -2281,6 +2551,58 @@ def _write_planner_step(sweep_dir: str, lane_dir_name: str, filename: str, data:
     lane_plan_dir = os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, lane_dir_name, "plan")
     os.makedirs(lane_plan_dir, exist_ok=True)
     write_step(lane_plan_dir, filename, data)
+
+
+def test_finalize_multi_planner_merges_genuinely_by_construction_over_a_real_partition():
+    # AC10/AC6 end to end: two independent planners handed the SAME
+    # harness-computed partition, writing hypotheses only (never their own
+    # scope/files), merge into exactly one step per partition entry with
+    # identical scope/files by construction -- not because they happened to
+    # choose the same scope.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "go.mod": "module example.com/x\n\ngo 1.23\n",
+                "pkg/a/a.go": "package a\n",
+                "pkg/b/b.go": "package b\n",
+            },
+        )
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        with open(os.path.join(sweep_dir, "plan", planner.PARTITION_FILENAME)) as f:
+            partition_steps = json.load(f)
+        check(len(partition_steps) >= 2, "sanity: this fixture's bundle produces at least two partition steps", str(partition_steps))
+
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+        for lane_dir_name in ("claude-fable-5-1", "codex-gpt-terra"):
+            for index, _step in enumerate(partition_steps, start=1):
+                _write_planner_step(
+                    sweep_dir, lane_dir_name, f"step-{index:03d}.json",
+                    {"step_id": f"step-{index:03d}", "hypotheses": [valid_hypothesis(id=f"h-{lane_dir_name}")]},
+                )
+
+        ok, errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: both planners' hypotheses-only steps validate", str(errors))
+
+        merged_files = sorted(f for f in os.listdir(os.path.join(sweep_dir, "plan")) if planner.STEP_FILENAME_RE.match(f))
+        check(
+            len(merged_files) == len(partition_steps),
+            "finalize_multi_planner: exactly one merged step per partition entry -- genuine merge, not accidental overlap",
+            f"{len(merged_files)} != {len(partition_steps)}",
+        )
+        for merged_filename, source_step in zip(merged_files, partition_steps):
+            with open(os.path.join(sweep_dir, "plan", merged_filename)) as f:
+                merged = json.load(f)
+            check(
+                merged["scope"] == source_step["scope"] and merged["files"] == source_step["files"],
+                f"finalize_multi_planner: {merged_filename}'s scope/files match the partition entry exactly",
+                str((merged["scope"], source_step["scope"])),
+            )
+            check(
+                set(merged["planners"]) == {"claude-fable-5-1", "codex-gpt-terra"},
+                f"finalize_multi_planner: {merged_filename} carries both planners",
+                str(merged["planners"]),
+            )
 
 
 def test_finalize_multi_planner_merges_overlapping_scopes_from_two_planners():
