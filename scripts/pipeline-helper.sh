@@ -50,6 +50,13 @@ po-act.sh dispatch for --defer drafts):
                                                  Convert a draft to a locked internal issue; link under epic.
                                                  Applies cap:* from --cap, or from the body marker on defer.
 
+Standalone fix issues (no parent epic):
+  create-fix-issue <title> <body_file> [--cap <c1,c2>] [--defer] [--skip-validation]
+                                                 Create a locked `internal` + `bug` issue with NO epic
+                                                 parent. Use for a defect found after an epic's scope was
+                                                 defined: attaching it to that epic would grow the epic's
+                                                 denominator and stop it ever closing on delivery.
+
 Community issues (human-directed, interactive sessions only):
   create-community-issue <title> <body_file>     Create a PUBLIC, UNLOCKED community issue
 
@@ -436,6 +443,40 @@ SPLICE_EOF
     ;;
 
   # ── Community issues (human-directed, interactive only) ──────────
+
+  create-fix-issue)
+    # A defect fix that belongs to NO epic (Issue #4055). Epics describe a
+    # planned scope; a bug found afterwards is not part of that scope, and
+    # attaching it re-opens the epic's denominator forever — an epic at N/N
+    # gains an N+1th child and can never be closed on delivery. Standalone fix
+    # issues keep epic completion meaningful: the epic closes when the scope it
+    # declared is delivered, and later defects are tracked on their own.
+    #
+    # Identical to `create-story 0 ...` (epic_num 0 = no parent) plus a `bug`
+    # label, exposed as its own verb because "pass zero" is not discoverable and
+    # was, in practice, never used.
+    title="${1:?Usage: create-fix-issue <title> <body_file> [--cap <c1,c2>] [--defer] [--skip-validation]}"
+    body_file="${2:?Usage: create-fix-issue <title> <body_file> [--cap <c1,c2>] [--defer] [--skip-validation]}"
+    shift 2
+
+    out=$(bash "$0" create-story 0 "$title" "$body_file" "$@") || {
+      echo "$out"
+      echo "ERROR: create-fix-issue aborted — create-story failed."
+      exit 1
+    }
+    echo "$out"
+
+    # A --defer draft has no issue yet; materialize-issue applies labels later.
+    issue_num=$(echo "$out" | grep -oE 'CREATED_ISSUE:[^:]+:#[0-9]+' | grep -oE '[0-9]+$' || true)
+    if [ -n "$issue_num" ]; then
+      # gh pr/issue edit --add-label hits the deprecated Projects-classic
+      # GraphQL path and fails; the REST route is the one that works.
+      gh api "repos/${REPO}/issues/${issue_num}/labels" \
+        -f "labels[]=bug" >/dev/null || {
+        echo "WARN: could not apply 'bug' label to #${issue_num}" >&2
+      }
+    fi
+    ;;
 
   create-community-issue)
     # Public, UNLOCKED, `community`-labelled. For a human in an interactive

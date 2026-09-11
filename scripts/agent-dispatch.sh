@@ -3565,6 +3565,78 @@ PY
       done
     done
 
+    # --- Investigator container reap (Issue #4055) ---
+    # security-review investigator containers were covered by no reap pass at
+    # all: not the story loop above (their names carry no issue number), not
+    # cleanup-stale-reviews (that matches cfg-agent-review-pr-*). Measured
+    # 2026-09-11: ten exited investigators had accumulated over 40 hours,
+    # holding ~179MB. Their findings are written to the host sweep directory,
+    # never kept inside the container, so an exited one holds nothing of value.
+    #
+    # Grace window rather than immediate: a just-exited investigator may still
+    # be being read by the sweep that launched it.
+    inv_grace_min="${CFGMS_INVESTIGATOR_REAP_MINUTES:-30}"
+    while IFS=$'\t' read -r inv_name inv_finished; do
+      [[ -z "${inv_name:-}" ]] && continue
+      [[ -z "${inv_finished:-}" ]] && continue
+      inv_epoch="$(date -d "$inv_finished" +%s 2>/dev/null)" || continue
+      inv_age_min=$(( ( $(date +%s) - inv_epoch ) / 60 ))
+      if (( inv_age_min < inv_grace_min )); then
+        continue
+      fi
+      docker rm "$inv_name" >/dev/null 2>&1 || continue
+      echo "CLEANED:investigator:${inv_name}:age_min=${inv_age_min}"
+      cleaned=$((cleaned + 1))
+    done < <(docker ps -a --filter "name=cfg-agent-investigator-" --filter "status=exited" \
+               --format '{{.Names}}' 2>/dev/null \
+             | while read -r _n; do
+                 [[ -z "$_n" ]] && continue
+                 printf '%s\t%s\n' "$_n" "$(docker inspect -f '{{.State.FinishedAt}}' "$_n" 2>/dev/null)"
+               done || true)
+
+    # --- Orphaned git worktree reap (Issue #4055) ---
+    # Two distinct leaks, and `git worktree prune` only covers the first.
+    #
+    # (a) Registrations whose directory is gone. `prune` clears exactly these.
+    #
+    # (b) Registrations whose directory still EXISTS but belongs to a dead
+    #     session. Measured 2026-09-11: five worktrees under
+    #     /tmp/claude-*/<session-id>/scratchpad/ from sessions that ended weeks
+    #     earlier, aged 8 and 27 days. `prune` is a no-op on all five because
+    #     the directories are still there, so they accumulate forever.
+    #
+    # A scratchpad worktree is session-scoped by construction: when the session
+    # ends nothing will ever use it again. But "abandoned" is inferred, not
+    # known, so this reaps only when all three hold — path under a scratchpad,
+    # older than the threshold, and NO uncommitted changes. A dirty worktree is
+    # somebody's unsaved work and is never removed, however old.
+    if git -C "$REPO_ROOT" worktree list --porcelain >/dev/null 2>&1; then
+      wt_reap_days="${CFGMS_WORKTREE_REAP_DAYS:-7}"
+      while read -r wt_path _; do
+        [[ -z "${wt_path:-}" ]] && continue
+        [[ "$wt_path" == *"/scratchpad/"* ]] || continue
+        [[ -d "$wt_path" ]] || continue
+        if [[ -n "$(find "$wt_path" -maxdepth 0 -mtime "-${wt_reap_days}" 2>/dev/null)" ]]; then
+          continue  # still recent
+        fi
+        if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+          echo "KEPT:worktree:${wt_path}:uncommitted_changes"
+          continue
+        fi
+        if git -C "$REPO_ROOT" worktree remove --force "$wt_path" 2>/dev/null; then
+          echo "CLEANED:worktree:${wt_path}"
+          cleaned=$((cleaned + 1))
+        fi
+      done < <(git -C "$REPO_ROOT" worktree list 2>/dev/null | awk '{print $1}' || true)
+
+      # (a): registrations whose directory is already gone.
+      pruned_wt="$(git -C "$REPO_ROOT" worktree prune --verbose --dry-run 2>/dev/null | grep -c '^Removing' || true)"
+      if [[ "${pruned_wt:-0}" -gt 0 ]]; then
+        git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+        echo "PRUNED_WORKTREE_REGISTRATIONS:${pruned_wt}"
+      fi
+    fi
+
     # --- Expired distributed-lease GC (multi-host cron coordination) ---
     # Reap lease refs whose holder died past TTL. acquire-time reclaim already
     # frees a key when it is re-acquired directly; this collects the rest (e.g. a
