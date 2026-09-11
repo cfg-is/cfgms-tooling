@@ -2681,6 +2681,89 @@ def test_extract_resolved_model_unknown_when_modelusage_absent():
         )
 
 
+def test_extract_resolved_model_picks_the_highest_outputtokens_entry():
+    # REQUIRED (Issue #4043, AC5): built from the real envelope shape observed
+    # on sweep 2026-09-11T0112Z-b73b6ece -- a helper model billed with a large
+    # inputTokens but near-zero outputTokens, alongside the requested model's
+    # own entry with a large outputTokens. Reverting the highest-outputTokens
+    # selection in planner.py (back to "first key") makes this fail, since the
+    # helper model key sorts first in this fixture's insertion order.
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            json.dump(
+                {
+                    "modelUsage": {
+                        "claude-haiku-4-5-20251001": {"inputTokens": 53272, "outputTokens": 29},
+                        "claude-fable-5-1": {"inputTokens": 1033, "outputTokens": 161056},
+                    }
+                },
+                f,
+            )
+        check(
+            planner._extract_resolved_model(result_path) == "claude-fable-5-1",
+            "_extract_resolved_model: returns the entry with the highest outputTokens, not the first key",
+        )
+
+
+def test_extract_resolved_model_unknown_when_highest_outputtokens_is_tied():
+    # REQUIRED (Issue #4043, AC6): a tie between two different models must
+    # not be resolved by insertion order -- that is exactly the bug being
+    # fixed, just with equal instead of merely first values.
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            json.dump(
+                {
+                    "modelUsage": {
+                        "claude-sonnet-5": {"outputTokens": 500},
+                        "claude-opus-5": {"outputTokens": 500},
+                    }
+                },
+                f,
+            )
+        check(
+            planner._extract_resolved_model(result_path) == "unknown",
+            "_extract_resolved_model: unknown when the top outputTokens value ties between two models",
+        )
+
+
+def test_extract_resolved_model_unknown_when_no_entry_has_usable_outputtokens():
+    # REQUIRED (Issue #4043, AC6): with two or more keys and none carrying a
+    # usable outputTokens, there is nothing to disambiguate with -- must
+    # return unknown rather than falling back to the first key.
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            json.dump(
+                {
+                    "modelUsage": {
+                        "claude-haiku-4-5-20251001": {"inputTokens": 53272},
+                        "claude-fable-5-1": {"inputTokens": 1033},
+                    }
+                },
+                f,
+            )
+        check(
+            planner._extract_resolved_model(result_path) == "unknown",
+            "_extract_resolved_model: unknown when no multi-key entry carries a usable outputTokens",
+        )
+
+
+def test_extract_resolved_model_single_key_returned_even_without_outputtokens():
+    # AC2: a single-key envelope returns that key unchanged from today's
+    # behavior -- it never goes through the outputTokens filter at all, since
+    # with one key there is nothing to disambiguate.
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, planner.PLAN_RESULT_FILENAME)
+        with open(result_path, "w") as f:
+            json.dump({"modelUsage": {"claude-fable-5-1": {"inputTokens": 1033}}}, f)
+        check(
+            planner._extract_resolved_model(result_path) == "claude-fable-5-1",
+            "_extract_resolved_model: single-key envelope returns that key even with no outputTokens field",
+        )
+
+
 def test_finalize_multi_planner_writes_resolved_models_sidecar_for_every_planner():
     # REQUIRED: finalize_multi_planner() must record a resolved-model entry
     # for every configured planner, whether or not that planner's container
@@ -2713,6 +2796,52 @@ def test_finalize_multi_planner_writes_resolved_models_sidecar_for_every_planner
         check(
             resolved == {"claude-fable-5-1": "claude-sonnet-5", "codex-gpt-terra": "unknown"},
             "finalize_multi_planner: sidecar has one entry per configured planner, unknown where nothing was reported",
+            str(resolved),
+        )
+
+
+def test_finalize_multi_planner_writes_model_usage_sidecar_for_every_planner():
+    # AC4: the full modelUsage map must be recorded somewhere readable, keyed
+    # by lane_dir_name, alongside the resolved-model sidecar -- so a future
+    # selection-rule change can be re-derived from recorded data.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        write_context(sweep_dir)
+        lanes = roster.parse_roster("claude:fable-5-1,codex:gpt-terra")
+
+        _write_planner_step(
+            sweep_dir, "claude-fable-5-1", "step-001.json",
+            valid_step("step-001", scope=["pkg/a/a.go"]),
+        )
+        usage = {
+            "claude-haiku-4-5-20251001": {"inputTokens": 53272, "outputTokens": 29},
+            "claude-fable-5-1": {"inputTokens": 1033, "outputTokens": 161056},
+        }
+        _write_plan_result(sweep_dir, "claude-fable-5-1", {"modelUsage": usage})
+        # codex-gpt-terra deliberately gets no PLAN_RESULT_FILENAME at all.
+        _write_planner_step(
+            sweep_dir, "codex-gpt-terra", "step-001.json",
+            valid_step("step-001", scope=["pkg/b/b.go"]),
+        )
+
+        ok, _errors = planner.finalize_multi_planner(sweep_dir, lanes)
+        check(ok is True, "finalize_multi_planner: still succeeds while writing the model-usage sidecar")
+
+        sidecar_path = os.path.join(sweep_dir, planner.MODEL_USAGE_FILENAME)
+        check(os.path.isfile(sidecar_path), "finalize_multi_planner: writes the model-usage sidecar")
+        with open(sidecar_path) as f:
+            recorded = json.load(f)
+        check(
+            recorded == {"claude-fable-5-1": usage, "codex-gpt-terra": {}},
+            "finalize_multi_planner: model-usage sidecar preserves the full modelUsage map per planner",
+            str(recorded),
+        )
+
+        resolved_path = os.path.join(sweep_dir, planner.RESOLVED_MODELS_FILENAME)
+        with open(resolved_path) as f:
+            resolved = json.load(f)
+        check(
+            resolved == {"claude-fable-5-1": "claude-fable-5-1", "codex-gpt-terra": "unknown"},
+            "finalize_multi_planner: resolved-models sidecar still resolves by highest outputTokens",
             str(resolved),
         )
 

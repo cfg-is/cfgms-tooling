@@ -171,7 +171,23 @@ PLAN_RESULT_FILENAME = ".investigator-plan-result.json"
 # back to fill `resolved_model` on the "planners" entries of
 # `<sweep_dir>/dispatch_report.json` (epic #3950's D3): the requested and
 # resolved identities must stay distinguishable, never collapsed into one.
+# This file's schema is a fixed `{lane_dir_name: <resolved model id string>}`
+# -- `security-review.sh` writes that string straight into
+# `dispatch_report.json`'s `resolved_model` field, so it must never become a
+# dict. The full per-lane `modelUsage` map (Issue #4043) is recorded
+# separately, in MODEL_USAGE_FILENAME.
 RESOLVED_MODELS_FILENAME = ".plan-resolved-models.json"
+
+# Sidecar `finalize_multi_planner()` writes at the sweep root recording, per
+# configured planner (`lane_dir_name`), the raw `modelUsage` dict read from
+# that planner's own PLAN_RESULT_FILENAME -- or `{}` when there was nothing
+# to read (Issue #4043). `_extract_resolved_model()`'s selection among
+# multiple billed models is a rule applied on top of this data, and rules
+# change; keeping the full envelope readable here means a future rule change
+# can be re-derived from what was actually recorded rather than a lost
+# envelope. Nothing reads this back into `dispatch_report.json` --
+# `security-review.sh` is out of scope for this sidecar.
+MODEL_USAGE_FILENAME = ".plan-model-usage.json"
 
 # Sub-sweep-dirs for multi-planner dispatch (C6) live under this directory,
 # one per roster entry, named for that entry's own `lane_dir_name` -- see
@@ -1678,33 +1694,89 @@ def finalize(sweep_dir: str) -> tuple[bool, list[str]]:
     return True, errors
 
 
-def _extract_resolved_model(result_path: str) -> str:
-    """Best-effort read of the model that actually executed a plan-mode
-    investigator run, from `claude --output-format json`'s result envelope
-    at `result_path` (investigator-entrypoint.sh's PLAN_RESULT_FILENAME).
-
-    Confirmed against the installed CLI: the envelope's top-level
-    `modelUsage` object is keyed by the canonical model id that served the
-    request -- independent of whatever alias `--model` was given. Returns
-    "unknown" whenever the file is absent, unparseable, or does not carry
-    that field: a data-availability signal for the dispatch report, never a
-    guess. This function must never fall back to the lane's own requested
-    model on a read failure -- doing so is exactly the "copy the requested id
-    into an effective-model field" fabrication epic #3950's D3 forbids.
+def _read_model_usage(result_path: str) -> "dict | None":
+    """Parses `result_path` (`claude --output-format json`'s result envelope,
+    investigator-entrypoint.sh's PLAN_RESULT_FILENAME) and returns its
+    top-level `modelUsage` dict. Returns None when the file is absent,
+    unparseable, not a JSON object, or carries no non-empty `modelUsage`
+    field -- a data-availability signal, never a guess.
     """
     try:
         with open(result_path, "r") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return "unknown"
+        return None
     if not isinstance(data, dict):
-        return "unknown"
+        return None
     model_usage = data.get("modelUsage")
     if isinstance(model_usage, dict) and model_usage:
-        first_key = next(iter(model_usage))
-        if isinstance(first_key, str) and first_key:
-            return first_key
-    return "unknown"
+        return model_usage
+    return None
+
+
+def _resolve_model_from_usage(model_usage: dict) -> str:
+    """Picks the model that actually produced a plan-mode run out of a
+    `modelUsage` dict (Issue #4043).
+
+    The installed CLI bills every model it used in the session under this
+    key, not just the one that produced the plan -- a real envelope commonly
+    carries a second, near-zero-output entry for the CLI's own internal
+    helper-model calls alongside the requested model's entry. Key order is
+    the CLI's insertion order, not a ranking, so it is never used to choose.
+
+    With exactly one key there is nothing to disambiguate: that key is
+    returned unchanged, regardless of whether it carries a usable
+    `outputTokens` (matches pre-Issue-#4043 behavior for the common case).
+
+    With two or more keys, the entry with the highest `outputTokens` is
+    returned -- `outputTokens` is what distinguishes the model that
+    generated the plan from a helper model billed alongside it, since the
+    plan itself is the output. Returns "unknown", never a guess and never
+    the lane's own requested model, when no entry carries a usable
+    (non-negative numeric) `outputTokens` or when the highest value is tied
+    between two different models.
+    """
+    if not model_usage:
+        return "unknown"
+
+    if len(model_usage) == 1:
+        key = next(iter(model_usage))
+        return key if isinstance(key, str) and key else "unknown"
+
+    best_key: "str | None" = None
+    best_tokens = -1.0
+    tied = False
+    for key, usage in model_usage.items():
+        if not isinstance(key, str) or not key or not isinstance(usage, dict):
+            continue
+        tokens = usage.get("outputTokens")
+        if isinstance(tokens, bool) or not isinstance(tokens, (int, float)) or tokens < 0:
+            continue
+        if tokens > best_tokens:
+            best_tokens = tokens
+            best_key = key
+            tied = False
+        elif tokens == best_tokens:
+            tied = True
+
+    if best_key is None or tied:
+        return "unknown"
+    return best_key
+
+
+def _extract_resolved_model(result_path: str) -> str:
+    """Best-effort read of the model that actually executed a plan-mode
+    investigator run, from `claude --output-format json`'s result envelope
+    at `result_path` (investigator-entrypoint.sh's PLAN_RESULT_FILENAME).
+
+    Delegates the actual selection to `_resolve_model_from_usage()` -- see
+    that docstring for the disambiguation rule. Returns "unknown" whenever
+    the file is absent, unparseable, or does not carry a usable `modelUsage`
+    field. This function must never fall back to the lane's own requested
+    model on a read failure -- doing so is exactly the "copy the requested id
+    into an effective-model field" fabrication epic #3950's D3 forbids.
+    """
+    return _resolve_model_from_usage(_read_model_usage(result_path) or {})
 
 
 def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tuple[bool, list[str]]:
@@ -1748,6 +1820,13 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     overwriting the `lane.harness`/`lane.model` it already records for the
     requested identity (D3: requested and resolved must stay distinguishable).
 
+    Also writes `<sweep_dir>/MODEL_USAGE_FILENAME` (Issue #4043) alongside it,
+    recording each entry's own raw `modelUsage` dict keyed by `lane_dir_name`
+    -- the full envelope `_extract_resolved_model()`'s selection was derived
+    from, so a future change to that selection rule can be re-derived from
+    recorded data rather than a lost envelope. Nothing reads this sidecar
+    back today; `security-review.sh` is unchanged by this addition.
+
     Also writes `<sweep_dir>/plan/coverage.json` (Issue #3980), exactly like
     `finalize()`, computed over the merged steps that survived post-merge
     validation and were written to `plan/` -- never the pre-merge per-planner
@@ -1757,13 +1836,17 @@ def finalize_multi_planner(sweep_dir: str, planners: "list[roster.Lane]") -> tup
     plan_dir = os.path.join(sweep_dir, "plan")
     os.makedirs(plan_dir, exist_ok=True)
 
-    resolved_models = {
-        lane.lane_dir_name: _extract_resolved_model(
-            os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan", PLAN_RESULT_FILENAME)
+    resolved_models: dict[str, str] = {}
+    model_usage_map: dict[str, dict] = {}
+    for lane in planners:
+        result_path = os.path.join(
+            sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name, "plan", PLAN_RESULT_FILENAME
         )
-        for lane in planners
-    }
+        usage = _read_model_usage(result_path) or {}
+        model_usage_map[lane.lane_dir_name] = usage
+        resolved_models[lane.lane_dir_name] = _resolve_model_from_usage(usage)
     atomic_write.write_json_atomic(os.path.join(sweep_dir, RESOLVED_MODELS_FILENAME), resolved_models)
+    atomic_write.write_json_atomic(os.path.join(sweep_dir, MODEL_USAGE_FILENAME), model_usage_map)
 
     context = _read_sweep_context(sweep_dir)
     root_files = _repository_root_files(sweep_dir)
