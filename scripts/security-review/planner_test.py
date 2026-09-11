@@ -501,7 +501,7 @@ def test_launch_invokes_agent_dispatch_with_plan_mode():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
-            f.write("prompt text\n")
+            f.write("prompt text\n" + planner.CLAUDE_WRITE_MECHANISM)
         bundle_dir = os.path.join(sweep_dir, "bundle")
         os.makedirs(bundle_dir)
 
@@ -534,7 +534,7 @@ def test_launch_raises_on_nonzero_exit():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
-            f.write("prompt text\n")
+            f.write("prompt text\n" + planner.CLAUDE_WRITE_MECHANISM)
         bundle_dir = os.path.join(sweep_dir, "bundle")
         os.makedirs(bundle_dir)
 
@@ -569,7 +569,7 @@ def test_launch_refuses_without_bundle_dir():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
-            f.write("prompt text\n")
+            f.write("prompt text\n" + planner.CLAUDE_WRITE_MECHANISM)
         stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
         write_stub_script(stub_path, STUB_DISPATCH_SUCCESS)
 
@@ -2064,7 +2064,7 @@ def test_launch_single_planner_default_is_unchanged_by_the_planners_parameter():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
-            f.write("prompt text\n")
+            f.write("prompt text\n" + planner.CLAUDE_WRITE_MECHANISM)
         bundle_dir = os.path.join(sweep_dir, "bundle")
         os.makedirs(bundle_dir)
 
@@ -2096,7 +2096,7 @@ def test_launch_multi_planner_dispatches_one_container_per_roster_entry():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
-            f.write("prompt text for planners\n")
+            f.write("prompt text for planners\n" + planner.CLAUDE_WRITE_MECHANISM)
         bundle_dir = os.path.join(sweep_dir, "bundle")
         os.makedirs(bundle_dir)
         with open(os.path.join(bundle_dir, "a.txt"), "w") as f:
@@ -2133,8 +2133,30 @@ def test_launch_multi_planner_dispatches_one_container_per_roster_entry():
             check(expected in lines, f"launch: {lane.lane_dir_name} dispatched with its own --sweep-dir/--bundle-dir/--harness/--model", str(lines))
             prompt_copy = os.path.join(lane_sweep_dir, "plan", planner.PROMPT_FILENAME)
             check(os.path.isfile(prompt_copy), f"launch: {lane.lane_dir_name} got its own copy of the prepared prompt")
+            # Since Issue #4041 each lane's copy is the prepared prompt with
+            # its ONE harness-specific paragraph rendered for that harness --
+            # byte-identical for claude, and identical outside that paragraph
+            # for every other harness. That shared remainder is what keeps a
+            # cross-planner comparison evidence about models, not prompts.
+            expected_prompt = planner._prompt_for_harness(
+                "prompt text for planners\n" + planner.CLAUDE_WRITE_MECHANISM, lane.harness
+            )
             with open(prompt_copy) as f:
-                check(f.read() == "prompt text for planners\n", f"launch: {lane.lane_dir_name}'s prompt copy matches the prepared prompt")
+                check(
+                    f.read() == expected_prompt,
+                    f"launch: {lane.lane_dir_name}'s prompt copy is the prepared prompt rendered for its own harness",
+                )
+            with open(prompt_copy) as f:
+                copied = f.read()
+            check(
+                copied.startswith("prompt text for planners\n"),
+                f"launch: {lane.lane_dir_name}'s prompt keeps every shared line",
+            )
+            if lane.harness != "claude":
+                check(
+                    planner.CLAUDE_WRITE_MECHANISM not in copied,
+                    f"launch: {lane.lane_dir_name} is not given Claude's tool-surface wording",
+                )
             lane_bundle_file = os.path.join(lane_bundle_dir, "a.txt")
             check(os.path.isfile(lane_bundle_file), f"launch: {lane.lane_dir_name} got its own materialized bundle/")
             check(
@@ -2149,7 +2171,7 @@ def test_launch_multi_planner_attempts_every_entry_even_if_one_fails():
     with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
         os.makedirs(os.path.join(sweep_dir, "plan"))
         with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
-            f.write("prompt\n")
+            f.write("prompt\n" + planner.CLAUDE_WRITE_MECHANISM)
         bundle_dir = os.path.join(sweep_dir, "bundle")
         os.makedirs(bundle_dir)
 
@@ -2188,6 +2210,69 @@ esac
         with open(log_path) as f:
             lines = [l for l in f.read().splitlines() if l.strip()]
         check(len(lines) == 2, "launch: the claude entry is still attempted despite codex's failure", str(lines))
+
+
+def test_launch_multi_planner_unwired_harness_does_not_stop_the_others():
+    # REQUIRED (Issue #4041): an unwired planner harness must be reported, and
+    # must not abort the loop before a wired entry beside it is dispatched --
+    # the same "one bad entry never blocks another" rule dispatch failures
+    # already follow above.
+    with tempfile.TemporaryDirectory() as sweep_dir, tempfile.TemporaryDirectory() as bin_dir:
+        os.makedirs(os.path.join(sweep_dir, "plan"))
+        with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME), "w") as f:
+            f.write("prompt\n" + planner.CLAUDE_WRITE_MECHANISM)
+        bundle_dir = os.path.join(sweep_dir, "bundle")
+        os.makedirs(bundle_dir)
+
+        stub_path = os.path.join(bin_dir, "agent-dispatch.sh")
+        log_path = os.path.join(bin_dir, "stub.log")
+        write_stub_script(
+            stub_path,
+            """#!/usr/bin/env bash
+set -uo pipefail
+echo "ARGS:$*" >> "$STUB_LOG"
+echo "LAUNCHED_INVESTIGATOR:plan:deadbeef"
+exit 0
+""",
+        )
+
+        # ollama first, so a loop that aborted on it would never reach claude.
+        lanes = roster.parse_roster("ollama:glm-5.3-flash:cloud,claude:fable-5-1")
+
+        env_backup = os.environ.get("STUB_LOG")
+        os.environ["STUB_LOG"] = log_path
+        try:
+            raised = False
+            try:
+                planner.launch(sweep_dir, bundle_dir=bundle_dir, dispatch_script=stub_path, planners=lanes)
+            except planner.PlannerError as exc:
+                raised = True
+                check(
+                    "ollama" in str(exc),
+                    "launch: the raised error names the unwired planner harness",
+                    str(exc),
+                )
+        finally:
+            if env_backup is None:
+                os.environ.pop("STUB_LOG", None)
+            else:
+                os.environ["STUB_LOG"] = env_backup
+
+        check(raised, "launch: raises PlannerError for an unwired planner harness")
+        with open(log_path) as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        check(
+            len(lines) == 1 and "--harness claude" in lines[0],
+            "launch: the claude entry is still dispatched despite the unwired entry ahead of it",
+            str(lines),
+        )
+        check(
+            not os.path.isfile(
+                os.path.join(sweep_dir, planner.PLANNERS_SUBDIR, "ollama-glm-5.3-flash-cloud",
+                             "plan", planner.PROMPT_FILENAME)
+            ),
+            "launch: no prompt is written for an unwired planner harness",
+        )
 
 
 # --- finalize_multi_planner() (C6) -------------------------------------------
@@ -2478,6 +2563,81 @@ def _write_plan_result(sweep_dir: str, lane_dir_name: str, data: object) -> str:
         else:
             json.dump(data, f)
     return result_path
+
+
+def test_prompt_for_harness_leaves_the_claude_prompt_byte_identical():
+    # REQUIRED (Issue #4041): the claude planner's prompt must not change at
+    # all, so a cross-planner comparison against earlier sweeps stays valid.
+    prompt = "before\n" + planner.CLAUDE_WRITE_MECHANISM + "after\n"
+    check(
+        planner._prompt_for_harness(prompt, "claude") == prompt,
+        "_prompt_for_harness: the claude prompt is returned unchanged",
+    )
+
+
+def test_prompt_for_harness_swaps_the_claude_tool_wording_for_codex():
+    # REQUIRED (Issue #4041): a codex planner must not be told it has `Bash`
+    # and `Glob` and no `Write` -- those are Claude Code's tool names, and
+    # codex writes step files with its own shell and patch tools instead.
+    # Everything outside that one paragraph must survive unchanged.
+    prompt = "before\n" + planner.CLAUDE_WRITE_MECHANISM + "after\n"
+    rendered = planner._prompt_for_harness(prompt, "codex")
+    check(
+        "`Bash` and `Glob` only" not in rendered,
+        "_prompt_for_harness: codex prompt drops the Claude tool-surface wording",
+    )
+    check(
+        "Bash heredoc" not in rendered,
+        "_prompt_for_harness: codex prompt drops the Bash-heredoc instruction",
+    )
+    check(
+        "/workspace-out" in rendered,
+        "_prompt_for_harness: codex prompt still names the writable output directory",
+    )
+    check(
+        rendered.startswith("before\n") and rendered.endswith("after\n"),
+        "_prompt_for_harness: codex prompt changes only the write-mechanism paragraph",
+    )
+
+
+def test_prompt_for_harness_rejects_a_harness_with_no_wording():
+    try:
+        planner._prompt_for_harness("before\n" + planner.CLAUDE_WRITE_MECHANISM, "ollama")
+    except planner.PlannerError as exc:
+        check(
+            "ollama" in str(exc) and "claude" in str(exc) and "codex" in str(exc),
+            "_prompt_for_harness: an unwired harness raises, naming it and the wired set",
+        )
+    else:
+        check(False, "_prompt_for_harness: an unwired harness must raise, not fall back to claude")
+
+
+def test_prompt_for_harness_rejects_a_prompt_missing_the_mechanism_paragraph():
+    # REQUIRED (Issue #4041): if build_prompt()'s wording is edited without
+    # updating CLAUDE_WRITE_MECHANISM, the substitution would silently no-op
+    # and hand a codex planner Claude's tool instructions. Fail loudly instead.
+    try:
+        planner._prompt_for_harness("a plan prompt that was reworded\n", "codex")
+    except planner.PlannerError as exc:
+        check(
+            "CLAUDE_WRITE_MECHANISM" in str(exc),
+            "_prompt_for_harness: a reworded prompt raises and names the constant to update",
+        )
+    else:
+        check(False, "_prompt_for_harness: a prompt missing the paragraph must raise")
+
+
+def test_build_prompt_still_contains_the_claude_write_mechanism_verbatim():
+    # REQUIRED (Issue #4041): the guard above is only useful while the real
+    # build_prompt() output actually contains the constant. This is the test
+    # that fails first if someone rewords the prompt.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
+        prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
+    check(
+        planner.CLAUDE_WRITE_MECHANISM in prompt,
+        "build_prompt: output still contains CLAUDE_WRITE_MECHANISM verbatim",
+    )
 
 
 def test_extract_resolved_model_reads_the_sole_modelusage_key():

@@ -361,6 +361,195 @@ assert_contains "$result_contents" "modelUsage" "modeled plan mode: --output-for
 rm -rf "$BIN_DIR" "$WORK_HOME"
 rm -f "$PROMPT_FILE" "$RESULT_FILE" "$STDIN_CAPTURE"
 
+# ----------------------------------------------------------------------------
+# Plan-mode harness dispatch (Issue #4041). Before this story the plan branch
+# always exec'd `claude` and always pre-checked ~/.claude/.credentials.json,
+# ignoring CFGMS_SECURITY_REVIEW_HARNESS entirely -- so a `--harness codex`
+# planner container (a real call shape since the multi-planner roster, Issue
+# #3937) died on a Claude credential it was never meant to have, even though
+# agent-dispatch.sh had correctly mounted the codex session for it.
+#
+# Wired planner harnesses are `claude` and `codex` only. `opencode` drives its
+# prompt through argv (opencode_lane.py), which cannot carry a plan prompt over
+# MAX_ARG_STRLEN, and `ollama run` has no tool surface with which to write a
+# step file at all -- both fail closed here by name rather than silently
+# falling back to `claude` and authenticating as the wrong account.
+
+# Stub `codex` binary: mirrors make_stub_claude_capturing_stdin, plus an argv
+# log so the sandbox/model flags can be asserted, and it writes a step file
+# into its own cwd so the "cwd is the plan output directory" contract is
+# observable.
+make_stub_codex_capturing_stdin() {
+    local dir="$1"
+    cat > "${dir}/codex" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "${CODEX_ARGV_CAPTURE}"
+pwd > "${CODEX_CWD_CAPTURE}"
+cat > "${CODEX_STDIN_CAPTURE}"
+exit 0
+STUB
+    chmod +x "${dir}/codex"
+}
+
+# Stub `claude` that records the fact it ran at all. Used to prove the codex
+# and unwired-harness branches never reach `claude`.
+make_stub_claude_recording_invocation() {
+    local dir="$1"
+    cat > "${dir}/claude" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "claude-was-invoked" > "${CLAUDE_INVOKED_MARKER}"
+cat > /dev/null
+echo '{"modelUsage":{}}'
+exit 0
+STUB
+    chmod +x "${dir}/claude"
+}
+
+run_plan_entrypoint_harness() {
+    # run_plan_entrypoint_harness <prompt_file> <result_file> <harness> <model>
+    # Deliberately does NOT create ~/.claude/.credentials.json -- a non-claude
+    # planner must not depend on it. Callers that need it create it themselves.
+    local prompt_file="$1" result_file="$2" harness="$3" model="${4:-}"
+    echo "nameserver 127.0.0.1" > "${WORK_HOME}/resolv.conf"
+    timeout 20 env HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+      CFGMS_TEST_PROMPT_FILE_PATH="$prompt_file" \
+      CFGMS_TEST_PLAN_RESULT_PATH="$result_file" \
+      CFGMS_TEST_RESOLV_CONF_PATH="${WORK_HOME}/resolv.conf" \
+      CFGMS_INVESTIGATOR_DISALLOWED_TOOLS="Bash(curl:*),Bash(wget:*)" \
+      CFGMS_SECURITY_REVIEW_HARNESS="$harness" \
+      CFGMS_SECURITY_REVIEW_MODEL="$model" \
+      CLAUDE_INVOKED_MARKER="${WORK_HOME}/claude-invoked" \
+      CODEX_STDIN_CAPTURE="${WORK_HOME}/codex-stdin" \
+      CODEX_ARGV_CAPTURE="${WORK_HOME}/codex-argv" \
+      CODEX_CWD_CAPTURE="${WORK_HOME}/codex-cwd" \
+      bash "$ENTRYPOINT" plan
+}
+
+# ----------------------------------------------------------------------------
+echo ""
+echo "--- REQUIRED TEST: plan mode with --harness codex runs codex, never"
+echo "    claude, and pipes the whole prompt on stdin (Issue #4041) ---"
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PLAN_OUT_DIR="$(mktemp -d)"
+PROMPT_FILE="${PLAN_OUT_DIR}/.investigator-plan-prompt.md"
+RESULT_FILE="${PLAN_OUT_DIR}/.investigator-plan-result.json"
+make_stub_codex_capturing_stdin "$BIN_DIR"
+make_stub_claude_recording_invocation "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+mkdir -p "${WORK_HOME}/.codex"
+echo '{}' > "${WORK_HOME}/.codex/auth.json"
+
+set +e
+out=$(run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "codex" "gpt-6-astra" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "codex planner: entrypoint exits 0"
+assert_not_contains "$out" "Argument list too long" "codex planner: no argv-too-long error"
+assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "" \
+  "codex planner: claude was never invoked"
+received_size="$(wc -c < "${WORK_HOME}/codex-stdin" 2>/dev/null | tr -d ' ' || true)"
+received_size="${received_size:-0}"
+assert_eq "$received_size" "200000" "codex planner: codex receives the full 200000-byte prompt on stdin"
+codex_argv="$(cat "${WORK_HOME}/codex-argv" 2>/dev/null || true)"
+assert_contains "$codex_argv" "exec" "codex planner: invoked via codex exec"
+assert_contains "$codex_argv" "--model gpt-6-astra" "codex planner: roster model is passed through"
+assert_contains "$codex_argv" "--sandbox danger-full-access" \
+  "codex planner: passes the --sandbox value the container supports, so step files can be written"
+assert_contains "$codex_argv" "--skip-git-repo-check" "codex planner: git-repo check skipped"
+assert_eq "$(cat "${WORK_HOME}/codex-cwd" 2>/dev/null || true)" "$PLAN_OUT_DIR" \
+  "codex planner: cwd is the plan output directory, so step-NNN.json lands there"
+rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
+
+# ----------------------------------------------------------------------------
+echo ""
+echo "--- REQUIRED TEST: plan mode with --harness codex fails closed on a"
+echo "    missing codex session, naming its own path (Issue #4041) ---"
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PLAN_OUT_DIR="$(mktemp -d)"
+PROMPT_FILE="${PLAN_OUT_DIR}/.investigator-plan-prompt.md"
+RESULT_FILE="${PLAN_OUT_DIR}/.investigator-plan-result.json"
+make_stub_codex_capturing_stdin "$BIN_DIR"
+make_stub_claude_recording_invocation "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+# A Claude credential IS present and must not satisfy the codex branch.
+mkdir -p "${WORK_HOME}/.claude"
+touch "${WORK_HOME}/.claude/.credentials.json"
+
+set +e
+out=$(run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "codex" "gpt-6-astra" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "1" "codex planner without a session: exits 1"
+assert_contains "$out" ".codex/auth.json" "codex planner without a session: names the codex credential path"
+assert_not_contains "$out" "No Claude credentials" \
+  "codex planner without a session: does not report a Claude credential problem"
+assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "" \
+  "codex planner without a session: claude was never invoked"
+rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
+
+# ----------------------------------------------------------------------------
+echo ""
+echo "--- REQUIRED TEST: plan mode with an unwired planner harness fails"
+echo "    closed and never falls back to claude (Issue #4041) ---"
+for unwired in opencode ollama madeup; do
+  BIN_DIR="$(mktemp -d)"
+  WORK_HOME="$(mktemp -d)"
+  PLAN_OUT_DIR="$(mktemp -d)"
+  PROMPT_FILE="${PLAN_OUT_DIR}/.investigator-plan-prompt.md"
+  RESULT_FILE="${PLAN_OUT_DIR}/.investigator-plan-result.json"
+  make_stub_codex_capturing_stdin "$BIN_DIR"
+  make_stub_claude_recording_invocation "$BIN_DIR"
+  make_large_prompt_file "$PROMPT_FILE"
+  mkdir -p "${WORK_HOME}/.claude"
+  touch "${WORK_HOME}/.claude/.credentials.json"
+
+  set +e
+  out=$(run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "$unwired" "some-model" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" "1" "unwired planner harness ${unwired}: exits 1"
+  assert_contains "$out" "$unwired" "unwired planner harness ${unwired}: names the harness"
+  assert_contains "$out" "claude, codex" "unwired planner harness ${unwired}: names the wired set"
+  assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "" \
+    "unwired planner harness ${unwired}: claude was never invoked"
+  rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
+done
+
+# ----------------------------------------------------------------------------
+echo ""
+echo "--- REQUIRED TEST: plan mode with --harness claude is unchanged --"
+echo "    still checks the Claude credential and still runs claude (Issue #4041) ---"
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PLAN_OUT_DIR="$(mktemp -d)"
+PROMPT_FILE="${PLAN_OUT_DIR}/.investigator-plan-prompt.md"
+RESULT_FILE="${PLAN_OUT_DIR}/.investigator-plan-result.json"
+make_stub_codex_capturing_stdin "$BIN_DIR"
+make_stub_claude_recording_invocation "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+
+set +e
+out=$(run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "claude" "claude-fable-5-1" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "1" "claude planner without a session: exits 1"
+assert_contains "$out" "No Claude credentials" "claude planner without a session: reports the Claude credential"
+
+mkdir -p "${WORK_HOME}/.claude"
+touch "${WORK_HOME}/.claude/.credentials.json"
+set +e
+out=$(run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "claude" "claude-fable-5-1" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "claude planner: entrypoint exits 0"
+assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "claude-was-invoked" \
+  "claude planner: claude was invoked"
+rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
+
 echo ""
 echo "=== Summary: $TESTS_PASSED/$TESTS_RUN passed ==="
 if [[ ${#FAILURES[@]} -gt 0 ]]; then

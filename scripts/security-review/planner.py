@@ -836,7 +836,16 @@ def launch(
         lane_sweep_dir = os.path.join(sweep_dir, PLANNERS_SUBDIR, lane.lane_dir_name)
         lane_plan_dir = os.path.join(lane_sweep_dir, "plan")
         os.makedirs(lane_plan_dir, exist_ok=True)
-        atomic_write.write_text_atomic(os.path.join(lane_plan_dir, PROMPT_FILENAME), prompt_text)
+        # Collected like a dispatch failure rather than raised straight out of
+        # the loop (Issue #4041): one unwired roster entry must not stop the
+        # others from dispatching, exactly as one failing launch-investigator
+        # call does not. The aggregate raise below still surfaces it.
+        try:
+            lane_prompt = _prompt_for_harness(prompt_text, lane.harness)
+        except PlannerError as exc:
+            failures.append(f"{lane.lane_dir_name}: {exc}")
+            continue
+        atomic_write.write_text_atomic(os.path.join(lane_plan_dir, PROMPT_FILENAME), lane_prompt)
         lane_bundle_dir = _materialize_lane_bundle(bundle_dir, lane_sweep_dir)
 
         try:
@@ -875,6 +884,69 @@ def launch(
     if failures:
         raise PlannerError("planner dispatch failed for one or more roster entries: " + "; ".join(failures))
     return "".join(outputs)
+
+
+# The one paragraph of the shared plan prompt that is not harness-neutral
+# (Issue #4041): it names the `claude` CLI's own tool surface. Every OTHER line
+# of the prompt is identical for every planner, which is what makes a
+# cross-planner comparison evidence about the MODELS rather than about prompt
+# variance -- the same C4 rule `lanes/harness_runner.py` states for lane
+# prompts ("a per-harness deviation ... is a concern for that harness's own
+# runner, layered around these two constants, never a second copy of them").
+#
+# `build_prompt()` renders the claude wording, because the legacy
+# single-planner call shape has no harness at all and has always been claude.
+# `_prompt_for_harness()` swaps in another harness's wording for a roster entry
+# that is not claude, and raises if the paragraph is not found verbatim -- a
+# future edit to the prompt must not silently skip the substitution and leave a
+# codex planner reading instructions about Claude Code's tool list.
+CLAUDE_WRITE_MECHANISM = """Write each step as its own JSON file. Because your tools are `Bash` and `Glob` only (no `Write`),
+create each file with a Bash heredoc, for example:
+"""
+
+HARNESS_WRITE_MECHANISM = {
+    "claude": CLAUDE_WRITE_MECHANISM,
+    # `codex exec` runs with its cwd set to the output directory, so it writes
+    # files with its ordinary shell and patch tools -- no heredoc instruction,
+    # and no Claude tool names. investigator-entrypoint.sh's plan branch owns
+    # the `--sandbox` value and the reasoning behind it; do not restate it here,
+    # where it would go stale the moment that value changes.
+    "codex": """Write each step as its own JSON file in your current working directory, which is
+`/workspace-out` -- the only directory you may write to. For example:
+""",
+}
+
+
+def _prompt_for_harness(prompt_text: str, harness: str) -> str:
+    """Return `prompt_text` with its one harness-specific paragraph rendered
+    for `harness`. Everything else is byte-identical across planners.
+
+    Raises `PlannerError` for a harness with no wording of its own, and for a
+    prompt that no longer contains `CLAUDE_WRITE_MECHANISM` verbatim -- both
+    are silent-wrong-prompt failures otherwise, and a planner given the wrong
+    tool instructions produces no steps at all rather than bad ones, which
+    reads on the dispatch report as an ordinary harness failure.
+    """
+    mechanism = HARNESS_WRITE_MECHANISM.get(harness)
+    if mechanism is None:
+        raise PlannerError(
+            f"harness {harness!r} has no plan-prompt write mechanism; "
+            f"wired planner harnesses: {', '.join(sorted(HARNESS_WRITE_MECHANISM))}"
+        )
+    if mechanism == CLAUDE_WRITE_MECHANISM:
+        # Nothing to substitute, so nothing to verify: the claude prompt is the
+        # prompt `build_prompt()` already rendered. Checking for the paragraph
+        # here would make every caller that supplies its own prompt text --
+        # including this module's own launch()-level tests -- depend on wording
+        # that only matters when it is about to be REPLACED.
+        return prompt_text
+    if CLAUDE_WRITE_MECHANISM not in prompt_text:
+        raise PlannerError(
+            "plan prompt no longer contains the harness-specific write-mechanism "
+            "paragraph verbatim; update planner.CLAUDE_WRITE_MECHANISM alongside "
+            "build_prompt()"
+        )
+    return prompt_text.replace(CLAUDE_WRITE_MECHANISM, mechanism)
 
 
 def _scope_paths(scope: object) -> list[str] | None:

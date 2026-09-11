@@ -85,10 +85,33 @@ fi
 
 case "$MODE" in
   plan)
-    if [ ! -f "${HOME}/.claude/.credentials.json" ]; then
-        echo "ERROR: No Claude credentials found at ~/.claude/.credentials.json"
-        exit 1
-    fi
+    # Which harness runs this planner (Issue #4041). Empty means the legacy
+    # single-planner call shape, which predates --harness and has always been
+    # `claude`; agent-dispatch.sh mounts the Claude credential itself in
+    # exactly that case, and delegates the mount to its own per-harness block
+    # whenever --harness IS supplied. Before this story the branch below
+    # ignored this variable entirely and always exec'd `claude` after
+    # pre-checking ~/.claude/.credentials.json -- so a `--harness codex`
+    # planner container (a real call shape since the multi-planner roster,
+    # Issue #3937) exited 1 on a Claude credential it was deliberately not
+    # given, while its correctly-mounted codex session sat unused. Confirmed
+    # end to end: sweep 2026-09-11T0112Z-b73b6ece, roster
+    # `claude:claude-fable-5-1,codex:gpt-6-astra` -- the claude planner wrote
+    # 203 accepted steps, the codex planner died in about a second.
+    #
+    # WIRED PLANNER HARNESSES ARE `claude` AND `codex` ONLY. The other two
+    # lane harnesses cannot plan, for reasons that are properties of their
+    # CLIs rather than missing work here:
+    #   - `opencode run` takes its prompt as an argv element
+    #     (lanes/opencode_lane.py), and a plan prompt for this repository is
+    #     ~156 KB -- over Linux's 131072-byte MAX_ARG_STRLEN, the same limit
+    #     Issue #4002 hit. There is no confirmed stdin form for it.
+    #   - `ollama run` has no tool surface at all, so it cannot write a
+    #     step-NNN.json file; its whole answer would have to be one message,
+    #     and a real plan for this repository is ~161k output tokens.
+    # Both therefore fail closed by name below rather than silently running
+    # `claude` and authenticating as the wrong account.
+    PLAN_HARNESS="${CFGMS_SECURITY_REVIEW_HARNESS:-claude}"
 
     # CFGMS_TEST_PROMPT_FILE_PATH / CFGMS_TEST_PLAN_RESULT_PATH let
     # investigator-entrypoint_test.sh point plan mode at fixture paths it
@@ -150,15 +173,99 @@ case "$MODE" in
     # 3283 inventory paths), so the old form failed every run on this
     # repository with "Argument list too long" before `claude` ever started
     # -- confirmed fixed in the same image by piping instead.
-    if [ -n "${CFGMS_SECURITY_REVIEW_MODEL:-}" ]; then
-      exec claude --dangerously-skip-permissions --agent investigator -p \
-        --disallowedTools "$DISALLOWED_TOOLS" \
-        --model "$CFGMS_SECURITY_REVIEW_MODEL" \
-        --output-format json < "$PROMPT_FILE" > "$PLAN_RESULT_FILE"
-    else
-      exec claude --dangerously-skip-permissions --agent investigator -p \
-        --disallowedTools "$DISALLOWED_TOOLS" < "$PROMPT_FILE"
-    fi
+    case "$PLAN_HARNESS" in
+      claude)
+        if [ ! -f "${HOME}/.claude/.credentials.json" ]; then
+            echo "ERROR: No Claude credentials found at ~/.claude/.credentials.json"
+            exit 1
+        fi
+        if [ -n "${CFGMS_SECURITY_REVIEW_MODEL:-}" ]; then
+          exec claude --dangerously-skip-permissions --agent investigator -p \
+            --disallowedTools "$DISALLOWED_TOOLS" \
+            --model "$CFGMS_SECURITY_REVIEW_MODEL" \
+            --output-format json < "$PROMPT_FILE" > "$PLAN_RESULT_FILE"
+        else
+          exec claude --dangerously-skip-permissions --agent investigator -p \
+            --disallowedTools "$DISALLOWED_TOOLS" < "$PROMPT_FILE"
+        fi
+        ;;
+      codex)
+        # `codex exec` must write step files, which its default `read-only`
+        # sandbox forbids -- that mode is correct for lanes/codex_lane.py,
+        # which only ever returns findings on stdout, and must stay there.
+        #
+        # WHY NOT `--sandbox workspace-write`: codex implements every
+        # non-bypass sandbox mode with bubblewrap, which needs an unprivileged
+        # user namespace. This container cannot create one under Docker's
+        # default seccomp/apparmor profiles, so that mode fails every write AND
+        # every shell command codex runs inside it. Confirmed end to end on
+        # sweep 2026-09-11T0205Z-7e40b065: the container exited 0 having
+        # written no steps at all, with "bwrap: No permissions to create a new
+        # namespace" in its log, and `unshare --user true` fails in this image
+        # unless both profiles are unconfined. The `--sandbox` value chosen
+        # below is the narrowest one that does not depend on bubblewrap, and
+        # it leaves codex's approval policy exactly as it was.
+        #
+        # The alternative was launching this container with
+        # `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`
+        # so bubblewrap could work (verified to succeed). That was rejected on
+        # purpose: it weakens the OUTER boundary -- the one this harness's
+        # whole threat model rests on -- to restore an inner one that sits
+        # strictly inside it.
+        #
+        # What actually confines codex here is the container, and in plan mode
+        # it is a tighter box than bubblewrap would be: /workspace is the
+        # auditable bundle mounted :ro, structured metadata with no source file
+        # body anywhere in the filesystem (Issue #3979); the only writable
+        # mount is /workspace-out; egress is default-deny behind a per-harness
+        # DNS allowlist; and the process holds one read-only credential.
+        # Removing codex's inner sandbox grants it nothing the container does
+        # not already permit.
+        #
+        # Do NOT carry this to a lane. A lane mounts a real source checkout,
+        # and its read-only sandbox works there precisely because a lane never
+        # needs to write.
+        #
+        # cwd is the plan output directory, so a step file created by a bare
+        # relative name still lands where the harness reads it.
+        #
+        # `-` as the positional prompt argument with the prompt on stdin is
+        # the same transport lanes/codex_lane.py already uses and Issue #4002
+        # established as mandatory: a plan prompt for this repository is
+        # ~156 KB, over Linux's 131072-byte MAX_ARG_STRLEN.
+        #
+        # PLAN_RESULT_FILE is NOT reused for codex's own output. That path is
+        # read by planner.py::_extract_resolved_model(), which expects the
+        # `claude --output-format json` envelope; codex reports no equivalent
+        # resolved-model record, so a marker is written there instead and the
+        # resolved model is recorded as "unknown" rather than guessed from the
+        # requested id (epic #3950's D3 forbids that fabrication). Codex's own
+        # final message goes beside it, for an operator reading the sweep.
+        if [ ! -f "${CODEX_HOME:-${HOME}/.codex}/auth.json" ]; then
+            echo "ERROR: No codex session found at ${CODEX_HOME:-${HOME}/.codex}/auth.json"
+            echo "Run 'codex login' on the host before dispatching a codex planner."
+            exit 1
+        fi
+        if [ -z "${CFGMS_SECURITY_REVIEW_MODEL:-}" ]; then
+            echo "ERROR: the codex planner requires CFGMS_SECURITY_REVIEW_MODEL (the roster's model id)"
+            exit 1
+        fi
+        PLAN_OUT_DIR="$(dirname "$PLAN_RESULT_FILE")"
+        printf '%s\n' '{"harness":"codex","resolvedModelReported":false}' > "$PLAN_RESULT_FILE"
+        cd "$PLAN_OUT_DIR"
+        exec codex exec \
+          --model "$CFGMS_SECURITY_REVIEW_MODEL" \
+          --sandbox danger-full-access \
+          --skip-git-repo-check \
+          --output-last-message "${PLAN_OUT_DIR}/.investigator-plan-last-message.txt" \
+          - < "$PROMPT_FILE"
+        ;;
+      *)
+        echo "ERROR: harness '${PLAN_HARNESS}' is not wired as a planner (wired: claude, codex)"
+        echo "See investigator-entrypoint.sh's plan branch for why opencode and ollama cannot plan."
+        exit 1
+        ;;
+    esac
     ;;
   *)
     # CFGMS_TEST_LANE_SCRIPT_PATH lets investigator-entrypoint_test.sh point
