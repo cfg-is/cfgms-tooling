@@ -661,7 +661,11 @@ def test_call_opencode_harness_reaches_the_real_subprocess() -> None:
             "real invocation passes --dir set to out_dir",
             repr(argv),
         )
-        check(argv[-1] == "prompt body", "prompt is passed positionally, last", repr(argv))
+        check(
+            not any("prompt body" in element for element in argv),
+            "prompt never appears in argv -- carried on stdin instead",
+            repr(argv),
+        )
 
         config_path = os.path.join(out_dir, "opencode.json")
         check(os.path.isfile(config_path), "opencode.json permission file was written to out_dir")
@@ -671,6 +675,64 @@ def test_call_opencode_harness_reaches_the_real_subprocess() -> None:
         check(perms.get("edit") == "allow", "permission config allows edit (the write-tool gate)", repr(perms))
         for key in ("bash", "webfetch", "websearch", "task", "question", "external_directory"):
             check(perms.get(key) == "deny", f"permission config denies {key}", repr(perms))
+
+
+def _make_argv_and_stdin_capturing_stub(bin_dir: str, name: str, argv_path: str, stdin_path: str) -> str:
+    """A stub binary that records its own argv (as JSON) and everything it
+    read from stdin, then exits 0 -- used to prove both the real flag names
+    and the stdin prompt transport (Issue #4031) actually reach the real
+    subprocess, not just an injected `call_harness_fn` stand-in. Identical to
+    `codex_lane_test.py`'s own `_make_argv_and_stdin_capturing_stub`."""
+    stub_path = os.path.join(bin_dir, name)
+    with open(stub_path, "w") as f:
+        f.write(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
+            f"open({stdin_path!r}, 'w').write(sys.stdin.read())\n"
+            "sys.exit(0)\n"
+        )
+    os.chmod(stub_path, 0o755)
+    return stub_path
+
+
+def test_large_prompt_reaches_harness_via_stdin() -> None:
+    """[REQUIRED TEST] (Issue #4031) A 200000-byte prompt -- well over Linux's
+    131072-byte MAX_ARG_STRLEN single-argv-argument cap -- must reach the real
+    `opencode` subprocess intact, on stdin, with no element of argv carrying
+    any prompt content. Before this fix, passing the prompt as the trailing
+    positional argv element made `subprocess.run` raise `OSError(E2BIG)` on
+    any prompt this large (166842 bytes was enough to trip it on a real
+    `pkg/session` step in the #3985 sweep), which this lane folded into a
+    synthetic non-zero exit code -- so the step silently failed rather than
+    reviewing anything. This test fails if `call_opencode_harness` is
+    reverted to argv passing: the stub would never be reached at all."""
+    with tempfile.TemporaryDirectory() as bin_dir, tempfile.TemporaryDirectory() as work_dir:
+        argv_path = os.path.join(work_dir, "argv.json")
+        stdin_path = os.path.join(work_dir, "stdin.txt")
+        _make_argv_and_stdin_capturing_stub(bin_dir, "opencode", argv_path, stdin_path)
+
+        large_prompt = "B" * 200_000
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{original_path}"
+        try:
+            exit_code, rate_limited, _output_tail = opencode_lane.call_opencode_harness(
+                MODEL, large_prompt, os.path.join(work_dir, "raw.json")
+            )
+        finally:
+            os.environ["PATH"] = original_path
+
+        check(exit_code == 0 and not rate_limited, "a 200000-byte prompt launches without E2BIG", repr(exit_code))
+        with open(argv_path, "r") as f:
+            argv = json.load(f)
+        check(
+            not any(large_prompt in element for element in argv),
+            "no element of argv carries any prompt content",
+            repr([len(element) for element in argv]),
+        )
+        with open(stdin_path, "r") as f:
+            received = f.read()
+        check(received == large_prompt, "the full 200000-byte prompt is delivered on stdin, byte for byte", str(len(received)))
 
 
 def test_default_lane_id_and_model() -> None:

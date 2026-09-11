@@ -395,8 +395,25 @@ def call_opencode_harness(
         roster's bare model id (see this module's docstring).
       - `--dir <path>` -- the CLI's project root, set to `out_dir` so the
         `write` tool's target is always in-root (see above).
-      - The message is passed positionally, exactly as `codex_lane.py`
-        passes its prompt.
+
+    Issue #4031: the prompt is sent on stdin (`input=prompt`), with no
+    positional `message` argument at all, never as a trailing argv element.
+    Linux caps a single argv string at MAX_ARG_STRLEN (131072 bytes); a step
+    bundling ~13 files routinely builds a prompt over that (166842 bytes
+    measured for a real `pkg/session` step in the #3985 sweep), and
+    `subprocess.run` raised `OSError(E2BIG)` on a prompt that large before
+    this fix -- folded into the synthetic exit code below like any other
+    launch failure, so it looked like an ordinary harness failure rather than
+    a transport limit. Confirmed against the installed CLI
+    (`opencode-ai@1.18.29`): `opencode run --model ... --dir ...` with no
+    positional message and the prompt piped on stdin reaches the model as the
+    turn's message -- verified by inspecting the CLI's own session storage
+    after a piped run, since (unlike `codex exec`) there is no
+    `--help`-documented stdin flag or sentinel for this CLI version; it reads
+    stdin whenever no positional message is given. This is a different
+    mechanism from `codex_lane.py`'s fix (Issue #4002), which passes an
+    explicit `-` sentinel positional argument -- `opencode run` has no
+    equivalent sentinel and does not need one.
     """
     out_dir = os.path.dirname(output_path)
     _write_opencode_config(out_dir)
@@ -412,8 +429,8 @@ def call_opencode_harness(
                 f"{OPENCODE_PROVIDER}/{model}",
                 "--dir",
                 out_dir,
-                prompt,
             ],
+            input=prompt,
             env=env,
             capture_output=True,
             text=True,
