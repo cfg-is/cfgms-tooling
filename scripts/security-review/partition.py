@@ -7,9 +7,10 @@ model's real contribution: the first varies so much between models that two
 plans become impossible to compare (see the issue's evidence sweep), which
 blocks benchmarking one planner model against another. This module replaces
 the first job with plain code: `partition(bundle_dir)` is a pure function of
-the bundle's `01-tree.tsv` file inventory plus `06-config-surface.tsv`'s
-`referencing_files` column (Issue #4056 AC4b) -- no model, no I/O beyond
-reading those two already-written bundle artifacts, no randomness. The same
+the bundle's `01-tree.tsv` file inventory plus `06-config-surface.tsv`'s and
+`07-authz-store-surface.tsv`'s `referencing_files` columns (Issue #4056 AC4b;
+`07-authz-store-surface.tsv` added by Issue #4060) -- no model, no I/O beyond
+reading those already-written bundle artifacts, no randomness. The same
 bundle produces a byte-identical, order-independent partition every time
 (AC1) -- `planner.py::prepare()` writes the result to `plan/partition.json`
 (AC10) and `planner.py::build_prompt()` presents each returned step's own
@@ -26,16 +27,40 @@ Two axes, concatenated in the list `partition()` returns:
   directory-axis step therefore satisfies `BOUNDED_SCOPE_RULE` BY
   CONSTRUCTION: it is never possible for one to span two top-level subtrees,
   so `validate_step()` never has to catch one that does.
-- **`axis: "boundary"`** (AC4). Cut by trust boundary rather than by the tree:
-  for every configuration key in `06-config-surface.tsv` whose
-  `referencing_files` (AC4b) span more than one top-level subtree, one step
-  containing exactly those files -- deliberately spanning the same subtree
-  boundary the directory axis cannot cross, so a defect whose evidence sits on
-  both sides of a package boundary (a caller that assumes the callee
-  validates; a callee that assumes the caller did) has somewhere to be seen.
-  A key referenced from only one subtree is not a boundary case -- the
-  directory axis already covers it -- and produces no boundary step (AC4c: an
-  empty boundary axis is a valid outcome, never a failure).
+- **`axis: "boundary"`** (AC4). Cut by trust boundary rather than by the tree,
+  fed by two independent bundle artifacts that share one row shape:
+  - For every configuration key in `06-config-surface.tsv` whose
+    `referencing_files` (AC4b) span more than one top-level subtree, one step
+    containing exactly those files -- deliberately spanning the same subtree
+    boundary the directory axis cannot cross, so a defect whose evidence sits
+    on both sides of a package boundary (a caller that assumes the callee
+    validates; a callee that assumes the caller did) has somewhere to be
+    seen. A key referenced from only one subtree is not a boundary case --
+    the directory axis already covers it -- and produces no boundary step
+    (AC4c: an empty boundary axis is a valid outcome, never a failure).
+  - `07-authz-store-surface.tsv` (Issue #4060) carries the same shape for the
+    **authorization** boundary: the package that declares the RBAC store
+    interfaces and decides with them, joined with the package(s) that
+    implement the specific methods that decision reads a grant through (the
+    "grant read path"). It targets the fail-open risk a data-driven RBAC
+    model actually has -- not a route naming the wrong permission string
+    (verified unanswerable: `features/rbac/engine.go`'s
+    `AuthEngine.CheckPermission` resolves each request's resource/action
+    against runtime grants, so no route-keyed join ever leaves
+    `features/controller/api/`), but a single over-broad grant row being
+    accepted by a loose `permissionMatches` comparison once the
+    role/subject/assignment reads it depends on have actually returned data.
+    Seeing the matcher (`features/rbac`) and the store that feeds it
+    (`pkg/storage/providers/*`) in one step is what makes that visible; a
+    directory-scoped step never would. See
+    `metadata._extract_authz_store_surface()` for exactly how the join is
+    computed, and its module docstring for why the row-naming and
+    permission-string alternatives were rejected. An empty authorization axis
+    (no interface declared in scope, or no external package implements the
+    full read set) is a valid outcome for the same reason an empty
+    configuration-keyed boundary axis is.
+  Both feed the same `_boundary_steps()` unmodified: a row is a row,
+  regardless of which artifact it came from.
 
 Both axes are bounded the same way: no step's total `loc` over its
 `tier != "test"` files exceeds `MAX_STEP_NON_TEST_LOC` (AC3). A `tier: test`
@@ -53,7 +78,7 @@ identical ids for identical scopes, the "shared spine" `plan/partition.json`
 exists to give two planners' contributions something to be diffed against.
 
 **Purity and safety.** Like `metadata.py`, this module's only I/O is reading
-two files already written under `bundle_dir` -- no subprocess, no network, no
+files already written under `bundle_dir` -- no subprocess, no network, no
 model call. Every path is re-checked against `metadata._prompt_safe()` before
 it can become part of a returned step (mirroring `planner.py`'s own
 `_read_bundle_tree_paths()` re-check), so a hand-crafted or corrupted bundle
@@ -72,6 +97,7 @@ import metadata  # noqa: E402
 
 TREE_ARTIFACT_NAME = "01-tree.tsv"
 CONFIG_ARTIFACT_NAME = "06-config-surface.tsv"
+AUTHZ_ARTIFACT_NAME = "07-authz-store-surface.tsv"
 
 AXIS_DIRECTORY = "directory"
 AXIS_BOUNDARY = "boundary"
@@ -202,6 +228,36 @@ def _read_config_rows(bundle_dir: str) -> "list[dict]":
     return rows
 
 
+def _read_authz_rows(bundle_dir: str) -> "list[dict]":
+    """Tolerant parse of `<bundle_dir>/07-authz-store-surface.tsv` (Issue
+    #4060). `[]` on any absent, header-only (AC5: an empty authorization axis
+    is a valid outcome), or malformed file -- same posture as
+    `_read_config_rows()`. Same row shape as `06-config-surface.tsv`
+    (`metadata.AUTHZ_HEADER == metadata.CONFIG_HEADER`'s columns), so the
+    caller can hand both lists to `_boundary_steps()` without it knowing or
+    caring which artifact a row came from."""
+    authz_path = os.path.join(bundle_dir, AUTHZ_ARTIFACT_NAME)
+    try:
+        with open(authz_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return []
+
+    lines = text.split("\n")
+    if not lines or lines[0].split("\t") != list(metadata.AUTHZ_HEADER):
+        return []
+
+    rows: list[dict] = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != len(metadata.AUTHZ_HEADER):
+            continue
+        rows.append(dict(zip(metadata.AUTHZ_HEADER, fields)))
+    return rows
+
+
 def _step_id(scope_paths: "list[str]") -> str:
     """A digest of `scope_paths`' sorted content (AC5) -- never a counter, so
     two independent calls over equivalent scopes (regardless of input order)
@@ -319,14 +375,18 @@ def _boundary_steps(tree_rows: "list[dict]", config_rows: "list[dict]") -> "list
 
 def partition(bundle_dir: str) -> "list[dict]":
     """Compute the deterministic step partition for the bundle at
-    `bundle_dir` (AC1). Pure function of `01-tree.tsv` and
-    `06-config-surface.tsv`'s content -- the same bundle produces a
-    byte-identical, order-independent result on every call.
+    `bundle_dir` (AC1). Pure function of `01-tree.tsv`, `06-config-surface.tsv`,
+    and `07-authz-store-surface.tsv`'s content (Issue #4060) -- the same
+    bundle produces a byte-identical, order-independent result on every call.
 
     Returns an ordered list of step dicts, each `{"step_id", "axis", "scope",
-    "files"}` (`axis: "boundary"` steps additionally carry `"config_key"`).
-    Directory-axis steps come first (AC2), sorted by their top-level
-    boundary; boundary-axis steps follow (AC4), sorted by configuration key.
+    "files"}` (`axis: "boundary"` steps additionally carry `"config_key"` --
+    the configuration key for a `06-config-surface.tsv` row, or
+    `metadata.AUTHZ_SURFACE_KEY` for the authorization boundary row from
+    `07-authz-store-surface.tsv`; the two artifacts share one row shape, so
+    `_boundary_steps()` treats a row from either identically). Directory-axis
+    steps come first (AC2), sorted by their top-level boundary; boundary-axis
+    steps follow (AC4), sorted by key across both artifacts' rows together.
     Both axes are bounded by `MAX_STEP_NON_TEST_LOC` (AC3). Carries no
     hypotheses -- those are the planner model's own contribution, added later
     by `planner.py::finalize()` from whatever the model wrote for a step this
@@ -334,4 +394,5 @@ def partition(bundle_dir: str) -> "list[dict]":
     """
     tree_rows = _read_tree_rows(bundle_dir)
     config_rows = _read_config_rows(bundle_dir)
-    return _directory_steps(tree_rows) + _boundary_steps(tree_rows, config_rows)
+    authz_rows = _read_authz_rows(bundle_dir)
+    return _directory_steps(tree_rows) + _boundary_steps(tree_rows, config_rows + authz_rows)

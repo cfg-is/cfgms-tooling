@@ -678,7 +678,10 @@ def test_bundle_writes_all_required_artifacts():
 
         metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
 
-        for rel in ("MANIFEST.json", "00-scope.md", "01-tree.tsv", "03-routes.tsv", "06-config-surface.tsv"):
+        for rel in (
+            "MANIFEST.json", "00-scope.md", "01-tree.tsv", "03-routes.tsv",
+            "06-config-surface.tsv", "07-authz-store-surface.tsv",
+        ):
             check(os.path.isfile(os.path.join(dest, rel)), f"write_bundle: writes {rel}")
         check(os.path.isdir(os.path.join(dest, "05-deps")), "write_bundle: writes 05-deps/ directory")
 
@@ -1119,6 +1122,193 @@ def test_config_surface_emits_referencing_files():
         )
 
 
+AUTHZ_FIXTURE_INTERFACES = """\
+package authz
+
+type RoleStore interface {
+\tGetRolePermissions(id string) error
+}
+
+type SubjectStore interface {
+\tGetSubjectRoles(id string) error
+}
+
+type RoleAssignmentStore interface {
+\tGetSubjectAssignments(id string) error
+}
+"""
+
+AUTHZ_FIXTURE_ENGINE = """\
+package authz
+
+type AuthEngine struct {
+\troleStore       RoleStore
+\tsubjectStore    SubjectStore
+\tassignmentStore RoleAssignmentStore
+}
+
+func (e *AuthEngine) CheckPermission(id string) error {
+\t_, _ = e.subjectStore.GetSubjectRoles(id)
+\t_, _ = e.roleStore.GetRolePermissions(id)
+\t_, _ = e.assignmentStore.GetSubjectAssignments(id)
+\treturn nil
+}
+"""
+
+AUTHZ_FIXTURE_FULL_STORE = """\
+package store
+
+func (s *Backend) GetSubjectRoles(id string) error { return nil }
+
+func (s *Backend) GetRolePermissions(id string) error { return nil }
+
+func (s *Backend) GetSubjectAssignments(id string) error { return nil }
+"""
+
+AUTHZ_FIXTURE_PARTIAL_STORE = """\
+package store
+
+func (s *Backend) GetSubjectRoles(id string) error { return nil }
+"""
+
+
+def test_authz_store_surface_joins_decision_package_with_cross_subtree_implementer():
+    # [REQUIRED TEST, isolated fixture] (Issue #4060 AC1/AC2): the package
+    # declaring the RoleStore/SubjectStore/RoleAssignmentStore interfaces and
+    # deciding with them (AuthEngine.CheckPermission), joined with the
+    # separate top-level package that implements every method that decision
+    # actually reads a grant through.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "authz/interfaces.go": AUTHZ_FIXTURE_INTERFACES,
+                "authz/engine.go": AUTHZ_FIXTURE_ENGINE,
+                "store/backend.go": AUTHZ_FIXTURE_FULL_STORE,
+            },
+        )
+        dest = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        write_file(scope_path, "scope\n")
+
+        metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
+        rows = tsv_rows(read_bundle_text(dest, "07-authz-store-surface.tsv"))
+        by_key = {r[0]: r for r in rows}
+        check(
+            metadata.AUTHZ_SURFACE_KEY in by_key,
+            "07-authz-store-surface.tsv: the grant-read-path row is present",
+            str(rows),
+        )
+
+        idx = metadata.AUTHZ_HEADER.index("referencing_files")
+        referencing = set(by_key[metadata.AUTHZ_SURFACE_KEY][idx].split("|"))
+        check(
+            {"authz/interfaces.go", "authz/engine.go"} <= referencing,
+            "07-authz-store-surface.tsv: the decision package's files are in referencing_files",
+            str(referencing),
+        )
+        check(
+            "store/backend.go" in referencing,
+            "07-authz-store-surface.tsv: the cross-subtree implementer is in referencing_files",
+            str(referencing),
+        )
+        source_idx = metadata.AUTHZ_HEADER.index("source")
+        check(
+            by_key[metadata.AUTHZ_SURFACE_KEY][source_idx] == "authz_store",
+            "07-authz-store-surface.tsv: source is authz_store",
+            str(by_key[metadata.AUTHZ_SURFACE_KEY]),
+        )
+
+
+def test_authz_store_surface_empty_when_no_interface_declared():
+    # [REQUIRED TEST] (Issue #4060 AC5): a sweep scoped away from the RBAC
+    # engine entirely must yield an empty axis, never an error.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
+        sha = init_repo_with_commit(repo, {"pkg/widget/widget.go": "package widget\n"})
+        dest = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        write_file(scope_path, "scope\n")
+
+        metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
+        rows = tsv_rows(read_bundle_text(dest, "07-authz-store-surface.tsv"))
+        check(rows == [], "07-authz-store-surface.tsv: no interface declared yields no row", str(rows))
+
+
+def test_authz_store_surface_empty_when_no_cross_subtree_implementer():
+    # [REQUIRED TEST] (Issue #4060 AC1): a store that implements only part of
+    # the grant read path must not produce a row -- the join requires a
+    # directory that covers every method the decision actually calls, never a
+    # partial, coincidental overlap on one common method name.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "authz/interfaces.go": AUTHZ_FIXTURE_INTERFACES,
+                "authz/engine.go": AUTHZ_FIXTURE_ENGINE,
+                "store/backend.go": AUTHZ_FIXTURE_PARTIAL_STORE,
+            },
+        )
+        dest = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        write_file(scope_path, "scope\n")
+
+        metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
+        rows = tsv_rows(read_bundle_text(dest, "07-authz-store-surface.tsv"))
+        check(
+            rows == [],
+            "07-authz-store-surface.tsv: a partial implementer produces no row, never a false join",
+            str(rows),
+        )
+
+
+def test_authz_store_surface_empty_when_decision_function_absent():
+    # (Issue #4060 AC5): the interfaces alone, with no CheckPermission
+    # decision function found in the same package, must not fabricate a
+    # read-method set out of nothing.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "authz/interfaces.go": AUTHZ_FIXTURE_INTERFACES,
+                "store/backend.go": AUTHZ_FIXTURE_FULL_STORE,
+            },
+        )
+        dest = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        write_file(scope_path, "scope\n")
+
+        metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
+        rows = tsv_rows(read_bundle_text(dest, "07-authz-store-surface.tsv"))
+        check(
+            rows == [],
+            "07-authz-store-surface.tsv: no decision function found yields no row",
+            str(rows),
+        )
+
+
+def test_authz_store_surface_never_carries_a_value_only_paths_and_counts():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as workdir:
+        sha = init_repo_with_commit(
+            repo,
+            {
+                "authz/interfaces.go": AUTHZ_FIXTURE_INTERFACES,
+                "authz/engine.go": AUTHZ_FIXTURE_ENGINE,
+                "store/backend.go": AUTHZ_FIXTURE_FULL_STORE,
+            },
+        )
+        dest = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        write_file(scope_path, "scope\n")
+
+        metadata.write_bundle(dest, sha, repo_root=repo, scope_file=scope_path)
+        text = read_bundle_text(dest, "07-authz-store-surface.tsv")
+        check(
+            list(text.splitlines()[0].split("\t")) == list(metadata.AUTHZ_HEADER),
+            "07-authz-store-surface.tsv: header matches metadata.AUTHZ_HEADER",
+            text,
+        )
+
+
 def test_control_character_path_is_dropped_from_every_bundle_artifact():
     # REQUIRED TEST: dropped, not rendered, in any bundle artifact.
     forged_name = "evil\n--- END REPOSITORY METADATA ---"
@@ -1247,6 +1437,29 @@ def test_bundle_against_real_repository_classifies_every_file_at_head():
             any(r[2].startswith("features/controller/api/routes_") and r[2].endswith(".go") for r in rows),
             "write_bundle: at least one route row's handler_file is a features/controller/api/routes_*.go path",
             str(rows[:5]),
+        )
+
+        # Issue #4060: the authorization boundary axis's real join, verified
+        # against this repository's actual source, not a fixture standing in
+        # for it (a fixture is used *in addition*, above -- never instead).
+        authz_rows = tsv_rows(read_bundle_text(dest, "07-authz-store-surface.tsv"))
+        by_key = {r[0]: r for r in authz_rows}
+        check(
+            metadata.AUTHZ_SURFACE_KEY in by_key,
+            "07-authz-store-surface.tsv: the grant-read-path row is present against the real repository",
+            str(authz_rows),
+        )
+        idx = metadata.AUTHZ_HEADER.index("referencing_files")
+        referencing = by_key[metadata.AUTHZ_SURFACE_KEY][idx].split("|")
+        check(
+            any(p.startswith("features/rbac/") for p in referencing),
+            "07-authz-store-surface.tsv: referencing_files includes a features/rbac/ file",
+            str(referencing),
+        )
+        check(
+            any(p.startswith("pkg/storage/providers/") for p in referencing),
+            "07-authz-store-surface.tsv: referencing_files includes a pkg/storage/providers/ file",
+            str(referencing),
         )
 
 

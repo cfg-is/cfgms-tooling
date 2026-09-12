@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -49,6 +50,17 @@ def write_config_tsv(bundle_dir: str, rows: "list[tuple[str, str, str, str, str,
     lines = ["\t".join(metadata.CONFIG_HEADER)]
     lines.extend("\t".join(row) for row in rows)
     with open(os.path.join(bundle_dir, "06-config-surface.tsv"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_authz_tsv(bundle_dir: str, rows: "list[tuple[str, str, str, str, str, str]]") -> None:
+    """Write a `07-authz-store-surface.tsv` by hand, matching
+    `metadata.AUTHZ_HEADER`'s shape -- the same six columns
+    `write_config_tsv()` writes (Issue #4060)."""
+    os.makedirs(bundle_dir, exist_ok=True)
+    lines = ["\t".join(metadata.AUTHZ_HEADER)]
+    lines.extend("\t".join(row) for row in rows)
+    with open(os.path.join(bundle_dir, "07-authz-store-surface.tsv"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
 
@@ -256,6 +268,156 @@ def test_boundary_axis_oversized_key_splits_deterministically():
     for s in boundary_steps:
         non_test_loc = sum(300 for _ in s["files"])
         check(non_test_loc <= partition.MAX_STEP_NON_TEST_LOC, "partition: each split boundary step stays within budget", str(non_test_loc))
+
+
+# --- Authorization boundary axis (Issue #4060) -------------------------------
+
+def test_authz_boundary_step_spans_two_subtrees_for_grant_read_path():
+    # A synthetic, isolated exercise of the plumbing: 07-authz-store-surface.tsv
+    # feeds _boundary_steps() exactly like 06-config-surface.tsv does (Issue
+    # #4060 AC4). The real join, driven by metadata.py's actual extraction
+    # logic against real repository source, is the REQUIRED test below --
+    # this one is the fixture used *in addition*, never instead (AC3).
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [
+            ("features/rbac/engine.go", "go", "10", "aaaaaaaaaaaa", "business"),
+            ("features/rbac/interfaces.go", "go", "10", "bbbbbbbbbbbb", "business"),
+            ("pkg/storage/providers/database/rbac_queries.go", "go", "10", "cccccccccccc", "dataaccess"),
+            ("features/rbac/scope.go", "go", "10", "dddddddddddd", "business"),
+        ])
+        write_authz_tsv(bundle_dir, [
+            (
+                metadata.AUTHZ_SURFACE_KEY, "authz_store", "3",
+                "features/rbac/engine.go|features/rbac/interfaces.go|pkg/storage/providers/database/rbac_queries.go",
+                "n/a", "business",
+            ),
+        ])
+        steps = partition.partition(bundle_dir)
+
+    boundary_steps = [s for s in steps if s["axis"] == "boundary" and s["config_key"] == metadata.AUTHZ_SURFACE_KEY]
+    check(len(boundary_steps) == 1, "partition: one boundary step for the authz grant-read-path row", str(boundary_steps))
+    check(
+        boundary_steps[0]["files"] == sorted([
+            "features/rbac/engine.go", "features/rbac/interfaces.go",
+            "pkg/storage/providers/database/rbac_queries.go",
+        ]),
+        "partition: the authz boundary step contains exactly the row's referencing files",
+        str(boundary_steps[0]["files"]),
+    )
+    check(
+        "features/rbac/scope.go" not in boundary_steps[0]["files"],
+        "partition: a file not named in the authz row is not pulled into the boundary step",
+        str(boundary_steps[0]["files"]),
+    )
+
+
+def test_authz_boundary_axis_empty_when_no_cross_subtree_row():
+    # (Issue #4060 AC5): an absent or header-only 07-authz-store-surface.tsv
+    # is a valid outcome, never an error -- mirrors the config axis's AC4c.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [("features/rbac/engine.go", "go", "10", "aaaaaaaaaaaa", "business")])
+        steps = partition.partition(bundle_dir)
+    check(
+        [s for s in steps if s["axis"] == "boundary"] == [],
+        "partition: an absent authz-store-surface artifact yields no boundary step, not an error",
+        str(steps),
+    )
+
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [("features/rbac/engine.go", "go", "10", "aaaaaaaaaaaa", "business")])
+        write_authz_tsv(bundle_dir, [])
+        steps = partition.partition(bundle_dir)
+    check(
+        [s for s in steps if s["axis"] == "boundary"] == [],
+        "partition: a header-only authz-store-surface artifact yields no boundary step, not an error",
+        str(steps),
+    )
+
+
+def test_authz_and_config_boundary_rows_combine_in_one_partition():
+    # The two artifacts share one row shape and one code path (_boundary_steps()) --
+    # a config-keyed row and an authz-keyed row present in the same bundle
+    # must both surface as independent boundary steps.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [
+            ("pkg/ha/config.go", "go", "10", "aaaaaaaaaaaa", "business"),
+            ("features/controller/config/config.go", "go", "10", "bbbbbbbbbbbb", "business"),
+            ("features/rbac/engine.go", "go", "10", "cccccccccccc", "business"),
+            ("pkg/storage/providers/database/rbac_queries.go", "go", "10", "dddddddddddd", "dataaccess"),
+        ])
+        write_config_tsv(bundle_dir, [
+            (
+                "CFGMS_HA_MODE", "env", "2",
+                "features/controller/config/config.go|pkg/ha/config.go",
+                "unknown", "business",
+            ),
+        ])
+        write_authz_tsv(bundle_dir, [
+            (
+                metadata.AUTHZ_SURFACE_KEY, "authz_store", "2",
+                "features/rbac/engine.go|pkg/storage/providers/database/rbac_queries.go",
+                "n/a", "business",
+            ),
+        ])
+        steps = partition.partition(bundle_dir)
+
+    boundary_keys = {s["config_key"] for s in steps if s["axis"] == "boundary"}
+    check(
+        boundary_keys == {"CFGMS_HA_MODE", metadata.AUTHZ_SURFACE_KEY},
+        "partition: a config-keyed row and an authz-keyed row both produce independent boundary steps",
+        str(boundary_keys),
+    )
+
+
+def test_authz_boundary_step_from_real_repository_spans_features_rbac_and_pkg_storage():
+    # [REQUIRED TEST] (Issue #4060 AC2/AC3): driven by metadata.py's real
+    # bundle-writing path against this repository's actual source at HEAD --
+    # never only a hand-built fixture. Asserts the resulting step(s) genuinely
+    # contain at least one file from features/rbac/ and at least one from
+    # pkg/storage/providers/, and that the join is not reducible to a single
+    # subtree.
+    repo_root = str(Path(__file__).resolve().parents[3])
+    sha = subprocess.run(
+        ["git", "-C", repo_root, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30, check=True
+    ).stdout.strip()
+    with tempfile.TemporaryDirectory() as workdir:
+        bundle_dir = os.path.join(workdir, "bundle")
+        scope_path = os.path.join(workdir, "scope.md")
+        with open(scope_path, "w", encoding="utf-8") as f:
+            f.write("Authorization boundary axis real-repository test.\n")
+        metadata.write_bundle(bundle_dir, sha, repo_root=repo_root, scope_file=scope_path)
+        steps = partition.partition(bundle_dir)
+
+    authz_steps = [s for s in steps if s["axis"] == "boundary" and s["config_key"] == metadata.AUTHZ_SURFACE_KEY]
+    check(len(authz_steps) >= 1, "partition: the real repository produces at least one authz boundary step", str(len(authz_steps)))
+
+    all_files = sorted({f for s in authz_steps for f in s["files"]})
+    check(
+        any(f.startswith("features/rbac/") for f in all_files),
+        "partition: the real authz boundary step(s) contain a features/rbac/ file",
+        str(all_files),
+    )
+    check(
+        any(f.startswith("pkg/storage/providers/") for f in all_files),
+        "partition: the real authz boundary step(s) contain a pkg/storage/providers/ file",
+        str(all_files),
+    )
+
+    # The join must not be reducible to a single top-level subtree: fail if a
+    # future regression collapses the extraction back to features/rbac alone
+    # (or pkg/storage alone) -- the exact failure mode the config-string join
+    # this axis replaces had (Issue #4060's "split out" section).
+    top_level_dirs = {f.split("/", 1)[0] for f in all_files}
+    check(
+        len(top_level_dirs) >= 2,
+        "partition: the authz boundary step(s) span at least two top-level subtrees",
+        str(top_level_dirs),
+    )
+    for step in authz_steps:
+        check(
+            len(step["files"]) > 0,
+            f"partition: authz boundary step {step['step_id']} is non-empty",
+        )
 
 
 # --- AC5: stable step ids -----------------------------------------------------

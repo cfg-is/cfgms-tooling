@@ -9,9 +9,10 @@ Two independent outputs live in this module:
   every existing caller keeps working exactly as before.
 - `write_bundle(dest, commit_sha, ...)` -- writes the auditable bundle
   directory (`MANIFEST.json`, `00-scope.md`, `01-tree.tsv`, `03-routes.tsv`,
-  `05-deps/`, `06-config-surface.tsv`) that will become the planner's only
-  input once #WS2-2 cuts it over. This story only produces the bundle; it is
-  written but not yet consumed by anything downstream.
+  `05-deps/`, `06-config-surface.tsv`, `07-authz-store-surface.tsv`) that will
+  become the planner's only input once #WS2-2 cuts it over. This story only
+  produces the bundle; it is written but not yet consumed by anything
+  downstream.
 
 Everything both paths read is read against the sweep's pinned `commit_sha`
 via `git ls-tree` / `git cat-file --batch` (a batch read of the exact blob
@@ -89,6 +90,26 @@ failing either check is dropped from the row and logged as
 `prompt_unsafe_route_value_dropped` (route fields) or
 `prompt_unsafe_config_key_dropped` (config keys); it is never emitted
 partially or escaped in place.
+
+**`07-authz-store-surface.tsv` (Issue #4060) is the security-review harness's
+authorization boundary axis data source**, the same role `06-config-surface.tsv`'s
+`referencing_files` plays for the configuration-keyed boundary axis. CFGMS's
+RBAC is data-driven -- `CheckPermission` resolves resource/action strings
+against grants held in storage, so no source file encodes what a route
+demands and a route-keyed join never leaves `features/controller/api/` (see
+`_extract_authz_store_surface()`'s docstring for the verified reason that
+definition was rejected). What *is* in source and does cross a package
+boundary is the relationship between the package that declares the
+authorization store interfaces and decides with them
+(`features/rbac/interfaces.go`'s `RoleStore`/`SubjectStore`/
+`RoleAssignmentStore`, consumed by `features/rbac/engine.go`'s
+`AuthEngine.CheckPermission`) and the packages that implement the specific
+methods that decision actually calls to read a grant
+(`pkg/storage/providers/database`, `pkg/storage/providers/sqlite`). Emitted in
+the same `(key, source, referenced_in_count, referencing_files, has_default,
+tier)` shape `06-config-surface.tsv` uses, `source="authz_store"`, so
+`partition.py`'s existing boundary-axis step builder consumes both artifacts
+identically without change.
 
 **Purity.** This module's only subprocess is `git`. No function here makes a
 network call, calls a model, or shells out to an agent CLI -- the bundle is
@@ -416,7 +437,7 @@ def render_payload(metadata: dict) -> str:
 # ---------------------------------------------------------------------------
 
 BUNDLE_VERSION = "1"
-EXTRACTOR_VERSION = "1.0.0"
+EXTRACTOR_VERSION = "1.1.0"
 
 # Basename patterns never read into a bundle artifact's content, and never
 # even opened for hashing/loc purposes -- matched against the file's basename
@@ -499,6 +520,36 @@ METHOD_SHAPE_RE = re.compile(r'^[A-Z]{3,7}$')
 ENV_VAR_RE = re.compile(r'\bos\.(?:Getenv|LookupEnv)\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)')
 ENV_KEY_SHAPE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
 
+# Authorization boundary axis (Issue #4060). The three store interfaces the
+# authorization decision consumes -- declared in `features/rbac/interfaces.go`
+# today, matched by name rather than by that path so a future rename of the
+# file does not silently blind this extractor.
+AUTHZ_STORE_INTERFACE_NAMES = ("RoleStore", "SubjectStore", "RoleAssignmentStore")
+AUTHZ_INTERFACE_DECL_RE = re.compile(
+    r'^type\s+(?:' + '|'.join(AUTHZ_STORE_INTERFACE_NAMES) + r')\s+interface\b',
+    re.MULTILINE,
+)
+# The one decision function these interfaces exist to serve -- verified
+# against `develop` as `features/rbac/engine.go`'s `AuthEngine.CheckPermission`
+# (see the module docstring's "07-authz-store-surface.tsv" paragraph for why a
+# route- or permission-string-keyed join was rejected instead). Matched by
+# receiver type and method name, never by file path.
+AUTHZ_DECISION_FUNC_RE = re.compile(r'func\s*\(\s*\w+\s+\*?AuthEngine\s*\)\s+CheckPermission\s*\(')
+# A call of the shape `e.roleStore.GetRolePermissions(...)` inside that
+# function's body -- the actual grant reads the decision depends on. This is
+# the "grant read path": the specific methods a fail-open bug in
+# `permissionMatches` would need real store data flowing through to matter.
+AUTHZ_STORE_CALL_RE = re.compile(r'\be\.\w+Store\.([A-Za-z_]\w*)\s*\(')
+# Any method declaration anywhere else, matched by name only against the read
+# set above. This is the "one hop from interface declaration to
+# implementation" the axis is keyed on -- never a full call graph, and never a
+# match against English words (the `requirePermission("resource","action")`
+# join this axis replaces failed exactly that way; see the module docstring).
+AUTHZ_METHOD_DECL_RE = re.compile(r'func\s*\(\s*\w+\s+\*?[A-Za-z_]\w*\s*\)\s+([A-Za-z_]\w*)\s*\(')
+
+AUTHZ_SURFACE_KEY = "rbac_grant_read_path"
+AUTHZ_SURFACE_SOURCE = "authz_store"
+
 DEPS_FILES = ("go.mod", "go.sum", "web/package.json")
 
 SCOPE_FILE_MAX_BYTES = 300_000
@@ -506,6 +557,11 @@ SCOPE_FILE_MAX_BYTES = 300_000
 TREE_HEADER = ("path", "lang", "loc", "sha256_12", "tier")
 ROUTES_HEADER = ("method", "path", "handler_file", "handler_symbol", "auth_middleware", "framework")
 CONFIG_HEADER = ("key", "source", "referenced_in_count", "referencing_files", "has_default", "tier")
+# Same shape as CONFIG_HEADER, kept as its own named constant rather than an
+# alias so a future schema change to one artifact does not silently change
+# the other -- see the module docstring's "07-authz-store-surface.tsv"
+# paragraph (Issue #4060).
+AUTHZ_HEADER = ("key", "source", "referenced_in_count", "referencing_files", "has_default", "tier")
 
 
 def _is_denied(path: str) -> bool:
@@ -826,6 +882,160 @@ def _extract_config_surface(
     return rows
 
 
+def _authz_boundary_dir(path: str) -> str:
+    """The directory `path` sits in -- `''` for a repository-root file. Only
+    used to decide whether two files declare/consume or implement the
+    authorization store contract from the *same* package; the boundary a
+    resulting step must span two top-level subtrees of is decided later, by
+    `partition.py`'s own `_directory_boundary()`, exactly as it already is for
+    `06-config-surface.tsv`'s rows."""
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def _extract_authz_store_surface(
+    files: list[str],
+    path_to_content: dict[str, bytes],
+    path_to_tier: dict[str, str],
+    commit_sha: str,
+) -> list[dict]:
+    """Find the authorization boundary axis's one relationship (Issue #4060):
+    the package that declares `RoleStore`/`SubjectStore`/`RoleAssignmentStore`
+    and consumes them to decide (`features/rbac`, via `AuthEngine.CheckPermission`),
+    joined with the package(s) elsewhere that implement the specific methods
+    that decision actually reads a grant through.
+
+    **Why not a route- or permission-string join.** A prior definition asked
+    which files define the permission a route demands, matched via
+    `requirePermission("resource","action")` literals. Verified against real
+    routes (`account`/`revoke-enrollment-link`, `refresh`/`list-pending`,
+    `cluster`/`drain-node`), every one resolves only to files inside
+    `features/controller/api/` -- CFGMS's RBAC is data-driven, so no second
+    file in another package encodes what a route demands, and the join never
+    produces a cross-subtree step. Matching the resource/action words
+    separately fails the other way: `steward` alone appears in 98 files,
+    `config` in 73, blowing the step size budget on nearly every step. This
+    function asks a different, answerable question instead: not what a route
+    demands, but what package *implements the read* the decision depends on.
+
+    **The join, in three structural hops, no call graph and no English-word
+    matching:**
+
+    1. Find every non-test `.go` file declaring one of `AUTHZ_STORE_INTERFACE_NAMES`
+       (`AUTHZ_INTERFACE_DECL_RE`) -- today, `features/rbac/interfaces.go`. Its
+       directory is the decision package.
+    2. Within that same directory, find `AuthEngine.CheckPermission`
+       (`AUTHZ_DECISION_FUNC_RE`) and scan its body (up to the next top-level
+       `func`) for `e.<field>Store.<Method>(` calls (`AUTHZ_STORE_CALL_RE`).
+       Those method names are the grant read path: the fail-open target is
+       `permissionMatches`, and it only matters once a role's permissions,
+       a subject's roles, and a subject's active assignments have actually
+       been read -- a failed read of any of the three already returns a
+       denial (fail-closed), confirmed by reading `engine.go` and by this
+       repository's own `TestAuthEngine_CheckPermission_DBError_Propagates`
+       and `..._NotFoundError_Skips` tests.
+    3. Group every OTHER non-test `.go` file by directory and find the ones
+       whose declared methods (`AUTHZ_METHOD_DECL_RE`), unioned across that
+       directory's files, cover every method name from step 2. Verified
+       against `develop`: this lands on exactly `pkg/storage/providers/database`
+       (split across `rbac_queries.go` and `rbac_subjects.go`) and
+       `pkg/storage/providers/sqlite` (`rbac_store.go`) -- never on a
+       directory that merely happens to share one or two generic CRUD method
+       names (`features/controller/service`, matching only 2 of the 4, is
+       correctly excluded).
+
+    Returns a single-row list keyed `AUTHZ_SURFACE_KEY`, in the same shape
+    `_extract_config_surface()` returns, so `partition.py`'s existing
+    boundary-axis step builder (keyed on `06-config-surface.tsv`'s
+    `referencing_files`) consumes it identically -- no partitioner change
+    needed for this axis to exist. Returns `[]` (a valid, not a failure,
+    outcome -- AC5) when no interface is declared in scope, when its decision
+    function calls no store method, or when no other directory implements the
+    full read set -- each a legitimate outcome for a sweep scoped away from
+    the RBAC engine entirely.
+    """
+    go_files = [p for p in files if p.endswith(".go") and not p.endswith("_test.go")]
+
+    declaring_files: list[str] = []
+    for path in go_files:
+        content = path_to_content.get(path)
+        if content is None:
+            continue
+        if AUTHZ_INTERFACE_DECL_RE.search(content.decode("utf-8", errors="replace")):
+            declaring_files.append(path)
+
+    if not declaring_files:
+        return []
+
+    decision_dirs = {_authz_boundary_dir(path) for path in declaring_files}
+
+    read_methods: set[str] = set()
+    decision_files: set[str] = set(declaring_files)
+    for path in go_files:
+        if _authz_boundary_dir(path) not in decision_dirs:
+            continue
+        content = path_to_content.get(path)
+        if content is None:
+            continue
+        text = content.decode("utf-8", errors="replace")
+        func_m = AUTHZ_DECISION_FUNC_RE.search(text)
+        if not func_m:
+            continue
+        decision_files.add(path)
+        rest = text[func_m.end():]
+        next_func_m = re.search(r'\nfunc\s', rest)
+        body = rest[:next_func_m.start()] if next_func_m else rest
+        for call_m in AUTHZ_STORE_CALL_RE.finditer(body):
+            read_methods.add(call_m.group(1))
+
+    if not read_methods:
+        return []
+
+    dir_methods: dict[str, set[str]] = {}
+    dir_files: dict[str, set[str]] = {}
+    for path in go_files:
+        directory = _authz_boundary_dir(path)
+        if directory in decision_dirs:
+            continue
+        content = path_to_content.get(path)
+        if content is None:
+            continue
+        text = content.decode("utf-8", errors="replace")
+        found = {m.group(1) for m in AUTHZ_METHOD_DECL_RE.finditer(text)} & read_methods
+        if found:
+            dir_methods.setdefault(directory, set()).update(found)
+            dir_files.setdefault(directory, set()).add(path)
+
+    implementing_files: set[str] = set()
+    for directory, methods in dir_methods.items():
+        if methods == read_methods:
+            implementing_files.update(dir_files[directory])
+
+    if not implementing_files:
+        return []
+
+    referencing_files = sorted(decision_files | implementing_files)
+    safe_referencing_files = [p for p in referencing_files if _prompt_safe(p)]
+    if len(safe_referencing_files) != len(referencing_files):
+        schema.log_event(
+            "prompt_unsafe_authz_referencing_file_dropped",
+            commit_sha=commit_sha,
+            key=AUTHZ_SURFACE_KEY,
+        )
+    if not safe_referencing_files:
+        return []
+
+    tier = path_to_tier.get(safe_referencing_files[0], UNKNOWN_TIER)
+
+    return [{
+        "key": AUTHZ_SURFACE_KEY,
+        "source": AUTHZ_SURFACE_SOURCE,
+        "referenced_in_count": str(len(safe_referencing_files)),
+        "referencing_files": "|".join(safe_referencing_files),
+        "has_default": "n/a",
+        "tier": tier,
+    }]
+
+
 def _assemble_bundle_contents(
     commit_sha: str, repo_root: str | None, scope_paths: "list[str] | None" = None
 ) -> dict:
@@ -879,6 +1089,7 @@ def _assemble_bundle_contents(
     path_to_tier = {row["path"]: row["tier"] for row in tree_rows}
     route_rows = _extract_routes(files, path_to_content, commit_sha)
     config_rows = _extract_config_surface(files, path_to_content, path_to_tier, commit_sha)
+    authz_rows = _extract_authz_store_surface(files, path_to_content, path_to_tier, commit_sha)
 
     deps: dict[str, bytes] = {}
     for rel in DEPS_FILES:
@@ -889,6 +1100,7 @@ def _assemble_bundle_contents(
         "tree_rows": tree_rows,
         "route_rows": route_rows,
         "config_rows": config_rows,
+        "authz_rows": authz_rows,
         "deps": deps,
         "unknown_tier_count": unknown_tier_count,
         "files_excluded_by_deny": files_excluded_by_deny,
@@ -958,9 +1170,10 @@ def write_bundle(
     bundle is bounded to, validated via `_normalize_scope_paths()` before
     anything else in this function runs. `None` or empty means the full
     repository, exactly as before this story. It bounds `01-tree.tsv` and
-    `03-routes.tsv` to only the in-scope entries -- route extraction and the
-    config-surface scan both walk the same, already-filtered file list, so
-    they narrow for free -- and is recorded verbatim as `MANIFEST.json`'s
+    `03-routes.tsv` to only the in-scope entries -- route extraction, the
+    config-surface scan, and the authz-store-surface scan (Issue #4060) all
+    walk the same, already-filtered file list, so they narrow for free -- and
+    is recorded verbatim as `MANIFEST.json`'s
     `scope_paths` field (`null` when unscoped) so a bundle is self-describing
     about what it does and does not cover. This is a different axis from
     `scope_file`/`no_scope`: `--path` bounds *which files* are read at all;
@@ -1028,6 +1241,10 @@ def write_bundle(
     config_text = _render_tsv(CONFIG_HEADER, contents["config_rows"])
     atomic_write.write_text_atomic(os.path.join(dest, "06-config-surface.tsv"), config_text)
     _record("06-config-surface.tsv", config_text.encode("utf-8"))
+
+    authz_text = _render_tsv(AUTHZ_HEADER, contents["authz_rows"])
+    atomic_write.write_text_atomic(os.path.join(dest, "07-authz-store-surface.tsv"), authz_text)
+    _record("07-authz-store-surface.tsv", authz_text.encode("utf-8"))
 
     if repo_root:
         repo_label = os.path.basename(os.path.abspath(repo_root))
