@@ -156,6 +156,31 @@ check_contains "state prints the drained streak" "${out}" "drained_streak=0"
 out="$(bash "${WATCH}" --help)"
 check_contains "usage lists record-cycle" "${out}" "record-cycle"
 
+# --- drained shutdown exits CLEANLY ----------------------------------------
+# Regression: the EXIT trap referenced a `local` pidfile, so it ran after the
+# function returned, hit `set -u`, and turned the clean drained shutdown into
+# exit 1 with a stale pid file left behind. The stop event fired correctly and
+# the watcher still died dirty — so asserting on the event alone would not have
+# caught it. Assert the exit code and the pid file.
+# Arming resets the streak by design, so it cannot be pre-seeded from outside.
+# A zero limit makes the very first tick satisfy `streak >= limit`, which
+# exercises the same shutdown path.
+bash "${WATCH}" reset >/dev/null
+rc=0
+out="$(PIPELINE_WATCH_DRAINED_LIMIT=0 \
+       PIPELINE_WATCH_FAST=1 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+       PIPELINE_WATCH_SHA_CMD="printf 'sha-x\n'" \
+       PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+       PIPELINE_WATCH_BOARD_CMD="echo 0" \
+       PIPELINE_WATCH_PRS_CMD="printf ''" \
+       timeout 20 bash "${WATCH}" watch 2>&1)" || rc=$?
+check_contains "drained shutdown emits the stop event" "${out}" "EVENT stop reason=drained"
+check_not_contains "drained shutdown does not report unbound variable" "${out}" "unbound variable"
+check_eq "drained shutdown exits 0" "${rc}" "0"
+ran=$((ran + 1))
+if [[ ! -f "${PO_CACHE_DIR}/watch/watch.pid" ]]; then printf '  ok    pid file is removed on shutdown\n'
+else printf '  FAIL  pid file left behind after shutdown\n'; fail=$((fail + 1)); fi
+
 echo "--------------------------------------"
 printf 'ran %d, failed %d\n' "${ran}" "${fail}"
 [[ "${fail}" -eq 0 ]] || exit 1

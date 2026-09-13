@@ -214,7 +214,13 @@ slow_tick() {
 # ---------------------------------------------------------------- loop
 
 cmd_watch() {
-  local pidfile="${STATE_DIR}/watch.pid" existing now
+  # NOT `local`: the EXIT trap below runs after this function has returned, so a
+  # function-scoped name is already out of scope by then and `set -u` turns the
+  # clean drained shutdown into an "unbound variable" exit 1 — the watcher did
+  # its job, reported `EVENT stop`, and then died dirty, leaving the pid file it
+  # was trying to remove. Measured on the first real drained shutdown.
+  pidfile="${STATE_DIR}/watch.pid"
+  local existing now
   mkdir -p "${STATE_DIR}"
   existing="$(cat "${pidfile}" 2>/dev/null || true)"
   if [[ -n "${existing}" ]] && kill -0 "${existing}" 2>/dev/null; then
