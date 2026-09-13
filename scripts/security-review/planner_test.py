@@ -3472,6 +3472,51 @@ def test_finalize_both_gates_pass_for_a_fully_covered_plan():
         )
 
 
+def test_evaluate_coverage_g3_coverage_half_holds_for_a_partition_produced_plan():
+    # Issue #4066: the partitioner-produced plan, not a hand-crafted fixture,
+    # must actually give every HIGH_RISK_TIERS file a second, differently-
+    # keyed step -- this is the exact contract Issue #4056 claimed held "by
+    # construction" and did not (evidenced by sweep 2026-09-12T1251Z-bab1f8d6,
+    # where every scoped file failed G-3 on `len(covering) < 2`). Reproduces
+    # that scope shape: two directories (pkg/cert, pkg/session), each
+    # entirely security-tier, no configuration-keyed cross-reference between
+    # them -- the boundary axis contributes nothing here, matching the
+    # evidence. Hypotheses are still supplied by hand (the model's job, out
+    # of scope for this test), but every step's objective text differs by
+    # axis, so G-3 passes in full, not only on its coverage half.
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        bundle_dir = _bundle_dir(sweep_dir)
+        write_context(sweep_dir)
+        _write_tree_tsv(bundle_dir, [
+            ("pkg/cert/manager.go", "go", "10", "aaaaaaaaaaaa", "security"),
+            ("pkg/cert/util.go", "go", "10", "bbbbbbbbbbbb", "security"),
+            ("pkg/session/session.go", "go", "10", "cccccccccccc", "security"),
+        ])
+        steps = planner.partition.partition(bundle_dir)
+        check(
+            {s["axis"] for s in steps} == {"directory", "risk"},
+            "sanity: this scope produces only directory and risk steps -- no shared config key",
+            str(steps),
+        )
+
+        for step in steps:
+            objective = (
+                "cross-subtree data flow within this directory"
+                if step["axis"] == "directory"
+                else "review against the general threat model, independent of directory"
+            )
+            step["hypotheses"] = [valid_hypothesis(id="h1", objective=objective)]
+
+        coverage = planner.evaluate_coverage(sweep_dir, steps)
+        check(coverage["evaluated"] is True, "coverage: evaluated is true", str(coverage))
+        check(
+            coverage["g3"]["passed"] is True,
+            "coverage: G-3 passes over the partitioner's own steps once the model's objectives differ by axis",
+            str(coverage),
+        )
+        check(coverage["g3"]["short_files"] == [], "coverage: no high-risk file is left short", str(coverage))
+
+
 def test_finalize_records_coverage_evaluated_false_when_bundle_tree_is_missing():
     # AC: a missing or unparseable bundle tree listing must record
     # evaluated=false with a reason -- never a silent pass -- and must never

@@ -519,12 +519,19 @@ def _render_partition_steps_block(steps: "list[dict]") -> str:
     for index, step in enumerate(steps, start=1):
         filename = f"step-{index:03d}.json"
         files_block = "\n".join(f"{metadata.ENTRY_PREFIX}{p}" for p in step["files"]) or "  (none)"
-        axis_note = (
-            f"axis: boundary (configuration key `{step['config_key']}`, spans more than one "
-            "top-level subtree by design -- see the bounded-scope note below)"
-            if step["axis"] == partition.AXIS_BOUNDARY
-            else "axis: directory"
-        )
+        if step["axis"] == partition.AXIS_BOUNDARY:
+            axis_note = (
+                f"axis: boundary (configuration key `{step['config_key']}`, spans more than one "
+                "top-level subtree by design -- see the bounded-scope note below)"
+            )
+        elif step["axis"] == partition.AXIS_RISK:
+            axis_note = (
+                "axis: risk (entrypoint/security-tier file grouped for a second look from a "
+                "different angle than its directory step, spans more than one top-level subtree "
+                "by design -- see the bounded-scope note below)"
+            )
+        else:
+            axis_note = "axis: directory"
         blocks.append(
             f"Step {index} -- write your hypotheses to `/workspace-out/{filename}` ({axis_note})\n"
             f"files:\n{files_block}"
@@ -1249,7 +1256,7 @@ def _bundle_tree_index(sweep_dir: str) -> "dict[str, dict] | None":
     return index
 
 
-VALID_AXES = frozenset({partition.AXIS_DIRECTORY, partition.AXIS_BOUNDARY})
+VALID_AXES = frozenset({partition.AXIS_DIRECTORY, partition.AXIS_BOUNDARY, partition.AXIS_RISK})
 
 
 def validate_step(
@@ -1280,10 +1287,13 @@ def validate_step(
       enforcing `BOUNDED_SCOPE_RULE` -- the same text `build_prompt()` gives
       the planning model, so the instruction and its enforcement cannot drift
       apart).
-    - any other axis (today, only `"boundary"`): EXEMPT from
-      `_scope_boundary()` -- a boundary-axis step is deliberately allowed to
-      span more than one top-level subtree, since spanning the boundary is
-      the entire point (AC4). It is bounded instead by
+    - any other axis (today, `"boundary"` and `"risk"` -- Issue #4066): EXEMPT
+      from `_scope_boundary()` -- a boundary-axis step is deliberately allowed
+      to span more than one top-level subtree, since spanning the boundary is
+      the entire point (AC4); a risk-axis step is deliberately allowed to
+      span more than one top-level subtree for the same reason -- giving a
+      `HIGH_RISK_TIERS` file a second step on a genuinely different grouping
+      key is the entire point (Issue #4066). It is bounded instead by
       `partition.MAX_STEP_NON_TEST_LOC` over its `tree_index`-derived
       non-test `loc`, the same size bound `partition.py`'s own
       `_split_by_loc_budget()` enforces when it computes the step in the
