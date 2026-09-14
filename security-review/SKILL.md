@@ -134,6 +134,21 @@ bind-mounted `:ro`, writable only in that lane's own `lanes/<lane-id>/` director
 default-deny behind a per-harness DNS allowlist. `docs/architecture/security-review-harness.md`
 is the full architecture reference if you need more than this summary.
 
+**Plan steps come from three axes (Issue #4056, #4059).** Directory, so every file is looked at
+once. Configuration key, so files that never share a folder but share a setting are looked at
+together. And **scenario** — one step per entry in `docs/security-review/threat-scenarios.md`, which
+states the product-level risks a file tree cannot suggest on its own. Coverage over risk is
+structural: a scenario always has a step, so it cannot go unexamined.
+
+A scenario step is the one place the planner picks its own files. Its id is the scenario id, so two
+models' plans line up and can be compared. A scenario with nothing in scope selects nothing and is
+recorded rather than dispatched.
+
+**Scoring a model** uses `docs/security-review/regression-corpus.md`: defects this repository has
+had, pinned to commits where they are still present. Read that score beside the lanes' closure rate,
+never alone — the corpus rewards finding known defects, closure rate rewards narrow hypotheses, and
+either on its own tunes the harness in the wrong direction.
+
 **The planner roster (`CFGMS_SECURITY_REVIEW_PLANNERS`) is claude and codex only (Issue #4041).**
 It takes the same comma-separated `harness:model` shape as the lane roster. Configuring more than
 one entry is a **benchmarking mode, not the normal path** (Issue #4056) — the default remains one

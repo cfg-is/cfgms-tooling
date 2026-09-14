@@ -2089,6 +2089,287 @@ def test_methodology_resolves_from_the_trusted_harness_mount_first():
                     os.environ[k] = v
 
 
+def _scenario_step(scenario_id: str = "TS-12") -> dict:
+    return {
+        "step_id": scenario_id,
+        "axis": "scenario",
+        "scenario_id": scenario_id,
+        "scope": scenario_id,
+        "files": ["pkg/fleet/selector/selector.go"],
+        "hypotheses": [{"id": "h1", "objective": "o", "required_evidence": "e"}],
+    }
+
+
+def _directory_step() -> dict:
+    return {
+        "step_id": "step-001",
+        "axis": "directory",
+        "scope": "pkg/a",
+        "files": ["pkg/a/a.go"],
+        "hypotheses": [{"id": "h1", "objective": "o", "required_evidence": "e"}],
+    }
+
+
+def test_scenario_block_is_selected_by_id_not_by_word_overlap():
+    # REQUIRED (Issue #4059): a scenario is the step's entire subject, so it is
+    # looked up by the id the harness put on the step. Anchors may be chosen
+    # lexically because they are illustrative; a scenario may not, because a
+    # miss leaves the lane reviewing a file list with no idea which risk it was
+    # assembled for.
+    step = _scenario_step("TS-12")
+    step["files"] = ["totally/unrelated/path.go"]
+    step["hypotheses"] = [{"id": "h1", "objective": "zzz", "required_evidence": "zzz"}]
+    block = harness_runner.scenario_block(step)
+    check("THREAT SCENARIO TS-12" in block, "scenario block: found by id even with no lexical overlap", block[:120])
+
+
+def test_scenario_block_carries_tier_and_boundary():
+    block = harness_runner.scenario_block(_scenario_step("TS-12"))
+    check("attacker tier T2" in block, "scenario block: names the attacker tier")
+    check("boundary controller-to-steward" in block, "scenario block: names the trust boundary")
+
+
+def test_scenario_block_is_empty_for_a_non_scenario_step():
+    check(
+        harness_runner.scenario_block(_directory_step()) == "",
+        "scenario block: a directory step gets no scenario",
+    )
+
+
+def test_unknown_scenario_id_does_not_break_the_lane():
+    # A lane resuming an older sweep whose plan predates a catalogue edit must
+    # still run against the files it was given. The planner is where a missing
+    # catalogue fails closed; a lane degrades instead.
+    step = _scenario_step("TS-99")
+    check(harness_runner.scenario_block(step) == "", "scenario block: an unknown id yields no block, not an error")
+    preamble = harness_runner.shared_preamble(step)
+    check(harness_runner.SYSTEM_PROMPT in preamble, "scenario block: the lane still gets its preamble for an unknown id")
+
+
+def test_shared_preamble_includes_the_scenario_only_when_there_is_one():
+    with_scenario = harness_runner.shared_preamble(_scenario_step("TS-12"))
+    without = harness_runner.shared_preamble(_directory_step())
+    check("THREAT SCENARIO TS-12" in with_scenario, "preamble: a scenario step carries its scenario")
+    check("THREAT SCENARIO" not in without, "preamble: a directory step is unchanged")
+    check(
+        harness_runner.METHODOLOGY_CORE in with_scenario and harness_runner.METHODOLOGY_CORE in without,
+        "preamble: the methodology core still reaches both",
+    )
+
+
+def test_every_catalogue_scenario_renders_for_a_lane():
+    # REQUIRED: a scenario the planner can plan but a lane cannot render would
+    # produce a step reviewed with no stated risk, silently.
+    import scenarios as _scenarios
+    missing = []
+    for s in _scenarios.load_scenarios():
+        block = harness_runner.scenario_block({"axis": "scenario", "scenario_id": s["id"]})
+        if s["requirement"] not in block:
+            missing.append(s["id"])
+    check(not missing, "scenario block: every catalogue scenario renders for a lane", str(missing))
+
+
+def test_lane_timeout_default_is_generous_enough_for_a_slow_finder():
+    # REQUIRED (Issue #4059). 600s was set when every lane was a hosted
+    # frontier model. On the six-step benchmark both Ollama Cloud lanes timed
+    # out on BOTH large steps at 600s, having done the work correctly on every
+    # step they had time for -- four of that run's failures were this one
+    # number. The roster is heading toward local models on the operator's own
+    # hardware, where a few tokens per second is normal.
+    import os as _os
+    saved = _os.environ.pop(harness_runner.LANE_TIMEOUT_ENV, None)
+    try:
+        check(
+            harness_runner.lane_timeout_seconds() >= 3600.0,
+            "lane timeout: the default leaves room for a slow finder",
+            str(harness_runner.lane_timeout_seconds()),
+        )
+    finally:
+        if saved is not None:
+            _os.environ[harness_runner.LANE_TIMEOUT_ENV] = saved
+
+
+def test_lane_timeout_is_overridable_and_fails_safe():
+    import os as _os
+    saved = _os.environ.get(harness_runner.LANE_TIMEOUT_ENV)
+    try:
+        _os.environ[harness_runner.LANE_TIMEOUT_ENV] = "7200"
+        check(harness_runner.lane_timeout_seconds() == 7200.0, "lane timeout: an override is honoured")
+        for bad in ("", "garbage", "0", "-5"):
+            _os.environ[harness_runner.LANE_TIMEOUT_ENV] = bad
+            check(
+                harness_runner.lane_timeout_seconds() == harness_runner.LANE_TIMEOUT_SECONDS_DEFAULT,
+                f"lane timeout: {bad!r} falls back to the default rather than raising",
+                str(harness_runner.lane_timeout_seconds()),
+            )
+    finally:
+        _os.environ.pop(harness_runner.LANE_TIMEOUT_ENV, None)
+        if saved is not None:
+            _os.environ[harness_runner.LANE_TIMEOUT_ENV] = saved
+
+
+def test_every_lane_uses_the_shared_timeout():
+    # A per-lane constant is how 600s survived in four places; assert they all
+    # resolve to the one value so a future slow-finder change is a single edit.
+    import claude_lane, codex_lane, ollama_lane, opencode_lane  # noqa: E402
+    values = {
+        "claude": claude_lane.CLAUDE_TIMEOUT_SECONDS,
+        "codex": codex_lane.CODEX_TIMEOUT_SECONDS,
+        "ollama": ollama_lane.OLLAMA_TIMEOUT_SECONDS,
+        "opencode": opencode_lane.OPENCODE_TIMEOUT_SECONDS,
+    }
+    check(len(set(values.values())) == 1, "lane timeout: every lane shares one value", str(values))
+
+
+def test_rate_limit_backoff_retries_the_same_step_before_parking():
+    # REQUIRED (Issue #4059). A lane that parks on the FIRST rate limit moves
+    # straight to the next step, hits the same limit, and so on to the end of
+    # the plan. Measured: the codex lane completed 3 of 6 steps, then parked the
+    # remaining 3 within seconds, and a resume two minutes later parked the same
+    # three again. Parking without waiting only converts "not done" into "not
+    # done, recorded".
+    slept, calls = [], []
+
+    def limited_then_ok(model, prompt, raw_path):
+        calls.append(1)
+        return (0, len(calls) < 3, "tail")
+
+    ec, rate_limited, _ = harness_runner.call_with_rate_limit_backoff(
+        limited_then_ok, "m", "p", "/tmp/raw", sleep_fn=slept.append
+    )
+    check(len(calls) == 3, "backoff: the same step is retried until it succeeds", str(len(calls)))
+    check(rate_limited is False, "backoff: a retry that succeeds is not parked")
+    check(slept == [30.0, 60.0], "backoff: the wait doubles between attempts", str(slept))
+
+
+def test_rate_limit_backoff_is_bounded_by_total_wait():
+    import os as _os
+    saved = _os.environ.get(harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV)
+    slept, calls = [], []
+
+    def always_limited(model, prompt, raw_path):
+        calls.append(1)
+        return (0, True, "tail")
+
+    try:
+        _os.environ.pop(harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV, None)
+        ec, rate_limited, _ = harness_runner.call_with_rate_limit_backoff(
+            always_limited, "m", "p", "/tmp/raw", sleep_fn=slept.append
+        )
+        check(rate_limited is True, "backoff: a step still rate limited at the budget is parked")
+        check(
+            sum(slept) <= harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_DEFAULT,
+            "backoff: total wait never exceeds the budget",
+            str(sum(slept)),
+        )
+    finally:
+        if saved is not None:
+            _os.environ[harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV] = saved
+
+
+def test_rate_limit_backoff_zero_budget_still_makes_one_attempt():
+    # Zero means "do not wait", never "do not try" -- a lane that skipped the
+    # call entirely would report a park it never earned.
+    import os as _os
+    saved = _os.environ.get(harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV)
+    slept, calls = [], []
+    try:
+        _os.environ[harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV] = "0"
+        harness_runner.call_with_rate_limit_backoff(
+            lambda m, p, r: (calls.append(1), (0, True, "t"))[1], "m", "p", "/tmp/raw",
+            sleep_fn=slept.append,
+        )
+        check(len(calls) == 1, "backoff: a zero budget still attempts the call once", str(len(calls)))
+        check(slept == [], "backoff: a zero budget waits not at all")
+    finally:
+        _os.environ.pop(harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV, None)
+        if saved is not None:
+            _os.environ[harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV] = saved
+
+
+def test_sanitize_harness_output_tail_strips_whole_escape_sequences():
+    # Removing the ESC byte alone leaves the sequence BODY as ordinary text, so
+    # a spinner-dominated tail reads as `[?25l[?25h...` and the one line that
+    # explains the failure is pushed out by the 4,000-character cap.
+    raw = "\x1b[?25l\x1b[?25h" * 50 + "error: model not found"
+    cleaned = harness_runner.sanitize_harness_output_tail(raw)
+    check(
+        cleaned == "error: model not found",
+        "sanitize_harness_output_tail: a spinner leaves no residue at all",
+        repr(cleaned[:80]),
+    )
+
+
+def test_write_step_diagnostic_persists_under_the_diagnostics_dir():
+    with tempfile.TemporaryDirectory() as lane_dir:
+        path = harness_runner.write_step_diagnostic(lane_dir, "step-001.stdout.txt", "the bytes")
+        check(path is not None, "write_step_diagnostic: returns the path it wrote")
+        check(
+            path == os.path.join(lane_dir, harness_runner.STEP_DIAGNOSTICS_DIRNAME, "step-001.stdout.txt"),
+            "write_step_diagnostic: writes under the diagnostics subdirectory",
+            str(path),
+        )
+        with open(path) as f:
+            check(f.read() == "the bytes", "write_step_diagnostic: content is written verbatim")
+
+
+def test_write_step_diagnostic_ignores_empty_content():
+    with tempfile.TemporaryDirectory() as lane_dir:
+        check(
+            harness_runner.write_step_diagnostic(lane_dir, "empty.txt", "") is None,
+            "write_step_diagnostic: empty content writes nothing",
+        )
+        check(
+            not os.path.isdir(harness_runner.step_diagnostics_dir(lane_dir)),
+            "write_step_diagnostic: empty content does not even create the directory",
+        )
+
+
+def test_write_step_diagnostic_keeps_the_end_when_over_the_cap():
+    with tempfile.TemporaryDirectory() as lane_dir:
+        tail = "the actual error"
+        oversized = "a" * harness_runner.STEP_DIAGNOSTICS_MAX_BYTES + tail
+        path = harness_runner.write_step_diagnostic(lane_dir, "big.txt", oversized)
+        with open(path) as f:
+            written = f.read()
+        check(
+            written.endswith(tail) and len(written) == harness_runner.STEP_DIAGNOSTICS_MAX_BYTES,
+            "write_step_diagnostic: an oversized value is bounded and keeps its end",
+            str(len(written)),
+        )
+
+
+def test_write_step_diagnostic_never_raises_on_an_unwritable_dir():
+    with tempfile.TemporaryDirectory() as parent:
+        lane_dir = os.path.join(parent, "ro")
+        os.makedirs(lane_dir)
+        os.chmod(lane_dir, 0o500)
+        try:
+            check(
+                harness_runner.write_step_diagnostic(lane_dir, "x.txt", "data") is None,
+                "write_step_diagnostic: an unwritable lane dir returns None instead of raising",
+            )
+        finally:
+            os.chmod(lane_dir, 0o700)
+
+
+def test_remove_step_temp_artifacts_never_removes_diagnostics():
+    with tempfile.TemporaryDirectory() as lane_dir:
+        harness_runner.write_step_diagnostic(lane_dir, "step-001.prompt.txt", "the prompt")
+        open(os.path.join(lane_dir, ".step-001.raw.json"), "w").close()
+        harness_runner.remove_step_temp_artifacts(lane_dir, "step-001")
+        check(
+            not os.path.exists(os.path.join(lane_dir, ".step-001.raw.json")),
+            "remove_step_temp_artifacts: the step's own scratch dotfile is still removed",
+        )
+        check(
+            os.path.exists(
+                os.path.join(lane_dir, harness_runner.STEP_DIAGNOSTICS_DIRNAME, "step-001.prompt.txt")
+            ),
+            "remove_step_temp_artifacts: the evidence a failure left behind survives cleanup",
+        )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

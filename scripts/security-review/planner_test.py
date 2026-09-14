@@ -34,8 +34,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import basedir  # noqa: E402
 import consolidate  # noqa: E402
 import metadata  # noqa: E402
+import partition  # noqa: E402
 import planner  # noqa: E402
 import roster  # noqa: E402
+import scenarios  # noqa: E402
 import schema  # noqa: E402
 
 FAILURES: list[str] = []
@@ -211,7 +213,7 @@ def test_build_prompt_metadata_block_cannot_be_escaped_by_a_crafted_path_via_rea
 
         after_block = prompt.split("--- END REPOSITORY METADATA ---", 1)[1]
         check(
-            after_block.lstrip().startswith("This sweep has already been partitioned"),
+            after_block.lstrip().startswith("Each hypothesis is a falsifiable claim"),
             "build_prompt: the real instructional body directly follows the closing delimiter",
             repr(after_block[:120]),
         )
@@ -282,7 +284,7 @@ def test_build_prompt_no_longer_instructs_glob_and_names_the_tree_artifact():
         prompt,
     )
     check(
-        planner.TREE_ARTIFACT_NAME in prompt,
+        planner.TREE_ARTIFACT_NAME not in prompt,
         "build_prompt: names 01-tree.tsv as the source of the file inventory",
         prompt,
     )
@@ -299,18 +301,18 @@ def test_build_prompt_presents_assigned_steps_and_never_asks_for_scope():
         ])
         prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
     check(
-        "already been partitioned" in prompt and "not by you" in prompt,
-        "build_prompt: states the partition is the harness's own, not the model's job",
+        "Steps are fixed" in prompt,
+        "build_prompt: states the partition is fixed and not the model's to change",
         prompt,
     )
     check(
-        "Do NOT include `scope`, `files`" in prompt,
-        "build_prompt: instructs the model not to supply scope or files",
+        "No other keys" in prompt,
+        "build_prompt: instructs the model to emit no key beyond the template's",
         prompt,
     )
     check(
-        "rejected" in prompt,
-        "build_prompt: states a disagreeing model-supplied scope/files is rejected",
+        "rejected" not in prompt,
+        "build_prompt: does not narrate what the harness does with a malformed step",
         prompt,
     )
     check("pkg/foo/foo.go" in prompt and "pkg/bar/bar.go" in prompt, "build_prompt: both assigned steps' files are listed")
@@ -332,8 +334,8 @@ def test_prompt_requires_falsifiable_hypothesis_form():
     )
     check("Good:" in prompt and "Bad:" in prompt, "build_prompt: gives one worked example of each shape, good and bad", prompt)
     check(
-        "inconclusive" in prompt,
-        "build_prompt: explains why a broad property tends to resolve inconclusive",
+        "inconclusive" not in prompt,
+        "build_prompt: does not explain the downstream disposition, only the required form",
         prompt,
     )
 
@@ -345,7 +347,8 @@ def test_prompt_requires_one_absence_shaped_hypothesis_per_step():
         _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
         prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
     check(
-        "absence-shaped" in prompt and "what check should exist" in prompt,
+        "at least one hypothesis naming a check that should exist" in prompt
+        and "does\nnot" in prompt,
         "build_prompt: requires at least one absence-shaped hypothesis per step",
         prompt,
     )
@@ -374,7 +377,7 @@ def test_build_prompt_states_bounded_scope_from_bundle_manifest():
             json.dump({"scope_paths": ["pkg/cert", "pkg/session"]}, f)
         prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
     check(
-        "BOUNDED sweep" in prompt,
+        "Scope: `pkg/cert`, `pkg/session`." in prompt,
         "build_prompt: a scoped bundle's prompt says the inventory is a bounded scope",
         prompt,
     )
@@ -458,7 +461,11 @@ def test_prepare_paths_filters_bundle_and_prompt_states_the_scope():
             "prepare: --path bounds the prompt's file inventory, excluding out-of-scope files",
             content,
         )
-        check("BOUNDED sweep" in content, "prepare: the prompt states the inventory is a bounded scope")
+        check(
+            content.startswith("Write review hypotheses.\n\nScope: `pkg/cert`"),
+            "prepare: the prompt states the bounded scope",
+            content[:120],
+        )
 
         manifest_path = os.path.join(sweep_dir, "bundle", "MANIFEST.json")
         with open(manifest_path) as f:
@@ -553,6 +560,11 @@ def test_finalize_injects_scope_and_files_from_the_partition():
         check(ok is True, "finalize: a plan with hypotheses only (no scope/files) is accepted end-to-end", str(errors))
 
         for index, step in enumerate(partition_steps, start=1):
+            # A scenario step for which the stub selected no files is dropped
+            # from the plan by design (Issue #4059) -- there is nothing for a
+            # lane to read -- so it has no file to read back here.
+            if step.get("axis") == partition.AXIS_SCENARIO:
+                continue
             with open(os.path.join(plan_dir, f"step-{index:03d}.json")) as f:
                 written = json.load(f)
             check(
@@ -593,6 +605,159 @@ def test_finalize_rejects_a_step_whose_scope_disagrees_with_the_partition():
         )
 
 
+def test_rules_do_not_contradict_the_scenario_step_instruction():
+    # REQUIRED (Issue #4059). The rules line once read "No other keys", which
+    # flatly contradicted every scenario step's "Set `files` to the paths ...".
+    # Astra obeyed the literal rule and set no files on all fifteen scenario
+    # steps; Fable inferred the intent and set them. Both behaved correctly
+    # given a self-contradicting prompt. Because an empty scenario step is
+    # dropped from the plan by design, the consequence was that every
+    # product-level risk would have been reviewed by nobody, silently.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
+        prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
+    check("Set `files`" in prompt, "prompt: a scenario step is told to set files")
+    check(
+        "No other keys" not in prompt or "A scenario step also sets `files`" in prompt,
+        "prompt: the rules do not forbid the key a scenario step is told to set",
+        prompt[-300:],
+    )
+
+
+def test_scenario_step_accepts_model_chosen_files_from_the_inventory():
+    # REQUIRED (Issue #4059): the scenario axis is the one deliberate exception
+    # to #4056 AC6. Which files bear on a risk is a judgement about the code,
+    # so the model selects them -- but only from paths that exist in this
+    # commit, checked against the inventory the partition itself carries.
+    step = {"axis": partition.AXIS_SCENARIO, "scope": "TS-01", "files": []}
+    data = {"step_id": "TS-01", "files": ["pkg/a/a.go", "cmd/b/b.go"]}
+    err = planner._inject_partition_fields(
+        data, step, "step-003.json", frozenset({"pkg/a/a.go", "cmd/b/b.go", "pkg/c/c.go"})
+    )
+    check(err is None, "scenario step: model-chosen files from the inventory are accepted", str(err))
+    check(
+        data["files"] == ["pkg/a/a.go", "cmd/b/b.go"],
+        "scenario step: the model's files are kept in its own order, de-duplicated",
+        str(data.get("files")),
+    )
+    check(data["axis"] == partition.AXIS_SCENARIO, "scenario step: axis still comes from the partition")
+
+
+def test_scenario_step_file_selection_is_bounded_by_the_loc_budget():
+    # REQUIRED (Issue #4059). Every other axis is bounded when the partition
+    # builds it; a scenario step is built by the MODEL, so nothing bounded it
+    # until finalize. Unbounded, Fable selected 50 files for TS-12 and the
+    # finder lane failed outright -- a 305,221-token prompt against a 200,000
+    # limit -- so every product-level risk was reviewed by nobody and the step
+    # read as `failed` rather than as a gap in the design.
+    step = {"axis": partition.AXIS_SCENARIO, "scope": "TS-01", "files": []}
+    paths = [f"pkg/p{i}/f.go" for i in range(10)]
+    data = {"step_id": "TS-01", "files": list(paths)}
+    loc = {p: 4000 for p in paths}
+    err = planner._inject_partition_fields(
+        data, step, "step-003.json", frozenset(paths), loc
+    )
+    check(err is None, "scenario step: an over-budget selection is trimmed, not rejected", str(err))
+    kept = data["files"]
+    check(
+        sum(loc[p] for p in kept) <= partition.MAX_SCENARIO_NON_TEST_LOC,
+        "scenario step: the kept files fit the scenario loc budget",
+        f"{sum(loc[p] for p in kept)} > {partition.MAX_SCENARIO_NON_TEST_LOC}",
+    )
+    check(
+        kept == paths[:len(kept)],
+        "scenario step: trimming keeps the model's own order -- its only relevance ranking",
+        str(kept),
+    )
+    check(
+        data.get("files_dropped_over_budget") == paths[len(kept):],
+        "scenario step: the dropped paths are recorded, never silently gone",
+        str(data.get("files_dropped_over_budget")),
+    )
+
+
+def test_scenario_step_under_budget_keeps_every_file():
+    step = {"axis": partition.AXIS_SCENARIO, "scope": "TS-01", "files": []}
+    paths = ["pkg/a/a.go", "pkg/b/b.go"]
+    data = {"step_id": "TS-01", "files": list(paths)}
+    err = planner._inject_partition_fields(
+        data, step, "step-003.json", frozenset(paths), {p: 10 for p in paths}
+    )
+    check(err is None and data["files"] == paths, "scenario step: an in-budget selection is untouched", str(data))
+    check(
+        "files_dropped_over_budget" not in data,
+        "scenario step: nothing is recorded as dropped when nothing was",
+    )
+
+
+def test_scenario_step_rejects_a_file_absent_from_the_commit():
+    step = {"axis": partition.AXIS_SCENARIO, "scope": "TS-01", "files": []}
+    data = {"step_id": "TS-01", "files": ["pkg/a/a.go", "pkg/invented/nope.go"]}
+    err = planner._inject_partition_fields(
+        data, step, "step-003.json", frozenset({"pkg/a/a.go"})
+    )
+    check(
+        err is not None and "pkg/invented/nope.go" in err,
+        "scenario step: a path absent from the inventory is rejected, naming it",
+        str(err),
+    )
+
+
+def test_scenario_step_may_select_nothing():
+    # REQUIRED (Issue #4059): a scenario with nothing bearing on it inside a
+    # bounded scope is covered-with-nothing-to-review, not a malformed step.
+    # TS-01 is about route authorisation; a sweep scoped to `pkg/cert` has no
+    # routes. Same posture #4056 AC4c takes for an empty boundary axis.
+    step = {"axis": partition.AXIS_SCENARIO, "scope": "TS-01", "files": []}
+    data = {"step_id": "TS-01"}
+    err = planner._inject_partition_fields(data, step, "step-003.json", frozenset({"pkg/a/a.go"}))
+    check(err is None, "scenario step: selecting no files is a valid outcome", str(err))
+    check(data["files"] == [], "scenario step: an empty selection stays empty")
+
+
+def test_non_scenario_step_still_rejects_model_supplied_files():
+    # The #4056 AC6 rule is unchanged everywhere else: a directory step's files
+    # are the harness's, and a model that supplies different ones is a signal
+    # something went wrong, not something to silently overwrite.
+    step = {"axis": partition.AXIS_DIRECTORY, "scope": "pkg/a", "files": ["pkg/a/a.go"]}
+    data = {"step_id": "step-001", "files": ["pkg/a/other.go"]}
+    err = planner._inject_partition_fields(data, step, "step-001.json", frozenset({"pkg/a/a.go", "pkg/a/other.go"}))
+    check(
+        err is not None and "disagrees with the harness-assigned" in err,
+        "directory step: model-supplied files are still rejected",
+        str(err),
+    )
+
+
+def test_every_scenario_gets_a_step_in_a_real_prepare():
+    # REQUIRED (Issue #4059): coverage over risk is structural. Every id in the
+    # shipped catalogue must appear as a step after a real prepare() -- this is
+    # the assertion that replaces a coverage gate evaluated after the fact.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        with open(os.path.join(sweep_dir, "plan", planner.PARTITION_FILENAME)) as f:
+            steps = json.load(f)
+    planned = {s["step_id"] for s in steps if s.get("axis") == partition.AXIS_SCENARIO}
+    missing = [sid for sid in scenarios.scenario_ids() if sid not in planned]
+    check(not missing, "prepare: every catalogue scenario has its own plan step", str(missing))
+
+
+def test_prompt_carries_each_scenario_to_its_own_step():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep_dir:
+        sha = init_repo_with_commit(repo, {"go.mod": "module example.com/x\n\ngo 1.23\n", "pkg/a/a.go": "package a\n"})
+        planner.prepare(sweep_dir, sha, repo_root=repo)
+        with open(os.path.join(sweep_dir, "plan", planner.PROMPT_FILENAME)) as f:
+            prompt = f.read()
+    catalogue = scenarios.load_scenarios()
+    missing = [s["id"] for s in catalogue if s["requirement"] not in prompt]
+    check(not missing, "prompt: every scenario's requirement reaches the prompt", str(missing))
+    check(
+        "This step is a risk, not a directory" in prompt,
+        "prompt: a scenario step is presented as a risk rather than a location",
+    )
+
+
 def test_finalize_rejects_a_step_position_with_no_partition_entry():
     # AC6: a model that writes more step files than the harness assigned
     # steps has nowhere for the extra file to be positionally matched.
@@ -602,14 +767,23 @@ def test_finalize_rejects_a_step_position_with_no_partition_entry():
         plan_dir = os.path.join(sweep_dir, "plan")
         with open(os.path.join(plan_dir, planner.PARTITION_FILENAME)) as f:
             partition_steps = json.load(f)
-        check(len(partition_steps) == 1, "sanity: this fixture's bundle produces exactly one partition step", str(partition_steps))
+        # One directory step plus one step per threat scenario (Issue #4059).
+        # The extra file is the first position PAST the partition, whatever
+        # that number is, so this does not re-pin a count the catalogue moves.
+        assigned = len(partition_steps)
+        check(assigned >= 1, "sanity: the fixture bundle produces at least one partition step", str(assigned))
 
-        write_step(plan_dir, "step-001.json", {"step_id": "step-001", "hypotheses": [valid_hypothesis()]})
-        write_step(plan_dir, "step-002.json", {"step_id": "step-002", "hypotheses": [valid_hypothesis()]})
+        for index in range(1, assigned + 1):
+            write_step(
+                plan_dir, f"step-{index:03d}.json",
+                {"step_id": f"step-{index:03d}", "hypotheses": [valid_hypothesis()]},
+            )
+        extra = f"step-{assigned + 1:03d}.json"
+        write_step(plan_dir, extra, {"step_id": extra[:-5], "hypotheses": [valid_hypothesis()]})
 
         ok, errors = planner.finalize(sweep_dir)
-        check(ok is True, "finalize: the one valid step still survives", str(errors))
-        check(not os.path.exists(os.path.join(plan_dir, "step-002.json")), "finalize: the extra step with no partition entry is removed")
+        check(ok is True, "finalize: the assigned steps still survive", str(errors))
+        check(not os.path.exists(os.path.join(plan_dir, extra)), "finalize: the extra step with no partition entry is removed")
         check(
             any("no partition step assigned at this position" in e for e in errors),
             "finalize: the rejection names the missing partition entry",
@@ -935,12 +1109,18 @@ def test_validate_step_root_file_scope_error_and_prompt_share_the_same_rule_text
         "validate_step: rejection message quotes BOUNDED_SCOPE_RULE verbatim",
         str(errors),
     )
+    # The rule is single-sourced into `validate_step()`'s rejection message, asserted above, and
+    # deliberately NOT into the plan prompt. Since Issue #4056 the partition is computed by the
+    # harness and the model never chooses a scope, so quoting 1,296 characters of scope rule at it
+    # instructs nothing it can act on -- it was already marked "informational only" where it sat.
+    # The drift this pairing guards against is between the rule and its ENFORCEMENT, which the
+    # assertion above covers; a prompt that cannot use the rule is not part of that pairing.
     with tempfile.TemporaryDirectory() as bundle_dir:
         _write_tree_tsv(bundle_dir, [("pkg/foo/foo.go", "go", "1", "abcdef123456", "business")])
         prompt = planner.build_prompt(bundle_dir, sweep_id="sweep-1")
     check(
-        planner.BOUNDED_SCOPE_RULE in prompt,
-        "build_prompt: the prompt quotes the exact same BOUNDED_SCOPE_RULE text used by validate_step",
+        planner.BOUNDED_SCOPE_RULE not in prompt,
+        "build_prompt: does not quote the scope rule at a model that no longer chooses scope",
     )
 
 

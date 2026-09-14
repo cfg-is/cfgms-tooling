@@ -174,7 +174,10 @@ DEFAULT_PLAN_DIR = "/workspace-plan"
 DEFAULT_OUT_DIR = "/workspace-out"
 DEFAULT_REPO_ROOT = "/workspace"
 
-OPENCODE_TIMEOUT_SECONDS = 600.0
+# Single-sourced in `harness_runner` (Issue #4059) so one number covers every
+# lane and a slow finder does not need a per-lane edit. See that module for
+# why it is bounded rather than removed.
+OPENCODE_TIMEOUT_SECONDS = harness_runner.lane_timeout_seconds()
 
 # OpenCode's Zen gateway provider id -- confirmed via `opencode models`,
 # which lists its free catalog as `opencode/<id>` with no login required.
@@ -684,7 +687,13 @@ def run_lane(
 
                 prompt = build_prompt(task_step, file_contents, raw_path)
                 try:
-                    exit_code, rate_limited, output_tail = call_harness_fn(model, prompt, raw_path)
+                    # Wait out a rate limit rather than parking on the first one
+                    # (Issue #4059): parking without waiting only converts "not
+                    # done" into "not done, recorded", and a lane on a limited
+                    # account can never finish a plan that way.
+                    exit_code, rate_limited, output_tail = harness_runner.call_with_rate_limit_backoff(
+                        call_harness_fn, model, prompt, raw_path
+                    )
                 except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
                     launch_exc = exc
                     break

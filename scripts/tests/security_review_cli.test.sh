@@ -783,7 +783,7 @@ bundle_manifest_scope="$(python3 -c "import json; print(json.dumps(json.load(ope
 check_eq "the bundle MANIFEST.json records scope_paths" "$bundle_manifest_scope" '["pkg/example"]'
 
 prompt_content_path="$(cat "${SWEEP_DIR_PATH}/plan/.investigator-plan-prompt.md")"
-check_contains "the planner prompt states the inventory is a bounded scope" "$prompt_content_path" "BOUNDED sweep"
+check_contains "the planner prompt states the bounded scope" "$prompt_content_path" 'Scope: `pkg/example`.'
 check_contains "the planner prompt names the scoped subtree" "$prompt_content_path" "pkg/example"
 check_not_contains "the planner prompt does not list the out-of-scope sibling file" "$prompt_content_path" "pkg/other/file.go"
 

@@ -3044,6 +3044,7 @@ PROMPT_EOF
     # of its own.
     inv_harness_creds_mount=()
     inv_harness_env=()
+    inv_harness_extra_run_args=()
     if [[ -n "$inv_harness" ]]; then
       case "$inv_harness" in
         claude)
@@ -3170,6 +3171,35 @@ PROMPT_EOF
             echo "LAUNCH_FAILED:${container_name}:credential_unavailable:ollama key not signed in -- no session keypair at ${inv_ollama_key_dir}/id_ed25519{,.pub} (looked in ${inv_ollama_key_source}); run 'ollama signin' as that account, or pass --ollama-key-dir to point at the correct directory"
             exit 1
           fi
+          # A bind mount keeps the HOST's ownership and mode, and the signin
+          # keypair is mode 600 owned by the ollama service account (uid 999
+          # here). The container runs as `agent` (uid 1000), so without this
+          # the private key is present and unreadable: `ollama serve` starts,
+          # finds no usable key, and every step fails with "You need to be
+          # signed in to Ollama to run Cloud models" -- indistinguishable from
+          # a genuinely signed-out host, and measured as exactly that before
+          # this was found. The public half is 644 and reads fine, which is
+          # why the failure is silent rather than obvious.
+          #
+          # Joining the key file's own group is the narrowest fix: no copy of
+          # a private key anywhere, no world-readable mode, and the group is
+          # read off the file rather than hardcoded, so a host that installed
+          # ollama under a different account still works. The key must be
+          # group-readable (640) for this to help; the launch fails closed
+          # below with that instruction if it is not.
+          inv_ollama_key_mode="$(stat -c '%a' "${inv_ollama_key_dir}/id_ed25519" 2>/dev/null || true)"
+          # The GROUP digit is the middle one, and read is bit 4. Testing the
+          # last digit instead (as this first did) rejects 640 -- the very mode
+          # the error message tells the operator to set.
+          inv_ollama_key_group_digit="${inv_ollama_key_mode: -2:1}"
+          if [[ -z "$inv_ollama_key_group_digit" || $(( inv_ollama_key_group_digit & 4 )) -eq 0 ]]; then
+            echo "LAUNCH_FAILED:${container_name}:credential_unavailable:ollama key ${inv_ollama_key_dir}/id_ed25519 is mode ${inv_ollama_key_mode} -- not group-readable, so the container's agent user cannot read it and the daemon reports itself signed out. Run: sudo chmod 640 ${inv_ollama_key_dir}/id_ed25519"
+            exit 1
+          fi
+          inv_ollama_key_gid="$(stat -c '%g' "${inv_ollama_key_dir}/id_ed25519" 2>/dev/null || true)"
+          if [[ -n "$inv_ollama_key_gid" ]]; then
+            inv_harness_extra_run_args+=(--group-add "$inv_ollama_key_gid")
+          fi
           inv_harness_creds_mount=(
             -v "${inv_ollama_key_dir}/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
             -v "${inv_ollama_key_dir}/id_ed25519.pub:/home/agent/.ollama/id_ed25519.pub:ro"
@@ -3180,6 +3210,13 @@ PROMPT_EOF
         -e "CFGMS_SECURITY_REVIEW_HARNESS=${inv_harness}"
         -e "CFGMS_SECURITY_REVIEW_MODEL=${inv_model}"
         -e "CFGMS_SECURITY_REVIEW_LANE_ID=${inv_mode}"
+        # Rate-limit backoff is opt-in inside the lane (Issue #4059): a lane
+        # test's stub reports rate limited on purpose, and waiting that out for
+        # real would make every such suite sit for the whole budget. A REAL
+        # lane always wants to wait, so the variable is set here, at the one
+        # place that launches a real one. The operator's own value wins.
+        -e "CFGMS_SECURITY_REVIEW_RATE_LIMIT_MAX_WAIT_SECONDS=${CFGMS_SECURITY_REVIEW_RATE_LIMIT_MAX_WAIT_SECONDS:-900}"
+        -e "CFGMS_SECURITY_REVIEW_LANE_TIMEOUT_SECONDS=${CFGMS_SECURITY_REVIEW_LANE_TIMEOUT_SECONDS:-3600}"
       )
     fi
 
@@ -3329,6 +3366,7 @@ PY
       "${inv_plan_mount[@]}" \
       "${inv_out_mount[@]}" \
       "${inv_harness_creds_mount[@]}" \
+      "${inv_harness_extra_run_args[@]}" \
       "${inv_lane_entrypoint_mount[@]}" \
       -v "${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh:/usr/local/bin/investigator-entrypoint.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \

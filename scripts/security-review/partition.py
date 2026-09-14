@@ -174,6 +174,19 @@ AUTHZ_ARTIFACT_NAME = "07-authz-store-surface.tsv"
 AXIS_DIRECTORY = "directory"
 AXIS_BOUNDARY = "boundary"
 AXIS_RISK = "risk"
+# One step per threat scenario (Issue #4059). Unlike the other three axes, a
+# scenario step's `files` are EMPTY here and chosen by the planner model from
+# the inventory -- the deliberate exception to Issue #4056 AC6, documented at
+# `planner._inject_partition_fields()`. The harness fixes WHICH risks are
+# reviewed and what each step is called; the model contributes which files bear
+# on that risk, which is the judgement worth benchmarking. Step id is the
+# scenario id, so two planner models produce comparable plans.
+#
+# It differs from `AXIS_RISK` in what it guarantees. The risk axis guarantees a
+# high-risk FILE is seen twice; this guarantees a catalogued RISK is asked
+# about, and unlike the risk axis it supplies the question rather than only a
+# regrouping.
+AXIS_SCENARIO = "scenario"
 
 # Mirrors `planner.HIGH_RISK_TIERS` exactly (Issue #4066) -- kept as an
 # independent, minimal copy for the same import-cycle reason
@@ -181,14 +194,36 @@ AXIS_RISK = "risk"
 # compute the partition, so a reverse import would cycle.
 HIGH_RISK_TIERS = frozenset({"entrypoint", "security"})
 
-# Basis recorded in Issue #4056: measured on the evidence sweep's own bundle
-# (scope pkg/cert + pkg/session, commit 70b3024c), Fable's four steps came to
-# 3441/910/544/1090 non-test loc, and pkg/cert alone is 4895 non-test loc
-# across 17 non-test files. 1500 splits only the one outsized step and leaves
-# the other three intact -- it reproduces the shape of a plan a capable model
-# already produced rather than imposing an invented granularity. A starting
-# point with a recorded basis, not a law -- tune it against later evidence.
-MAX_STEP_NON_TEST_LOC = 1500
+# Raised from 1500 to 3000 (Issue #4059) against full-repository evidence.
+#
+# 1500 was calibrated on a BOUNDED sweep -- two packages, where Fable's own
+# four steps came to 3441/910/544/1090 non-test loc -- and does not generalise.
+# This repository holds 621,684 non-test loc, so a 1500 budget imposes a floor
+# of 415 directory steps and produced 513, against the 203 Fable chose when it
+# planned the same tree itself. The budget, not the grouping, sets the step
+# count, and every step is one invocation per lane: a granularity two and a
+# half times finer than a capable model thought the work needed is paid on
+# every lane of every sweep.
+#
+# Still a starting point with a recorded basis, not a law -- but calibrate the
+# next change against the whole tree, not one package.
+MAX_STEP_NON_TEST_LOC = 3000
+
+# A scenario step is bounded separately, and larger (Issue #4059). The other
+# axes hold one package or one configuration key; a scenario deliberately spans
+# the repository, and 3000 loc reduced TS-12 from the 50 files its planner
+# chose to 2 -- a loud failure traded for a quiet one, which is worse.
+#
+# Sized against the real constraint, which is the finder's context window
+# rather than a number anyone picked. MEASURED on the failing run: TS-12's 50
+# files came to 21,270 non-test loc and produced a ~305,000-token prompt, so
+# this tree averages ~14.3 tokens per line. 10,000 lines is ~143,000 tokens of
+# file content, leaving headroom under a 200,000-token limit for the shared
+# preamble, the scenario, the hypotheses and the scanner evidence.
+#
+# Re-measure this if the limit changes or the corpus shifts -- the ratio is a
+# property of this repository's code, not a constant.
+MAX_SCENARIO_NON_TEST_LOC = 10000
 
 # Mirrors `planner.EXCLUDED_TOP_LEVEL_DIRS` / `REPO_ROOT_BOUNDARY` exactly
 # (kept as an independent, minimal copy rather than an import -- see the
@@ -603,6 +638,14 @@ def _directory_steps(tree_rows: "list[dict]") -> "list[dict]":
     return steps
 
 
+def _boundary_buckets(rows: "list[dict]") -> "list[list[dict]]":
+    """One bucket per boundary-axis step for a single key: the whole key when
+    it fits `MAX_STEP_NON_TEST_LOC`, and nothing at all when it does not."""
+    if sum(_counted_loc(r) for r in rows) <= MAX_STEP_NON_TEST_LOC:
+        return [sorted(rows, key=lambda r: r["path"])]
+    return []
+
+
 def _boundary_steps(tree_rows: "list[dict]", config_rows: "list[dict]") -> "list[dict]":
     root_files = frozenset(r["path"] for r in tree_rows if "/" not in r["path"])
     tree_by_path = {r["path"]: r for r in tree_rows}
@@ -627,7 +670,23 @@ def _boundary_steps(tree_rows: "list[dict]", config_rows: "list[dict]") -> "list
             continue
 
         rows_for_key = [tree_by_path[p] for p in referencing]
-        for bucket in _split_by_loc_budget(rows_for_key):
+        # ONE STEP PER KEY, or none (Issue #4059). `_split_by_loc_budget()`
+        # orders by directory stem so a test file sorts beside its subject --
+        # correct for the directory axis and exactly wrong here, because it
+        # buckets a key's files BY DIRECTORY, the axis this one exists to
+        # escape. Measured on the full tree before the fix: 43 boundary steps
+        # over 29 keys, 11 keys shredded, and 20 of the 43 confined to a single
+        # subtree. `CFGMS_ADMIN_BUNDLE` became one step holding a single test
+        # file and another holding six files elsewhere, so the cross-package
+        # pairing the step exists to show was split apart.
+        #
+        # Over budget, the key is SKIPPED. A boundary step's only property is
+        # that every file touching the key is visible at once; any split
+        # destroys it and leaves something that looks like coverage. A key
+        # referenced that widely is not a trust signal either -- it says
+        # "widely used". The directory axis still covers every one of those
+        # files, and an empty boundary axis is already valid (#4056 AC4c).
+        for bucket in _boundary_buckets(rows_for_key):
             files = sorted(r["path"] for r in bucket)
             steps.append(
                 {
@@ -684,7 +743,38 @@ def _risk_steps(tree_rows: "list[dict]") -> "list[dict]":
     return steps
 
 
-def partition(bundle_dir: str) -> "list[dict]":
+def _scenario_steps(scenario_list: "list[dict] | None") -> "list[dict]":
+    """One step per threat scenario, in catalogue order (Issue #4059).
+
+    `files` is empty and `scope` is the scenario id rather than a path: the
+    planner model selects the files that bear on this risk, because which files
+    those are is a judgement about the code, not something a partition over the
+    file tree can compute. `planner.validate_step()` already bounds every
+    non-directory axis by `MAX_STEP_NON_TEST_LOC` instead of the subtree rule,
+    so a scenario step spanning the repository is valid and a bloated one is
+    not.
+
+    `scenario_list` is passed in rather than loaded here so `partition()` stays
+    a pure function of its arguments -- a test can partition without a
+    catalogue on disk, and the caller owns the fail-closed load.
+    """
+    if not scenario_list:
+        return []
+    return [
+        {
+            "step_id": s["id"],
+            "axis": AXIS_SCENARIO,
+            "scope": s["id"],
+            "files": [],
+            "scenario_id": s["id"],
+            "scenario_tier": s["tier"],
+            "scenario_boundary": s["boundary"],
+        }
+        for s in scenario_list
+    ]
+
+
+def partition(bundle_dir: str, scenario_list: "list[dict] | None" = None) -> "list[dict]":
     """Compute the deterministic step partition for the bundle at
     `bundle_dir` (AC1). Pure function of `01-tree.tsv`, `06-config-surface.tsv`,
     and `07-authz-store-surface.tsv`'s content (Issue #4060) -- the same
@@ -712,4 +802,5 @@ def partition(bundle_dir: str) -> "list[dict]":
         _directory_steps(tree_rows)
         + _boundary_steps(tree_rows, config_rows + authz_rows)
         + _risk_steps(tree_rows)
+        + _scenario_steps(scenario_list)
     )

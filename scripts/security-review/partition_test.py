@@ -69,6 +69,71 @@ def _canon(steps: "list[dict]") -> str:
     return json.dumps(steps, sort_keys=True)
 
 
+# --- Issue #4059: the scenario axis -----------------------------------------
+
+SCENARIO_FIXTURE = [
+    {"id": "TS-01", "tier": "T0", "boundary": "internet-listener",
+     "requirement": "A requirement.", "check": "- **Check:** something."},
+    {"id": "TS-02", "tier": "T2", "boundary": "cross-cutting",
+     "requirement": "Another requirement.", "check": "- **Check:** something else."},
+]
+
+
+def test_scenario_axis_emits_one_step_per_scenario_in_catalogue_order():
+    # REQUIRED: coverage over risk is structural -- a scenario cannot go
+    # unexamined because it always has a step. Order is catalogue order so the
+    # plan is stable across runs and comparable across planner models.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [("pkg/a/a.go", "go", "10", "abcdef123456", "business")])
+        steps = partition.partition(bundle_dir, SCENARIO_FIXTURE)
+    scenario_steps = [s for s in steps if s["axis"] == partition.AXIS_SCENARIO]
+    check(len(scenario_steps) == 2, "scenario axis: one step per scenario", str(len(scenario_steps)))
+    check(
+        [s["step_id"] for s in scenario_steps] == ["TS-01", "TS-02"],
+        "scenario axis: step_id is the scenario id, in catalogue order",
+        str([s["step_id"] for s in scenario_steps]),
+    )
+
+
+def test_scenario_steps_come_last_and_leave_files_to_the_model():
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [("pkg/a/a.go", "go", "10", "abcdef123456", "business")])
+        steps = partition.partition(bundle_dir, SCENARIO_FIXTURE)
+    axes = [s["axis"] for s in steps]
+    check(
+        axes.index(partition.AXIS_SCENARIO) == len(axes) - 2,
+        "scenario axis: scenario steps come after every other axis",
+        str(axes),
+    )
+    check(
+        all(s["files"] == [] for s in steps if s["axis"] == partition.AXIS_SCENARIO),
+        "scenario axis: files are left empty for the model to select",
+    )
+
+
+def test_partition_without_a_catalogue_is_unchanged():
+    # REQUIRED: `partition()` stays a pure function of its arguments. A caller
+    # with no catalogue -- every existing test, and any pre-#4059 sweep --
+    # gets exactly the partition it got before.
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [("pkg/a/a.go", "go", "10", "abcdef123456", "business")])
+        without = partition.partition(bundle_dir)
+        with_empty = partition.partition(bundle_dir, [])
+    check(_canon(without) == _canon(with_empty), "scenario axis: no catalogue and an empty catalogue agree")
+    check(
+        all(s["axis"] != partition.AXIS_SCENARIO for s in without),
+        "scenario axis: no scenario steps are emitted without a catalogue",
+    )
+
+
+def test_scenario_axis_is_deterministic():
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, [("pkg/a/a.go", "go", "10", "abcdef123456", "business")])
+        first = partition.partition(bundle_dir, SCENARIO_FIXTURE)
+        second = partition.partition(bundle_dir, list(reversed(list(reversed(SCENARIO_FIXTURE)))))
+    check(_canon(first) == _canon(second), "scenario axis: repeated calls are byte-identical")
+
+
 # --- AC1: pure function, order-independent ----------------------------------
 
 def test_partition_is_order_independent():
@@ -239,10 +304,18 @@ def test_boundary_axis_empty_when_config_surface_is_header_only():
     )
 
 
-def test_boundary_axis_oversized_key_splits_deterministically():
-    # Tech Lead note: a key whose referencing_files alone exceed the budget
-    # splits into multiple axis:boundary steps keyed to the same config key,
-    # never silently dropping files or emitting an over-budget step.
+def test_boundary_axis_skips_an_oversized_key_rather_than_splitting_it():
+    # CHANGED (Issue #4059). This previously asserted that an over-budget key
+    # SPLITS into several steps. Measured against the real repository, that is
+    # the wrong behaviour: splitting buckets a key's files by directory, which
+    # is the axis the boundary step exists to escape, and it produced steps
+    # confined to one subtree -- twenty of forty-four -- and even single-file
+    # steps. A boundary step's only property is that every file touching the
+    # key is visible at once; a split destroys it and leaves something that
+    # looks like coverage. A key referenced that widely is also not a trust
+    # signal, it just says "widely used". The directory axis still covers every
+    # one of those files, and an empty boundary axis is already valid (#4056
+    # AC4c), so the key is skipped.
     rows = []
     files = []
     for i, top in enumerate(["pkg", "features"]):
@@ -258,17 +331,46 @@ def test_boundary_axis_oversized_key_splits_deterministically():
         steps = partition.partition(bundle_dir)
 
     boundary_steps = [s for s in steps if s["axis"] == "boundary"]
-    check(len(boundary_steps) > 1, "partition: an oversized boundary key splits into more than one step", str(len(boundary_steps)))
     check(
-        all(s["config_key"] == "CFGMS_WIDE_KEY" for s in boundary_steps),
-        "partition: every split step stays keyed to the same config key",
+        boundary_steps == [],
+        "partition: an oversized boundary key yields no boundary step, rather than a split one",
         str(boundary_steps),
     )
-    all_files = sorted(f for s in boundary_steps for f in s["files"])
-    check(all_files == sorted(files), "partition: no file is dropped across the split", str(all_files))
-    for s in boundary_steps:
-        non_test_loc = sum(300 for _ in s["files"])
-        check(non_test_loc <= partition.MAX_STEP_NON_TEST_LOC, "partition: each split boundary step stays within budget", str(non_test_loc))
+    # The files are not lost -- the directory axis covers all of them.
+    covered = {f for s in steps if s["axis"] == "directory" for f in s["files"]}
+    check(
+        covered.issuperset(files),
+        "partition: skipping the key drops no file from the plan",
+        str(sorted(set(files) - covered)),
+    )
+
+
+def test_boundary_axis_keeps_an_in_budget_key_whole():
+    # The property the axis exists for: every file touching one key in ONE
+    # step, spanning subtrees. Asserted directly so a future change that
+    # reintroduces splitting fails here.
+    rows = []
+    files = []
+    for i, top in enumerate(["pkg", "features"]):
+        path = f"{top}/mod{i}/file.go"
+        files.append(path)
+        rows.append((path, "go", "100", f"{'b' * 10}{i}0", "business"))
+    with tempfile.TemporaryDirectory() as bundle_dir:
+        write_tree_tsv(bundle_dir, rows)
+        write_config_tsv(bundle_dir, [
+            ("CFGMS_NARROW_KEY", "env", "2", "|".join(sorted(files)), "unknown", "business"),
+        ])
+        steps = partition.partition(bundle_dir)
+
+    boundary_steps = [s for s in steps if s["axis"] == "boundary"]
+    check(len(boundary_steps) == 1, "partition: an in-budget key is exactly one step", str(len(boundary_steps)))
+    check(
+        sorted(boundary_steps[0]["files"]) == sorted(files),
+        "partition: that step holds every file touching the key",
+        str(boundary_steps[0]["files"]),
+    )
+    tops = {f.split("/")[0] for f in boundary_steps[0]["files"]}
+    check(len(tops) == 2, "partition: and it spans more than one top-level subtree", str(tops))
 
 
 # --- Risk axis (Issue #4066) -------------------------------------------------
