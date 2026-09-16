@@ -276,10 +276,29 @@ def _is_member(value: object, allowed: frozenset) -> bool:
     return isinstance(value, str) and value in allowed
 
 
-def validate_finding(finding: object) -> list[str]:
+def validate_finding(finding: object, known_hypothesis_ids: object = None) -> list[str]:
     """Return a list of validation errors; empty list means valid.
 
     Never raises on malformed input -- a caller checks `errors == []`.
+
+    `known_hypothesis_ids`, when given, is the set of ids the step this
+    finding came from actually carried; a `hypothesis_id` outside it is an
+    error naming the ids that were available. Optional and defaulting to
+    `None` so every existing caller is unchanged: without the step's ids
+    there is nothing to check against, and a caller that cannot supply them
+    must not start failing findings it previously accepted.
+
+    Why this check exists (Issue #4069): models abbreviate the id. Measured
+    on sweep `bench-finders-02`, 75 of 244 findings quoted a bare `h6`
+    instead of the `codex-gpt-6-astra:h6` the step gave them, in all five
+    lanes. A bare `h6` is a non-empty string in a required field, so it
+    passed validation, so the lane's repair round never saw a defect to
+    correct -- and the finding could no longer be traced to the planner that
+    proposed it, which is the provenance the multi-planner merge exists to
+    provide. Three prompt wordings were measured against this and none beat
+    the unmodified contract; the model's run-to-run variance (4% to 52%
+    truncation on identical input) swamped every difference. Checking the id
+    is the fix that does not depend on a model choosing to behave.
     """
     if not isinstance(finding, dict):
         return ["finding must be a JSON object"]
@@ -311,6 +330,15 @@ def validate_finding(finding: object) -> list[str]:
                 errors.append(f"line must be a positive integer (>= 1), got {value!r}")
         elif not isinstance(value, str) or value == "":
             errors.append(f"field {field} must be a non-empty string, got {value!r}")
+
+    if known_hypothesis_ids:
+        known = set(known_hypothesis_ids)
+        found = finding.get("hypothesis_id")
+        if isinstance(found, str) and found and found not in known:
+            errors.append(
+                f"hypothesis_id {found!r} is not one this step carried; copy one of "
+                f"{sorted(known)!r} exactly"
+            )
 
     if "end_line" in finding:
         end_line = finding["end_line"]

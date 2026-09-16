@@ -1017,6 +1017,36 @@ def test_enum_fields_holding_json_arrays_or_objects_are_errors_not_exceptions():
             check(ok, f"{name}: {bad!r} is a validation error, never an exception", detail)
 
 
+def test_validate_finding_accepts_any_hypothesis_id_without_step_ids():
+    f = valid_finding(hypothesis_id="h3")
+    check(schema.validate_finding(f) == [],
+          "validate_finding: without step ids a bare id is still accepted (callers unchanged)")
+
+
+def test_validate_finding_rejects_an_id_the_step_never_carried():
+    # Issue #4069: models abbreviate codex-gpt-6-astra:h6 to h6. A bare id is a
+    # non-empty string in a required field, so it passed and the lane's repair
+    # round never saw a defect to correct.
+    f = valid_finding(hypothesis_id="h3")
+    errors = schema.validate_finding(f, {"codex-gpt-6-astra:h3", "codex-gpt-6-astra:h4"})
+    check(len(errors) == 1, "validate_finding: a truncated id is one error", repr(errors))
+    check("h3" in errors[0] and "codex-gpt-6-astra:h3" in errors[0],
+          "validate_finding: the error names both what was written and what was available",
+          repr(errors))
+
+
+def test_validate_finding_accepts_the_full_id():
+    f = valid_finding(hypothesis_id="codex-gpt-6-astra:h3")
+    check(schema.validate_finding(f, {"codex-gpt-6-astra:h3"}) == [],
+          "validate_finding: the exact id validates")
+
+
+def test_validate_finding_empty_id_set_disables_the_check():
+    f = valid_finding(hypothesis_id="h3")
+    check(schema.validate_finding(f, set()) == [],
+          "validate_finding: an empty id set is treated as 'nothing to check against'")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

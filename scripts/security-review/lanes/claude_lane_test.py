@@ -1014,6 +1014,163 @@ def test_run_lane_folds_scanner_evidence_into_prompt_and_envelope() -> None:
         check(isinstance(scans, list) and any(e.get("gap") == "unsupported_language" for e in scans), "envelope records the scan summary with the gap", repr(scans))
 
 
+def test_rate_limit_detector_ignores_digits_inside_numbers():
+    # The measured false positive: a scanner's own timing value contains the
+    # digits 429, and the markers are matched against the harness's COMBINED
+    # output, which includes the model's answer. A finished step was parked.
+    check(
+        not claude_lane._looks_rate_limited('"rules_parse_time":0.015944957733154297'),
+        "claude_lane: a timing number containing 429 is not a rate limit",
+    )
+    check(
+        not claude_lane._looks_rate_limited("line 429 is missing a bounds check"),
+        "claude_lane: a line number 429 is not a rate limit",
+    )
+    check(
+        not claude_lane._looks_rate_limited("elapsed 4290ms"),
+        "claude_lane: 429 inside a larger number is not a rate limit",
+    )
+
+
+def test_rate_limit_detector_ignores_a_finding_about_rate_limiting():
+    # A security review's answer is the text most likely to discuss rate
+    # limiting. Saying an endpoint lacks one must not park the step reporting it.
+    for text in (
+        "the endpoint has no rate limit",
+        "add a rate limit to this handler",
+        "no usage limit is enforced",
+    ):
+        check(
+            not claude_lane._looks_rate_limited(text),
+            "claude_lane: a finding about rate limiting is not a rate limit",
+            repr(text),
+        )
+
+
+def test_rate_limit_detector_still_matches_real_limits():
+    for text in (
+        "HTTP 429 too many requests",
+        "429 Too Many Requests",
+        "status: 429",
+        "Usage limit reached, try later",
+        "rate limit exceeded",
+        "You have hit your usage limit",
+        "quota exceeded",
+    ):
+        check(
+            claude_lane._looks_rate_limited(text),
+            "claude_lane: a real rate limit is still detected",
+            repr(text),
+        )
+
+
+def make_sequenced_harness_stub(responses: list, prompts: list):
+    """A `call_harness_fn` serving `responses` in order, one per call, recording
+    every prompt it was handed. Each response is `(exit_code, rate_limited,
+    raw_body_or_None)`; `None` writes no answer file. Calls past the end raise --
+    a test expecting two calls must fail loudly, not silently, on a third."""
+
+    def _stub(model, prompt, output_path):
+        prompts.append(prompt)
+        exit_code, rate_limited, raw_body = responses[len(prompts) - 1]
+        if raw_body is not None:
+            with open(output_path, "w") as f:
+                json.dump(raw_body, f)
+        return exit_code, rate_limited, ""
+
+    return _stub
+
+
+def _no_cwe(**overrides) -> dict:
+    finding = good_finding(**overrides)
+    del finding["cwe"]
+    return finding
+
+
+def test_a_finding_missing_a_required_field_is_repaired():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [_no_cwe()]}), (0, False, {"findings": [good_finding()]})],
+                prompts,
+            ),
+        )
+        check(len(prompts) == 2, "repair: exactly one repair call was made", str(len(prompts)))
+        repair_prompt = prompts[1] if len(prompts) > 1 else ""
+        check("missing required field: cwe" in repair_prompt,
+              "repair: the repair prompt names the exact defect", repr(repair_prompt[:300]))
+        check(written[0]["state"] == "complete",
+              "repair: a repaired step ends complete", repr(written[0]["state"]))
+
+
+def test_a_truncated_hypothesis_id_is_repaired():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001", hypotheses=[{
+            "id": "codex-gpt-6-astra:h1", "objective": "o",
+            "required_evidence": "e", "planner": "codex-gpt-6-astra"}])
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [good_finding(hypothesis_id="h1")]}),
+                 (0, False, {"findings": [good_finding(hypothesis_id="codex-gpt-6-astra:h1")]})],
+                prompts,
+            ),
+        )
+        check(len(prompts) == 2, "repair: a truncated hypothesis id triggers a repair",
+              str(len(prompts)))
+        check(written[0]["state"] == "complete",
+              "repair: the step completes once the id is corrected", repr(written[0]["state"]))
+
+
+def test_a_rate_limited_call_is_never_repaired():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub([(1, True, None)], prompts),
+        )
+        check(len(prompts) == 1, "repair: a rate-limited call is not repaired", str(len(prompts)))
+        check(written[0]["state"] == "parked", "repair: a rate-limited step still parks",
+              repr(written[0]["state"]))
+
+
+def test_a_complete_step_leaves_no_diagnostics():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub([(0, False, {"findings": []})], prompts),
+        )
+        check(written[0]["state"] == "complete", "diagnostics: the step completes")
+        check(not os.path.isdir(harness_runner.step_diagnostics_dir(out_dir)),
+              "diagnostics: a complete step leaves nothing behind")
+
+
+def test_a_failed_step_keeps_its_prompt():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [_no_cwe()]}), (0, False, {"findings": [_no_cwe()]})],
+                prompts,
+            ),
+        )
+        diag = harness_runner.step_diagnostics_dir(out_dir)
+        names = sorted(os.listdir(diag)) if os.path.isdir(diag) else []
+        check(any(n.endswith(".prompt.txt") for n in names),
+              "diagnostics: a failed step keeps the prompt that produced it", str(names))
+        check(any("repair1-prompt" in n for n in names),
+              "diagnostics: the repair prompt is kept separately", str(names))
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

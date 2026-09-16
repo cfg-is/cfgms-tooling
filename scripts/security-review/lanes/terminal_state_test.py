@@ -108,15 +108,41 @@ def test_classify_rate_limited_signal_is_parked():
         check(state == terminal_state.PARKED, "classify: an explicit rate-limit signal is parked", state)
 
 
-def test_classify_rate_limited_takes_priority_over_a_valid_findings_file():
-    # A rate-limit/quota signal is authoritative regardless of what else is on
-    # disk -- e.g. a harness that writes a partial findings file before being
-    # cut off by its own subscription quota must still park, not complete.
+def test_classify_a_valid_findings_file_outranks_the_rate_limit_signal():
+    # Issue #4069, reversing the earlier precedence. The signal is a substring
+    # match over the harness's combined output, which includes the model's own
+    # answer -- so it false-positives on exactly the text a security review
+    # produces. Measured: a finished step was parked because a scanner's timing
+    # value, 0.015944957733154297, contains the digits 429.
+    #
+    # A call that left a VALID findings file behind produced an answer, so it
+    # was not cut off. A harness truncated mid-write leaves an unparseable file,
+    # which is not valid and still parks -- see the next test.
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "step-005.findings.json")
         write_findings(path, {"findings": []})
         state = terminal_state.classify(0, path, rate_limited=True)
-        check(state == terminal_state.PARKED, "classify: rate_limited overrides an otherwise-complete artifact", state)
+        check(
+            state == terminal_state.COMPLETE,
+            "classify: a valid findings file is never discarded as rate limited",
+            state,
+        )
+
+
+def test_classify_rate_limited_still_parks_without_a_valid_artifact():
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = os.path.join(tmp, "step-006.findings.json")
+        check(
+            terminal_state.classify(0, missing, rate_limited=True) == terminal_state.PARKED,
+            "classify: a rate limit with no findings file still parks",
+        )
+        truncated = os.path.join(tmp, "step-007.findings.json")
+        with open(truncated, "w") as f:
+            f.write('{"findings": [')
+        check(
+            terminal_state.classify(0, truncated, rate_limited=True) == terminal_state.PARKED,
+            "classify: a rate limit with a truncated findings file still parks",
+        )
 
 
 # --- C3 table row: non-zero exit, or a malformed file -> failed ------------

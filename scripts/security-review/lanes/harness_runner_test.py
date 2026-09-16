@@ -2370,6 +2370,128 @@ def test_remove_step_temp_artifacts_never_removes_diagnostics():
         )
 
 
+def _valid_finding() -> dict:
+    return {
+        "hypothesis_id": "h1", "file": "pkg/a/b.go", "symbol": "S.Do", "line": 4,
+        "vuln_class": "injection", "cwe": "CWE-89", "severity": "high",
+        "confidence": "medium", "title": "t", "evidence": "e", "suggested_fix": "f",
+        "sweep_id": "s", "commit_sha": "c" * 40, "lane": "l", "step_id": "step-001",
+    }
+
+
+def test_describe_findings_defects_is_empty_when_every_finding_validates():
+    check(
+        harness_runner.describe_findings_defects([_valid_finding()]) == [],
+        "describe_findings_defects: a valid finding produces no defect line",
+    )
+
+
+def test_describe_findings_defects_names_the_index_and_the_error():
+    broken = _valid_finding()
+    del broken["cwe"]
+    defects = harness_runner.describe_findings_defects([_valid_finding(), broken])
+    check(len(defects) == 1, "describe_findings_defects: one line per invalid finding", str(defects))
+    check(
+        defects[0].startswith("findings[1]:") and "cwe" in defects[0],
+        "describe_findings_defects: the line names the position and the missing field",
+        str(defects),
+    )
+
+
+def test_build_repair_prompt_carries_the_defects_and_the_previous_answer():
+    prompt = harness_runner.build_repair_prompt(
+        ["findings[0]: missing required field: cwe"], '{"findings": []}'
+    )
+    check("missing required field: cwe" in prompt, "build_repair_prompt: carries the defect")
+    check('{"findings": []}' in prompt, "build_repair_prompt: carries the previous answer")
+    check(
+        harness_runner.OUTPUT_SCHEMA_DESCRIPTION in prompt,
+        "build_repair_prompt: carries the output contract",
+    )
+
+
+def test_build_repair_prompt_falls_back_to_the_unparseable_message():
+    prompt = harness_runner.build_repair_prompt([], "not json at all")
+    check(
+        harness_runner.UNPARSEABLE_ANSWER_DEFECT in prompt,
+        "build_repair_prompt: no per-finding defect means the answer itself was unparseable",
+        repr(prompt[:300]),
+    )
+
+
+def test_build_repair_prompt_bounds_a_huge_previous_answer():
+    huge = "x" * (harness_runner.REPAIR_PREVIOUS_ANSWER_MAX_CHARS + 5_000)
+    prompt = harness_runner.build_repair_prompt(["findings[0]: bad"], huge)
+    embedded = prompt.split("Your previous answer:\n", 1)[1].rstrip("\n")
+    check(
+        len(embedded) == harness_runner.REPAIR_PREVIOUS_ANSWER_MAX_CHARS,
+        "build_repair_prompt: an oversized previous answer is bounded",
+        str(len(embedded)),
+    )
+
+
+def test_repair_budget_is_capped_at_two_attempts():
+    check(
+        harness_runner.REPAIR_MAX_ATTEMPTS == 2,
+        "repair: the hard cap is two attempts, so a model converging one defect "
+        "at a time cannot walk a rate-limited account's budget to zero",
+        str(harness_runner.REPAIR_MAX_ATTEMPTS),
+    )
+
+
+def test_repair_signature_separates_unparseable_from_schema_defects():
+    check(
+        harness_runner.repair_signature(None, []) == harness_runner.UNPARSEABLE_SIGNATURE,
+        "repair_signature: an answer that did not parse has its own signature",
+    )
+    check(
+        harness_runner.repair_signature([{}, {}], ["a", "b"]) == ("schema", 2),
+        "repair_signature: a parsing answer carries its defect count",
+    )
+
+
+def test_repair_progress_when_an_unparseable_answer_starts_parsing():
+    check(
+        harness_runner.repair_made_progress(
+            harness_runner.UNPARSEABLE_SIGNATURE, ("schema", 60)
+        ),
+        "repair_made_progress: unparseable -> parseable is progress even with many defects",
+    )
+
+
+def test_repair_progress_when_the_defect_count_shrinks():
+    check(
+        harness_runner.repair_made_progress(("schema", 60), ("schema", 3)),
+        "repair_made_progress: fewer defects is progress",
+    )
+
+
+def test_repair_no_progress_when_the_defect_count_holds_or_grows():
+    check(
+        not harness_runner.repair_made_progress(("schema", 2), ("schema", 2)),
+        "repair_made_progress: the same defect count is not progress",
+    )
+    check(
+        not harness_runner.repair_made_progress(("schema", 2), ("schema", 5)),
+        "repair_made_progress: more defects is not progress",
+    )
+
+
+def test_repair_no_progress_when_a_parsing_answer_stops_parsing():
+    check(
+        not harness_runner.repair_made_progress(
+            ("schema", 2), harness_runner.UNPARSEABLE_SIGNATURE
+        ),
+        "repair_made_progress: a parsing answer that stopped parsing went backwards",
+    )
+    check(
+        not harness_runner.repair_made_progress(
+            harness_runner.UNPARSEABLE_SIGNATURE, harness_runner.UNPARSEABLE_SIGNATURE
+        ),
+        "repair_made_progress: still unparseable is not progress",
+    )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

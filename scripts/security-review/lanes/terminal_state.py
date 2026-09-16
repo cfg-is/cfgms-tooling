@@ -61,7 +61,7 @@ FAILED = "failed"
 TERMINAL_STATES = frozenset({COMPLETE, PARKED, REFUSED, FAILED})
 
 
-def _load_findings(findings_path: str) -> list | None:
+def _load_findings(findings_path: str, known_hypothesis_ids: object = None) -> list | None:
     """Return the validated `findings` list at `findings_path`, or `None` if
     the file is absent, unparseable, not the expected shape, or contains any
     finding that fails `schema.validate_finding`.
@@ -83,12 +83,17 @@ def _load_findings(findings_path: str) -> list | None:
     if not isinstance(findings, list):
         return None
     for finding in findings:
-        if schema.validate_finding(finding):
+        if schema.validate_finding(finding, known_hypothesis_ids):
             return None
     return findings
 
 
-def classify(exit_code: int, findings_path: str | None, rate_limited: bool = False) -> str:
+def classify(
+    exit_code: int,
+    findings_path: str | None,
+    rate_limited: bool = False,
+    known_hypothesis_ids: object = None,
+) -> str:
     """Derive one of the four C3 terminal states from the artifact a harness
     process left behind.
 
@@ -101,7 +106,25 @@ def classify(exit_code: int, findings_path: str | None, rate_limited: bool = Fal
 
     Never raises. Always returns a member of `TERMINAL_STATES`.
     """
-    if rate_limited:
+    findings = (
+        _load_findings(findings_path, known_hypothesis_ids)
+        if findings_path and os.path.isfile(findings_path)
+        else None
+    )
+
+    # THE ARTIFACT OUTRANKS THE SIGNAL. A call that left a valid findings file
+    # behind produced an answer, so it was not rate limited -- whatever its
+    # output text said. Checking `rate_limited` first meant one loose substring
+    # match discarded a complete review and recorded it "retry later".
+    #
+    # Measured: a lane parked a finished step because a scanner's own timing
+    # number, `"rules_parse_time":0.015944957733154297`, contains the digits
+    # 429. The markers are scanned against the harness's combined output, which
+    # includes the model's answer -- and a security review's answer is exactly
+    # the text most likely to contain both a stray `429` and the words "rate
+    # limit". Tightening the markers (see each lane's `_looks_rate_limited`)
+    # narrows that; this ordering is what makes a false positive harmless.
+    if rate_limited and findings is None:
         return PARKED
 
     if exit_code != 0:
@@ -110,7 +133,6 @@ def classify(exit_code: int, findings_path: str | None, rate_limited: bool = Fal
     if not findings_path or not os.path.isfile(findings_path):
         return REFUSED
 
-    findings = _load_findings(findings_path)
     if findings is None:
         return FAILED
 

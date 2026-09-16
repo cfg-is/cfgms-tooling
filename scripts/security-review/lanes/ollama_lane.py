@@ -186,8 +186,6 @@ OLLAMA_TIMEOUT_SECONDS = harness_runner.lane_timeout_seconds()
 # recognizing it is explicitly a caller concern. Best-effort text match over
 # the subprocess's combined stdout+stderr, case-insensitive; the same marker
 # set every other lane uses.
-_RATE_LIMIT_MARKERS = ("rate limit", "usage limit", "quota exceeded", "429")
-
 # The exact phrase Ollama Cloud's own 401 response carries, confirmed against
 # the real CLI while writing #3976 ("You need to be signed in to Ollama to run
 # Cloud models.") and reused verbatim in this story's own JSON-shaped variant
@@ -201,9 +199,33 @@ _RATE_LIMIT_MARKERS = ("rate limit", "usage limit", "quota exceeded", "429")
 _NOT_SIGNED_IN_MARKER = "signed in"
 
 
+# Issue #4069: a rate limit must look like a rate limit, not like three digits.
+# The previous markers were bare substrings -- "rate limit", "usage limit",
+# "quota exceeded", "429" -- tested against the harness's COMBINED output, which
+# includes the model's own answer. A security review's answer is precisely the
+# text most likely to contain both: a finding that says an endpoint "has no rate
+# limit", and a stray 429 inside any number. Measured: a finished step was
+# parked because a scanner's timing value, 0.015944957733154297, contains 429.
+#
+# Every alternative below needs a companion word, so a number alone and a
+# finding that merely discusses rate limiting no longer match. A real limit that
+# is phrased differently is missed and the step records a failure instead --
+# visible and retryable, unlike silently discarding a complete review.
+_RATE_LIMIT_RE = re.compile(
+    r"too\s+many\s+requests"
+    r"|(?:http|https|status(?:\s+code)?|code|error)\s*[:/]?\s*429\b"
+    r"|rate[\s_-]?limit(?:s|ed|ing)?[\s:,.-]+(?:exceeded|reached|hit|error)"
+    r"|(?:exceeded|reached|hit)\s+(?:your\s+|the\s+)*rate[\s_-]?limit"
+    r"|usage\s+limit[\s:,.-]+(?:exceeded|reached)"
+    r"|(?:exceeded|reached|hit)\s+(?:your\s+|the\s+)*usage\s+limit"
+    r"|quota\s+(?:exceeded|exhausted)"
+    r"|(?:exceeded|exhausted)\s+(?:your\s+|the\s+)*quota",
+    re.IGNORECASE,
+)
+
+
 def _looks_rate_limited(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+    return bool(_RATE_LIMIT_RE.search(text or ""))
 
 
 def _looks_not_signed_in(text: str) -> bool:
@@ -551,6 +573,33 @@ def _diagnostic_base(output_path: str) -> str:
     return base[:-5] if base.endswith(".json") else base
 
 
+def _previous_answer_text(out_dir: str, raw_path: str) -> str:
+    """What the model actually said on the call now being repaired.
+
+    Prefers the extracted JSON object at `raw_path` -- the answer as the model
+    wrote it, before enrichment adds the harness-owned identity fields, so a
+    repair round never shows the model fields it must not supply. Falls back to
+    the raw stdout `call_ollama_harness` preserved under `diagnostics/`, which
+    is the only surviving record when extraction found no JSON at all. Returns
+    `""` when neither survives: there is then nothing to repair, and the caller
+    must not spend a call asking the model to correct an answer it cannot see.
+    """
+    try:
+        with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        pass
+    diag_path = os.path.join(
+        harness_runner.step_diagnostics_dir(out_dir),
+        f"{_diagnostic_base(raw_path)}.stdout.txt",
+    )
+    try:
+        with open(diag_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def _raw_output_path(out_dir: str, step_id: str) -> str:
     return os.path.join(out_dir, f".{step_id}.ollama-raw.json")
 
@@ -802,9 +851,96 @@ def run_lane(
                     launch_exc = exc
                     break
 
+                # Issue #4069: the ids this task actually showed the model. A
+                # finding quoting anything else is a defect, so classify() must
+                # see them -- otherwise the envelope reads `complete` and the
+                # repair round below never fires. Task-scoped, not step-scoped:
+                # a split step shows each task only its own subset.
+                task_hypothesis_ids = {
+                    h.get("id") for h in task_hypotheses if isinstance(h, dict) and h.get("id")
+                }
                 enriched = _build_candidate(raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id)
                 findings_path = candidate_path if enriched is not None else None
-                task_state = terminal_state.classify(exit_code, findings_path, rate_limited=rate_limited)
+                task_state = terminal_state.classify(
+                    exit_code, findings_path, rate_limited=rate_limited,
+                    known_hypothesis_ids=task_hypothesis_ids,
+                )
+
+                # Issue #4059: one repair round. Both measured ollama failures
+                # were a complete, correct review thrown away over
+                # transcription -- one answer omitted the opening quote on a
+                # long string value, the other omitted one required field from
+                # its single finding. Handing the model the exact defect and
+                # its own previous answer recovers the whole step for one small
+                # call: a repair prompt carries no file contents, so it is a
+                # fraction of the original's size.
+                #
+                # Never attempted for a rate-limited call. That is not a
+                # defective answer, it is no answer, and `parked` already means
+                # "retry this later" -- spending the repair budget on it would
+                # burn the one attempt a genuinely repairable answer needs.
+                if task_state != terminal_state.COMPLETE and not rate_limited:
+                    attempt = 0
+                    defects = (
+                        harness_runner.describe_findings_defects(enriched, task_hypothesis_ids)
+                        if enriched is not None
+                        else []
+                    )
+                    signature = harness_runner.repair_signature(enriched, defects)
+                    while attempt < harness_runner.REPAIR_MAX_ATTEMPTS:
+                        previous_answer = _previous_answer_text(out_dir, raw_path)
+                        if not previous_answer:
+                            break
+                        attempt += 1
+                        repair_prompt = harness_runner.build_repair_prompt(defects, previous_answer)
+                        harness_runner.write_step_diagnostic(
+                            out_dir,
+                            f"{_diagnostic_base(raw_path)}.repair{attempt}-prompt.txt",
+                            repair_prompt,
+                        )
+                        schema.log_event(
+                            "step_repair_attempted",
+                            step_id=step_id,
+                            attempt=attempt,
+                            defects=len(defects),
+                        )
+                        try:
+                            exit_code, rate_limited, output_tail = (
+                                harness_runner.call_with_rate_limit_backoff(
+                                    call_harness_fn, model, repair_prompt, raw_path
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step
+                            launch_exc = exc
+                            break
+                        enriched = _build_candidate(
+                            raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id
+                        )
+                        findings_path = candidate_path if enriched is not None else None
+                        task_state = terminal_state.classify(
+                            exit_code, findings_path, rate_limited=rate_limited,
+                            known_hypothesis_ids=task_hypothesis_ids,
+                        )
+                        schema.log_event(
+                            "step_repair_result",
+                            step_id=step_id,
+                            attempt=attempt,
+                            state=task_state,
+                        )
+                        if task_state == terminal_state.COMPLETE or rate_limited:
+                            break
+                        defects = (
+                            harness_runner.describe_findings_defects(enriched, task_hypothesis_ids)
+                            if enriched is not None
+                            else []
+                        )
+                        next_signature = harness_runner.repair_signature(enriched, defects)
+                        if not harness_runner.repair_made_progress(signature, next_signature):
+                            break
+                        signature = next_signature
+                    if launch_exc is not None:
+                        break
+
                 task_states.append(task_state)
 
                 if task_state == terminal_state.COMPLETE:

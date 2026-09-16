@@ -145,37 +145,52 @@ SYSTEM_PROMPT = (
 # the same C4 single-sourcing this module already applies to the methodology
 # document is applied here to the closed CWE vocabulary too.
 def _build_output_schema_description() -> str:
+    """The output contract, shared by all four lanes (C4).
+
+    Describes the SHAPE only. Each lane states its own destination -- a file
+    path for claude and opencode, standard output for codex and ollama -- so
+    naming one here would contradict two of the four in the same prompt.
+    """
     cwe_list = ", ".join(f'"{cwe}"' for cwe in sorted(schema.CWE_VALUES))
     return (
-        'Write a single JSON object of the exact shape {"findings": [...], '
-        '"dispositions": [...]} to the output file. '
-        '"dispositions" is a JSON array with exactly one entry per hypothesis you '
-        "were given -- every hypothesis id must appear exactly once. Each entry is a "
-        'JSON object with exactly these string fields: "hypothesis_id" (the id of '
-        'the hypothesis this entry resolves), "disposition" (one of '
-        '"investigated"/"candidate_found"/"inconclusive"/"not_attempted"), and '
-        '"summary" (what you found, or why you could not investigate it). Use '
-        '"not_attempted" only for a hypothesis you genuinely could not get to -- '
-        "never fabricate a summary for one you skipped, and never invent a "
-        "hypothesis id that was not given to you. "
-        '"findings" is a JSON array, empty if you found nothing -- a '
-        "genuinely clean review is a valid, expected result. Each element is a JSON "
-        'object with these fields, all required except "end_line": "hypothesis_id" '
-        '(the id of the hypothesis this finding resulted from), "file" '
-        '(repo-relative path), "symbol" (function/method/type name), "line" '
-        "(integer, 1 or greater -- the primary line number the defect concerns), "
-        '"end_line" (integer >= "line", only when the defect spans more than one '
-        'line -- omit it otherwise), "vuln_class" (a short vulnerability-class '
-        f'label), "cwe" (exactly one of {cwe_list}, or "other: <short label>" when '
-        'none of those fits -- never a bare number, never free text outside that '
-        'escape), "severity" (one of "low"/"medium"/"high"/"critical"), '
-        '"confidence" (one of "low"/"medium"/"high"), "title", "evidence" (why this '
-        'is a real, exploitable issue), and "suggested_fix". "line"/"end_line" are '
-        "read as a hint at where to look, never verified against the file -- get "
-        "them as close as you can, but a defect is never dropped for an uncertain "
-        "line. Findings are de-duplicated by file + symbol + vuln_class, never by "
-        "line -- report the same defect once even if you are unsure of the exact "
-        "line. Include no fields beyond these."
+        'A single JSON object: {"findings": [...], "dispositions": [...]}\n'
+        "\n"
+        '"dispositions" -- one entry per hypothesis you were given, every id '
+        "exactly once:\n"
+        '  "hypothesis_id"  the hypothesis this entry resolves\n'
+        '  "disposition"    "investigated" | "candidate_found" | "inconclusive" '
+        '| "not_attempted"\n'
+        '  "summary"        what you found, or why you could not investigate it\n'
+        "\n"
+        'Use "not_attempted" only for a hypothesis you did not investigate. '
+        "Never invent a hypothesis id.\n"
+        "\n"
+        '"findings" -- one entry per defect. An empty array is a valid result.\n'
+        'Every field below is required except "end_line". Add no other fields.\n'
+        '  "hypothesis_id"  the hypothesis this finding came from\n'
+        '  "file"           repo-relative path\n'
+        '  "symbol"         function, method, or type name\n'
+        '  "line"           integer, 1 or greater\n'
+        '  "end_line"       integer >= "line", only when the defect spans '
+        "several lines\n"
+        '  "vuln_class"     short vulnerability-class label\n'
+        # Measured, not styled. nemotron-3-super omitted "cwe" on 74 of 110
+        # findings (67%) without this line and 0 of 94 with it, same prompt,
+        # four samples each -- it emits "vuln_class" and treats "cwe" as the
+        # same field unless told otherwise at the point it chooses. Reword only
+        # with a fresh measurement; the wording below is the one that was tested.
+        '  (every finding needs BOTH "vuln_class" and "cwe" below -- they are '
+        "different fields)\n"
+        f'  "cwe"            exactly one of: {cwe_list}\n'
+        '                   or "other: <short label>" when none of those fits\n'
+        '  "severity"       "low" | "medium" | "high" | "critical"\n'
+        '  "confidence"     "low" | "medium" | "high"\n'
+        '  "title"          one line\n'
+        '  "evidence"       why this is a real, exploitable issue\n'
+        '  "suggested_fix"  what to change\n'
+        "\n"
+        '"line" is a hint; get it close. Report each defect once -- duplicates '
+        'are matched on "file" + "symbol" + "vuln_class".'
     )
 
 
@@ -988,7 +1003,12 @@ def call_with_rate_limit_backoff(call_fn, model, prompt, raw_path, sleep_fn=None
     delay = RATE_LIMIT_FIRST_WAIT_SECONDS
     while True:
         exit_code, rate_limited, output_tail = call_fn(model, prompt, raw_path)
-        if not rate_limited:
+        # A call that wrote its answer is not retried, whatever its output text
+        # said. Without this, one loose marker match in a model's own findings
+        # makes a FINISHED step sleep out the whole wait budget before being
+        # parked -- the cost of a false positive goes from wrong to expensive.
+        # `terminal_state.classify` applies the same precedence.
+        if not rate_limited or os.path.isfile(raw_path):
             return exit_code, rate_limited, output_tail
         if waited + delay > budget:
             return exit_code, rate_limited, output_tail
@@ -1135,6 +1155,142 @@ def write_step_diagnostic(lane_dir: str, name: str, text: str) -> "str | None":
         return path
     except OSError:
         return None
+
+
+# A repair round is worth repeating only while it is converging. Measured on the
+# six-step benchmark: one step's first answer was unparseable, the repair fixed
+# the JSON, and the now-readable answer turned out to omit a required field on
+# all 60 of its findings. The defect class had CHANGED -- the answer was
+# strictly better -- but the budget was already spent, so a recoverable step was
+# recorded failed.
+#
+# An attempt that changes the defect class, or shrinks the defect count, is
+# evidence the model is converging and earns one more. An attempt that
+# reproduces the same defect earns nothing: a model that repeats its own error
+# verbatim will repeat it again. Hard cap regardless, so a model that converges
+# by one defect at a time cannot walk a rate-limited account's budget to zero.
+REPAIR_MAX_ATTEMPTS = 2
+
+UNPARSEABLE_SIGNATURE = ("unparseable",)
+
+
+def repair_signature(enriched: "list | None", defects: list) -> tuple:
+    """A comparable summary of what is wrong with one answer: either it did not
+    parse into the expected shape at all, or it parsed and carries a count of
+    schema defects. Compared across attempts by `repair_made_progress`."""
+    if enriched is None:
+        return UNPARSEABLE_SIGNATURE
+    return ("schema", len(defects))
+
+
+def repair_made_progress(previous: tuple, current: tuple) -> bool:
+    """True when `current` is strictly better than `previous`.
+
+    Two ways to be better: an answer that did not parse now parses, or a
+    parsing answer carries strictly fewer schema defects. Everything else --
+    the same count, more defects, or a parsing answer that stopped parsing --
+    is not progress, and the caller stops rather than spending another call.
+    """
+    if previous == UNPARSEABLE_SIGNATURE:
+        return current != UNPARSEABLE_SIGNATURE
+    if current == UNPARSEABLE_SIGNATURE:
+        return False
+    return current[1] < previous[1]
+
+# A repair prompt carries the previous answer but NOT the step's file
+# contents, so it is a fraction of the original prompt's size and costs a
+# fraction of its time. This cap bounds the pathological case (a model that
+# answered with megabytes) rather than the normal one.
+REPAIR_PREVIOUS_ANSWER_MAX_CHARS = 120_000
+
+UNPARSEABLE_ANSWER_DEFECT = (
+    'your answer was not a JSON object of the shape '
+    '{"findings": [...], "dispositions": [...]}'
+)
+
+
+def describe_findings_defects(findings: list, known_hypothesis_ids: object = None) -> list:
+    """One line per schema violation across `findings`, indexed by the
+    position the model wrote each finding at, so a repair prompt can name
+    exactly which entry to fix. Empty when every finding validates.
+
+    Validate the ENRICHED findings, not the raw ones: the harness-owned
+    identity fields are added before validation, so a defect reported here is
+    always the model's own and never an artifact of enrichment."""
+    defects: list = []
+    for index, finding in enumerate(findings):
+        errors = schema.validate_finding(finding, known_hypothesis_ids)
+        if errors:
+            defects.append(f"findings[{index}]: " + "; ".join(errors))
+    return defects
+
+
+def build_repair_prompt(defects: list, previous_answer: str) -> str:
+    """The prompt for one repair round: the defects, the output contract, and
+    the model's own previous answer.
+
+    Deliberately omits the step's file contents. The model has already done
+    the review; what is being asked for is a transcription fix, and re-sending
+    hundreds of kilobytes of source invites it to review again from scratch
+    and produce a different answer rather than correct this one."""
+    answer = previous_answer or ""
+    if len(answer) > REPAIR_PREVIOUS_ANSWER_MAX_CHARS:
+        answer = answer[:REPAIR_PREVIOUS_ANSWER_MAX_CHARS]
+    defect_lines = "\n".join(f"- {d}" for d in defects) if defects else f"- {UNPARSEABLE_ANSWER_DEFECT}"
+    return (
+        "Your previous answer was rejected. Correct it.\n\n"
+        "Rejected because:\n"
+        f"{defect_lines}\n\n"
+        "Keep every finding and every disposition you already wrote. Change only "
+        "what the list above names. Do not review the code again. Do not add or "
+        "remove findings.\n\n"
+        "Required shape:\n"
+        f"{OUTPUT_SCHEMA_DESCRIPTION}\n\n"
+        "Print the corrected JSON object, and only that object, to standard "
+        "output -- no prose before or after it.\n\n"
+        "Your previous answer:\n"
+        f"{answer}\n"
+    )
+
+
+def write_call_diagnostics(
+    output_path: str, model: str, exit_code: int, prompt: str, stdout: str, stderr: str,
+    timeout: float,
+) -> None:
+    """Preserve what a failing harness call printed, for lanes whose harness
+    writes its own answer file (claude, codex, opencode).
+
+    Called only when the call failed -- a non-zero exit, or no answer file
+    written. A `complete` call keeps nothing, for the reason
+    `write_step_diagnostic` gives: a full-repository sweep would otherwise
+    write hundreds of megabytes to answer a question nobody asked.
+
+    The filename stem comes from `output_path` so it carries the step id and
+    any `.taskN` suffix, matching what each lane's own `_diagnostic_base`
+    derives. Never raises."""
+    base = os.path.basename(output_path).lstrip(".")
+    if base.endswith(".json"):
+        base = base[:-5]
+    lane_dir = os.path.dirname(output_path)
+    write_step_diagnostic(lane_dir, f"{base}.stdout.txt", stdout)
+    write_step_diagnostic(lane_dir, f"{base}.stderr.txt", stderr)
+    write_step_diagnostic(lane_dir, f"{base}.prompt.txt", prompt)
+    write_step_diagnostic(
+        lane_dir,
+        f"{base}.meta.json",
+        json.dumps(
+            {
+                "model": model,
+                "exit_code": exit_code,
+                "answer_file_written": os.path.isfile(output_path),
+                "prompt_chars": len(prompt or ""),
+                "stdout_chars": len(stdout or ""),
+                "stderr_chars": len(stderr or ""),
+                "timeout_seconds": timeout,
+            },
+            indent=2,
+        ),
+    )
 
 
 def write_step_failure_envelope(

@@ -972,6 +972,343 @@ def _run_with_fake_ollama(out_dir, raw_path, stdout, stderr, returncode):
         ollama_lane.subprocess.run = real_run
 
 
+def make_sequenced_harness_stub(responses: list, prompts: list):
+    """A `call_harness_fn` that serves `responses` in order, one per call, and
+    appends every prompt it was handed to `prompts`. Each response is
+    `(exit_code, rate_limited, raw_body_or_None)`; `None` writes no output file,
+    standing in for extraction having found no JSON at all. Calls past the end
+    of the list raise -- a test that expects two calls must fail loudly, not
+    silently, if the lane makes three."""
+
+    def _stub(model, prompt, output_path):
+        prompts.append(prompt)
+        exit_code, rate_limited, raw_body = responses[len(prompts) - 1]
+        if raw_body is not None:
+            with open(output_path, "w") as f:
+                json.dump(raw_body, f)
+        return exit_code, rate_limited, ""
+
+    return _stub
+
+
+def test_a_finding_missing_a_required_field_is_repaired():
+    # The measured step-412 failure: one finding, otherwise complete and
+    # correct, rejected for omitting "cwe".
+    broken = good_finding()
+    del broken["cwe"]
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [broken]}), (0, False, {"findings": [good_finding()]})],
+                prompts,
+            ),
+        )
+        check(written[0]["state"] == "complete", "repair: a repaired step ends complete", repr(written[0]["state"]))
+        check(len(prompts) == 2, "repair: exactly one repair call was made", str(len(prompts)))
+        repair_prompt = prompts[1] if len(prompts) > 1 else ""
+        check(
+            "missing required field: cwe" in repair_prompt,
+            "repair: the repair prompt names the exact defect",
+            repr(repair_prompt[:400]),
+        )
+        check(
+            "findings[0]" in repair_prompt,
+            "repair: the repair prompt names which finding to fix",
+            repr(repair_prompt[:400]),
+        )
+
+
+def test_an_unparseable_answer_is_repaired():
+    # The measured step-443 failure: extraction found no JSON object at all,
+    # so no output file was written and the exit code was forced non-zero.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        # The raw stdout the failed call preserved is the only record of what
+        # the model said, and is what the repair round must quote back.
+        harness_runner.write_step_diagnostic(
+            out_dir, "step-001.ollama-raw.stdout.txt", '{"findings": [], "dispositions": [}'
+        )
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(1, False, None), (0, False, {"findings": []})], prompts
+            ),
+        )
+        check(written[0]["state"] == "complete", "repair: an unparseable answer is repaired", repr(written[0]["state"]))
+        check(len(prompts) == 2, "repair: exactly one repair call was made", str(len(prompts)))
+        repair_prompt = prompts[1] if len(prompts) > 1 else ""
+        check(
+            harness_runner.UNPARSEABLE_ANSWER_DEFECT in repair_prompt,
+            "repair: the repair prompt says the answer was not a JSON object",
+            repr(repair_prompt[:400]),
+        )
+        check(
+            '"dispositions": [}' in repair_prompt,
+            "repair: the repair prompt quotes the model's own broken answer back",
+            repr(repair_prompt[-300:]),
+        )
+
+
+def test_a_repair_that_does_not_help_is_attempted_only_once():
+    broken = good_finding()
+    del broken["cwe"]
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [broken]}), (0, False, {"findings": [broken]})], prompts
+            ),
+        )
+        check(len(prompts) == 2, "repair: a failed repair is never retried a second time", str(len(prompts)))
+        check(
+            written[0]["state"] == "failed",
+            "repair: a step the model could not fix is still recorded failed",
+            repr(written[0]["state"]),
+        )
+
+
+def test_a_rate_limited_call_is_never_repaired():
+    # `parked` already means "retry this later". Spending the one repair
+    # attempt on an answer that was never produced burns the budget a
+    # genuinely repairable answer needs.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub([(1, True, None)], prompts),
+        )
+        check(len(prompts) == 1, "repair: a rate-limited call is not repaired", str(len(prompts)))
+        check(written[0]["state"] == "parked", "repair: a rate-limited step still parks", repr(written[0]["state"]))
+
+
+def test_a_complete_answer_is_never_repaired():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub([(0, False, {"findings": []})], prompts),
+        )
+        check(len(prompts) == 1, "repair: a complete answer costs exactly one call", str(len(prompts)))
+        check(written[0]["state"] == "complete", "repair: a complete answer stays complete")
+
+
+def test_repair_is_skipped_when_no_previous_answer_survives():
+    # Nothing to quote back means nothing to repair; spending a call would ask
+    # the model to correct an answer it cannot see.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub([(1, False, None)], prompts),
+        )
+        check(len(prompts) == 1, "repair: no surviving answer means no repair call", str(len(prompts)))
+        check(written[0]["state"] == "failed", "repair: the step is still recorded failed", repr(written[0]["state"]))
+
+
+def _no_cwe(**overrides) -> dict:
+    finding = good_finding(**overrides)
+    del finding["cwe"]
+    return finding
+
+
+def test_a_converging_repair_earns_a_second_attempt():
+    # The measured step-413 case: the first answer did not parse, the first
+    # repair fixed the JSON and revealed findings that every one omitted a
+    # required field. The defect class changed, so the model is converging and
+    # earns the second attempt that recovers the step.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        harness_runner.write_step_diagnostic(
+            out_dir, "step-001.ollama-raw.stdout.txt", '{"findings": [}'
+        )
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [
+                    (1, False, None),
+                    (0, False, {"findings": [_no_cwe(), _no_cwe()]}),
+                    (0, False, {"findings": [good_finding(), good_finding()]}),
+                ],
+                prompts,
+            ),
+        )
+        check(len(prompts) == 3, "converging repair: two repair calls were made", str(len(prompts)))
+        check(
+            written[0]["state"] == "complete",
+            "converging repair: the step is recovered",
+            repr(written[0]["state"]),
+        )
+        recovered = written[0].get("findings") or []
+        check(
+            len(recovered) == 2,
+            "converging repair: both findings survive",
+            repr(len(recovered)),
+        )
+
+
+def test_a_converging_repair_still_stops_at_the_hard_cap():
+    # Converging is not a licence to keep calling. Two attempts, then stop,
+    # even though the defect count is still falling.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        harness_runner.write_step_diagnostic(
+            out_dir, "step-001.ollama-raw.stdout.txt", '{"findings": [}'
+        )
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [
+                    (1, False, None),
+                    (0, False, {"findings": [_no_cwe(), _no_cwe(), _no_cwe()]}),
+                    (0, False, {"findings": [_no_cwe()]}),
+                ],
+                prompts,
+            ),
+        )
+        check(
+            len(prompts) == 3,
+            "converging repair: the hard cap stops a third repair call",
+            str(len(prompts)),
+        )
+        check(
+            written[0]["state"] == "failed",
+            "converging repair: a step still broken at the cap is recorded failed",
+            repr(written[0]["state"]),
+        )
+
+
+def test_a_repair_that_goes_backwards_earns_nothing():
+    # A parsing answer that stops parsing is not converging.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [_no_cwe()]}), (1, False, None)], prompts
+            ),
+        )
+        check(
+            len(prompts) == 2,
+            "backwards repair: no second attempt is spent",
+            str(len(prompts)),
+        )
+        check(written[0]["state"] == "failed", "backwards repair: the step is recorded failed")
+
+
+def test_rate_limit_detector_ignores_digits_inside_numbers():
+    # The measured false positive: a scanner's own timing value contains the
+    # digits 429, and the markers are matched against the harness's COMBINED
+    # output, which includes the model's answer. A finished step was parked.
+    check(
+        not ollama_lane._looks_rate_limited('"rules_parse_time":0.015944957733154297'),
+        "ollama_lane: a timing number containing 429 is not a rate limit",
+    )
+    check(
+        not ollama_lane._looks_rate_limited("line 429 is missing a bounds check"),
+        "ollama_lane: a line number 429 is not a rate limit",
+    )
+    check(
+        not ollama_lane._looks_rate_limited("elapsed 4290ms"),
+        "ollama_lane: 429 inside a larger number is not a rate limit",
+    )
+
+
+def test_rate_limit_detector_ignores_a_finding_about_rate_limiting():
+    # A security review's answer is the text most likely to discuss rate
+    # limiting. Saying an endpoint lacks one must not park the step reporting it.
+    for text in (
+        "the endpoint has no rate limit",
+        "add a rate limit to this handler",
+        "no usage limit is enforced",
+    ):
+        check(
+            not ollama_lane._looks_rate_limited(text),
+            "ollama_lane: a finding about rate limiting is not a rate limit",
+            repr(text),
+        )
+
+
+def test_rate_limit_detector_still_matches_real_limits():
+    for text in (
+        "HTTP 429 too many requests",
+        "429 Too Many Requests",
+        "status: 429",
+        "Usage limit reached, try later",
+        "rate limit exceeded",
+        "You have hit your usage limit",
+        "quota exceeded",
+    ):
+        check(
+            ollama_lane._looks_rate_limited(text),
+            "ollama_lane: a real rate limit is still detected",
+            repr(text),
+        )
+
+
+def test_a_truncated_hypothesis_id_is_repaired():
+    # The measured case: the model answers with the bare "h1" instead of the
+    # full id the step gave it. Before Issue #4069 that passed validation, so
+    # the repair round never fired and the finding could not be traced back to
+    # the planner that proposed it.
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001", hypotheses=[{
+            "id": "codex-gpt-6-astra:h1", "objective": "o",
+            "required_evidence": "e", "planner": "codex-gpt-6-astra"}])
+        step = json.load(open(os.path.join(plan_dir, "step-001.json")))
+        real_id = (step.get("hypotheses") or [{}])[0].get("id")
+        check(real_id == "codex-gpt-6-astra:h1",
+              "repair: the fixture step carries a prefixed hypothesis id", repr(real_id))
+        truncated = good_finding(hypothesis_id="h1")
+        fixed = good_finding(hypothesis_id=real_id)
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [truncated]}), (0, False, {"findings": [fixed]})],
+                prompts,
+            ),
+        )
+        check(len(prompts) == 2, "repair: a truncated id triggers exactly one repair call",
+              str(len(prompts)))
+        repair_prompt = prompts[1] if len(prompts) > 1 else ""
+        check("h1" in repair_prompt and real_id in repair_prompt,
+              "repair: the repair prompt names the bad id and the ids that were available",
+              repr(repair_prompt[:400]))
+        check(written[0]["state"] == "complete",
+              "repair: the step completes once the id is corrected", repr(written[0]["state"]))
+        check((written[0].get("findings") or [{}])[0].get("hypothesis_id") == real_id,
+              "repair: the corrected finding carries the full id")
+
+
+def test_a_correct_hypothesis_id_costs_no_repair():
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001", hypotheses=[{
+            "id": "codex-gpt-6-astra:h1", "objective": "o",
+            "required_evidence": "e", "planner": "codex-gpt-6-astra"}])
+        step = json.load(open(os.path.join(plan_dir, "step-001.json")))
+        real_id = (step.get("hypotheses") or [{}])[0].get("id")
+        written = ollama_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [good_finding(hypothesis_id=real_id)]})], prompts),
+        )
+        check(len(prompts) == 1, "repair: a correct id costs exactly one call", str(len(prompts)))
+        check(written[0]["state"] == "complete", "repair: and the step completes")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
