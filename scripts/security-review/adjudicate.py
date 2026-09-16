@@ -115,11 +115,17 @@ def prepare(sweep_dir: str, repo_root: str) -> tuple[str | None, dict]:
     catch that by `input_hash`, but a stale file should not exist at all).
     """
     report = consolidate.consolidate(sweep_dir, repo_root)
+    # source_root is passed here and in `consolidate()` identically (Issue
+    # #4080): the redaction it drives is part of the bytes the container is
+    # handed, and the hash over those bytes is what tells a later consolidation
+    # whether an envelope is current. One caller redacting and the other not
+    # would make every adjudication read as stale against its own input.
     adjudication_input = consolidate.build_adjudication_input(
         report["sweep_id"],
         consolidate._sweep_commit_sha(sweep_dir),
         report["findings"],
         report["cross_step_groups"],
+        source_root=os.path.join(sweep_dir, "snapshot"),
     )
 
     sub_dir = adjudication_dir(sweep_dir)

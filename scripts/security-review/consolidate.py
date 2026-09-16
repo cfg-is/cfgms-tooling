@@ -130,6 +130,7 @@ import atomic_write  # noqa: E402
 import basedir  # noqa: E402
 import planner  # noqa: E402
 import schema  # noqa: E402
+import source_leak  # noqa: E402
 
 STEP_STATES = ("complete", "parked", "refused", "failed")
 NOT_STARTED = "not_started"
@@ -625,7 +626,65 @@ def build_cross_step_groups(findings: list[dict]) -> list[dict]:
     return groups
 
 
-def build_adjudication_input(sweep_id: str, commit_sha: str, findings: list[dict], groups: list[dict]) -> dict:
+# Issue #4080. The adjudicator's contract is "findings, never source", and
+# `adjudicate._ensure_empty_snapshot` holds that on the MOUNT side. Nothing held
+# it on the CONTENT side: finder evidence travels to the adjudicator inside the
+# findings, and measured on sweep bench-finders-02, 10 of 224 evidence strings
+# (4.5%) carry a verbatim 60+ character run from the file they name.
+#
+# That matters because the adjudicator is a DIFFERENT PROVIDER from the finders.
+# A lane shipping file bodies to its own provider is the documented design; the
+# same source reaching a third provider through an unchecked evidence field is
+# the empty snapshot being routed around.
+EVIDENCE_REDACTED = (
+    "[evidence withheld: contained a verbatim excerpt of the source file it names, "
+    "which may not be passed to the adjudicator]"
+)
+
+
+def _redact_source_from_reports(reports: list, file_value: str, source_root: "str | None") -> int:
+    """Replace any report text quoting `file_value` with `EVIDENCE_REDACTED`.
+
+    Returns how many strings were replaced. Both `evidence` and
+    `suggested_fix` are checked -- a suggested fix that pastes the corrected
+    line leaks exactly as much as evidence that pastes the broken one.
+
+    REDACTS, NEVER DROPS. The finding keeps its place, its coordinates and its
+    severity; only the offending string is replaced, and with a marker rather
+    than an empty value, so the adjudicator is told it is rating a claim it
+    cannot read instead of quietly receiving one less field.
+
+    Never raises: an unreadable file leaves the reports untouched. A boundary
+    check that takes down a sweep would be worse than the leak it prevents.
+    """
+    if not source_root or not file_value:
+        return 0
+    try:
+        with open(os.path.join(source_root, file_value), "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except OSError:
+        return 0
+    if not source:
+        return 0
+    redacted = 0
+    for report in reports:
+        for field in ("evidence", "suggested_fix"):
+            value = report.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                if source_leak.find_leak(value, source) is not None:
+                    report[field] = EVIDENCE_REDACTED
+                    redacted += 1
+            except Exception:  # noqa: BLE001 -- a check must never fail a sweep
+                continue
+    return redacted
+
+
+def build_adjudication_input(
+    sweep_id: str, commit_sha: str, findings: list[dict], groups: list[dict],
+    source_root: "str | None" = None,
+) -> dict:
     """The exact object the adjudication stage is handed (Issue #3984):
     findings only -- each finding's key, the lanes' own severities/
     confidences/titles/evidence/suggested fixes, and its deterministic
@@ -640,30 +699,48 @@ def build_adjudication_input(sweep_id: str, commit_sha: str, findings: list[dict
     report re-sorts once an adjudication is merged, and the hash over this
     object must be identical before and after that merge or every
     adjudication would read as stale against its own input."""
+    # `source_root` is the sweep's own SNAPSHOT, not the live checkout: the
+    # evidence describes the code that was reviewed, at the commit that was
+    # pinned, and the working tree may have moved since. It MUST be passed
+    # identically by every caller. `adjudicate.py`
+    # writes these bytes for the container and `consolidate()` recomputes them
+    # to check an envelope's `input_hash` is over the current set; if one
+    # redacted and the other did not, every adjudication would read as stale
+    # against its own input. Optional only so a test can build an input without
+    # a tree; both production call sites pass it.
+    redacted_count = 0
+    built_findings = []
+    for finding in sorted(findings, key=_finding_key):
+        reports = [
+            {
+                "lane": occ["lane"],
+                "step_id": occ["step_id"],
+                "severity": occ["severity"],
+                "confidence": occ["confidence"],
+                "title": occ["title"],
+                "evidence": occ["evidence"],
+                "suggested_fix": occ["suggested_fix"],
+            }
+            for occ in finding["occurrences"]
+        ]
+        redacted_count += _redact_source_from_reports(reports, finding["file"], source_root)
+        built_findings.append({
+            "file": finding["file"],
+            "symbol": finding["symbol"],
+            "vuln_class": finding["vuln_class"],
+            "step_ids": list(finding["step_ids"]),
+            "severity_range": finding["severity_range"],
+            "reports": reports,
+        })
+    if redacted_count:
+        schema.log_event("adjudication_evidence_redacted", count=redacted_count)
+
     return {
         "sweep_id": sweep_id,
         "commit_sha": commit_sha,
+        "evidence_redacted": redacted_count,
         "findings": [
-            {
-                "file": finding["file"],
-                "symbol": finding["symbol"],
-                "vuln_class": finding["vuln_class"],
-                "step_ids": list(finding["step_ids"]),
-                "severity_range": finding["severity_range"],
-                "reports": [
-                    {
-                        "lane": occ["lane"],
-                        "step_id": occ["step_id"],
-                        "severity": occ["severity"],
-                        "confidence": occ["confidence"],
-                        "title": occ["title"],
-                        "evidence": occ["evidence"],
-                        "suggested_fix": occ["suggested_fix"],
-                    }
-                    for occ in finding["occurrences"]
-                ],
-            }
-            for finding in sorted(findings, key=_finding_key)
+            *built_findings,
         ],
         "cross_step_groups": [
             {
@@ -1142,8 +1219,10 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     # complete, for this sweep, and over this input.
     cross_step_groups = build_cross_step_groups(consolidated_findings)
     adjudication_input = build_adjudication_input(
-        sweep_id, _sweep_commit_sha(sweep_dir), consolidated_findings, cross_step_groups
+        sweep_id, _sweep_commit_sha(sweep_dir), consolidated_findings, cross_step_groups,
+        source_root=os.path.join(sweep_dir, "snapshot"),
     )
+    evidence_redacted = adjudication_input.get("evidence_redacted", 0)
     adjudication, envelope = load_adjudication(
         sweep_dir,
         dispatch,
@@ -1151,6 +1230,10 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         adjudication_input_hash(adjudication_input),
         has_findings=bool(consolidated_findings),
     )
+    # Issue #4080: recorded whether or not an adjudicator ran, because the
+    # redaction happened when the input was built. A reader must be able to
+    # tell evidence was WITHHELD from that stage rather than never written.
+    adjudication["evidence_redacted"] = evidence_redacted
     if envelope is not None:
         _apply_adjudication(consolidated_findings, cross_step_groups, envelope, adjudication)
 
@@ -1720,8 +1803,30 @@ def render_markdown(report: dict) -> str:
 
 
 def _adjudication_lines(adjudication: dict) -> list[str]:
-    """The `## Adjudication` section body: one status sentence a reader can
-    act on, never a blank. Says plainly when severities are raw."""
+    """The `## Adjudication` section body: the stage's status, then what was
+    withheld from it.
+
+    The redaction line is appended to EVERY status branch, including the ones
+    where no adjudicator ran (Issue #4080). The redaction happens when the
+    input is built, so it is a fact about this sweep whether or not the stage
+    was configured -- and a reader must be able to tell evidence was withheld
+    from that stage rather than never written."""
+    lines = _adjudication_status_lines(adjudication)
+    redacted = adjudication.get("evidence_redacted", 0)
+    return lines + [
+        "",
+        f"Evidence strings withheld because they quoted the source file they name: "
+        f"**{redacted}**. The adjudicator's contract is findings, never source, and its "
+        "container mounts an empty snapshot; this is that same boundary applied to what "
+        "the findings themselves carry. A withheld string is replaced with a marker, "
+        "never dropped -- the finding keeps its place, and the adjudicator is told it is "
+        "rating a claim it cannot read.",
+    ]
+
+
+def _adjudication_status_lines(adjudication: dict) -> list[str]:
+    """One status sentence a reader can act on, never a blank. Says plainly
+    when severities are raw."""
     status = adjudication.get("status", ADJUDICATION_NOT_CONFIGURED)
     harness = _md_escape_inline(adjudication.get("harness") or "unknown")
     model_id = _md_escape_inline(adjudication.get("model_id") or "unknown")

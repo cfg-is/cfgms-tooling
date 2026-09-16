@@ -2555,6 +2555,114 @@ def test_the_consolidated_finding_carries_its_evidence():
           "evidence: and a verification slot starts empty")
 
 
+def _leaky_finding(src_line: str) -> dict:
+    return {
+        "file": "pkg/a/b.go", "symbol": "S", "vuln_class": "v",
+        "step_ids": ["step-001"],
+        "severity_range": {"lowest": "high", "highest": "high", "by_lane": {"l": "high"},
+                           "disagreement": False},
+        "occurrences": [{
+            "lane": "l", "step_id": "step-001", "severity": "high", "confidence": "high",
+            "cwe": "CWE-89", "line": 3, "end_line": None, "title": "t",
+            "evidence": f"the finder pasted: {src_line}",
+            "suggested_fix": "change it",
+        }],
+    }
+
+
+def _write_source(tmp: str, body: str) -> str:
+    import os
+    d = os.path.join(tmp, "pkg", "a")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "b.go"), "w") as f:
+        f.write(body)
+    return tmp
+
+
+LONG_LINE = ("if err := s.configService.GetConfiguration(context.Background(), req); "
+             "err != nil { return fmt.Errorf(\"could not load: %w\", err) }")
+
+
+def test_evidence_quoting_source_is_redacted_not_dropped():
+    # Issue #4080. The adjudicator's contract is findings, never source, and its
+    # container mounts an empty snapshot -- but finder evidence travels to it
+    # inside the findings. Measured: 10 of 224 strings on a real sweep.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_source(tmp, "package a\n" + LONG_LINE + "\n")
+        out = consolidate.build_adjudication_input(
+            "s", "c" * 40, [_leaky_finding(LONG_LINE)], [], source_root=tmp)
+        check(out["evidence_redacted"] == 1, "redaction: the leak is counted",
+              str(out["evidence_redacted"]))
+        report = out["findings"][0]["reports"][0]
+        check(report["evidence"] == consolidate.EVIDENCE_REDACTED,
+              "redaction: the evidence is replaced with a marker", report["evidence"][:60])
+        check(len(out["findings"]) == 1,
+              "redaction: the FINDING is kept, only the string is withheld")
+        check(out["findings"][0]["severity_range"]["highest"] == "high",
+              "redaction: the finding keeps its severity")
+
+
+def test_a_suggested_fix_quoting_source_is_redacted_too():
+    # A suggested fix that pastes the corrected line leaks as much as evidence
+    # that pastes the broken one.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_source(tmp, "package a\n" + LONG_LINE + "\n")
+        f = _leaky_finding("nothing quoted here")
+        f["occurrences"][0]["suggested_fix"] = LONG_LINE
+        out = consolidate.build_adjudication_input("s", "c" * 40, [f], [], source_root=tmp)
+        check(out["findings"][0]["reports"][0]["suggested_fix"] == consolidate.EVIDENCE_REDACTED,
+              "redaction: suggested_fix is checked too")
+
+
+def test_clean_evidence_is_untouched():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_source(tmp, "package a\n" + LONG_LINE + "\n")
+        f = _leaky_finding("reached from handleThing at pkg/a/b.go:3, no guard found")
+        out = consolidate.build_adjudication_input("s", "c" * 40, [f], [], source_root=tmp)
+        check(out["evidence_redacted"] == 0, "redaction: a coordinate citation is not a leak",
+              str(out["evidence_redacted"]))
+        check("reached from handleThing" in out["findings"][0]["reports"][0]["evidence"],
+              "redaction: clean evidence survives verbatim")
+
+
+def test_no_source_root_redacts_nothing():
+    out = consolidate.build_adjudication_input("s", "c" * 40, [_leaky_finding(LONG_LINE)], [])
+    check(out["evidence_redacted"] == 0,
+          "redaction: without a source root there is nothing to compare against",
+          str(out["evidence_redacted"]))
+
+
+def test_an_unreadable_file_cannot_fail_the_sweep():
+    # AC3: a boundary check that takes down a sweep would be worse than the leak
+    # it prevents.
+    out = consolidate.build_adjudication_input(
+        "s", "c" * 40, [_leaky_finding(LONG_LINE)], [], source_root="/nonexistent/path")
+    check(out["evidence_redacted"] == 0,
+          "fail open: a missing source tree leaves evidence as it was")
+    check(out["findings"][0]["reports"][0]["evidence"].startswith("the finder pasted:"),
+          "fail open: and the evidence is unchanged")
+
+
+def test_the_redaction_count_reaches_the_report_on_every_branch():
+    for status in (consolidate.ADJUDICATION_NOT_CONFIGURED,
+                   consolidate.ADJUDICATION_COMPLETE,
+                   consolidate.ADJUDICATION_SKIPPED_NO_FINDINGS):
+        lines = consolidate._adjudication_lines({"status": status, "evidence_redacted": 7})
+        joined = "\n".join(lines)
+        check("withheld because they quoted the source" in joined and "**7**" in joined,
+              f"report: the count is shown when status is {status}", joined[-90:])
+
+
+def test_zero_redactions_still_says_zero():
+    lines = consolidate._adjudication_lines(
+        {"status": consolidate.ADJUDICATION_NOT_CONFIGURED, "evidence_redacted": 0})
+    check("**0**" in "\n".join(lines),
+          "report: a run with no redactions says zero rather than omitting the line")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
