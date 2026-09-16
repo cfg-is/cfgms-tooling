@@ -52,11 +52,23 @@ VALID_BOUNDARIES = frozenset({
     "cross-cutting",
 })
 
+# The body is matched non-greedily, so a block whose `scenario:end` is missing
+# would otherwise run past the NEXT `scenario:begin` and terminate at the end
+# marker after it -- swallowing that following scenario entirely and returning a
+# catalogue one short, with no error. Excluding `<!-- scenario:begin` from the
+# body makes an unterminated block simply fail to match, and `_BEGIN_RE` below
+# turns that non-match into a named error rather than a silent omission.
+# Issue #4070.
 _SCENARIO_RE = re.compile(
     r"<!-- scenario:begin id=(?P<id>\S+) tier=(?P<tier>\S+) boundary=(?P<boundary>\S+) -->"
-    r"\s*(?P<text>.*?)\s*<!-- scenario:end -->",
+    r"(?P<text>(?:(?!<!-- scenario:begin).)*?)\s*<!-- scenario:end -->",
     re.DOTALL,
 )
+
+# Every opening marker in the document, whether or not it went on to parse.
+# The count is the denominator the parse result is checked against: a scenario
+# that fails to parse for ANY reason must be an error, not a shorter list.
+_BEGIN_RE = re.compile(r"<!-- scenario:begin id=(?P<id>\S+)")
 _ID_RE = re.compile(r"^TS-\d{2,}$")
 
 
@@ -130,6 +142,22 @@ def parse_catalogue(text: str) -> "list[dict]":
 
     if not scenarios:
         raise ScenarioError("catalogue contains no scenario blocks")
+
+    # Issue #4070: a block that opened and never parsed is a dropped scenario,
+    # and a dropped scenario is a silent coverage hole -- the `scenario` axis
+    # emits one step per catalogue entry, so the threat it describes is simply
+    # never reviewed while the plan still looks complete. Compare against the
+    # opening markers rather than trusting the match set, and name the ids that
+    # went missing.
+    opened = [m.group("id") for m in _BEGIN_RE.finditer(text)]
+    if len(opened) != len(scenarios):
+        parsed = {s["id"] for s in scenarios}
+        missing = [sid for sid in opened if sid not in parsed]
+        raise ScenarioError(
+            f"{len(opened)} scenario:begin marker(s) but {len(scenarios)} parsed; "
+            f"unterminated or malformed: {', '.join(missing) or 'unknown'} "
+            "(check for a missing <!-- scenario:end -->)"
+        )
     return scenarios
 
 

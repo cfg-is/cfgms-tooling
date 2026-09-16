@@ -125,6 +125,50 @@ def test_real_catalogue_loads_and_validates():
     )
 
 
+def test_a_block_without_an_end_marker_is_an_error():
+    # Issue #4070. The body pattern is non-greedy under DOTALL, so a missing
+    # end marker makes the match run past the NEXT begin marker and stop at the
+    # next end -- swallowing the following scenario whole. It returned one
+    # scenario and raised nothing.
+    text = (
+        "<!-- scenario:begin id=TS-01 tier=T0 boundary=internet-listener -->\n"
+        "**First requirement.**\n\n- **Check:** first.\n"
+        + block("TS-02")
+    )
+    expect_error(text, "TS-01", "unterminated block: the error names the scenario that was left open")
+
+
+def test_a_swallowed_scenario_is_never_silently_dropped():
+    text = (
+        "<!-- scenario:begin id=TS-01 tier=T0 boundary=internet-listener -->\n"
+        "**First requirement.**\n\n- **Check:** first.\n"
+        + block("TS-02")
+    )
+    try:
+        got = scenarios.parse_catalogue(text)
+    except scenarios.ScenarioError:
+        check(True, "unterminated block: raises rather than returning a short catalogue")
+    else:
+        check(False, "unterminated block: raises rather than returning a short catalogue",
+              f"returned {len(got)} scenario(s): {[s['id'] for s in got]}")
+
+
+def test_parsed_count_must_match_the_begin_marker_count():
+    # A second, cause-independent guard: however a block fails to parse, the
+    # number of scenarios must equal the number of begin markers.
+    text = block("TS-01") + block("TS-02") + block("TS-03")
+    got = scenarios.parse_catalogue(text)
+    check(len(got) == 3, "well-formed catalogue: all three parse", str(len(got)))
+    check([s["id"] for s in got] == ["TS-01", "TS-02", "TS-03"],
+          "well-formed catalogue: document order is preserved", str([s["id"] for s in got]))
+
+
+def test_a_stray_end_marker_alone_is_not_a_scenario():
+    text = block("TS-01") + "<!-- scenario:end -->\n"
+    got = scenarios.parse_catalogue(text)
+    check(len(got) == 1, "a trailing stray end marker does not invent a scenario", str(len(got)))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
