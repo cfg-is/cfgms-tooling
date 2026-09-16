@@ -253,8 +253,36 @@ case "$MODE" in
         PLAN_OUT_DIR="$(dirname "$PLAN_RESULT_FILE")"
         printf '%s\n' '{"harness":"codex","resolvedModelReported":false}' > "$PLAN_RESULT_FILE"
         cd "$PLAN_OUT_DIR"
+        # Reasoning effort is NOT left to the model default here. Every
+        # top-tier codex id (gpt-6-astra, gpt-5.6-sol) defaults to `low`, while
+        # the cheaper gpt-5.6-terra and gpt-5.6-luna default to `medium` -- so
+        # without this the planner runs the most capable model at its weakest
+        # setting, and a cheaper finder out-reasons it. Planning is the stage
+        # where a miss is unrecoverable: nothing downstream can review a file
+        # the plan never assigned.
+        #
+        # An unset variable leaves the flag off entirely and the harness keeps
+        # its own default, so this cannot change behaviour for an operator who
+        # has not opted in. The value is validated by the launcher before it
+        # reaches here; `--strict-config` makes codex reject an unknown
+        # configuration key outright rather than ignoring it silently, which is
+        # what makes a typo a loud failure instead of a setting that never
+        # applied.
+        # An array, not a string: the string form had to be expanded unquoted
+        # to split into its three tokens, which also subjected the *value* to
+        # word splitting and pathname expansion -- a value carrying a space
+        # would have appended extra argv entries to codex. The launcher
+        # whitelists the value, but this script is a second entry point that
+        # reads the environment directly and validates nothing of its own, so
+        # it should not depend on that check. An empty array expands to zero
+        # words, so the opted-out path still passes no flags at all.
+        CODEX_REASONING_ARGS=()
+        if [ -n "${CFGMS_SECURITY_REVIEW_PLANNER_REASONING:-}" ]; then
+            CODEX_REASONING_ARGS=(--strict-config -c "model_reasoning_effort=${CFGMS_SECURITY_REVIEW_PLANNER_REASONING}")
+        fi
         exec codex exec \
           --model "$CFGMS_SECURITY_REVIEW_MODEL" \
+          "${CODEX_REASONING_ARGS[@]}" \
           --sandbox danger-full-access \
           --skip-git-repo-check \
           --output-last-message "${PLAN_OUT_DIR}/.investigator-plan-last-message.txt" \

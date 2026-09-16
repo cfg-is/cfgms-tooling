@@ -465,6 +465,64 @@ rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
 
 # ----------------------------------------------------------------------------
 echo ""
+echo "--- REQUIRED TEST: the codex planner runs at its harness default unless"
+echo "    CFGMS_SECURITY_REVIEW_PLANNER_REASONING asks otherwise ---"
+# Every top-tier codex id (gpt-6-astra, gpt-5.6-sol) defaults to `low`, while
+# the cheaper gpt-5.6-terra/luna default to `medium` -- so an unset variable
+# must leave the flag off entirely rather than guess a level on the operator's
+# behalf, and a set one must reach codex.
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PLAN_OUT_DIR="$(mktemp -d)"
+PROMPT_FILE="${PLAN_OUT_DIR}/.investigator-plan-prompt.md"
+RESULT_FILE="${PLAN_OUT_DIR}/.investigator-plan-result.json"
+make_stub_codex_capturing_stdin "$BIN_DIR"
+make_stub_claude_recording_invocation "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+mkdir -p "${WORK_HOME}/.codex"
+touch "${WORK_HOME}/.codex/auth.json"
+
+set +e
+CFGMS_SECURITY_REVIEW_PLANNER_REASONING="" \
+  out=$(run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "codex" "gpt-6-astra" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "reasoning unset: entrypoint exits 0"
+codex_argv="$(cat "${WORK_HOME}/codex-argv" 2>/dev/null || true)"
+assert_not_contains "$codex_argv" "model_reasoning_effort" \
+  "reasoning unset: no reasoning flag is passed, so the harness keeps its own default"
+assert_not_contains "$codex_argv" "--strict-config" \
+  "reasoning unset: --strict-config is not passed either"
+rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
+
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+PLAN_OUT_DIR="$(mktemp -d)"
+PROMPT_FILE="${PLAN_OUT_DIR}/.investigator-plan-prompt.md"
+RESULT_FILE="${PLAN_OUT_DIR}/.investigator-plan-result.json"
+make_stub_codex_capturing_stdin "$BIN_DIR"
+make_stub_claude_recording_invocation "$BIN_DIR"
+make_large_prompt_file "$PROMPT_FILE"
+mkdir -p "${WORK_HOME}/.codex"
+touch "${WORK_HOME}/.codex/auth.json"
+
+set +e
+out=$(CFGMS_SECURITY_REVIEW_PLANNER_REASONING=high \
+  run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "codex" "gpt-6-astra" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "reasoning high: entrypoint exits 0"
+codex_argv="$(cat "${WORK_HOME}/codex-argv" 2>/dev/null || true)"
+assert_contains "$codex_argv" "-c model_reasoning_effort=high" \
+  "reasoning high: the effort reaches codex"
+assert_contains "$codex_argv" "--strict-config" \
+  "reasoning high: --strict-config makes codex reject an unknown key instead of ignoring it"
+assert_contains "$codex_argv" "--model gpt-6-astra" \
+  "reasoning high: the roster model is still passed through"
+rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
+
+# ----------------------------------------------------------------------------
+echo ""
 echo "--- REQUIRED TEST: plan mode with --harness codex fails closed on a"
 echo "    missing codex session, naming its own path (Issue #4041) ---"
 BIN_DIR="$(mktemp -d)"

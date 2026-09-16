@@ -3206,6 +3206,32 @@ PROMPT_EOF
           )
           ;;
       esac
+      # Reasoning effort for the codex PLANNER, when set, must be one of the
+      # values codex accepts. Finder lanes are deliberately not covered yet:
+      # the measured finder roster runs gpt-5.6-luna, which already defaults to
+      # `medium`, and the lane-side change belongs with the lane work in
+      # Issue #4069 rather than ahead of it.
+      # Validated HERE, before any container starts, because the failure it
+      # prevents is silent: a value codex does not recognise makes the run
+      # exit non-zero inside the container after the prompt was already spent,
+      # and an unvalidated typo in a variable name would leave the planner on
+      # its default while the operator believed otherwise. Both variables are
+      # optional; unset means the harness keeps its own default and no flag is
+      # passed at all.
+      for _inv_reasoning_var in CFGMS_SECURITY_REVIEW_PLANNER_REASONING; do
+        _inv_reasoning_value="${!_inv_reasoning_var:-}"
+        if [[ -n "$_inv_reasoning_value" ]]; then
+          case "$_inv_reasoning_value" in
+            low|medium|high|xhigh|max|ultra) ;;
+            *)
+              echo "ERROR: ${_inv_reasoning_var}='${_inv_reasoning_value}' is not a codex reasoning effort" >&2
+              echo "       valid: low, medium, high, xhigh, max, ultra" >&2
+              exit 3
+              ;;
+          esac
+        fi
+      done
+
       inv_harness_env=(
         -e "CFGMS_SECURITY_REVIEW_HARNESS=${inv_harness}"
         -e "CFGMS_SECURITY_REVIEW_MODEL=${inv_model}"
@@ -3217,6 +3243,7 @@ PROMPT_EOF
         # place that launches a real one. The operator's own value wins.
         -e "CFGMS_SECURITY_REVIEW_RATE_LIMIT_MAX_WAIT_SECONDS=${CFGMS_SECURITY_REVIEW_RATE_LIMIT_MAX_WAIT_SECONDS:-900}"
         -e "CFGMS_SECURITY_REVIEW_LANE_TIMEOUT_SECONDS=${CFGMS_SECURITY_REVIEW_LANE_TIMEOUT_SECONDS:-3600}"
+        -e "CFGMS_SECURITY_REVIEW_PLANNER_REASONING=${CFGMS_SECURITY_REVIEW_PLANNER_REASONING:-}"
       )
     fi
 
