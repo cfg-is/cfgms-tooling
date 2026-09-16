@@ -817,6 +817,80 @@ atomic_write.write_json_atomic(report_path, report)
 PYEOF
 }
 
+# dispatch_verifier <sweep_dir>
+# The verification stage (Issue #4071). Runs AFTER every finder lane has exited
+# and BEFORE dispatch_adjudicator.
+#
+# THE ORDER IS THE POINT, not an optimisation. The adjudicator receives findings
+# only and can never establish whether one is real, so it discounts severity for
+# exploitability it cannot check -- its own rationale from sweep
+# bench-finders-02: "the precondition here is unconfirmed ... an unconfirmed
+# prerequisite moves severity down from the medium anchor to low". Verifying
+# first converts the adjudicator's largest source of uncertainty into an input
+# instead of a guess.
+#
+# UNLIKE EVERY OTHER DISPATCH HERE, THIS ONE NEVER RETURNS NON-ZERO. A
+# verification stage must not be able to fail a sweep whose finder lanes
+# completed. Every failure path -- unparseable roster, prepare failure, absent
+# credentials, a dispatch that exits non-zero, a container that writes nothing
+# -- leaves the findings unverified and the sweep intact, and the consolidator
+# reports the gap from the envelope's absence or its recorded state. That is
+# why there is no dispatch-outcome sidecar to keep in step: the envelope is the
+# record.
+dispatch_verifier() {
+  local sweep_dir="$1"
+
+  if [[ -z "${CFGMS_SECURITY_REVIEW_VERIFIER:-}" ]]; then
+    return 0
+  fi
+
+  local roster_output
+  if ! roster_output=$(python3 "${SECURITY_REVIEW_DIR}/roster.py" "$CFGMS_SECURITY_REVIEW_VERIFIER" 2>&1); then
+    echo "WARNING: could not parse CFGMS_SECURITY_REVIEW_VERIFIER; findings stay unverified: ${roster_output}" >&2
+    return 0
+  fi
+  local entry_count
+  entry_count=$(printf '%s\n' "$roster_output" | grep -c . || true)
+  if [[ "$entry_count" -ne 1 ]]; then
+    echo "WARNING: CFGMS_SECURITY_REVIEW_VERIFIER must name exactly one harness:model pair, got ${entry_count}; findings stay unverified" >&2
+    return 0
+  fi
+  local harness model lane_dir_name
+  IFS=$'\t' read -r harness model lane_dir_name <<<"$roster_output"
+
+  local prepare_output
+  if ! prepare_output=$(python3 "${SECURITY_REVIEW_DIR}/verify.py" prepare "$sweep_dir" --repo-root "$REPO_ROOT" 2>&1); then
+    echo "WARNING: verification prepare failed; findings stay unverified: ${prepare_output}" >&2
+    return 0
+  fi
+  if [[ "$prepare_output" == *NOTHING_TO_VERIFY* ]]; then
+    echo "verification skipped for ${sweep_dir}: no findings to verify" >&2
+    return 0
+  fi
+
+  local launch_output launch_rc=0
+  launch_output=$(python3 "${SECURITY_REVIEW_DIR}/verify.py" launch "$sweep_dir" \
+    --harness "$harness" --model "$model" --repo-root "$REPO_ROOT" 2>&1) || launch_rc=$?
+
+  if [[ $launch_rc -ne 0 ]]; then
+    if _is_intentional_dispatch_skip "$launch_output"; then
+      echo "WARNING: verifier dispatch skipped (credentials unavailable): ${launch_output}" >&2
+    else
+      echo "WARNING: verifier dispatch failed; findings stay unverified: ${launch_output}" >&2
+    fi
+    return 0
+  fi
+
+  local cid
+  cid="$(printf '%s\n' "$launch_output" | sed -n 's/^LAUNCHED_INVESTIGATOR:verifier://p' | tail -n1)"
+  if [[ -z "$cid" ]]; then
+    echo "WARNING: verifier dispatched but no container id was parsed; findings stay unverified" >&2
+    return 0
+  fi
+  docker wait "$cid" >/dev/null 2>&1 || true
+  return 0
+}
+
 # dispatch_adjudicator <sweep_dir>
 # The adjudication stage (Issue #3984). A no-op when
 # CFGMS_SECURITY_REVIEW_ADJUDICATOR is unset -- the consolidator then reports
@@ -941,6 +1015,7 @@ cmd_launch() {
   local dispatch_failed=0
   dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" "${scope_paths[@]:-}" || dispatch_failed=1
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
+  dispatch_verifier "$sweep_dir"
   dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then
@@ -1012,6 +1087,7 @@ cmd_resume() {
   fi
 
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
+  dispatch_verifier "$sweep_dir"
   dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 
   if ! run_consolidation "$sweep_dir"; then

@@ -150,6 +150,9 @@ _SEVERITY_BY_RANK = {rank: name for name, rank in _SEVERITY_RANK.items()}
 # `lanes/adjudicator/` is the container's only writable mount.
 ADJUDICATION_SUBDIR = "adjudication"
 ADJUDICATOR_LANE_ID = "adjudicator"
+VERIFICATION_SUBDIR = "verification"
+VERIFIER_LANE_ID = "verifier"
+VERIFICATION_OUTPUT_FILENAME = "verification.json"
 ADJUDICATION_INPUT_FILENAME = "adjudication-input.json"
 ADJUDICATION_OUTPUT_FILENAME = "adjudication.json"
 
@@ -525,7 +528,15 @@ def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]])
                 },
                 "occurrences": occurrences,
                 "severity_range": _severity_range(group["occurrences"]),
+                # Issue #4071 AC6: the evidence supporting the finding, not
+                # only its coordinates. It was previously reachable ONLY inside
+                # `occurrences`, so the artifact a reader opens first presented
+                # the claim without the proof. Taken from the first occurrence
+                # that recorded any -- the others stay in `occurrences` for a
+                # reader comparing lanes.
+                "evidence": _first_occurrence_field(occurrences, "evidence"),
                 "adjudication": None,
+                "verification": None,
             }
         )
     consolidated.sort(key=_group_rank_key)
@@ -683,6 +694,80 @@ def adjudication_input_hash(adjudication_input: dict) -> str:
     was added or excluded, after the adjudicator saw its input)."""
     canonical = canonical_adjudication_input(adjudication_input)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verification_output_path(sweep_dir: str) -> str:
+    return os.path.join(
+        sweep_dir, VERIFICATION_SUBDIR, "lanes", VERIFIER_LANE_ID, VERIFICATION_OUTPUT_FILENAME
+    )
+
+
+def _attach_verification(sweep_dir: str, findings: list) -> dict:
+    """Fold the verification stage's verdicts onto the findings they name, and
+    return the record the report prints about that stage.
+
+    ANNOTATES, NEVER DELETES (Issue #4071). A finding with no verdict, or one
+    the verifier could not decide, stays in the report with `verification` left
+    as recorded -- it is never dropped and never re-ranked here. A verifier
+    that could remove findings would be one model holding a veto over the whole
+    review, and the measured false positive cuts both ways: a careful verifier
+    rejects a bad claim correctly, a careless one rejects a real defect just as
+    easily.
+
+    Absent stage, unreadable file, or malformed envelope all read as "did not
+    run", never as an error that fails the sweep -- verification must not be
+    able to fail a sweep whose finder lanes completed.
+    """
+    record = {
+        "status": "missing", "verified": 0, "unverified": len(findings),
+        "leaked": 0, "unmatched": 0, "harness": None, "model_id": None, "errors": [],
+    }
+    path = verification_output_path(sweep_dir)
+    if not os.path.isfile(path):
+        return record
+    envelope = _load_json(path)
+    if not isinstance(envelope, dict):
+        record["status"] = "malformed"
+        return record
+
+    record["harness"] = envelope.get("harness")
+    record["model_id"] = envelope.get("model_id")
+    record["status"] = envelope.get("state") or "complete"
+    record["errors"] = [str(e) for e in (envelope.get("errors") or [])][:10]
+    record["leaked"] = len(envelope.get("leaked") or [])
+
+    by_key = {}
+    for entry in envelope.get("verifications") or []:
+        if not isinstance(entry, dict):
+            continue
+        by_key[(entry.get("file"), entry.get("symbol"), entry.get("vuln_class"))] = entry
+
+    matched: set = set()
+    for finding in findings:
+        key = _finding_key(finding)
+        entry = by_key.get(key)
+        if entry is None:
+            continue
+        matched.add(key)
+        record["verified"] += 1
+        finding["verification"] = {
+            "verdict": entry.get("verdict"),
+            "entry_point": entry.get("entry_point") or "",
+            "call_path": entry.get("call_path") or [],
+            "guard": entry.get("guard") or "",
+            "citation": entry.get("citation") or [],
+            "rationale": entry.get("rationale") or "",
+            "harness": envelope.get("harness"),
+            "model_id": envelope.get("model_id"),
+        }
+    record["unverified"] = len(findings) - record["verified"]
+    record["unmatched"] = sum(1 for k in by_key if k not in matched)
+    for key in by_key:
+        if key not in matched:
+            schema.log_event(
+                "verification_unmatched_key", file=key[0], symbol=key[1], vuln_class=key[2]
+            )
+    return record
 
 
 def adjudication_output_path(sweep_dir: str) -> str:
@@ -1069,6 +1154,13 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     if envelope is not None:
         _apply_adjudication(consolidated_findings, cross_step_groups, envelope, adjudication)
 
+    # Issue #4071: verification runs BEFORE adjudication in the pipeline, but is
+    # folded on AFTER it here -- these are independent annotations of the same
+    # finding and neither reads the other. The pipeline order matters because
+    # the adjudicator's severity should be informed by an established
+    # reachability rather than a guessed one; the render order does not.
+    verification = _attach_verification(sweep_dir, consolidated_findings)
+
     return {
         "sweep_id": sweep_id,
         "lanes": lanes,
@@ -1081,6 +1173,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "rejected_proposals": _load_rejected_proposals(sweep_dir),
         "coverage_gates": load_coverage_gates(sweep_dir),
         "adjudication": adjudication,
+        "verification": verification,
         "cross_step_groups": cross_step_groups,
         "findings": consolidated_findings,
         "failed_step_tails": _failed_step_tails(lanes, step_ids, lane_step_state, lane_step_tail),
@@ -1611,6 +1704,8 @@ def render_markdown(report: dict) -> str:
         lines.append("")
         lines.append(_severity_line(finding, report.get("adjudication") or {}))
         lines.append("")
+        lines.append(_verification_line(finding, report.get("verification") or {}))
+        lines.append("")
         for occ in finding["occurrences"]:
             lines.append(
                 f"- **{_md_escape_inline(occ['lane'])}** "
@@ -1698,6 +1793,60 @@ def _severity_line(finding: dict, adjudication_record: dict) -> str:
         f"Severity (raw): **{_md_escape_inline(severity_range['highest'])}** — lanes reported "
         f"{by_lane}; not adjudicated ({why})."
     )
+
+
+# Reachability reads first because it is the fact severity depends on. A
+# verdict beside a severity says "high, and reached from an HTTP handler"; a
+# severity alone says "high, and nobody checked".
+_VERDICT_TEXT = {
+    "reachable_from_untrusted": "**reachable from untrusted input**",
+    "reachable_internal_only": "**reachable, internal callers only**",
+    "guarded": "**guarded**",
+    "not_reachable": "**not reachable**",
+    "undetermined": "**undetermined**",
+}
+
+
+def _verification_line(finding: dict, verification_record: dict) -> str:
+    """The reachability line for one finding (Issue #4071).
+
+    Renders BESIDE the severity, never instead of it, and a finding without a
+    verdict still says so plainly -- an unverified finding must not read as a
+    verified-and-clean one. That asymmetry is the whole point: `not_reachable`
+    and `no verdict` mean opposite things and a reader must be able to tell
+    them apart at a glance."""
+    verification = finding.get("verification")
+    if isinstance(verification, dict):
+        verdict = verification.get("verdict") or "undetermined"
+        text = _VERDICT_TEXT.get(verdict, f"**{_md_escape_inline(verdict)}**")
+        parts = [f"Reachability: {text}"]
+        entry = verification.get("entry_point")
+        if entry:
+            parts.append(f"entry point `{_md_escape_inline(entry)}`")
+        path = verification.get("call_path") or []
+        if path:
+            parts.append("via " + " → ".join(f"`{_md_escape_inline(str(p))}`" for p in path))
+        guard = verification.get("guard")
+        if guard:
+            parts.append(f"guarded by `{_md_escape_inline(guard)}`")
+        citation = verification.get("citation") or []
+        if citation:
+            parts.append("cited at " + ", ".join(f"`{_md_escape_inline(str(c))}`" for c in citation))
+        tail = (
+            f" — by `{_md_escape_inline(verification.get('harness'))}` / "
+            f"`{_md_escape_inline(verification.get('model_id'))}`. "
+            f"{_md_escape_inline(verification.get('rationale') or '')}"
+        )
+        return "; ".join(parts) + tail
+
+    status = verification_record.get("status", "missing")
+    if status == "missing":
+        why = "no verifier configured"
+    elif status in ("complete",):
+        why = "the verifier returned no verdict for it"
+    else:
+        why = f"verification stage `{_md_escape_inline(status)}`"
+    return f"Reachability: **not verified** ({why})."
 
 
 def _cross_step_group_lines(groups: list[dict]) -> list[str]:

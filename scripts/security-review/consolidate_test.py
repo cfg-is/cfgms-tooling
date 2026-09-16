@@ -2447,6 +2447,114 @@ def test_render_markdown_states_full_repository_when_unscoped():
     check("**Scope:** full repository." in md, "render_markdown: an unscoped sweep states its scope is the full repository", md)
 
 
+def test_verification_absent_reads_as_not_verified_never_as_clean():
+    # Issue #4071 AC4. `not_reachable` and `no verdict` mean opposite things.
+    # A finding nobody verified must never render as a verified-and-clean one.
+    finding = {"verification": None}
+    line = consolidate._verification_line(finding, {"status": "missing"})
+    check("not verified" in line, "verification: an absent stage reads as not verified", line)
+    check("no verifier configured" in line, "verification: and says why", line)
+    check("not reachable" not in line,
+          "verification: absent is never rendered as not reachable", line)
+
+
+def test_a_verdict_renders_beside_the_severity_with_its_citation():
+    finding = {"verification": {
+        "verdict": "reachable_from_untrusted", "entry_point": "handleThing",
+        "call_path": ["handleThing", "Thing.Do"], "guard": "",
+        "citation": ["pkg/a/b.go:12"], "rationale": "reached from the HTTP handler",
+        "harness": "ollama", "model_id": "glm-5.3-flash:cloud"}}
+    line = consolidate._verification_line(finding, {"status": "complete"})
+    check("reachable from untrusted input" in line, "verification: the verdict is rendered", line)
+    check("handleThing" in line, "verification: the entry point is named", line)
+    check("pkg/a/b.go:12" in line, "verification: the coordinate citation is shown", line)
+    check("glm-5.3-flash:cloud" in line, "verification: the model is attributed", line)
+
+
+def test_every_verdict_term_renders():
+    for verdict in ("reachable_from_untrusted", "reachable_internal_only",
+                    "guarded", "not_reachable", "undetermined"):
+        line = consolidate._verification_line(
+            {"verification": {"verdict": verdict, "harness": "h", "model_id": "m"}},
+            {"status": "complete"})
+        check("Reachability:" in line and "not verified" not in line,
+              f"verification: {verdict} renders as a verdict", line[:70])
+
+
+def test_a_finding_the_verifier_skipped_says_so():
+    line = consolidate._verification_line({"verification": None}, {"status": "complete"})
+    check("returned no verdict for it" in line,
+          "verification: a skipped finding is distinguished from an absent stage", line)
+
+
+def test_attach_verification_is_missing_when_the_stage_never_ran():
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        findings = [{"file": "a.go", "symbol": "S", "vuln_class": "v"}]
+        rec = consolidate._attach_verification(tmp, findings)
+        check(rec["status"] == "missing", "attach: no stage reads as missing", rec["status"])
+        check(rec["unverified"] == 1, "attach: every finding counted unverified", str(rec))
+        check(findings[0].get("verification") is None,
+              "attach: the finding is untouched")
+
+
+def test_attach_verification_folds_a_verdict_onto_its_finding():
+    import tempfile, os, json
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, consolidate.VERIFICATION_SUBDIR, "lanes",
+                           consolidate.VERIFIER_LANE_ID)
+        os.makedirs(out)
+        with open(os.path.join(out, consolidate.VERIFICATION_OUTPUT_FILENAME), "w") as f:
+            json.dump({"state": "complete", "harness": "ollama", "model_id": "m",
+                       "leaked": [], "errors": [],
+                       "verifications": [{"file": "a.go", "symbol": "S", "vuln_class": "v",
+                                          "verdict": "guarded", "guard": "checkTenant",
+                                          "rationale": "a guard stands in the way"}]}, f)
+        findings = [{"file": "a.go", "symbol": "S", "vuln_class": "v"},
+                    {"file": "b.go", "symbol": "T", "vuln_class": "v"}]
+        rec = consolidate._attach_verification(tmp, findings)
+        check(rec["verified"] == 1, "attach: the matching finding is verified", str(rec))
+        check(rec["unverified"] == 1, "attach: the other stays unverified", str(rec))
+        check(findings[0]["verification"]["verdict"] == "guarded",
+              "attach: the verdict is folded on")
+        check(findings[1].get("verification") is None,
+              "attach: a finding with no verdict is left alone, never removed")
+        check(len(findings) == 2, "attach: no finding is deleted", str(len(findings)))
+
+
+def test_attach_verification_records_leaks_and_a_malformed_envelope():
+    import tempfile, os, json
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, consolidate.VERIFICATION_SUBDIR, "lanes",
+                           consolidate.VERIFIER_LANE_ID)
+        os.makedirs(out)
+        path = os.path.join(out, consolidate.VERIFICATION_OUTPUT_FILENAME)
+        with open(path, "w") as f:
+            json.dump({"state": "complete", "harness": "h", "model_id": "m",
+                       "leaked": [{"file": "a.go"}], "errors": [], "verifications": []}, f)
+        rec = consolidate._attach_verification(tmp, [])
+        check(rec["leaked"] == 1, "attach: a withheld verdict is counted", str(rec))
+        with open(path, "w") as f:
+            f.write("[]")
+        rec = consolidate._attach_verification(tmp, [])
+        check(rec["status"] == "malformed",
+              "attach: a malformed envelope reads as malformed, not as a crash", rec["status"])
+
+
+def test_the_consolidated_finding_carries_its_evidence():
+    # Issue #4071 AC6: it was previously reachable only inside `occurrences`,
+    # so the artifact a reader opens first showed the claim without the proof.
+    occ = [{"lane": "l", "step_id": "s", "severity": "high", "confidence": "high",
+            "cwe": "CWE-89", "line": 4, "end_line": None, "title": "t",
+            "evidence": "the proof", "suggested_fix": "f"}]
+    groups = {("a.go", "S", "v"): {"step_ids": {"s"}, "lanes": {"l"}, "occurrences": occ}}
+    got = consolidate._finalize_findings(groups, {"l": {"s": "complete"}})
+    check(got[0]["evidence"] == "the proof",
+          "evidence: the consolidated finding carries it", str(got[0].get("evidence")))
+    check(got[0]["verification"] is None,
+          "evidence: and a verification slot starts empty")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
