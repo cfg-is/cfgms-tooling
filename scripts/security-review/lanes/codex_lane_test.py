@@ -752,9 +752,9 @@ def test_default_lane_id_and_model() -> None:
 
 
 def test_looks_rate_limited() -> None:
-    check(codex_lane._looks_rate_limited("Usage limit reached, try later"), "detects 'usage limit'")
-    check(codex_lane._looks_rate_limited("HTTP 429 too many requests"), "detects '429'")
-    check(not codex_lane._looks_rate_limited("here are your findings"), "does not false-positive on normal output")
+    check(harness_runner.looks_rate_limited("Usage limit reached, try later"), "detects 'usage limit'")
+    check(harness_runner.looks_rate_limited("HTTP 429 too many requests"), "detects '429'")
+    check(not harness_runner.looks_rate_limited("here are your findings"), "does not false-positive on normal output")
 
 
 def test_import_isolation_single_file_layout() -> None:
@@ -864,7 +864,7 @@ def test_unhandled_step_error_is_failed_and_the_lane_continues() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")
         write_plan_step(plan_dir, "step-002")
-        os.mkdir(codex_lane._candidate_path(out_dir, "step-001"))
+        os.mkdir(codex_lane.LANE_SPEC.candidate_path(out_dir, "step-001"))
 
         written = codex_lane.run_lane(
             plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
@@ -951,15 +951,15 @@ def test_rate_limit_detector_ignores_digits_inside_numbers():
     # digits 429, and the markers are matched against the harness's COMBINED
     # output, which includes the model's answer. A finished step was parked.
     check(
-        not codex_lane._looks_rate_limited('"rules_parse_time":0.015944957733154297'),
+        not harness_runner.looks_rate_limited('"rules_parse_time":0.015944957733154297'),
         "codex_lane: a timing number containing 429 is not a rate limit",
     )
     check(
-        not codex_lane._looks_rate_limited("line 429 is missing a bounds check"),
+        not harness_runner.looks_rate_limited("line 429 is missing a bounds check"),
         "codex_lane: a line number 429 is not a rate limit",
     )
     check(
-        not codex_lane._looks_rate_limited("elapsed 4290ms"),
+        not harness_runner.looks_rate_limited("elapsed 4290ms"),
         "codex_lane: 429 inside a larger number is not a rate limit",
     )
 
@@ -973,7 +973,7 @@ def test_rate_limit_detector_ignores_a_finding_about_rate_limiting():
         "no usage limit is enforced",
     ):
         check(
-            not codex_lane._looks_rate_limited(text),
+            not harness_runner.looks_rate_limited(text),
             "codex_lane: a finding about rate limiting is not a rate limit",
             repr(text),
         )
@@ -990,7 +990,7 @@ def test_rate_limit_detector_still_matches_real_limits():
         "quota exceeded",
     ):
         check(
-            codex_lane._looks_rate_limited(text),
+            harness_runner.looks_rate_limited(text),
             "codex_lane: a real rate limit is still detected",
             repr(text),
         )

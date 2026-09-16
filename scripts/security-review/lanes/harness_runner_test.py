@@ -1771,13 +1771,28 @@ def test_scan_render_respects_budget_and_neutralises_delimiters():
 
 
 def test_scan_evidence_reaches_every_lane_and_the_envelope():
+    # Issue #4072 moved the step loop into `harness_runner.run_lane`, so the
+    # scan calls this test used to find in each lane's own source now live in
+    # the shared loop. The GUARANTEE is unchanged and in fact stronger -- there
+    # is one implementation instead of four -- so the assertions are re-pointed,
+    # not relaxed: the shared loop must make the calls, every lane must route
+    # through it, and no lane may run a scanner of its own.
     lanes_dir = Path(__file__).resolve().parent
+    shared = (lanes_dir / "harness_runner.py").read_text(encoding="utf-8")
+    check("collect_scan_evidence(step, repo_root, out_dir)" in shared,
+          "the shared runner collects scan evidence")
+    check("render_scan_evidence(" in shared,
+          "the shared runner renders scan evidence, never a lane's own copy")
+    check("scans=scan_summary(" in shared,
+          "the shared runner records the scan summary on its envelopes")
     for lane_file in sorted(lanes_dir.glob("*_lane.py")):
         source = lane_file.read_text(encoding="utf-8")
-        check("harness_runner.collect_scan_evidence(" in source, f"{lane_file.name} collects scan evidence through the shared runner")
-        check("harness_runner.render_scan_evidence(" in source, f"{lane_file.name} renders scan evidence through the shared runner, never its own copy")
-        check("scans=harness_runner.scan_summary(" in source, f"{lane_file.name} records the scan summary on its envelopes")
-        check("subprocess.Popen(" not in source.split("def build_prompt")[0] or "collect_scan_evidence" in source, f"{lane_file.name} defines no scanner execution of its own")
+        check("harness_runner.run_lane(" in source,
+              f"{lane_file.name} routes its step loop through the shared runner")
+        check("def run_lane(\n    plan_dir" not in source and "step_ids = discover_step_ids" not in source,
+              f"{lane_file.name} keeps no step loop of its own")
+        check("subprocess.Popen(" not in source.split("def build_prompt")[0],
+              f"{lane_file.name} defines no scanner execution of its own")
     for state in (terminal_state.COMPLETE, terminal_state.FAILED, terminal_state.REFUSED, terminal_state.PARKED):
         env = harness_runner.build_envelope(make_context(), "m", state, 0, stop_reason_raw="x", scans=[{"tool": "rg", "status": "empty"}])
         check(env.get("scans") == [{"tool": "rg", "status": "empty"}], f"envelope carries scans in state {state}")

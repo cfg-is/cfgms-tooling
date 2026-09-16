@@ -743,9 +743,9 @@ def test_default_lane_id_and_model() -> None:
 
 
 def test_looks_rate_limited() -> None:
-    check(ollama_lane._looks_rate_limited("Usage limit reached, try later"), "detects 'usage limit'")
-    check(ollama_lane._looks_rate_limited("HTTP 429 too many requests"), "detects '429'")
-    check(not ollama_lane._looks_rate_limited("here are your findings"), "does not false-positive on normal output")
+    check(harness_runner.looks_rate_limited("Usage limit reached, try later"), "detects 'usage limit'")
+    check(harness_runner.looks_rate_limited("HTTP 429 too many requests"), "detects '429'")
+    check(not harness_runner.looks_rate_limited("here are your findings"), "does not false-positive on normal output")
 
 
 def test_looks_not_signed_in() -> None:
@@ -905,7 +905,7 @@ def test_spinner_sequences_interleaved_inside_the_json_are_stripped():
 
 def test_a_failed_call_preserves_stdout_stderr_and_meta():
     with tempfile.TemporaryDirectory() as out_dir:
-        raw_path = ollama_lane._raw_output_path(out_dir, "step-900")
+        raw_path = ollama_lane.LANE_SPEC.raw_output_path(out_dir, "step-900")
         code, _limited, _tail = _run_with_fake_ollama(
             out_dir, raw_path, stdout="I cannot produce that.", stderr="warn: slow", returncode=0
         )
@@ -942,7 +942,7 @@ def test_a_failed_call_preserves_stdout_stderr_and_meta():
 
 def test_a_successful_call_writes_no_diagnostics():
     with tempfile.TemporaryDirectory() as out_dir:
-        raw_path = ollama_lane._raw_output_path(out_dir, "step-901")
+        raw_path = ollama_lane.LANE_SPEC.raw_output_path(out_dir, "step-901")
         code, _limited, _tail = _run_with_fake_ollama(
             out_dir, raw_path, stdout='{"findings": [], "dispositions": []}', stderr="", returncode=0
         )
@@ -1212,15 +1212,15 @@ def test_rate_limit_detector_ignores_digits_inside_numbers():
     # digits 429, and the markers are matched against the harness's COMBINED
     # output, which includes the model's answer. A finished step was parked.
     check(
-        not ollama_lane._looks_rate_limited('"rules_parse_time":0.015944957733154297'),
+        not harness_runner.looks_rate_limited('"rules_parse_time":0.015944957733154297'),
         "ollama_lane: a timing number containing 429 is not a rate limit",
     )
     check(
-        not ollama_lane._looks_rate_limited("line 429 is missing a bounds check"),
+        not harness_runner.looks_rate_limited("line 429 is missing a bounds check"),
         "ollama_lane: a line number 429 is not a rate limit",
     )
     check(
-        not ollama_lane._looks_rate_limited("elapsed 4290ms"),
+        not harness_runner.looks_rate_limited("elapsed 4290ms"),
         "ollama_lane: 429 inside a larger number is not a rate limit",
     )
 
@@ -1234,7 +1234,7 @@ def test_rate_limit_detector_ignores_a_finding_about_rate_limiting():
         "no usage limit is enforced",
     ):
         check(
-            not ollama_lane._looks_rate_limited(text),
+            not harness_runner.looks_rate_limited(text),
             "ollama_lane: a finding about rate limiting is not a rate limit",
             repr(text),
         )
@@ -1251,7 +1251,7 @@ def test_rate_limit_detector_still_matches_real_limits():
         "quota exceeded",
     ):
         check(
-            ollama_lane._looks_rate_limited(text),
+            harness_runner.looks_rate_limited(text),
             "ollama_lane: a real rate limit is still detected",
             repr(text),
         )

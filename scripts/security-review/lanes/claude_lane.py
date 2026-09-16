@@ -260,21 +260,6 @@ def resolve_disallowed_tools(env: "dict | None" = None) -> str:
 # finding that merely discusses rate limiting no longer match. A real limit that
 # is phrased differently is missed and the step records a failure instead --
 # visible and retryable, unlike silently discarding a complete review.
-_RATE_LIMIT_RE = re.compile(
-    r"too\s+many\s+requests"
-    r"|(?:http|https|status(?:\s+code)?|code|error)\s*[:/]?\s*429\b"
-    r"|rate[\s_-]?limit(?:s|ed|ing)?[\s:,.-]+(?:exceeded|reached|hit|error)"
-    r"|(?:exceeded|reached|hit)\s+(?:your\s+|the\s+)*rate[\s_-]?limit"
-    r"|usage\s+limit[\s:,.-]+(?:exceeded|reached)"
-    r"|(?:exceeded|reached|hit)\s+(?:your\s+|the\s+)*usage\s+limit"
-    r"|quota\s+(?:exceeded|exhausted)"
-    r"|(?:exceeded|exhausted)\s+(?:your\s+|the\s+)*quota",
-    re.IGNORECASE,
-)
-
-
-def _looks_rate_limited(text: str) -> bool:
-    return bool(_RATE_LIMIT_RE.search(text or ""))
 
 
 # Issue #4006: the pinned CLI rejects a model id outside its catalog with this
@@ -291,93 +276,14 @@ def _looks_like_unrecognized_model(text: str) -> bool:
     return _UNRECOGNIZED_MODEL_MARKER in text.lower()
 
 
-def _is_safe_repo_relative_path(value: object) -> bool:
-    """True iff `value` is a plain repo-relative path -- never absolute,
-    never `../`-shaped. Syntactic guard only; see `_resolve_within_repo` for
-    the containment check that closes what this cannot (a symlink whose
-    target escapes the checkout)."""
-    if not isinstance(value, str) or value == "":
-        return False
-    if os.path.isabs(value):
-        return False
-    normalized = os.path.normpath(value)
-    if normalized == os.pardir or normalized.startswith(os.pardir + os.sep):
-        return False
-    return True
 
 
-def _resolve_within_repo(repo_root: str, value: str) -> "str | None":
-    """Fully resolve `value` under `repo_root` -- following every symlink in
-    every path component -- and return the real path only if it is still
-    inside the real `repo_root`. Returns `None` when it escapes.
-
-    `files` entries originate in plan steps produced by a planner that
-    deliberately ingests untrusted repository source, and the symlink itself
-    can be committed by the pull request under review, so a repo-relative
-    name is not evidence of a repo-relative target."""
-    root = os.path.realpath(repo_root)
-    resolved = os.path.realpath(os.path.join(root, value))
-    if not resolved.startswith(root + os.sep):
-        return None
-    return resolved
 
 
-def _read_contained_file(path: str) -> str:
-    """Read an already-containment-checked real path. Opened `O_NOFOLLOW` so
-    a final component swapped for a symlink between the check and the open
-    fails closed instead of being followed, and rejected unless it is a
-    regular file so a fifo cannot block the lane indefinitely."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(errno.EINVAL, "not a regular file", path)
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
-            fd = -1  # fdopen owns the descriptor from here
-            return f.read()
-    finally:
-        if fd >= 0:
-            os.close(fd)
 
 
-def read_step_files(repo_root: str, files: list, step_id: str) -> dict:
-    """Read each repo-relative path in `files` from `repo_root`. An unsafe
-    path -- syntactically traversing, or resolving through symlinks to a
-    target outside the checkout -- or an unreadable file is logged and
-    skipped, never fails the whole step over one missing/renamed file."""
-    contents: dict = {}
-    for value in files:
-        if not _is_safe_repo_relative_path(value):
-            schema.log_event("unsafe_file_path_skipped", step_id=step_id, file=value)
-            continue
-        real_path = _resolve_within_repo(repo_root, value)
-        if real_path is None:
-            schema.log_event("unsafe_file_path_skipped", step_id=step_id, file=value)
-            continue
-        try:
-            contents[value] = _read_contained_file(real_path)
-        except OSError as exc:
-            schema.log_event("file_read_failed", step_id=step_id, file=value, error=str(exc))
-    return contents
 
 
-def _render_hypotheses(hypotheses: list) -> str:
-    """Render a plan step's `hypotheses` array as an explicit, numbered list
-    naming each hypothesis's `id`/`objective`/`required_evidence` -- never
-    just the old single free-text `description` -- so the harness has every
-    hypothesis id it must address in its `dispositions` output (Issue
-    #3959). Malformed entries (not a dict, or missing a field) are rendered
-    with whatever they have rather than dropped -- the harness still needs
-    to see every declared id even if a field is missing."""
-    lines = []
-    for index, hypothesis in enumerate(hypotheses, start=1):
-        if not isinstance(hypothesis, dict):
-            continue
-        lines.append(
-            f"{index}. id: {hypothesis.get('id', '')}\n"
-            f"   objective: {hypothesis.get('objective', '')}\n"
-            f"   required_evidence: {hypothesis.get('required_evidence', '')}"
-        )
-    return "\n".join(lines)
 
 
 def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
@@ -396,7 +302,7 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     else:
         scope_text = ""
     description = step.get("description", "")
-    hypotheses_text = _render_hypotheses(step.get("hypotheses") or [])
+    hypotheses_text = harness_runner.render_hypotheses(step.get("hypotheses") or [])
     sections = [f"## {path}\n```\n{content}\n```" for path, content in file_contents.items()]
     body = "\n\n".join(sections)
     return (
@@ -471,509 +377,37 @@ def call_claude_harness(model: str, prompt: str, output_path: str, timeout: floa
         harness_runner.write_call_diagnostics(
             output_path, model, exit_code, prompt, stdout, stderr, timeout
         )
-    return exit_code, _looks_rate_limited(combined), harness_runner.sanitize_harness_output_tail(combined)
+    return exit_code, harness_runner.looks_rate_limited(combined), harness_runner.sanitize_harness_output_tail(combined)
 
 
-def _diagnostic_base(output_path: str) -> str:
-    """Filename stem for the diagnostics a failing call leaves behind, derived
-    from the raw-output path so it carries the step id (and the `.taskN` suffix
-    when a step is split) without needing a second argument -- the
-    `call_harness_fn` signature is shared with the other three lanes."""
-    base = os.path.basename(output_path).lstrip(".")
-    return base[:-5] if base.endswith(".json") else base
+def _fatal_stop_reason(output_tail: str, model: str) -> "str | None":
+    """Issue #4006: the CLI rejects the configured model id identically on
+    every step, so the lane stops after recording it once rather than spending
+    a harness call per remaining step to learn the same thing."""
+    return f"unrecognized_model:{model}" if _looks_like_unrecognized_model(output_tail) else None
 
 
-def _previous_answer_text(out_dir: str, raw_path: str) -> str:
-    """What the model actually said on the call now being repaired.
+LANE_SPEC = harness_runner.LaneSpec(
+    harness="claude",
+    call_harness=call_claude_harness,
+    build_prompt=build_prompt,
+    fatal_stop_reason=_fatal_stop_reason,
+)
 
-    Prefers the answer at `raw_path` -- as the model wrote it, before
-    enrichment adds the harness-owned identity fields, so a repair round never
-    shows the model fields it must not supply. Falls back to the raw stdout
-    preserved under `diagnostics/`, which is the only surviving record when the
-    harness wrote no answer file at all. Returns `""` when neither survives:
-    there is then nothing to repair, and the caller must not spend a call
-    asking the model to correct an answer it cannot see."""
-    try:
-        with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError:
-        pass
-    diag_path = os.path.join(
-        harness_runner.step_diagnostics_dir(out_dir),
-        f"{_diagnostic_base(raw_path)}.stdout.txt",
+
+def run_lane(plan_dir, out_dir, repo_root, lane_id, model, call_harness_fn=None):
+    """This lane's entry into the one shared loop (Issue #4072).
+
+    Everything that used to live here -- step iteration, the per-step guard,
+    the budget split, the repair round, diagnostics, envelope assembly -- is
+    `harness_runner.run_lane`, driven by `LANE_SPEC` above. What remains in
+    this module is what is genuinely this harness's own: how it is invoked,
+    where it is told to put its answer, and the condition that makes further
+    steps pointless."""
+    return harness_runner.run_lane(
+        LANE_SPEC, plan_dir, out_dir, repo_root, lane_id, model,
+        call_harness_fn=call_harness_fn,
     )
-    try:
-        with open(diag_path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
-def _raw_output_path(out_dir: str, step_id: str) -> str:
-    return os.path.join(out_dir, f".{step_id}.claude-raw.json")
-
-
-def _candidate_path(out_dir: str, step_id: str) -> str:
-    return os.path.join(out_dir, f".{step_id}.claude-candidate.json")
-
-
-def _parse_raw_findings(raw_path: str) -> "list | None":
-    """Return the bare (unenriched) findings list the harness wrote at
-    `raw_path`, or `None` if the file is absent, unparseable, or not the
-    expected `{"findings": [...]}` (or bare list) shape. `None` is exactly
-    the "no valid findings file" signal `classify()` needs to reach
-    `refused` -- distinct from a present-but-schema-invalid file, which is
-    handled by `_build_candidate` below."""
-    try:
-        with open(raw_path, "r") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        findings = data.get("findings")
-        if isinstance(findings, list):
-            return findings
-    return None
-
-
-def _build_candidate(
-    raw_path: str, candidate_path: str, sweep_id: str, commit_sha: str, lane_id: str, step_id: str
-) -> "list | None":
-    """Enrich the harness's raw output with the harness-owned identity
-    fields the model is never trusted to supply, then write the result to
-    `candidate_path` -- the artifact `terminal_state.classify()` actually
-    inspects. Returns the enriched list on success (whether or not every
-    entry is itself schema-valid -- that per-item judgment is `classify()`'s
-    job, not this function's), or `None` if the raw output was not even the
-    right shape, in which case `candidate_path` is left unwritten."""
-    raw_findings = _parse_raw_findings(raw_path)
-    if raw_findings is None:
-        return None
-
-    enriched: list = []
-    for raw in raw_findings:
-        finding = dict(raw) if isinstance(raw, dict) else {}
-        finding.update(sweep_id=sweep_id, commit_sha=commit_sha, lane=lane_id, step_id=step_id)
-        enriched.append(finding)
-
-    atomic_write.write_json_atomic(candidate_path, {"findings": enriched})
-    return enriched
-
-
-def _parse_raw_dispositions(raw_path: str) -> list:
-    """Return the `dispositions` array the harness wrote at `raw_path`
-    alongside its findings, or `[]` if the file is absent, unparseable, or
-    carries no `dispositions` list at all. Unlike `_parse_raw_findings`, a
-    missing/malformed `dispositions` is never treated as "no valid findings
-    file" -- `_build_dispositions` below is what turns an empty result here
-    into synthesized `not_attempted` entries, one per hypothesis, rather than
-    failing the whole step."""
-    try:
-        with open(raw_path, "r") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return []
-    if isinstance(data, dict):
-        dispositions = data.get("dispositions")
-        if isinstance(dispositions, list):
-            return dispositions
-    return []
-
-
-def _build_dispositions(raw_path: str, hypotheses: list, step_id: str) -> list:
-    """Return exactly one disposition entry per hypothesis in `hypotheses`,
-    drawn from whatever the harness's raw output addressed, with a
-    `not_attempted` entry synthesized for any hypothesis id the raw output
-    did not address (Issue #3959's acceptance criteria: the lane -- never the
-    planner -- is the only place permitted to mark an actually-missing
-    disposition `not_attempted`).
-
-    A raw entry is used only when it independently validates via
-    `schema.validate_disposition` and its `hypothesis_id` matches a
-    hypothesis this step actually proposed -- a malformed entry (missing
-    `summary`, an out-of-enum `disposition` value) is treated exactly like a
-    missing one, never passed through to let a bundle complete on a
-    technicality.
-    """
-    raw_by_id: dict = {}
-    for raw in _parse_raw_dispositions(raw_path):
-        if not isinstance(raw, dict):
-            continue
-        hypothesis_id = raw.get("hypothesis_id")
-        if not isinstance(hypothesis_id, str) or not hypothesis_id:
-            continue
-        if not schema.validate_disposition(raw):
-            raw_by_id[hypothesis_id] = raw
-
-    result = []
-    for hypothesis in hypotheses:
-        if not isinstance(hypothesis, dict):
-            continue
-        hypothesis_id = hypothesis.get("id")
-        if not isinstance(hypothesis_id, str) or not hypothesis_id:
-            continue
-        if hypothesis_id in raw_by_id:
-            result.append(raw_by_id[hypothesis_id])
-        else:
-            schema.log_event(
-                "disposition_missing_synthesized_not_attempted",
-                step_id=step_id,
-                hypothesis_id=hypothesis_id,
-            )
-            result.append(
-                {
-                    "hypothesis_id": hypothesis_id,
-                    "disposition": "not_attempted",
-                    "summary": "the harness's raw output did not address this hypothesis",
-                }
-            )
-    return result
-
-
-def discover_step_ids(plan_dir: str) -> list:
-    if not os.path.isdir(plan_dir):
-        return []
-    names = []
-    for name in os.listdir(plan_dir):
-        if name.startswith("step-") and name.endswith(".json"):
-            names.append(name[: -len(".json")])
-    return sorted(names)
-
-
-def _load_plan_step(plan_dir: str, step_id: str) -> "dict | None":
-    path = os.path.join(plan_dir, f"{step_id}.json")
-    try:
-        with open(path, "r") as f:
-            step = json.load(f)
-    except (OSError, ValueError) as exc:
-        schema.log_event("invalid_plan_step", step_id=step_id, error=str(exc))
-        return None
-
-    errors = schema.validate_plan_step(step)
-    if errors:
-        schema.log_event("invalid_plan_step", step_id=step_id, errors=errors)
-        return None
-    return step
-
-
-def run_lane(
-    plan_dir: str,
-    out_dir: str,
-    repo_root: str,
-    lane_id: str,
-    model: str,
-    call_harness_fn=call_claude_harness,
-) -> list:
-    """Iterate every step this lane has not yet resolved and write one
-    envelope per step. Every step's body is independently guarded (Issue
-    #3959): a step that raises is recorded `failed` and the loop moves on, so
-    one malformed step can never cost the coverage of the steps behind it.
-    Returns the list of envelopes written, mainly for
-    tests -- the on-disk files are the actual contract."""
-    os.makedirs(out_dir, exist_ok=True)
-    step_ids = discover_step_ids(plan_dir)
-
-    # Issue #3962: the two resume-time binding checks. `harness_identity`
-    # comes straight from the env var #3952's `launch-investigator` injects
-    # (falling back to "unknown" for a standalone invocation outside the
-    # container, e.g. these tests) -- the same value this lane records on
-    # every envelope it writes below, so a later invocation launched under
-    # different harness code sees a mismatch against envelopes this run
-    # writes. `prompt_version` is recorded on every envelope but is not
-    # itself a resume-time check (see `harness_runner.compute_prompt_version`).
-    harness_identity = os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY", "unknown")
-    prompt_version = harness_runner.compute_prompt_version()
-    outstanding = resume.missing_steps(
-        out_dir, step_ids, plan_dir=plan_dir, current_harness_identity=harness_identity
-    )
-
-    written: list = []
-    for step_id in outstanding:
-        step = _load_plan_step(plan_dir, step_id)
-        if step is None:
-            continue
-
-        sweep_id = step["sweep_id"]
-        commit_sha = step["commit_sha"]
-        files = step.get("files") or []
-
-        plan_hash = harness_runner.compute_plan_hash(plan_dir, step_id)
-        context = {
-            "sweep_id": sweep_id,
-            "commit_sha": commit_sha,
-            "lane": lane_id,
-            "step_id": step_id,
-            "plan_hash": plan_hash,
-            "prompt_version": prompt_version,
-            "harness_identity": harness_identity,
-        }
-        envelope_path = harness_runner.status_envelope_path(out_dir, step_id)
-
-        # Issue #3959: every step's body runs inside its own guard, so one
-        # step that raises costs one step. The concrete case is a plan step
-        # carrying two hypotheses with the same `id`: the dispositions built
-        # from it collide, `harness_runner.write_envelope` refuses the
-        # envelope, and before this guard existed that `ValueError` unwound
-        # out of `run_lane` and out of `main()` -- killing the lane process
-        # mid-sweep, so every step after it produced no envelope at all. The
-        # step is recorded `failed` (never retried by `resume.missing_steps`,
-        # so a deterministically-broken step cannot loop) and the sweep
-        # continues.
-        try:
-            file_contents = read_step_files(repo_root, files, step_id)
-            # Issue #3982: fixed scanner profiles over the step's files; every
-            # tool problem is a recorded gap, never a failed step.
-            scan_evidence = harness_runner.collect_scan_evidence(step, repo_root, out_dir)
-            hypotheses = step.get("hypotheses") or []
-
-            # Issue #3959: a step whose combined file_contents exceeds the shared
-            # budget is split into multiple sequential execution tasks, each
-            # addressing a subset of the step's hypotheses -- see
-            # `harness_runner.split_hypotheses_for_budget`'s own docstring. The
-            # common case (within budget, or at most one hypothesis) returns a
-            # single task unchanged, so every existing single-call step below
-            # behaves exactly as before the split existed.
-            tasks = harness_runner.split_hypotheses_for_budget(
-                hypotheses, file_contents, harness_runner.MAX_BUNDLE_BYTES
-            )
-            multi_task = len(tasks) > 1
-
-            task_findings: list = []
-            task_dispositions: list = []
-            task_states: list = []
-            stop_reason_raw = None
-            harness_output_tail = None
-            launch_exc = None
-            unrecognized_model = False
-
-            for task_index, task_hypotheses in enumerate(tasks):
-                task_step = dict(step, hypotheses=task_hypotheses, scan_evidence=scan_evidence)
-                raw_id = f"{step_id}.task{task_index}" if multi_task else step_id
-                raw_path = _raw_output_path(out_dir, raw_id)
-                candidate_path = _candidate_path(out_dir, raw_id)
-                for stale in (raw_path, candidate_path):
-                    try:
-                        os.remove(stale)
-                    except OSError:
-                        pass
-
-                prompt = build_prompt(task_step, file_contents, raw_path)
-                try:
-                    # Wait out a rate limit rather than parking on the first one
-                    # (Issue #4059): parking without waiting only converts "not
-                    # done" into "not done, recorded", and a lane on a limited
-                    # account can never finish a plan that way.
-                    exit_code, rate_limited, output_tail = harness_runner.call_with_rate_limit_backoff(
-                        call_harness_fn, model, prompt, raw_path
-                    )
-                except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
-                    launch_exc = exc
-                    break
-
-                # Issue #4069: the ids this task actually showed the model. A
-                # finding quoting anything else is a defect, so classify() must
-                # see them -- otherwise the envelope reads `complete` and the
-                # repair round below never fires. Task-scoped, not step-scoped:
-                # a split step shows each task only its own subset.
-                task_hypothesis_ids = {
-                    h.get("id") for h in task_hypotheses if isinstance(h, dict) and h.get("id")
-                }
-                enriched = _build_candidate(raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id)
-                findings_path = candidate_path if enriched is not None else None
-                task_state = terminal_state.classify(
-                    exit_code, findings_path, rate_limited=rate_limited,
-                    known_hypothesis_ids=task_hypothesis_ids,
-                )
-
-                # Issue #4069: one repair round, a second only while the answer
-                # is still improving. Measured on the six-step benchmark: three
-                # of nemotron's failures were complete, correct reviews rejected
-                # over transcription -- a missing required field, a missing
-                # opening quote, an abbreviated hypothesis id. The repair prompt
-                # carries no file contents, so it costs a fraction of the
-                # original call. Never on a rate-limited call: that is no
-                # answer, not a defective one, and `parked` already means "retry
-                # later". Never without a surviving answer to quote back.
-                if task_state != terminal_state.COMPLETE and not rate_limited:
-                    attempt = 0
-                    defects = (
-                        harness_runner.describe_findings_defects(enriched, task_hypothesis_ids)
-                        if enriched is not None
-                        else []
-                    )
-                    signature = harness_runner.repair_signature(enriched, defects)
-                    while attempt < harness_runner.REPAIR_MAX_ATTEMPTS:
-                        previous_answer = _previous_answer_text(out_dir, raw_path)
-                        if not previous_answer:
-                            break
-                        attempt += 1
-                        repair_prompt = harness_runner.build_repair_prompt(defects, previous_answer)
-                        harness_runner.write_step_diagnostic(
-                            out_dir,
-                            f"{_diagnostic_base(raw_path)}.repair{attempt}-prompt.txt",
-                            repair_prompt,
-                        )
-                        schema.log_event(
-                            "step_repair_attempted",
-                            step_id=step_id,
-                            attempt=attempt,
-                            defects=len(defects),
-                        )
-                        try:
-                            exit_code, rate_limited, output_tail = (
-                                harness_runner.call_with_rate_limit_backoff(
-                                    call_harness_fn, model, repair_prompt, raw_path
-                                )
-                            )
-                        except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step
-                            launch_exc = exc
-                            break
-                        enriched = _build_candidate(
-                            raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id
-                        )
-                        findings_path = candidate_path if enriched is not None else None
-                        task_state = terminal_state.classify(
-                            exit_code, findings_path, rate_limited=rate_limited,
-                            known_hypothesis_ids=task_hypothesis_ids,
-                        )
-                        schema.log_event(
-                            "step_repair_result",
-                            step_id=step_id,
-                            attempt=attempt,
-                            state=task_state,
-                        )
-                        if task_state == terminal_state.COMPLETE or rate_limited:
-                            break
-                        defects = (
-                            harness_runner.describe_findings_defects(enriched, task_hypothesis_ids)
-                            if enriched is not None
-                            else []
-                        )
-                        next_signature = harness_runner.repair_signature(enriched, defects)
-                        if not harness_runner.repair_made_progress(signature, next_signature):
-                            break
-                        signature = next_signature
-                    if launch_exc is not None:
-                        break
-
-                task_states.append(task_state)
-
-                if task_state == terminal_state.COMPLETE:
-                    task_findings.extend(enriched or [])
-                    task_dispositions.extend(_build_dispositions(raw_path, task_hypotheses, step_id))
-                else:
-                    # Issue #4069: keep the prompt that produced this failure and
-                    # whatever answer the harness did manage to write, before the
-                    # cleanup below removes them. A failure readable only through
-                    # a bounded tail cannot be reproduced, and a failure that
-                    # cannot be reproduced gets diagnosed by guesswork.
-                    diag_base = _diagnostic_base(raw_path)
-                    harness_runner.write_step_diagnostic(
-                        out_dir, f"{diag_base}.prompt.txt", prompt
-                    )
-                    try:
-                        with open(raw_path, "r", encoding="utf-8", errors="replace") as rf:
-                            harness_runner.write_step_diagnostic(
-                                out_dir, f"{diag_base}.answer.json", rf.read()
-                            )
-                    except OSError:
-                        pass
-
-                    harness_output_tail = harness_output_tail or output_tail
-                    if task_state == terminal_state.PARKED:
-                        stop_reason_raw = stop_reason_raw or "rate_limited"
-                    elif task_state == terminal_state.REFUSED:
-                        stop_reason_raw = stop_reason_raw or "no_valid_findings_file"
-                    elif task_state == terminal_state.FAILED and exit_code != 0:
-                        # Issue #4006: the CLI rejects the configured model id
-                        # identically on every step -- this overrides whatever
-                        # stop_reason_raw an earlier task in this same step
-                        # already set, and the flag below stops the whole lane
-                        # after this step's envelope is written, so no further
-                        # step spends a harness call to record the same
-                        # rejection over and over.
-                        if _looks_like_unrecognized_model(output_tail):
-                            stop_reason_raw = f"unrecognized_model:{model}"
-                            unrecognized_model = True
-                        else:
-                            stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
-                    else:
-                        stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
-
-                for stale in (raw_path, candidate_path):
-                    try:
-                        os.remove(stale)
-                    except OSError:
-                        pass
-
-                if unrecognized_model:
-                    break
-
-            if launch_exc is not None:
-                schema.log_event("step_launch_failed", step_id=step_id, error=str(launch_exc))
-                envelope = harness_runner.apply_refusal_policy(
-                    terminal_state.FAILED,
-                    envelope_path,
-                    context,
-                    model,
-                    stop_reason_raw=f"launch_exception:{launch_exc}",
-                    files_intended=files,
-                    files_read=list(file_contents.keys()),
-                    scans=harness_runner.scan_summary(scan_evidence),
-                )
-                harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)
-                written.append(envelope)
-                continue
-
-            if task_states and all(s == terminal_state.COMPLETE for s in task_states):
-                state = terminal_state.COMPLETE
-            elif terminal_state.PARKED in task_states:
-                state = terminal_state.PARKED
-            elif terminal_state.REFUSED in task_states:
-                state = terminal_state.REFUSED
-            else:
-                state = terminal_state.FAILED
-
-            envelope = harness_runner.apply_refusal_policy(
-                state,
-                envelope_path,
-                context,
-                model,
-                stop_reason_raw=stop_reason_raw if state != terminal_state.COMPLETE else None,
-                findings=task_findings if state == terminal_state.COMPLETE else None,
-                files_intended=files,
-                files_read=list(file_contents.keys()),
-                scans=harness_runner.scan_summary(scan_evidence),
-                dispositions=task_dispositions if state == terminal_state.COMPLETE else None,
-                harness_output_tail=harness_output_tail if state != terminal_state.COMPLETE else None,
-            )
-            harness_runner.write_envelope(out_dir, step_id, envelope, plan_step=step)
-            schema.log_event(
-                "step_written",
-                step_id=step_id,
-                state=envelope["state"],
-                stop_reason_raw=envelope.get("stop_reason_raw"),
-            )
-            written.append(envelope)
-            if unrecognized_model:
-                # Issue #4006: every remaining step would fail on this same
-                # rejected model id -- stop the lane here instead of spending
-                # one harness call per remaining step to record it again.
-                schema.log_event("lane_stopped_unrecognized_model", step_id=step_id, model=model)
-                break
-        except Exception as exc:  # noqa: BLE001 -- one bad step is a failed step, never a crashed lane
-            schema.log_event("step_unhandled_error", step_id=step_id, error=str(exc))
-            harness_runner.remove_step_temp_artifacts(out_dir, step_id)
-            envelope = harness_runner.write_step_failure_envelope(
-                out_dir, context, model, f"unhandled_step_error:{exc}"
-            )
-            if envelope is not None:
-                written.append(envelope)
-            continue
-
-    return written
 
 
 def main(argv: "list | None" = None) -> int:
