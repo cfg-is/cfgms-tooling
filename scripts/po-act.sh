@@ -707,6 +707,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
       -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       "${session_mount[@]}" \
