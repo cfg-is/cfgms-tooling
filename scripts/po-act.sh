@@ -129,54 +129,137 @@ CYCLE_DIR="${CFGMS_CYCLE_DIR:-${CACHE_DIR}/cycles}"
 # Sessions without that variable (a human running po-act.sh from a plain shell)
 # all share the "unknown" slot -- no worse than the previous behaviour, and the
 # case that motivated this is agent sessions, which always have one.
+# Sessions do NOT separate an orchestrator from the subagents it spawns
+# (Issue #4094). A nested `Agent` runs inside the same CLI process and inherits
+# the parent's whole environment verbatim -- measured 2026-09-17: a probe
+# subagent reported byte-identical CLAUDE_CODE_SESSION_ID, CLAUDE_PID,
+# CLAUDE_CODE_MESSAGING_TOKEN and every other CLAUDE_* variable, and its shell
+# is a child of the same `claude` pid. There is therefore NO ambient identity a
+# shell can read that tells "the cycle's owner" apart from "a subagent it
+# spawned", which is why the two guards below are structural rather than
+# identity checks:
+#
+#   1. The pointer is a STACK, not a slot. cycle-start pushes, cycle-end pops
+#      the top entry only. A nested cycle opened inside an outer one closes
+#      itself and restores the outer cycle as current, instead of clearing it.
+#   2. Closing is REVERSIBLE. A step recorded shortly after a close reopens
+#      that manifest (clears `end`, bumps `reopened`) so the record cannot be
+#      truncated mid-cycle; the last cycle-end wins and correlates the whole
+#      span. This is the guarantee -- a manifest cannot silently lose steps --
+#      and it holds no matter which context called cycle-end.
+#
+# Observed 2026-09-16: cycle-20260916T140847Z-326991 was closed at 14:15:46Z
+# while its orchestrator was still working. Three further steps (a preflight,
+# the dispatch of story #4093 and a log on epic #4085) and the cycle's nested
+# agents never reached the record, and the orchestrator's own cycle-end at
+# ~14:19Z reported CYCLE_END_SKIPPED:no_open_cycle. cycle-report averages over
+# these manifests, so a truncated one skews the baseline down with no signal.
 CYCLE_SESSION_SLUG="$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-unknown}" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-64)"
 CYCLE_CURRENT_PTR="${CYCLE_DIR}/current.${CYCLE_SESSION_SLUG}"
 # Pre-split pointer. Read as a fallback so a cycle opened by an older revision
 # of this script still closes cleanly; never written.
 CYCLE_LEGACY_PTR="${CYCLE_DIR}/current"
+# Most recently closed cycle for this session, as "<cycle_id> <epoch>". Only a
+# step arriving within CYCLE_REOPEN_WINDOW_SEC of that close may reopen it --
+# the window bounds guard 2 so a stray subcommand hours later cannot resurrect
+# a long-finished cycle. Sized above a cycle's own wall-clock length so a
+# premature close anywhere inside a running cycle is always recoverable.
+CYCLE_CLOSED_PTR="${CYCLE_DIR}/closed.${CYCLE_SESSION_SLUG}"
+CYCLE_REOPEN_WINDOW_SEC="${CFGMS_CYCLE_REOPEN_WINDOW_SEC:-1800}"
+
+# _cycle_stack_top
+# Prints the innermost open cycle id for this session -- the last line of the
+# stack -- falling back to the pre-split single-id pointer. Empty when none.
+_cycle_stack_top() {
+  local ptr cycle_id=""
+  for ptr in "$CYCLE_CURRENT_PTR" "$CYCLE_LEGACY_PTR"; do
+    [[ -f "$ptr" ]] || continue
+    cycle_id=$(grep -v '^[[:space:]]*$' "$ptr" 2>/dev/null | tail -1) || cycle_id=""
+    [[ -n "$cycle_id" ]] && break
+  done
+  printf '%s' "$cycle_id"
+}
 
 # _cycle_manifest_path [cycle_id]
-# Prints the manifest path for the given (or currently open) cycle. Empty
+# Prints the manifest path for the given (or innermost open) cycle. Empty
 # output means no cycle is open -- callers must treat that as a silent no-op,
 # never an error: a human running a one-off `po-act.sh enqueue` outside a
 # cycle must not fail just because no cycle-start ever ran.
 _cycle_manifest_path() {
   local cycle_id="${1:-}"
-  if [[ -z "$cycle_id" ]]; then
-    local ptr
-    for ptr in "$CYCLE_CURRENT_PTR" "$CYCLE_LEGACY_PTR"; do
-      [[ -f "$ptr" ]] || continue
-      cycle_id=$(cat "$ptr" 2>/dev/null) || cycle_id=""
-      [[ -n "$cycle_id" ]] && break
-    done
-  fi
+  [[ -n "$cycle_id" ]] || cycle_id="$(_cycle_stack_top)"
   [[ -n "$cycle_id" ]] || return 0
   echo "${CYCLE_DIR}/${cycle_id}.json"
 }
 
-# _cycle_write_ptr <cycle_id>
-# Publishes the open-cycle pointer atomically. rename(2) within one directory
-# is atomic, so a concurrent reader sees either the old id or the new one,
-# never a partial write.
-_cycle_write_ptr() {
-  local cycle_id="$1" tmp
-  tmp="$(mktemp "${CYCLE_CURRENT_PTR}.XXXXXX" 2>/dev/null)" || {
-    _cycle_write_ptr "$cycle_id"
+# _cycle_step_manifest_path <subcommand>
+# The manifest a STEP should be recorded into: the innermost open cycle, or --
+# when nothing is open -- this session's most recently closed cycle if it was
+# closed less than CYCLE_REOPEN_WINDOW_SEC ago. Guard 2 above: a step after a
+# premature close belongs to that cycle, so it reopens the record rather than
+# vanishing. Re-pushes the id so the rest of the cycle records normally and the
+# eventual owner's cycle-end pops it. Never used by cycle-end itself, which
+# must not resurrect a cycle just to close it again.
+#
+# `cycle-report` is excluded from the reopen path: reading the cycle records is
+# its whole purpose, so letting it resurrect the cycle it is reporting on is
+# self-referential -- it would drop the just-closed cycle back out of its own
+# average. It still records a step normally while a cycle is genuinely open.
+_cycle_step_manifest_path() {
+  local subcommand="${1:-}"
+  local manifest closed_id closed_at now
+  manifest="$(_cycle_manifest_path)"
+  if [[ -n "$manifest" ]]; then
+    printf '%s' "$manifest"
     return 0
-  }
-  printf '%s\n' "$cycle_id" > "$tmp"
+  fi
+  [[ "$subcommand" != "cycle-report" ]] || return 0
+  [[ -f "$CYCLE_CLOSED_PTR" ]] || return 0
+  read -r closed_id closed_at < "$CYCLE_CLOSED_PTR" 2>/dev/null || return 0
+  [[ -n "$closed_id" ]] && [[ "$closed_at" =~ ^[0-9]+$ ]] || return 0
+  [[ -f "${CYCLE_DIR}/${closed_id}.json" ]] || return 0
+  now="$(date +%s 2>/dev/null)" || return 0
+  (( now - closed_at < CYCLE_REOPEN_WINDOW_SEC )) || return 0
+  _cycle_push_ptr "$closed_id"
+  rm -f "$CYCLE_CLOSED_PTR"
+  printf '%s' "${CYCLE_DIR}/${closed_id}.json"
+}
+
+# _cycle_push_ptr <cycle_id>
+# Pushes a cycle onto this session's open-cycle stack atomically. rename(2)
+# within one directory is atomic, so a concurrent reader sees either the old
+# stack or the new one, never a partial write.
+_cycle_push_ptr() {
+  local cycle_id="$1" tmp
+  tmp="$(mktemp "${CYCLE_CURRENT_PTR}.XXXXXX" 2>/dev/null)" || return 0
+  [[ -f "$CYCLE_CURRENT_PTR" ]] && cat "$CYCLE_CURRENT_PTR" >> "$tmp" 2>/dev/null
+  printf '%s\n' "$cycle_id" >> "$tmp"
   mv -f "$tmp" "$CYCLE_CURRENT_PTR" 2>/dev/null || rm -f "$tmp"
 }
 
-# _cycle_clear_ptr <cycle_id>
-# Removes this session's pointer, and the legacy pointer only when it still
-# names the cycle being closed -- never another session's open cycle.
-_cycle_clear_ptr() {
-  local cycle_id="$1"
-  rm -f "$CYCLE_CURRENT_PTR"
+# _cycle_pop_ptr <cycle_id>
+# Pops the named cycle off this session's stack, leaving any outer cycle open
+# and current, and records it as this session's most recently closed cycle so
+# a late step can reopen it. The legacy single-id pointer is removed only when
+# it still names the cycle being closed -- never another session's open cycle.
+_cycle_pop_ptr() {
+  local cycle_id="$1" tmp
+  if [[ -f "$CYCLE_CURRENT_PTR" ]] && tmp="$(mktemp "${CYCLE_CURRENT_PTR}.XXXXXX" 2>/dev/null)"; then
+    # Drop the LAST occurrence only: an outer cycle with the same id would be
+    # a duplicate push, and popping both would strand it.
+    grep -v '^[[:space:]]*$' "$CYCLE_CURRENT_PTR" 2>/dev/null \
+      | awk -v id="$cycle_id" '{ lines[NR] = $0; if ($0 == id) last = NR } END { for (i = 1; i <= NR; i++) if (i != last) print lines[i] }' \
+      > "$tmp" 2>/dev/null
+    if [[ -s "$tmp" ]]; then
+      mv -f "$tmp" "$CYCLE_CURRENT_PTR" 2>/dev/null || rm -f "$tmp"
+    else
+      rm -f "$tmp" "$CYCLE_CURRENT_PTR"
+    fi
+  fi
   if [[ -f "$CYCLE_LEGACY_PTR" ]] && [[ "$(cat "$CYCLE_LEGACY_PTR" 2>/dev/null)" == "$cycle_id" ]]; then
     rm -f "$CYCLE_LEGACY_PTR"
   fi
+  printf '%s %s\n' "$cycle_id" "$(date +%s 2>/dev/null || echo 0)" > "$CYCLE_CLOSED_PTR" 2>/dev/null || true
 }
 
 # _cycle_append_step <subcommand> [args...]
@@ -197,7 +280,7 @@ CYCLE_STEP_TEE_PID=""
 _cycle_append_step() {
   local subcommand="$1"; shift
   local manifest idx
-  manifest=$(_cycle_manifest_path) || return 0
+  manifest=$(_cycle_step_manifest_path "$subcommand") || return 0
   [[ -n "$manifest" ]] && [[ -f "$manifest" ]] || return 0
   local _step_args="$*"
   # stderr silenced by _cfgms_locked_do itself (best-effort recording never
@@ -216,6 +299,13 @@ try:
         manifest = json.load(f)
 except Exception:
     sys.exit(0)
+# A step arriving after `end` was set means the cycle was closed prematurely --
+# by a nested subagent, or by a caller that ran cycle-end and kept working
+# (Issue #4094). Reopen rather than drop the step: a truncated manifest looks
+# complete and silently under-reports, which is the failure this guards.
+if manifest.get("end") is not None:
+    manifest["end"] = None
+    manifest["reopened"] = (manifest.get("reopened") or 0) + 1
 steps = manifest.setdefault("steps", [])
 steps.append({
     "ts": ts, "subcommand": subcommand, "args": args,
@@ -1119,7 +1209,13 @@ PYEOF
       echo "CYCLE_START_FAILED:write"
       exit 0
     fi
-    echo "$cycle_id" > "$CYCLE_CURRENT_PTR"
+    # Push, never overwrite: a cycle opened while another is already open in
+    # this session (a nested subagent running its own cycle) must nest, so
+    # closing it restores the outer cycle rather than clearing it (#4094).
+    _cycle_push_ptr "$cycle_id"
+    # A fresh cycle supersedes any recently-closed one, so nothing can reopen
+    # the previous cycle once this one is running.
+    rm -f "$CYCLE_CLOSED_PTR"
     echo "CYCLE_STARTED:${cycle_id}"
     ;;
 
@@ -1196,8 +1292,12 @@ PYEOF
     # Scratch capture files from steps that were killed before their outcome
     # could be classified (the step record itself stays, honestly "incomplete").
     rm -f "${manifest}".step-*.out
-    _cycle_clear_ptr "$(basename "$manifest" .json)"
-    echo "CYCLE_ENDED:$(basename "$manifest" .json):cost=${cost}"
+    _cycle_pop_ptr "$(basename "$manifest" .json)"
+    # Surface a cycle that was closed early and reopened by a later step, so a
+    # premature close is visible in the record instead of silently repaired.
+    reopened=$(python3 -c "import json; print(json.load(open('${manifest}')).get('reopened') or 0)" 2>/dev/null || echo 0)
+    [[ "$reopened" =~ ^[1-9][0-9]*$ ]] || reopened=""
+    echo "CYCLE_ENDED:$(basename "$manifest" .json):cost=${cost}${reopened:+:reopened=${reopened}}"
     ;;
 
   cycle-report)

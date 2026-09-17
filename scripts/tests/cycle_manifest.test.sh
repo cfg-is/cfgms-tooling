@@ -454,6 +454,97 @@ check_eq "session A still closes cleanly after B closed — never CYCLE_END_SKIP
 check_eq "session A closed A's cycle, not B's" \
   "$(printf '%s' "$race_a_end" | cut -d: -f2)" "$race_a_id"
 
+printf '\n== a premature close cannot truncate the record (Issue #4094) ==\n'
+# A nested `Agent` subagent inherits its parent's environment verbatim --
+# measured 2026-09-17: identical CLAUDE_CODE_SESSION_ID, CLAUDE_PID and every
+# other CLAUDE_* variable, with its shell a child of the same `claude` pid. A
+# cycle-end it runs is therefore indistinguishable from the orchestrator's own,
+# which is why the guard is "a record cannot be truncated" rather than an
+# identity check. Simulated here by closing the cycle while it is still worked.
+#
+# Observed 2026-09-16 on cycle-20260916T140847Z-326991: closed at 14:15:46Z
+# with the orchestrator still running, so three later steps and every nested
+# agent were lost and the orchestrator's own cycle-end reported
+# CYCLE_END_SKIPPED:no_open_cycle.
+export CLAUDE_CODE_SESSION_ID="reopen-session"
+own_out="$("$POACT" cycle-start pipeline 2>&1 | tail -1)"
+own_id="${own_out#CYCLE_STARTED:}"
+own_json="${CYCLE_DIR}/${own_id}.json"
+bash "$POACT" merge-queue >/dev/null 2>&1 || true
+
+early_end="$(bash "$POACT" cycle-end 2>&1 | tail -1)"
+check_eq "the premature close still reports CYCLE_ENDED" \
+  "$(printf '%s' "$early_end" | cut -d: -f1)" "CYCLE_ENDED"
+check_eq "and really did stamp an end timestamp" \
+  "$([[ "$(jf "$own_json" 'd["end"]')" == "None" ]] && echo unset || echo set)" "set"
+
+# The orchestrator was still working. On the pre-#4094 code the pointer is gone
+# by now, so this step is silently dropped and the assertions below fail.
+bash "$POACT" merge-queue >/dev/null 2>&1 || true
+check_eq "a step after the premature close reopens the manifest" \
+  "$(jf "$own_json" 'd["end"]')" "None"
+check_eq "the reopen is counted, not silent" "$(jf "$own_json" 'd["reopened"]')" "1"
+check_eq "the post-close step is in the record, not dropped" \
+  "$(jf "$own_json" 'len(d["steps"])')" "2"
+
+owner_end="$(bash "$POACT" cycle-end 2>&1 | tail -1)"
+check_eq "the owner's own cycle-end still closes cleanly" \
+  "$(printf '%s' "$owner_end" | cut -d: -f1)" "CYCLE_ENDED"
+check_eq "and closes its own cycle" "$(printf '%s' "$owner_end" | cut -d: -f2)" "$own_id"
+check_contains "the close surfaces the premature close it repaired" "$owner_end" "reopened=1"
+check_eq "the final record is closed" \
+  "$([[ "$(jf "$own_json" 'd["end"]')" == "None" ]] && echo unset || echo set)" "set"
+check_eq "and carries every step, not just the pre-close ones" \
+  "$(jf "$own_json" 'len(d["steps"])')" "2"
+
+printf '\n== the reopen window is bounded ==\n'
+# Guard 2 must not resurrect a long-finished cycle for a stray later call.
+export CLAUDE_CODE_SESSION_ID="reopen-window-session"
+win_out="$("$POACT" cycle-start pipeline 2>&1 | tail -1)"
+win_id="${win_out#CYCLE_STARTED:}"
+win_json="${CYCLE_DIR}/${win_id}.json"
+bash "$POACT" cycle-end >/dev/null 2>&1 || true
+CFGMS_CYCLE_REOPEN_WINDOW_SEC=0 bash "$POACT" merge-queue >/dev/null 2>&1 || true
+check_eq "a step outside the window leaves the finished cycle closed" \
+  "$([[ "$(jf "$win_json" 'd["end"]')" == "None" ]] && echo reopened || echo closed)" "closed"
+check_eq "and is not recorded into it" "$(jf "$win_json" 'len(d["steps"])')" "0"
+
+printf '\n== a nested cycle nests instead of clobbering the outer one ==\n'
+# The pointer is a stack: a cycle opened inside another closes itself and
+# restores the outer one, instead of clearing the slot they used to share.
+export CLAUDE_CODE_SESSION_ID="nested-session"
+outer_out="$("$POACT" cycle-start pipeline 2>&1 | tail -1)"
+outer_id="${outer_out#CYCLE_STARTED:}"
+outer_json="${CYCLE_DIR}/${outer_id}.json"
+inner_out="$("$POACT" cycle-start cron 2>&1 | tail -1)"
+inner_id="${inner_out#CYCLE_STARTED:}"
+check_eq "the nested cycles are distinct" \
+  "$([[ "$outer_id" != "$inner_id" ]] && echo distinct || echo same)" "distinct"
+check_eq "the inner cycle is current while it runs" \
+  "$(tail -1 "$(cycle_ptr)")" "$inner_id"
+check_eq "the outer cycle is still on the stack underneath" \
+  "$(head -1 "$(cycle_ptr)")" "$outer_id"
+bash "$POACT" cycle-end >/dev/null 2>&1 || true
+check_eq "closing the inner cycle restores the outer one as current" \
+  "$(tail -1 "$(cycle_ptr)")" "$outer_id"
+bash "$POACT" merge-queue >/dev/null 2>&1 || true
+check_eq "a later step lands in the outer cycle" \
+  "$(jf "$outer_json" 'len(d["steps"])')" "1"
+outer_end="$(bash "$POACT" cycle-end 2>&1 | tail -1)"
+check_eq "the outer cycle closes cleanly, never CYCLE_END_SKIPPED" \
+  "$(printf '%s' "$outer_end" | cut -d: -f1)" "CYCLE_ENDED"
+check_eq "and it is the OUTER cycle that closed" \
+  "$(printf '%s' "$outer_end" | cut -d: -f2)" "$outer_id"
+check_eq "the stack is empty once both cycles are closed" \
+  "$([[ -f "$(cycle_ptr)" ]] && echo present || echo gone)" "gone"
+
+printf '\n== cycle-end stays best-effort ==\n'
+# Measurement infra must never fail a cycle, so every cycle-end path exits 0.
+export CLAUDE_CODE_SESSION_ID="stray-session"
+if stray_out="$(bash "$POACT" cycle-end 2>&1 | tail -1)"; then stray_rc=0; else stray_rc=$?; fi
+check_eq "a cycle-end with nothing open exits 0" "$stray_rc" "0"
+check_eq "and says so distinguishably" "$stray_out" "CYCLE_END_SKIPPED:no_open_cycle"
+
 printf '\n%s\n' "-----------------------------------------"
 if [[ "$fail" -eq 0 ]]; then
   printf 'PASS: %d checks\n' "$ran"; exit 0
