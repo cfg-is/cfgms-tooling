@@ -569,6 +569,37 @@ restrict_to_owner() {
   esac
 }
 
+# agent_trust_file <slug>
+# Writes a minimal per-container ~/.claude.json marking /workspace as trusted and
+# echoes its path, for mounting at /home/agent/.claude.json.
+#
+# Without this file a headless agent logs
+#   "Ignoring N permissions.allow entries from .claude/settings.json:
+#    this workspace has not been trusted"
+# and runs with its entire allowlist discarded, so routine calls hit the
+# permission classifier. The interactive paths (launch-interactive, po-live)
+# never showed the symptom because they mount the host's real ~/.claude.json,
+# which already carries the trust entry.
+#
+# Deliberately NOT mounting the host's ~/.claude.json here. Two reasons:
+#   1. It is the founder's full project history (tens of KB, every repo they
+#      have opened) and autonomous containers have no business reading it.
+#   2. It is mounted read-write, so N concurrent agents plus the host session
+#      race on one file. That is how the /workspace entry went missing in the
+#      first place: four containers on 2026-09-16 logged the untrusted warning
+#      while the host file did carry the entry by the time it was inspected.
+# A per-container file removes the race entirely — nothing else writes it.
+agent_trust_file() {
+  local slug="$1"
+  local dir="${AGENT_CRED_BASE}/trust/${slug}"
+  mkdir -p "$dir"
+  # Claude writes session state back to this file, so it must be writable and
+  # must not be shared between containers.
+  printf '{"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}\n' > "${dir}/.claude.json"
+  chmod 600 "${dir}/.claude.json"
+  printf '%s' "${dir}/.claude.json"
+}
+
 # mint_agent_creds <num>
 # Creates agent-test/<num> sub-tenant (idempotent) and issues an agent.dev-scoped
 # API key. Writes key value to ${AGENT_CRED_BASE}/<num>/api.key (0600) and the
@@ -1583,6 +1614,7 @@ case "$cmd" in
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
       -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      -v "$(agent_trust_file "cfg-agent-${num}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
@@ -1671,6 +1703,7 @@ case "$cmd" in
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
       -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
@@ -2000,6 +2033,7 @@ case "$cmd" in
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
       -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -e "GH_TOKEN=${gh_token}" \
@@ -2705,6 +2739,7 @@ PROMPT_EOF
       --stop-timeout=1800 \
       -v "${real_path}:/workspace" \
       -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
