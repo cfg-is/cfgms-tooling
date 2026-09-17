@@ -591,11 +591,24 @@ restrict_to_owner() {
 # A per-container file removes the race entirely — nothing else writes it.
 agent_trust_file() {
   local slug="$1"
-  local dir="${AGENT_CRED_BASE}/trust/${slug}"
-  mkdir -p "$dir"
+  # NOT under AGENT_CRED_BASE: that is /run/cfgms/agent-cred, root-owned 0755,
+  # so mkdir there fails for the dispatching user. It failed quietly enough that
+  # the launch still proceeded, and docker then created a *directory* at the
+  # mount target — leaving /home/agent/.claude.json as a directory, which is
+  # worse than the missing-trust bug this helper exists to fix.
+  local dir="${CFGMS_AGENT_TRUST_BASE:-${HOME}/.cache/cfgms-agent-trust}/${slug}"
+
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    echo "ERROR: cannot create agent trust dir: ${dir}" >&2
+    return 1
+  fi
+
   # Claude writes session state back to this file, so it must be writable and
   # must not be shared between containers.
-  printf '{"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}\n' > "${dir}/.claude.json"
+  if ! printf '{"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}\n' > "${dir}/.claude.json" 2>/dev/null; then
+    echo "ERROR: cannot write agent trust file: ${dir}/.claude.json" >&2
+    return 1
+  fi
   chmod 600 "${dir}/.claude.json"
   printf '%s' "${dir}/.claude.json"
 }
