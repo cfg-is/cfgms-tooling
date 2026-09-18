@@ -211,6 +211,65 @@ slow_tick() {
   sset pr_states "${cur_states}"
 }
 
+# ---------------------------------------------------------------- single instance
+
+# pid_alive <pid> — true when <pid> names a process that exists, including one
+# this user cannot signal. `kill -0` fails with EPERM on a live process owned by
+# another user; reading that failure as "dead" fails the guard open on a shared
+# host. Only ESRCH ("No such process") means the process is gone.
+pid_alive() {
+  local pid="$1" err
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null && return 0
+  err="$(export LC_ALL=C; kill -0 "${pid}" 2>&1 || true)"
+  [[ "${err}" == *"not permitted"* ]]
+}
+
+# claim_pidfile — the single-instance guard. Reading the pid file, checking it
+# and writing it must be ONE step: done separately, two starts racing from cold
+# state both read "nobody running", both write, and both emit a startup cycle
+# (issue #4137). A lock directory serialises the three: mkdir is atomic on every
+# filesystem bash runs on, and flock is not shipped with Git Bash.
+claim_pidfile() {
+  local lockdir="${STATE_DIR}/watch.lock.d" waited=0 existing rc=0
+  until mkdir "${lockdir}" 2>/dev/null; do
+    waited=$((waited + 1))
+    if (( waited > 50 )); then
+      # The critical section below takes milliseconds, so a lock older than a
+      # minute belongs to a start that died inside it. Reclaim it instead of
+      # locking the host out until someone deletes it by hand.
+      if [[ -n "$(find "${lockdir}" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+        rmdir "${lockdir}" 2>/dev/null || true
+        waited=0
+        continue
+      fi
+      printf 'pipeline-watch: another start holds %s\n' "${lockdir}" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+  existing="$(cat "${pidfile}" 2>/dev/null || true)"
+  if pid_alive "${existing}"; then
+    printf 'pipeline-watch already running (pid %s)\n' "${existing}" >&2
+    rc=1
+  else
+    # Absent, empty or naming a dead process: a crashed watcher's file is
+    # reclaimed here.
+    printf '%s\n' "$$" > "${pidfile}"
+  fi
+  rmdir "${lockdir}" 2>/dev/null || true
+  return "${rc}"
+}
+
+# release_pidfile — the EXIT trap. Removes the pid file only while it still
+# names this watcher; deleting another instance's claim would let the next start
+# run alongside it.
+release_pidfile() {
+  if [[ "$(cat "${pidfile}" 2>/dev/null || true)" == "$$" ]]; then
+    rm -f "${pidfile}"
+  fi
+}
+
 # ---------------------------------------------------------------- loop
 
 cmd_watch() {
@@ -220,15 +279,10 @@ cmd_watch() {
   # its job, reported `EVENT stop`, and then died dirty, leaving the pid file it
   # was trying to remove. Measured on the first real drained shutdown.
   pidfile="${STATE_DIR}/watch.pid"
-  local existing now
+  local now
   mkdir -p "${STATE_DIR}"
-  existing="$(cat "${pidfile}" 2>/dev/null || true)"
-  if [[ -n "${existing}" ]] && kill -0 "${existing}" 2>/dev/null; then
-    printf 'pipeline-watch already running (pid %s)\n' "${existing}" >&2
-    return 1
-  fi
-  printf '%s\n' "$$" > "${pidfile}"
-  trap 'rm -f "${pidfile}"' EXIT
+  claim_pidfile || return 1
+  trap release_pidfile EXIT
 
   # Re-baseline the edge-triggered probes against current reality on EVERY
   # start, resume included. Replaying the gap event by event would wake the

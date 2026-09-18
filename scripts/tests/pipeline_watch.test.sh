@@ -12,6 +12,9 @@
 #  - a still-pending PR emits nothing
 #  - drained streak: only `full_cycle` increments, `work` resets, bundle is inert
 #  - invalid record-cycle result exits 2
+#  - single-instance guard: two racing starts yield one watcher and one startup
+#    cycle; a stale pid file is reclaimed; the EXIT trap removes only its own
+#    pid file; a live-but-unsignalable pid counts as running
 #
 # All probes are stubbed via the *_CMD env overrides: no docker, no gh, no network.
 set -euo pipefail
@@ -354,6 +357,117 @@ out="$(PIPELINE_WATCH_DRAINED_LIMIT=0 \
        PIPELINE_WATCH_PRS_CMD="printf ''" \
        timeout 20 bash "${WATCH}" watch 2>&1)" || rc=$?
 check_contains "a future-dated last_full takes the cold-start path" "${out}" "EVENT full_cycle reason=startup"
+
+# --- the single-instance guard is atomic (issue #4137) ----------------------
+# The guard read the pid file, checked it, then wrote it, as three separate
+# steps. Two starts racing from cold state both read "nobody running", both
+# wrote, and both emitted `full_cycle reason=startup` — each one a full cycle.
+# The window is two lines wide, too narrow to hit reliably by launching two
+# processes, so a `cat` shim on PATH holds every read of the pid file open for
+# a second. On the unguarded read-check-write both starters sit in that read
+# together and both get through. With the check and the write serialised, the
+# second starter's read happens after the first has written, and it refuses.
+mkdir -p "${TMP}/slowbin"
+REAL_CAT="$(command -v cat)"
+cat > "${TMP}/slowbin/cat" <<CATEOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\${a}" == *watch.pid ]] && sleep 1; done
+exec "${REAL_CAT}" "\$@"
+CATEOF
+chmod +x "${TMP}/slowbin/cat"
+
+race_start() {
+  PATH="${TMP}/slowbin:${PATH}" \
+  PIPELINE_WATCH_DRAINED_LIMIT=99 \
+  PIPELINE_WATCH_FAST=1 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+  PIPELINE_WATCH_SHA_CMD="printf 'sha-race\n'" \
+  PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+  PIPELINE_WATCH_BOARD_CMD="echo 0" \
+  PIPELINE_WATCH_PRS_CMD="printf ''" \
+  timeout 6 bash "${WATCH}" watch > "$1" 2>&1
+}
+
+bash "${WATCH}" reset >/dev/null
+rc_a=0; rc_b=0
+race_start "${TMP}/race_a" & pid_a=$!
+race_start "${TMP}/race_b" & pid_b=$!
+wait "${pid_a}" || rc_a=$?
+wait "${pid_b}" || rc_b=$?
+race_out="$("${REAL_CAT}" "${TMP}/race_a" "${TMP}/race_b")"
+check_eq "two racing starts emit exactly one startup cycle" \
+  "$(grep -c 'full_cycle reason=startup' <<<"${race_out}" || true)" "1"
+# One stays up for the whole window (124), the other refuses (1).
+check_eq "exactly one racing start exits non-zero and the other stays up" \
+  "$(printf '%s\n' "${rc_a}" "${rc_b}" | sort | tr '\n' ' ')" "1 124 "
+check_contains "the refused start names the winner's pid" "${race_out}" "already running (pid "
+
+# --- a stale pid file does not block a start --------------------------------
+# A crashed watcher leaves its pid file behind. The guard must reclaim it, or
+# one crash locks the host out until someone deletes the file by hand.
+bash "${WATCH}" reset >/dev/null
+mkdir -p "${PO_CACHE_DIR}/watch"
+( exit 0 ) & dead_pid=$!
+wait "${dead_pid}" || true
+printf '%s\n' "${dead_pid}" > "${PO_CACHE_DIR}/watch/watch.pid"
+rc=0
+out="$(PIPELINE_WATCH_DRAINED_LIMIT=99 \
+       PIPELINE_WATCH_FAST=1 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+       PIPELINE_WATCH_SHA_CMD="printf 'sha-stale\n'" \
+       PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+       PIPELINE_WATCH_BOARD_CMD="echo 0" \
+       PIPELINE_WATCH_PRS_CMD="printf ''" \
+       timeout 4 bash "${WATCH}" watch 2>&1)" || rc=$?
+check_not_contains "a stale pid file is not read as a running watcher" "${out}" "already running"
+check_eq "and the start over a stale pid file stays up" "${rc}" "124"
+
+# --- the EXIT trap removes only its own pid file ----------------------------
+# The trap removed the pid file unconditionally. If another instance's pid is
+# in it by then, an exiting watcher deletes the live one's claim and the next
+# start runs alongside it. Overwrite the file mid-run and check it survives.
+bash "${WATCH}" reset >/dev/null
+rc=0
+PIPELINE_WATCH_DRAINED_LIMIT=0 \
+PIPELINE_WATCH_FAST=3 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+PIPELINE_WATCH_SHA_CMD="printf 'sha-trap\n'" \
+PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+PIPELINE_WATCH_BOARD_CMD="echo 0" \
+PIPELINE_WATCH_PRS_CMD="printf ''" \
+timeout 20 bash "${WATCH}" watch > "${TMP}/trap_out" 2>&1 & trap_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "${PO_CACHE_DIR}/watch/watch.pid" ]] && break
+  sleep 0.2
+done
+printf '424242\n' > "${PO_CACHE_DIR}/watch/watch.pid"
+wait "${trap_pid}" || rc=$?
+check_eq "the watcher still exits cleanly" "${rc}" "0"
+check_eq "its EXIT trap leaves another instance's pid file in place" \
+  "$("${REAL_CAT}" "${PO_CACHE_DIR}/watch/watch.pid" 2>/dev/null || true)" "424242"
+
+# --- a live pid this user cannot signal counts as running -------------------
+# `kill -0` fails with EPERM on a live process owned by another user. Reading
+# that failure as "dead" fails the guard open on a shared host. PID 1 is live
+# and root-owned on Linux, so a non-root run gets EPERM for it. As root the
+# signal succeeds, and elsewhere PID 1 may not exist, so neither case exercises
+# EPERM — the check is reported as not applicable rather than passed.
+if [[ -d /proc/1 && "$(id -u)" != "0" ]]; then
+  bash "${WATCH}" reset >/dev/null
+  mkdir -p "${PO_CACHE_DIR}/watch"
+  printf '1\n' > "${PO_CACHE_DIR}/watch/watch.pid"
+  rc=0
+  out="$(PIPELINE_WATCH_DRAINED_LIMIT=99 \
+         PIPELINE_WATCH_FAST=1 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+         PIPELINE_WATCH_SHA_CMD="printf 'sha-eperm\n'" \
+         PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+         PIPELINE_WATCH_BOARD_CMD="echo 0" \
+         PIPELINE_WATCH_PRS_CMD="printf ''" \
+         timeout 4 bash "${WATCH}" watch 2>&1)" || rc=$?
+  check_contains "a live pid owned by another user is read as running" "${out}" "already running (pid 1)"
+  check_eq "and the start refuses" "${rc}" "1"
+  check_eq "and does not overwrite that pid file" \
+    "$("${REAL_CAT}" "${PO_CACHE_DIR}/watch/watch.pid")" "1"
+else
+  printf '  n/a   EPERM guard: needs Linux /proc and a non-root user to reach EPERM\n'
+fi
 
 echo "--------------------------------------"
 printf 'ran %d, failed %d\n' "${ran}" "${fail}"
