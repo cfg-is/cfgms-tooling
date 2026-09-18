@@ -81,6 +81,7 @@ three future lane runners:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -1001,7 +1002,113 @@ def rate_limit_max_total_wait() -> float:
     return value if value >= 0 else RATE_LIMIT_MAX_TOTAL_WAIT_DEFAULT
 
 
-def call_with_rate_limit_backoff(call_fn, model, prompt, raw_path, sleep_fn=None):
+STEP_META_VERSION = 1
+
+# Stage names recorded in a step's `meta.json`. Constants rather than string
+# literals at each call site, because a typo in one of these is invisible: it
+# writes a plausible-looking stage nobody asked for and silently leaves the
+# real one at zero.
+STAGE_READ_FILES = "read_step_files"
+STAGE_SCAN_EVIDENCE = "collect_scan_evidence"
+STAGE_BUILD_PROMPT = "build_prompt"
+STAGE_MODEL_CALL = "model_call"
+STAGE_BACKOFF_SLEEP = "rate_limit_backoff_sleep"
+STAGE_EXTRACT = "extract_and_enrich"
+STAGE_REPAIR = "repair_rounds"
+STAGE_DISPOSITIONS = "build_dispositions"
+STAGE_VALIDATE_WRITE = "validate_and_write_envelope"
+
+# `repair_rounds` CONTAINS a model call and an extraction, so it overlaps two
+# stages that are also recorded on their own. It is kept because "how long did
+# repairing cost" is a question worth answering directly, and excluded from
+# any sum, because adding an interval to intervals inside it is not a
+# duration of anything. A reader who sums `stages` gets the step; a reader who
+# wants the repair cost reads the one entry.
+COMPOSITE_STAGES = frozenset({STAGE_REPAIR})
+
+
+class StepTimings:
+    """Wall-clock seconds per named stage of one step.
+
+    `time.monotonic()`, never `time.time()`. This measures elapsed time, and a
+    wall clock that steps backwards -- an NTP correction, a suspend/resume --
+    would put a negative duration in the one artifact whose entire purpose is
+    to be believed about durations.
+
+    A stage may be entered more than once: every repair round re-enters the
+    model call and the extraction. Both the total and the entry count are
+    kept, because "12 seconds" and "12 seconds across 4 attempts" are
+    different findings.
+
+    A stage that never ran is ABSENT, not zero. Zero is a measurement -- the
+    stage ran and was instant -- while absence means the step never got that
+    far. A file that cannot tell those apart is the reason this story exists.
+    """
+
+    def __init__(self) -> None:
+        self.seconds: dict = {}
+        self.entries: dict = {}
+
+    def record(self, name: str, seconds: float) -> None:
+        # Clamped at zero: monotonic cannot go backwards, but a caller
+        # passing a measured value from elsewhere might, and a negative
+        # duration is never a true statement about a stage.
+        self.seconds[name] = self.seconds.get(name, 0.0) + max(0.0, float(seconds))
+        self.entries[name] = self.entries.get(name, 0) + 1
+
+    @contextlib.contextmanager
+    def stage(self, name: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            # `finally`, so a stage that RAISED is still recorded. The time a
+            # failing stage spent is exactly the time nobody could account
+            # for before, which is what made a slow failure indistinguishable
+            # from a fast one.
+            self.record(name, time.monotonic() - started)
+
+    def as_dict(self) -> dict:
+        return {
+            name: {
+                "seconds": round(total, 6),
+                "entries": self.entries[name],
+                # Flagged in the data, not only in a doc: a consumer summing
+                # these has to be able to see which entries it must skip
+                # without knowing this module's constant.
+                **({"composite": True} if name in COMPOSITE_STAGES else {}),
+            }
+            for name, total in sorted(self.seconds.items())
+        }
+
+    def total_seconds(self) -> float:
+        """The sum of the non-overlapping stages. A composite stage contains
+        others, so including it would count the same seconds twice."""
+        return sum(
+            seconds for name, seconds in self.seconds.items() if name not in COMPOSITE_STAGES
+        )
+
+
+def new_backoff_stats() -> dict:
+    """A fresh accumulator for `call_with_rate_limit_backoff`.
+
+    One dict is shared by a step's first call AND every repair round, so the
+    totals are per STEP rather than per call -- which is the granularity the
+    missing time was missing at.
+    """
+    return {
+        "harness_calls": 0,
+        "model_seconds": 0.0,
+        "backoff_sleep_seconds": 0.0,
+        "backoff_sleep_scheduled_seconds": 0.0,
+        "rate_limited_attempts": 0,
+        "rate_limited_ever": False,
+        "rate_limited_final_attempt": False,
+        "backoff_gave_up_over_budget": False,
+    }
+
+
+def call_with_rate_limit_backoff(call_fn, model, prompt, raw_path, sleep_fn=None, stats=None):
     """Invoke a lane's harness call, waiting out rate limits rather than
     parking on the first one.
 
@@ -1012,7 +1119,23 @@ def call_with_rate_limit_backoff(call_fn, model, prompt, raw_path, sleep_fn=None
 
     `sleep_fn` is injected so a test can assert the backoff schedule without
     spending it.
+
+    `stats` (Issue #4135) is an optional accumulator -- use
+    `new_backoff_stats()` -- filled in place so the return tuple keeps the
+    shape every caller and every lane stub already expects. This is where the
+    missing time was: on one measured sweep the ollama lane averaged 7.29
+    min/step against codex's 1.26 on the identical plan, and the difference
+    was this function sleeping. Nothing recorded that it had, so the step
+    read as an ordinary slow success and `rate_limited` -- taken from the
+    FINAL attempt -- said false.
+
+    Pass one dict for a step's first call and every repair round, so the
+    totals are per step rather than per call.
     """
+    if stats is None:
+        stats = new_backoff_stats()
+    for key, default in new_backoff_stats().items():
+        stats.setdefault(key, default)
     # A lane test injects `call_harness_fn`, and its stub often reports rate
     # limited on purpose. Waiting that out for real makes every such suite sit
     # for the whole budget, so the wait is opt-IN: it happens only when the
@@ -1027,7 +1150,25 @@ def call_with_rate_limit_backoff(call_fn, model, prompt, raw_path, sleep_fn=None
     waited = 0.0
     delay = RATE_LIMIT_FIRST_WAIT_SECONDS
     while True:
-        exit_code, rate_limited, output_tail = call_fn(model, prompt, raw_path)
+        call_started = time.monotonic()
+        try:
+            exit_code, rate_limited, output_tail = call_fn(model, prompt, raw_path)
+        finally:
+            # Recorded in `finally` so a call that RAISED still contributes
+            # its time. A launch that hangs for ten minutes and then throws
+            # is exactly the case that used to leave no trace at all.
+            stats["model_seconds"] += max(0.0, time.monotonic() - call_started)
+            stats["harness_calls"] += 1
+        stats["rate_limited_final_attempt"] = bool(rate_limited)
+        if rate_limited:
+            stats["rate_limited_attempts"] += 1
+            # Issue #4135 AC4: the step WAS rate limited, whatever the last
+            # attempt ends up saying. A step that slept through four retries
+            # and succeeded on the fifth used to be recorded `complete` with
+            # `rate_limited: false`, so an operator reading the artifacts
+            # concluded the lane was not rate limited -- and the data agreed
+            # with them.
+            stats["rate_limited_ever"] = True
         # A call that wrote its answer is not retried, whatever its output text
         # said. Without this, one loose marker match in a model's own findings
         # makes a FINISHED step sleep out the whole wait budget before being
@@ -1036,8 +1177,19 @@ def call_with_rate_limit_backoff(call_fn, model, prompt, raw_path, sleep_fn=None
         if not rate_limited or os.path.isfile(raw_path):
             return exit_code, rate_limited, output_tail
         if waited + delay > budget:
+            # Distinct from "never rate limited": the wait budget ran out with
+            # the limit still in force, which is why the step parks.
+            stats["backoff_gave_up_over_budget"] = True
             return exit_code, rate_limited, output_tail
+        sleep_started = time.monotonic()
         sleep_fn(delay)
+        # Both are kept. `scheduled` is the backoff schedule this function
+        # chose and is what the budget is spent against; `seconds` is what the
+        # clock actually saw. An injected `sleep_fn` makes them differ on
+        # purpose, and a real sleep that overshoots makes them differ by
+        # accident -- reporting only one would hide whichever case matters.
+        stats["backoff_sleep_seconds"] += max(0.0, time.monotonic() - sleep_started)
+        stats["backoff_sleep_scheduled_seconds"] += delay
         waited += delay
         delay *= 2
 
@@ -1325,6 +1477,116 @@ def write_call_diagnostics(
             indent=2,
         ),
     )
+
+
+def build_step_meta(
+    *,
+    step_id: str,
+    lane_id: str,
+    model: str,
+    state: str,
+    timings: "StepTimings",
+    backoff: dict,
+    scan_evidence: dict | None,
+    disposition_stats: dict,
+    prompt_chars: int,
+    answer_chars: int,
+    repair_attempts: int,
+    repair_causes: list,
+    tasks: int,
+    prompt_version: str,
+    wall_seconds: float,
+    tokens: dict | None = None,
+) -> dict:
+    """Assemble one step's `meta.json` (Issue #4135).
+
+    Written for EVERY step, complete or not. The previous shape existed only
+    for steps that hit a repair, which meant the common case -- a step that
+    worked, slowly -- recorded nothing at all, and a lane's throughput is a
+    property of the steps that WORKED.
+
+    **Unavailable is named, never guessed.** `tokens` is present only for a
+    harness that reports counts; the others get an explicit
+    `tokens_unavailable` reason rather than a zero or an estimate. A zero
+    token count is indistinguishable from a real zero, and an estimate in an
+    artifact people use to compare harnesses is worse than a gap.
+    """
+    records = (scan_evidence or {}).get("records") or []
+    cache_hits = sum(1 for record in records if record.get("cached"))
+
+    meta = {
+        "meta_version": STEP_META_VERSION,
+        "step_id": step_id,
+        "lane": lane_id,
+        "model": model or "unknown",
+        "state": state,
+        "prompt_version": prompt_version,
+        "tasks": tasks,
+        # --- AC2: where the wall clock went, per stage ---
+        "stages": timings.as_dict(),
+        # The step's true elapsed time, and the part of it the stages account
+        # for. Both, because the GAP between them is a finding: it is time
+        # spent somewhere nothing instruments, which is precisely the
+        # condition this story exists to end. A reader who only ever sees the
+        # sum cannot notice that it does not add up.
+        "wall_seconds": round(max(0.0, wall_seconds), 6),
+        "attributed_seconds": round(timings.total_seconds(), 6),
+        "unattributed_seconds": round(max(0.0, wall_seconds - timings.total_seconds()), 6),
+        # --- AC3: the split that was invisible ---
+        "harness_calls": backoff.get("harness_calls", 0),
+        "model_seconds": round(backoff.get("model_seconds", 0.0), 6),
+        "rate_limit_backoff_sleep_seconds": round(backoff.get("backoff_sleep_seconds", 0.0), 6),
+        "rate_limit_backoff_scheduled_seconds": round(
+            backoff.get("backoff_sleep_scheduled_seconds", 0.0), 6
+        ),
+        "rate_limited_attempts": backoff.get("rate_limited_attempts", 0),
+        # --- AC4: EVER, not just the final attempt ---
+        # The bare name answers the question an operator actually asks. The
+        # final-attempt value is kept beside it because that is what
+        # `terminal_state.classify()` reads, and this story deliberately does
+        # not change the state machine -- so both have to be recoverable or
+        # the file would contradict the envelope with no way to tell why.
+        "rate_limited": bool(backoff.get("rate_limited_ever", False)),
+        "rate_limited_final_attempt": bool(backoff.get("rate_limited_final_attempt", False)),
+        "rate_limit_backoff_gave_up_over_budget": bool(
+            backoff.get("backoff_gave_up_over_budget", False)
+        ),
+        # --- AC6: enough to A/B a prompt change ---
+        "prompt_chars": prompt_chars,
+        "answer_chars": answer_chars,
+        "repair_attempts": repair_attempts,
+        "repair_causes": list(repair_causes),
+        "hypotheses_total": disposition_stats.get("hypotheses_total", 0),
+        "hypotheses_answered": disposition_stats.get("hypotheses_answered", 0),
+        "hypotheses_synthesized_not_attempted": disposition_stats.get(
+            "hypotheses_synthesized_not_attempted", 0
+        ),
+        # --- scanner cache, so a fast step is not mistaken for a fast tool ---
+        "scan_checks": len(records),
+        "scan_cache_hits": cache_hits,
+        "scan_cache_misses": len(records) - cache_hits,
+    }
+
+    if tokens:
+        meta["tokens"] = dict(tokens)
+        eval_count = tokens.get("eval_count")
+        model_seconds = backoff.get("model_seconds", 0.0)
+        if isinstance(eval_count, (int, float)) and model_seconds > 0:
+            meta["tokens_per_second_model_call"] = round(eval_count / model_seconds, 3)
+    else:
+        meta["tokens"] = None
+        # Named, not guessed. Two different reasons hide behind one absence,
+        # and a reader comparing harnesses needs to know which applies: the
+        # CLI harnesses genuinely cannot report counts, while ollama can and
+        # records them in its own per-call meta beside this file. A zero here
+        # would be indistinguishable from a real zero, and an estimate would
+        # be worse than the gap.
+        meta["tokens_unavailable"] = (
+            "not reported to the step runner: the claude, codex and opencode CLI "
+            "harnesses expose no usage figures at all; the ollama lane does and "
+            "writes them to its own per-call <step>.meta.json in this directory"
+        )
+    return meta
 
 
 def write_step_failure_envelope(
@@ -2504,7 +2766,10 @@ def _parse_raw_dispositions(raw_path: str) -> list:
     return []
 
 
-def _build_dispositions(raw_path: str, hypotheses: list, step_id: str) -> list:
+SYNTHESIZED_NOT_ATTEMPTED_SUMMARY = "the harness's raw output did not address this hypothesis"
+
+
+def _build_dispositions(raw_path: str, hypotheses: list, step_id: str, stats: dict | None = None) -> list:
     """Return exactly one disposition entry per hypothesis in `hypotheses`,
     drawn from whatever the harness's raw output addressed, with a
     `not_attempted` entry synthesized for any hypothesis id the raw output
@@ -2518,6 +2783,12 @@ def _build_dispositions(raw_path: str, hypotheses: list, step_id: str) -> list:
     `summary`, an out-of-enum `disposition` value) is treated exactly like a
     missing one, never passed through to let a bundle complete on a
     technicality.
+
+    `stats` (Issue #4135 AC6) is an optional accumulator recording how many
+    hypotheses the model ANSWERED against how many were synthesized here. The
+    counts are taken at the point the decision is made rather than inferred
+    afterwards from the summary text, which would be a string comparison
+    against a message that is free to change.
     """
     raw_by_id: dict = {}
     for raw in _parse_raw_dispositions(raw_path):
@@ -2536,9 +2807,17 @@ def _build_dispositions(raw_path: str, hypotheses: list, step_id: str) -> list:
         hypothesis_id = hypothesis.get("id")
         if not isinstance(hypothesis_id, str) or not hypothesis_id:
             continue
+        if stats is not None:
+            stats["hypotheses_total"] = stats.get("hypotheses_total", 0) + 1
         if hypothesis_id in raw_by_id:
+            if stats is not None:
+                stats["hypotheses_answered"] = stats.get("hypotheses_answered", 0) + 1
             result.append(raw_by_id[hypothesis_id])
         else:
+            if stats is not None:
+                stats["hypotheses_synthesized_not_attempted"] = (
+                    stats.get("hypotheses_synthesized_not_attempted", 0) + 1
+                )
             schema.log_event(
                 "disposition_missing_synthesized_not_attempted",
                 step_id=step_id,
@@ -2548,7 +2827,7 @@ def _build_dispositions(raw_path: str, hypotheses: list, step_id: str) -> list:
                 {
                     "hypothesis_id": hypothesis_id,
                     "disposition": "not_attempted",
-                    "summary": "the harness's raw output did not address this hypothesis",
+                    "summary": SYNTHESIZED_NOT_ATTEMPTED_SUMMARY,
                 }
             )
     return result
@@ -2716,6 +2995,56 @@ def run_lane(
         }
         envelope_path = status_envelope_path(out_dir, step_id)
 
+        # Issue #4135: one timer and one backoff accumulator per STEP, shared
+        # by every task and every repair round inside it, so the totals are at
+        # the granularity the missing time went missing at. Created before the
+        # guard below, so a step that raises still has something to write.
+        timings = StepTimings()
+        backoff_stats = new_backoff_stats()
+        disposition_stats: dict = {}
+        meta_prompt_chars = 0
+        meta_answer_chars = 0
+        meta_repair_attempts = 0
+        meta_repair_causes: list = []
+        meta_tasks = 0
+        meta_tokens: dict | None = None
+        scan_evidence = None
+        step_started = time.monotonic()
+
+        def _write_step_meta(state: str) -> None:
+            """Issue #4135 AC1: one meta file per step, on EVERY exit path.
+
+            Never raises. A diagnostics write that fails must not turn a
+            recorded step into a crashed lane -- the same rule
+            `write_step_diagnostic` itself follows.
+            """
+            try:
+                meta = build_step_meta(
+                    step_id=step_id,
+                    lane_id=lane_id,
+                    model=model,
+                    state=state,
+                    timings=timings,
+                    backoff=backoff_stats,
+                    scan_evidence=scan_evidence,
+                    disposition_stats=disposition_stats,
+                    prompt_chars=meta_prompt_chars,
+                    answer_chars=meta_answer_chars,
+                    repair_attempts=meta_repair_attempts,
+                    repair_causes=meta_repair_causes,
+                    tasks=meta_tasks,
+                    prompt_version=prompt_version,
+                    wall_seconds=time.monotonic() - step_started,
+                    tokens=meta_tokens,
+                )
+                write_step_diagnostic(
+                    out_dir,
+                    f"{step_id}.meta.json",
+                    json.dumps(meta, indent=2, sort_keys=True),
+                )
+            except Exception as exc:  # noqa: BLE001
+                schema.log_event("step_meta_unwritable", step_id=step_id, error=str(exc))
+
         # Issue #3959: every step's body runs inside its own guard, so one
         # step that raises costs one step. The concrete case is a plan step
         # carrying two hypotheses with the same `id`: the dispositions built
@@ -2727,10 +3056,12 @@ def run_lane(
         # so a deterministically-broken step cannot loop) and the sweep
         # continues.
         try:
-            file_contents = read_step_files(repo_root, files, step_id)
+            with timings.stage(STAGE_READ_FILES):
+                file_contents = read_step_files(repo_root, files, step_id)
             # Issue #3982: fixed scanner profiles over the step's files; every
             # tool problem is a recorded gap, never a failed step.
-            scan_evidence = collect_scan_evidence(step, repo_root, out_dir)
+            with timings.stage(STAGE_SCAN_EVIDENCE):
+                scan_evidence = collect_scan_evidence(step, repo_root, out_dir)
             hypotheses = step.get("hypotheses") or []
 
             # Issue #3959: a step whose combined file_contents exceeds the shared
@@ -2764,16 +3095,39 @@ def run_lane(
                     except OSError:
                         pass
 
-                prompt = spec.build_prompt(task_step, file_contents, raw_path)
+                meta_tasks += 1
+                with timings.stage(STAGE_BUILD_PROMPT):
+                    # `render_scan_evidence` runs inside this, so the stage
+                    # covers prompt assembly end to end rather than leaving
+                    # the scanner rendering unattributed.
+                    prompt = spec.build_prompt(task_step, file_contents, raw_path)
+                meta_prompt_chars += len(prompt or "")
                 try:
                     # Wait out a rate limit rather than parking on the first one
                     # (Issue #4059): parking without waiting only converts "not
                     # done" into "not done, recorded", and a lane on a limited
                     # account can never finish a plan that way.
+                    before_model = backoff_stats["model_seconds"]
+                    before_sleep = backoff_stats["backoff_sleep_seconds"]
                     exit_code, rate_limited, output_tail = call_with_rate_limit_backoff(
-                        call_harness_fn, model, prompt, raw_path
+                        call_harness_fn, model, prompt, raw_path, stats=backoff_stats
                     )
+                    timings.record(
+                        STAGE_MODEL_CALL, backoff_stats["model_seconds"] - before_model
+                    )
+                    if backoff_stats["backoff_sleep_seconds"] > before_sleep:
+                        timings.record(
+                            STAGE_BACKOFF_SLEEP,
+                            backoff_stats["backoff_sleep_seconds"] - before_sleep,
+                        )
                 except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step, never a crashed lane
+                    # The accumulator already holds this call's elapsed time:
+                    # `call_with_rate_limit_backoff` records it in a `finally`,
+                    # so a launch that hung for minutes before raising is not
+                    # lost the way it used to be.
+                    timings.record(
+                        STAGE_MODEL_CALL, backoff_stats["model_seconds"] - before_model
+                    )
                     launch_exc = exc
                     break
 
@@ -2785,7 +3139,12 @@ def run_lane(
                 task_hypothesis_ids = {
                     h.get("id") for h in task_hypotheses if isinstance(h, dict) and h.get("id")
                 }
-                enriched = _build_candidate(raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id)
+                with timings.stage(STAGE_EXTRACT):
+                    enriched = _build_candidate(raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id)
+                try:
+                    meta_answer_chars += os.path.getsize(raw_path)
+                except OSError:
+                    pass
                 findings_path = candidate_path if enriched is not None else None
                 task_state = terminal_state.classify(
                     exit_code, findings_path, rate_limited=rate_limited,
@@ -2814,6 +3173,18 @@ def run_lane(
                         if not previous_answer:
                             break
                         attempt += 1
+                        meta_repair_attempts += 1
+                        # AC6: the CAUSE, not just the count. A step repaired
+                        # for a missing field and a step repaired for
+                        # unparseable JSON are different signals about a
+                        # prompt change, and "repairs: 2" conflates them.
+                        meta_repair_causes.append(
+                            {
+                                "attempt": attempt,
+                                "defects": [str(d)[:120] for d in defects][:5],
+                                "defect_count": len(defects),
+                            }
+                        )
                         repair_prompt = build_repair_prompt(defects, previous_answer)
                         write_step_diagnostic(
                             out_dir,
@@ -2826,18 +3197,43 @@ def run_lane(
                             attempt=attempt,
                             defects=len(defects),
                         )
+                        meta_prompt_chars += len(repair_prompt or "")
+                        repair_started = time.monotonic()
                         try:
+                            before_model = backoff_stats["model_seconds"]
+                            before_sleep = backoff_stats["backoff_sleep_seconds"]
                             exit_code, rate_limited, output_tail = (
                                 call_with_rate_limit_backoff(
-                                    call_harness_fn, model, repair_prompt, raw_path
+                                    call_harness_fn, model, repair_prompt, raw_path,
+                                    stats=backoff_stats,
                                 )
                             )
+                            timings.record(
+                                STAGE_MODEL_CALL,
+                                backoff_stats["model_seconds"] - before_model,
+                            )
+                            if backoff_stats["backoff_sleep_seconds"] > before_sleep:
+                                timings.record(
+                                    STAGE_BACKOFF_SLEEP,
+                                    backoff_stats["backoff_sleep_seconds"] - before_sleep,
+                                )
                         except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed step
+                            timings.record(
+                                STAGE_MODEL_CALL,
+                                backoff_stats["model_seconds"] - before_model,
+                            )
+                            timings.record(STAGE_REPAIR, time.monotonic() - repair_started)
                             launch_exc = exc
                             break
-                        enriched = _build_candidate(
-                            raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id
-                        )
+                        with timings.stage(STAGE_EXTRACT):
+                            enriched = _build_candidate(
+                                raw_path, candidate_path, sweep_id, commit_sha, lane_id, step_id
+                            )
+                        # The whole round, model call included. Recorded
+                        # separately from STAGE_MODEL_CALL on purpose: the
+                        # overlap is what shows whether a repair is expensive
+                        # because of the model or because of everything else.
+                        timings.record(STAGE_REPAIR, time.monotonic() - repair_started)
                         findings_path = candidate_path if enriched is not None else None
                         task_state = terminal_state.classify(
                             exit_code, findings_path, rate_limited=rate_limited,
@@ -2867,7 +3263,12 @@ def run_lane(
 
                 if task_state == terminal_state.COMPLETE:
                     task_findings.extend(enriched or [])
-                    task_dispositions.extend(_build_dispositions(raw_path, task_hypotheses, step_id))
+                    with timings.stage(STAGE_DISPOSITIONS):
+                        task_dispositions.extend(
+                            _build_dispositions(
+                                raw_path, task_hypotheses, step_id, stats=disposition_stats
+                            )
+                        )
                 else:
                     # Issue #4069: keep the prompt that produced this failure and
                     # whatever answer the harness did manage to write, before the
@@ -2929,7 +3330,9 @@ def run_lane(
                     files_read=list(file_contents.keys()),
                     scans=scan_summary(scan_evidence),
                 )
-                write_envelope(out_dir, step_id, envelope, plan_step=step)
+                with timings.stage(STAGE_VALIDATE_WRITE):
+                    write_envelope(out_dir, step_id, envelope, plan_step=step)
+                _write_step_meta(envelope["state"])
                 written.append(envelope)
                 continue
 
@@ -2955,7 +3358,9 @@ def run_lane(
                 dispositions=task_dispositions if state == terminal_state.COMPLETE else None,
                 harness_output_tail=harness_output_tail if state != terminal_state.COMPLETE else None,
             )
-            write_envelope(out_dir, step_id, envelope, plan_step=step)
+            with timings.stage(STAGE_VALIDATE_WRITE):
+                write_envelope(out_dir, step_id, envelope, plan_step=step)
+            _write_step_meta(envelope["state"])
             schema.log_event(
                 "step_written",
                 step_id=step_id,
@@ -2976,6 +3381,11 @@ def run_lane(
             envelope = write_step_failure_envelope(
                 out_dir, context, model, f"unhandled_step_error:{exc}"
             )
+            # The meta is written here too. A step that raised is the one whose
+            # timings are most worth having -- it is the case where "where did
+            # the time go" has no other answer at all -- and `StepTimings`
+            # records a stage that raised because it closes in a `finally`.
+            _write_step_meta(terminal_state.FAILED)
             if envelope is not None:
                 written.append(envelope)
             continue

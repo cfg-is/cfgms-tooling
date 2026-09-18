@@ -19,6 +19,7 @@ Run: python3 .claude/scripts/security-review/lanes/claude_lane_test.py
 from __future__ import annotations
 
 import contextlib
+import io
 import hashlib
 import json
 import os
@@ -1156,6 +1157,182 @@ def test_a_rate_limited_call_is_never_repaired():
               repr(written[0]["state"]))
 
 
+def _step_meta(out_dir: str, step_id: str = "step-001") -> dict:
+    path = os.path.join(
+        harness_runner.step_diagnostics_dir(out_dir), f"{step_id}.meta.json"
+    )
+    with open(path) as f:
+        return json.load(f)
+
+
+def test_every_step_writes_a_meta_file_including_a_complete_one():
+    """[REQUIRED TEST -- Issue #4135 AC1] Written for EVERY step, not only
+    repaired ones.
+
+    The old shape existed only for a step that failed, so the common case -- a
+    step that worked, slowly -- recorded nothing. A lane's throughput is a
+    property of the steps that WORKED, which made the one number anybody
+    wanted unmeasurable from the artifacts.
+    """
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(exit_code=0, raw_body={"findings": []}),
+        )
+        check(written[0]["state"] == "complete", "meta: precondition -- the step completed")
+        meta = _step_meta(out_dir)
+        check(meta["step_id"] == "step-001" and meta["lane"] == LANE_ID,
+              "meta: identifies its own step and lane", str(meta)[:200])
+        check(meta["state"] == "complete", "meta: records the terminal state", str(meta.get("state")))
+        check(meta["meta_version"] == harness_runner.STEP_META_VERSION,
+              "meta: carries a version, so a later shape change is detectable")
+
+        # AC2: the stages, against the real functions.
+        stages = meta["stages"]
+        for stage in (harness_runner.STAGE_READ_FILES, harness_runner.STAGE_SCAN_EVIDENCE,
+                      harness_runner.STAGE_BUILD_PROMPT, harness_runner.STAGE_MODEL_CALL,
+                      harness_runner.STAGE_EXTRACT, harness_runner.STAGE_DISPOSITIONS,
+                      harness_runner.STAGE_VALIDATE_WRITE):
+            check(stage in stages, f"meta: stage {stage} is timed", str(sorted(stages)))
+        check(
+            all(isinstance(v["seconds"], (int, float)) and v["seconds"] >= 0 for v in stages.values()),
+            "meta: every stage carries a non-negative measured duration",
+            str(stages),
+        )
+        # A stage that never ran is ABSENT, not zero -- this step hit no
+        # rate limit and made no repair.
+        check(harness_runner.STAGE_BACKOFF_SLEEP not in stages,
+              "meta: a stage that never ran is absent, not recorded as zero", str(sorted(stages)))
+        check(harness_runner.STAGE_REPAIR not in stages,
+              "meta: no repair stage on a step that needed no repair", str(sorted(stages)))
+
+        check(meta["wall_seconds"] >= meta["attributed_seconds"],
+              "meta: the attributed time never exceeds the step's real elapsed time",
+              f"{meta['attributed_seconds']} vs {meta['wall_seconds']}")
+        check(meta["harness_calls"] == 1, "meta: one harness call for a clean step", str(meta["harness_calls"]))
+        check(meta["rate_limited"] is False, "meta: a clean step is not recorded as rate limited")
+
+        # AC5/AC6: unavailable is NAMED, never guessed.
+        check(meta["tokens"] is None, "meta: no token counts invented for a CLI harness")
+        check(
+            "claude, codex and opencode" in meta["tokens_unavailable"],
+            "meta: the reason names WHY the counts are missing, rather than leaving a bare null",
+            str(meta.get("tokens_unavailable")),
+        )
+        check(meta["prompt_chars"] > 0, "meta: prompt bytes in, for A/B-ing a prompt change", str(meta["prompt_chars"]))
+        check(meta["hypotheses_total"] == 1 and meta["hypotheses_answered"] == 0,
+              "meta: hypotheses answered is counted against the total",
+              str((meta["hypotheses_total"], meta["hypotheses_answered"])))
+        check(meta["hypotheses_synthesized_not_attempted"] == 1,
+              "meta: a hypothesis the model never addressed is counted as synthesized, not as answered",
+              str(meta["hypotheses_synthesized_not_attempted"]))
+
+
+def test_meta_records_repair_attempts_and_their_cause():
+    """Issue #4135 AC6: repair COUNT and CAUSE. "repairs: 2" conflates a
+    missing field with unparseable JSON, and those are different signals about
+    a prompt change."""
+    prompts: list = []
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_sequenced_harness_stub(
+                [(0, False, {"findings": [good_finding(severity="bogus")]}),
+                 (0, False, {"findings": [good_finding()], "dispositions": [
+                     {"hypothesis_id": "h1", "disposition": "investigated", "summary": "s"}]})],
+                prompts,
+            ),
+        )
+        meta = _step_meta(out_dir)
+        check(meta["repair_attempts"] >= 1, "meta: a repair round is counted", str(meta["repair_attempts"]))
+        check(meta["repair_causes"] and meta["repair_causes"][0]["defect_count"] >= 1,
+              "meta: the defects that triggered the repair are recorded, not just the count",
+              str(meta["repair_causes"]))
+        check(harness_runner.STAGE_REPAIR in meta["stages"],
+              "meta: the repair round is timed as its own stage", str(sorted(meta["stages"])))
+        check(meta["stages"][harness_runner.STAGE_REPAIR].get("composite") is True,
+              "meta: the repair stage is flagged composite, since it contains the model call it wraps")
+        check(meta["harness_calls"] >= 2, "meta: the repair's harness call is counted too", str(meta["harness_calls"]))
+        check(meta["hypotheses_answered"] == 1,
+              "meta: after the repair the hypothesis is answered, not synthesized",
+              str((meta["hypotheses_answered"], meta["hypotheses_synthesized_not_attempted"])))
+
+
+def test_a_failed_step_still_writes_its_meta():
+    """The failure path is where "where did the time go" has no other answer,
+    so it is the path that most needs the file."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = claude_lane.run_lane(
+            plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+            call_harness_fn=make_harness_stub(raise_exc=True),
+        )
+        check(written[0]["state"] == "failed", "meta/failed: precondition -- the step failed", str(written[0]["state"]))
+        meta = _step_meta(out_dir)
+        check(meta["state"] == "failed", "meta/failed: the meta records the failure", str(meta.get("state")))
+        check(harness_runner.STAGE_MODEL_CALL in meta["stages"],
+              "meta/failed: a harness call that RAISED still contributes its time",
+              str(sorted(meta["stages"])))
+        check(meta["harness_calls"] == 1,
+              "meta/failed: the raising call is counted", str(meta["harness_calls"]))
+
+
+def test_a_step_whose_body_raised_still_writes_its_meta():
+    """Issue #4135 AC1, the path that is easiest to miss.
+
+    `run_lane` has TWO failure paths and they are not the same one. A harness
+    call that raises is caught by the inner guard and becomes an ordinary
+    `failed` envelope. A step whose BODY raises -- the documented case is two
+    hypotheses sharing an `id`, which makes the dispositions collide and
+    `write_envelope` refuse -- unwinds to the outer per-step guard instead.
+
+    Found by mutation: deleting the meta write from the outer guard passed the
+    whole suite, because `test_a_failed_step_still_writes_its_meta` exercises
+    the INNER one. Two paths, one test, and the gap was invisible.
+
+    **The originally documented cause no longer reaches this guard.** Duplicate
+    hypothesis ids are now rejected by `_load_plan_step` as `invalid_plan_step`
+    and the step is skipped before the guard runs -- verified, not assumed. So
+    the fault is injected directly: `collect_scan_evidence` is documented never
+    to raise, which makes it a truthful stand-in for "something that was not
+    supposed to raise, did". The guard exists for exactly that class, and the
+    point is that the meta is written when it fires, whatever fired it.
+    """
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        original = harness_runner.collect_scan_evidence
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("a stage that was not supposed to raise")
+
+        harness_runner.collect_scan_evidence = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                written = claude_lane.run_lane(
+                    plan_dir, out_dir, "/workspace", LANE_ID, MODEL,
+                    call_harness_fn=make_harness_stub(exit_code=0, raw_body={"findings": []}),
+                )
+        finally:
+            harness_runner.collect_scan_evidence = original
+
+        check(written and written[0]["state"] == "failed",
+              "meta/raised: precondition -- the raise becomes a failed step, not a crashed lane",
+              str(written[0]["state"] if written else None))
+        path = os.path.join(harness_runner.step_diagnostics_dir(out_dir), "step-001.meta.json")
+        check(os.path.isfile(path),
+              "meta/raised: a step that unwound to the outer guard still writes its meta")
+        meta = _step_meta(out_dir)
+        check(meta["state"] == "failed", "meta/raised: recorded as failed", str(meta.get("state")))
+        check(meta["wall_seconds"] >= 0.0,
+              "meta/raised: it carries a real elapsed time -- the case where nothing else explains where the time went",
+              str(meta.get("wall_seconds")))
+        check(harness_runner.STAGE_SCAN_EVIDENCE in meta["stages"],
+              "meta/raised: the stage that RAISED is itself attributed, because the timer closes in a finally",
+              str(sorted(meta["stages"])))
+
+
 def test_a_complete_step_leaves_no_diagnostics():
     prompts: list = []
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
@@ -1165,8 +1342,25 @@ def test_a_complete_step_leaves_no_diagnostics():
             call_harness_fn=make_sequenced_harness_stub([(0, False, {"findings": []})], prompts),
         )
         check(written[0]["state"] == "complete", "diagnostics: the step completes")
-        check(not os.path.isdir(harness_runner.step_diagnostics_dir(out_dir)),
-              "diagnostics: a complete step leaves nothing behind")
+        # Issue #4135: a complete step now leaves EXACTLY one artifact -- its
+        # meta.json. The rule this replaces said "nothing behind", which read
+        # as a privacy/size guarantee but also forbade recording that the step
+        # had happened at all, so a lane's throughput was only ever measurable
+        # from its failures.
+        #
+        # The size argument the original test existed to protect is asserted
+        # directly instead: no prompt, no answer, no stdout/stderr dump. That
+        # is what would cost hundreds of megabytes on a full-repository sweep;
+        # a ~1 KB meta is not.
+        diag_dir = harness_runner.step_diagnostics_dir(out_dir)
+        names = sorted(os.listdir(diag_dir)) if os.path.isdir(diag_dir) else []
+        check(names == ["step-001.meta.json"],
+              "diagnostics: a complete step leaves its meta.json and nothing else",
+              str(names))
+        bulky = [n for n in names if n.endswith((".prompt.txt", ".answer.json", ".stdout.txt", ".stderr.txt"))]
+        check(bulky == [],
+              "diagnostics: no prompt or raw-output copy is kept for a complete step",
+              str(bulky))
 
 
 def test_a_failed_step_keeps_its_prompt():

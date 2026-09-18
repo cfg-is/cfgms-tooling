@@ -1189,8 +1189,25 @@ def test_a_complete_step_leaves_no_diagnostics():
             call_harness_fn=make_sequenced_harness_stub([(0, False, {"findings": []})], prompts),
         )
         check(written[0]["state"] == "complete", "diagnostics: the step completes")
-        check(not os.path.isdir(harness_runner.step_diagnostics_dir(out_dir)),
-              "diagnostics: a complete step leaves nothing behind")
+        # Issue #4135: a complete step now leaves EXACTLY one artifact -- its
+        # meta.json. The rule this replaces said "nothing behind", which read
+        # as a privacy/size guarantee but also forbade recording that the step
+        # had happened at all, so a lane's throughput was only ever measurable
+        # from its failures.
+        #
+        # The size argument the original test existed to protect is asserted
+        # directly instead: no prompt, no answer, no stdout/stderr dump. That
+        # is what would cost hundreds of megabytes on a full-repository sweep;
+        # a ~1 KB meta is not.
+        diag_dir = harness_runner.step_diagnostics_dir(out_dir)
+        names = sorted(os.listdir(diag_dir)) if os.path.isdir(diag_dir) else []
+        check(names == ["step-001.meta.json"],
+              "diagnostics: a complete step leaves its meta.json and nothing else",
+              str(names))
+        bulky = [n for n in names if n.endswith((".prompt.txt", ".answer.json", ".stdout.txt", ".stderr.txt"))]
+        check(bulky == [],
+              "diagnostics: no prompt or raw-output copy is kept for a complete step",
+              str(bulky))
 
 
 def test_a_failed_step_keeps_its_prompt():

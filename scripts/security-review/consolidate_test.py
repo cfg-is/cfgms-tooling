@@ -2928,6 +2928,108 @@ def test_failed_adjudication_stage_renders_raw_findings_and_incomplete():
         check("Severity (adjudicated)" not in md, "consolidate.md: nothing is rendered as adjudicated after a failed stage")
 
 
+def _write_step_meta(sweep: str, lane: str, step_id: str, **fields) -> None:
+    meta = {
+        "meta_version": 1,
+        "step_id": step_id,
+        "lane": lane,
+        "state": "complete",
+        "wall_seconds": 10.0,
+        "attributed_seconds": 9.0,
+        "unattributed_seconds": 1.0,
+        "model_seconds": 5.0,
+        "rate_limit_backoff_sleep_seconds": 0.0,
+        "harness_calls": 1,
+        "rate_limited": False,
+        "rate_limited_final_attempt": False,
+        "rate_limit_backoff_gave_up_over_budget": False,
+        "repair_attempts": 0,
+        "hypotheses_answered": 1,
+        "hypotheses_synthesized_not_attempted": 0,
+    }
+    meta.update(fields)
+    write(os.path.join(sweep, "lanes", lane, "diagnostics", f"{step_id}.meta.json"), meta)
+
+
+def test_timing_rollup_lands_in_the_sweep_tree():
+    """REQUIRED TEST (Issue #4135 AC7): a sweep-level roll-up of the per-step
+    timings, in the report rather than a container log.
+
+    Container logs die with the container, and the question this answers --
+    "why did that lane take six times longer on the same plan" -- is asked
+    days later from the report.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _two_lane_disagreement_sweep(repo, sweep)
+        # laneA: fast and clean. laneB: the shape this story was written about
+        # -- a step that hit a limit, slept, and then SUCCEEDED.
+        _write_step_meta(sweep, "laneA", "step-001", wall_seconds=60.0, model_seconds=55.0)
+        _write_step_meta(
+            sweep, "laneB", "step-001",
+            wall_seconds=900.0, model_seconds=60.0,
+            rate_limit_backoff_sleep_seconds=830.0,
+            harness_calls=5, rate_limited=True, rate_limited_final_attempt=False,
+            repair_attempts=2,
+        )
+        report = consolidate.consolidate(sweep, repo)
+        rows = {r["lane"]: r for r in report["timing"]}
+
+        check(set(rows) == {"laneA", "laneB"}, "timing: one row per lane", str(sorted(rows)))
+        check(rows["laneB"]["backoff_sleep_seconds"] == 830.0,
+              "timing: the backoff sleep is reported as its own number, not folded into the total",
+              str(rows["laneB"]))
+        check(rows["laneB"]["rate_limited_steps"] == 1,
+              "timing: the rate-limited step is counted", str(rows["laneB"]["rate_limited_steps"]))
+        check(rows["laneB"]["rate_limited_only_on_an_earlier_attempt"] == 1,
+              "timing: a step that was limited and then RECOVERED is counted distinctly -- the case that used to be invisible",
+              str(rows["laneB"]))
+        check(rows["laneA"]["rate_limited_steps"] == 0,
+              "timing: the clean lane claims no rate limiting", str(rows["laneA"]))
+        check(rows["laneB"]["mean_wall_seconds_per_step"] == 900.0,
+              "timing: mean seconds per step, the figure that made the two lanes comparable",
+              str(rows["laneB"]["mean_wall_seconds_per_step"]))
+        check(rows["laneB"]["repair_attempts"] == 2, "timing: repair attempts roll up", str(rows["laneB"]))
+
+        md = consolidate.render_markdown(report)
+        check("## Timing" in md, "timing.md: the section renders", md[:400])
+        check("Backoff sleep" in md and "830.0" in md,
+              "timing.md: the sleeping is visible in the report a human actually reads", md)
+        check("of those, recovered" in md,
+              "timing.md: the recovered-after-limit column is explained, not just numbered", md)
+
+
+def test_no_timing_section_when_no_lane_recorded_one():
+    """A sweep whose lanes predate this story gains no empty section. An
+    always-rendered table of zeros would train a reader to skip it."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _two_lane_disagreement_sweep(repo, sweep)
+        report = consolidate.consolidate(sweep, repo)
+        check(all(r["steps_measured"] == 0 for r in report["timing"]),
+              "timing: a lane with no metas reports zero steps measured rather than being omitted",
+              str(report["timing"]))
+        check("## Timing" not in consolidate.render_markdown(report),
+              "timing.md: no section at all when nothing was measured")
+
+
+def test_the_ollama_per_call_meta_is_not_counted_as_a_step():
+    """The ollama lane writes its own `<step>.taskN.meta.json` per CALL. Rolling
+    those up beside the per-STEP files would double-count its steps and make
+    its mean look better than every other lane's."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _two_lane_disagreement_sweep(repo, sweep)
+        _write_step_meta(sweep, "laneA", "step-001", wall_seconds=100.0)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "diagnostics", "step-001.task0.meta.json"),
+            {"meta_version": 1, "step_id": "step-001", "wall_seconds": 100.0, "model_seconds": 1.0},
+        )
+        rows = {r["lane"]: r for r in consolidate.consolidate(sweep, repo)["timing"]}
+        check(rows["laneA"]["steps_measured"] == 1,
+              "timing: a per-call meta beside the per-step one is not counted as a second step",
+              str(rows["laneA"]))
+        check(rows["laneA"]["wall_seconds"] == 100.0,
+              "timing: and its seconds are not added in either", str(rows["laneA"]["wall_seconds"]))
+
+
 def test_adjudication_dispatch_outcome_other_than_dispatched_is_a_gap():
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
         _two_lane_disagreement_sweep(repo, sweep)

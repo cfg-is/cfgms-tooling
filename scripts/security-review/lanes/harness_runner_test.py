@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2255,6 +2256,222 @@ def test_rate_limit_backoff_retries_the_same_step_before_parking():
     check(len(calls) == 3, "backoff: the same step is retried until it succeeds", str(len(calls)))
     check(rate_limited is False, "backoff: a retry that succeeds is not parked")
     check(slept == [30.0, 60.0], "backoff: the wait doubles between attempts", str(slept))
+
+
+def test_backoff_stats_split_sleeping_from_the_model_call():
+    """[REQUIRED TEST -- Issue #4135 AC3] The single most important field.
+
+    This is where the missing time went: a lane averaged 7.29 min/step against
+    another's 1.26 on the identical plan, and the difference was this function
+    sleeping. Nothing recorded that it had, so the step read as an ordinary
+    slow success.
+
+    `sleep_fn` is injected, so the CLOCK sees no sleep at all -- which is the
+    point. The scheduled total is what the backoff chose and what the budget
+    is spent against, and it is recoverable even when no real time passed.
+    """
+    calls = []
+
+    def limited_twice(model, prompt, raw_path):
+        calls.append(1)
+        # A real call costs real time; make it measurable without sleeping.
+        for _ in range(20000):
+            pass
+        return (0, len(calls) < 3, "tail")
+
+    stats = harness_runner.new_backoff_stats()
+    harness_runner.call_with_rate_limit_backoff(
+        limited_twice, "m", "p", "/tmp/raw-4135-a", sleep_fn=lambda _s: None, stats=stats
+    )
+    check(stats["harness_calls"] == 3, "backoff stats: every attempt is counted, retries included", str(stats["harness_calls"]))
+    check(
+        stats["backoff_sleep_scheduled_seconds"] == 90.0,
+        "backoff stats: the SCHEDULED wait is the backoff schedule (30 + 60), recoverable with an injected sleep",
+        str(stats["backoff_sleep_scheduled_seconds"]),
+    )
+    check(
+        stats["rate_limited_attempts"] == 2,
+        "backoff stats: the number of attempts that hit a limit is recorded, not just that one did",
+        str(stats["rate_limited_attempts"]),
+    )
+    check(
+        stats["model_seconds"] > 0.0,
+        "backoff stats: time inside the harness call is measured separately from the sleeping",
+        str(stats["model_seconds"]),
+    )
+    # NOT `== 0.0`: measuring around a no-op lambda still costs hundreds of
+    # nanoseconds, so exact equality on a measured value is flaky by
+    # construction. The real claim is that the MEASURED sleep is the clock's
+    # answer rather than an echo of the 90-second schedule -- three orders of
+    # magnitude is a safe separation and needs no timing luck.
+    check(
+        stats["backoff_sleep_seconds"] < 1.0,
+        "backoff stats: an injected sleep costs no real time, and the MEASURED total says so rather than echoing the 90s schedule",
+        str(stats["backoff_sleep_seconds"]),
+    )
+    check(
+        stats["backoff_gave_up_over_budget"] is False,
+        "backoff stats: a retry that succeeded did not give up over budget",
+    )
+
+    # The MEASURED sleep needs a sleep that actually costs time, or nothing
+    # distinguishes "measured the clock" from "recorded nothing": with an
+    # instant `sleep_fn` both answers are ~0. Found by mutation -- deleting the
+    # measurement line passed every assertion above.
+    #
+    # A real but tiny sleep, asserted with a wide margin below the real value,
+    # so this is a measurement rather than a race.
+    real_sleep_calls = []
+
+    def brief_real_sleep(_seconds):
+        real_sleep_calls.append(_seconds)
+        time.sleep(0.05)
+
+    slow = harness_runner.new_backoff_stats()
+    limited_once = []
+
+    def limited_then_ok_2(model, prompt, raw_path):
+        limited_once.append(1)
+        return (0, len(limited_once) < 2, "tail")
+
+    harness_runner.call_with_rate_limit_backoff(
+        limited_then_ok_2, "m", "p", "/tmp/raw-4135-e", sleep_fn=brief_real_sleep, stats=slow
+    )
+    check(real_sleep_calls == [30.0], "backoff stats: precondition -- exactly one backoff wait happened", str(real_sleep_calls))
+    check(
+        slow["backoff_sleep_seconds"] >= 0.04,
+        "backoff stats: the MEASURED sleep reflects real elapsed time, not the schedule and not zero",
+        str(slow["backoff_sleep_seconds"]),
+    )
+    check(
+        slow["backoff_sleep_scheduled_seconds"] == 30.0,
+        "backoff stats: the SCHEDULED wait stays the backoff's own 30s, independent of what the clock saw",
+        str(slow["backoff_sleep_scheduled_seconds"]),
+    )
+    check(
+        slow["backoff_sleep_seconds"] < slow["backoff_sleep_scheduled_seconds"],
+        "backoff stats: measured and scheduled are genuinely different numbers here -- asserting only one would hide the other",
+        f"{slow['backoff_sleep_seconds']} vs {slow['backoff_sleep_scheduled_seconds']}",
+    )
+
+
+def test_rate_limited_ever_survives_a_successful_final_attempt():
+    """[REQUIRED TEST -- Issue #4135 AC4] A step that slept and then succeeded
+    must say so.
+
+    The envelope's `rate_limited` reflects only the FINAL attempt, so such a
+    step was recorded `complete` with `rate_limited: false` and ~14 minutes of
+    waiting left no trace. An operator reading the artifacts concluded the lane
+    was not rate limited, and every recorded value agreed with them.
+
+    Both values are kept: `rate_limited_ever` answers the operator's question,
+    `rate_limited_final_attempt` is what `terminal_state.classify()` reads.
+    This story deliberately does not change the state machine, so the two must
+    be able to disagree without the file contradicting the envelope.
+    """
+    calls = []
+
+    def limited_then_ok(model, prompt, raw_path):
+        calls.append(1)
+        return (0, len(calls) < 3, "tail")
+
+    stats = harness_runner.new_backoff_stats()
+    _ec, final_rate_limited, _tail = harness_runner.call_with_rate_limit_backoff(
+        limited_then_ok, "m", "p", "/tmp/raw-4135-b", sleep_fn=lambda _s: None, stats=stats
+    )
+    check(final_rate_limited is False, "ever: precondition -- the final attempt succeeded")
+    check(
+        stats["rate_limited_ever"] is True,
+        "ever: the step is recorded as having been rate limited, though the last attempt was not",
+        str(stats),
+    )
+    check(
+        stats["rate_limited_final_attempt"] is False,
+        "ever: the final-attempt value is kept too, because that is what drives the terminal state",
+        str(stats["rate_limited_final_attempt"]),
+    )
+    check(
+        stats["rate_limited_ever"] != stats["rate_limited_final_attempt"],
+        "ever: the two genuinely differ on this path -- a test where they agree proves nothing",
+    )
+
+    # The negative direction: a step that was never limited must not claim it
+    # was. Without this, `rate_limited_ever = True` unconditionally passes.
+    clean = harness_runner.new_backoff_stats()
+    harness_runner.call_with_rate_limit_backoff(
+        lambda m, p, r: (0, False, "t"), "m", "p", "/tmp/raw-4135-c",
+        sleep_fn=lambda _s: None, stats=clean,
+    )
+    check(
+        clean["rate_limited_ever"] is False and clean["rate_limited_attempts"] == 0,
+        "ever: a step that never hit a limit does not claim one",
+        str(clean),
+    )
+
+
+def test_backoff_over_budget_is_distinct_from_never_limited():
+    """Parking because the wait budget ran out is a different fact from never
+    having been limited, and the roll-up reports them separately."""
+    import os as _os
+    saved = _os.environ.get(harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV)
+    try:
+        _os.environ[harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV] = "45"
+        stats = harness_runner.new_backoff_stats()
+        harness_runner.call_with_rate_limit_backoff(
+            lambda m, p, r: (0, True, "t"), "m", "p", "/tmp/raw-4135-d",
+            sleep_fn=lambda _s: None, stats=stats,
+        )
+        check(
+            stats["backoff_gave_up_over_budget"] is True,
+            "over budget: a step still limited when the budget ran out says so",
+            str(stats),
+        )
+        check(
+            stats["rate_limited_ever"] is True and stats["rate_limited_final_attempt"] is True,
+            "over budget: it was limited throughout, final attempt included",
+            str(stats),
+        )
+    finally:
+        if saved is None:
+            _os.environ.pop(harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV, None)
+        else:
+            _os.environ[harness_runner.RATE_LIMIT_MAX_TOTAL_WAIT_ENV] = saved
+
+
+def test_step_timings_record_a_stage_that_raised():
+    """A stage that raised is the one whose duration is most worth having: it
+    is the case where "where did the time go" has no other answer."""
+    timings = harness_runner.StepTimings()
+    try:
+        with timings.stage("boom"):
+            for _ in range(20000):
+                pass
+            raise ValueError("x")
+    except ValueError:
+        pass
+    check("boom" in timings.as_dict(), "timings: a stage that raised is still recorded", str(timings.as_dict()))
+    check(timings.as_dict()["boom"]["seconds"] >= 0.0, "timings: its duration is a real measurement")
+
+    # Re-entry accumulates, and the entry count distinguishes "12s" from
+    # "12s across 4 attempts".
+    for _ in range(3):
+        with timings.stage("again"):
+            pass
+    check(timings.as_dict()["again"]["entries"] == 3, "timings: re-entering a stage counts entries", str(timings.as_dict()))
+
+    # A composite stage is excluded from the total, because it contains others.
+    timings.record(harness_runner.STAGE_MODEL_CALL, 5.0)
+    timings.record(harness_runner.STAGE_REPAIR, 5.0)
+    check(
+        timings.as_dict()[harness_runner.STAGE_REPAIR].get("composite") is True,
+        "timings: a composite stage is flagged in the data, not only in a docstring",
+    )
+    check(
+        abs(timings.total_seconds() - (timings.seconds[harness_runner.STAGE_MODEL_CALL]
+                                       + timings.seconds["boom"] + timings.seconds["again"])) < 1e-9,
+        "timings: the total excludes the composite stage rather than double-counting it",
+        str(timings.total_seconds()),
+    )
 
 
 def test_rate_limit_backoff_is_bounded_by_total_wait():

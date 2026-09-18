@@ -183,6 +183,152 @@ def _load_json(path: str):
         return None
 
 
+STEP_DIAGNOSTICS_DIRNAME = "diagnostics"
+STEP_META_SUFFIX = ".meta.json"
+
+
+def build_timing_rollup(sweep_dir: str, lanes: list) -> list:
+    """Aggregate every lane's per-step `meta.json` into one row per lane
+    (Issue #4135 AC7).
+
+    This has to live in the sweep tree rather than a log. Container logs are
+    destroyed when the container exits (Issue #4132 captures them, but into
+    the sweep tree for the same reason), and the question this answers --
+    "why did that lane take six times longer than the other one on the same
+    plan" -- is asked days later, from the report.
+
+    Reads only `<step_id>.meta.json`, never the ollama lane's per-CALL
+    `<step_id>.taskN.meta.json`: the step file is written by the shared
+    runner for all four lanes, so the rows are comparable. A lane whose
+    envelopes predate this story contributes a row of zeros with
+    `steps_measured: 0` rather than being omitted, so a missing lane is
+    visibly missing.
+    """
+    rows = []
+    for lane in lanes:
+        diag_dir = os.path.join(sweep_dir, "lanes", lane, STEP_DIAGNOSTICS_DIRNAME)
+        row = {
+            "lane": lane,
+            "steps_measured": 0,
+            "wall_seconds": 0.0,
+            "model_seconds": 0.0,
+            "backoff_sleep_seconds": 0.0,
+            "unattributed_seconds": 0.0,
+            "harness_calls": 0,
+            "rate_limited_steps": 0,
+            "rate_limited_only_on_an_earlier_attempt": 0,
+            "over_budget_parks": 0,
+            "repair_attempts": 0,
+            "steps_with_repairs": 0,
+            "hypotheses_answered": 0,
+            "hypotheses_synthesized_not_attempted": 0,
+        }
+        if os.path.isdir(diag_dir):
+            for name in sorted(os.listdir(diag_dir)):
+                if not name.endswith(STEP_META_SUFFIX):
+                    continue
+                # A per-call meta carries a `.taskN.` segment; the step meta
+                # does not. Filtering by shape rather than by lane id keeps
+                # this correct when another lane gains per-call metas too.
+                if ".task" in name[: -len(STEP_META_SUFFIX)]:
+                    continue
+                meta = _load_json(os.path.join(diag_dir, name))
+                if not isinstance(meta, dict) or "wall_seconds" not in meta:
+                    continue
+                row["steps_measured"] += 1
+                for field, key in (
+                    ("wall_seconds", "wall_seconds"),
+                    ("model_seconds", "model_seconds"),
+                    ("backoff_sleep_seconds", "rate_limit_backoff_sleep_seconds"),
+                    ("unattributed_seconds", "unattributed_seconds"),
+                ):
+                    value = meta.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        row[field] += float(value)
+                for field, key in (
+                    ("harness_calls", "harness_calls"),
+                    ("repair_attempts", "repair_attempts"),
+                    ("hypotheses_answered", "hypotheses_answered"),
+                    ("hypotheses_synthesized_not_attempted", "hypotheses_synthesized_not_attempted"),
+                ):
+                    value = meta.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        row[field] += value
+                if meta.get("rate_limited"):
+                    row["rate_limited_steps"] += 1
+                    # The case this story was written about: a step that slept
+                    # through a limit and then SUCCEEDED. It used to be
+                    # recorded `complete` with `rate_limited: false`, so the
+                    # artifacts said the lane was not rate limited.
+                    if not meta.get("rate_limited_final_attempt"):
+                        row["rate_limited_only_on_an_earlier_attempt"] += 1
+                if meta.get("rate_limit_backoff_gave_up_over_budget"):
+                    row["over_budget_parks"] += 1
+                if (meta.get("repair_attempts") or 0) > 0:
+                    row["steps_with_repairs"] += 1
+
+        for field in ("wall_seconds", "model_seconds", "backoff_sleep_seconds", "unattributed_seconds"):
+            row[field] = round(row[field], 3)
+        row["mean_wall_seconds_per_step"] = (
+            round(row["wall_seconds"] / row["steps_measured"], 3) if row["steps_measured"] else 0.0
+        )
+        rows.append(row)
+    return rows
+
+
+def _timing_lines(rows: list) -> list:
+    """Render the timing roll-up. Returns [] when no lane recorded anything,
+    so a sweep whose lanes predate this story gains no empty section."""
+    measured = [r for r in rows if r["steps_measured"]]
+    if not measured:
+        return []
+    lines = [
+        "## Timing",
+        "",
+        "Where each lane's wall clock went, from the per-step `meta.json` the lane runner "
+        "writes for every step (Issue #4135). Read `backoff sleep` first when two lanes on "
+        "the same plan disagree wildly: on one measured sweep a lane averaged 7.29 min/step "
+        "against another's 1.26, and the whole difference was rate-limit backoff that no "
+        "artifact recorded.",
+        "",
+        "| Lane | Steps | Wall (s) | Mean/step (s) | Model (s) | Backoff sleep (s) | Unattributed (s) | Calls | Rate-limited steps | ... of those, recovered | Parked over budget | Repairs |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {lane} | {steps} | {wall} | {mean} | {model} | {sleep} | {unattributed} | {calls} "
+            "| {rl} | {recovered} | {parked} | {repairs} |".format(
+                lane=_md_escape_inline(row["lane"]),
+                steps=row["steps_measured"],
+                wall=row["wall_seconds"],
+                mean=row["mean_wall_seconds_per_step"],
+                model=row["model_seconds"],
+                sleep=row["backoff_sleep_seconds"],
+                unattributed=row["unattributed_seconds"],
+                calls=row["harness_calls"],
+                rl=row["rate_limited_steps"],
+                recovered=row["rate_limited_only_on_an_earlier_attempt"],
+                parked=row["over_budget_parks"],
+                repairs=row["repair_attempts"],
+            )
+        )
+    lines.append("")
+    lines.append(
+        "**`... of those, recovered`** counts steps that hit a rate limit, waited, and then "
+        "succeeded. Those are the ones that used to be invisible: the envelope's "
+        "`rate_limited` reflected only the FINAL attempt, so such a step was recorded "
+        "`complete` with `rate_limited: false` and its waiting left no trace at all."
+    )
+    lines.append("")
+    lines.append(
+        "**`Unattributed`** is wall time no stage accounted for. It should be small; a large "
+        "value means real time is being spent somewhere nothing instruments, which is the "
+        "condition this table exists to end rather than to hide."
+    )
+    lines.append("")
+    return lines
+
+
 def _discover_lanes(sweep_dir: str) -> list[str]:
     lanes_dir = os.path.join(sweep_dir, "lanes")
     if not os.path.isdir(lanes_dir):
@@ -1590,6 +1736,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "scope_paths": _sweep_scope_paths(sweep_dir),
         "coverage": coverage,
         "scanner_coverage": scanner_coverage,
+        "timing": build_timing_rollup(sweep_dir, lanes),
         "provenance": provenance,
         "dispatch": dispatch,
         "rejected_proposals": _load_rejected_proposals(sweep_dir),
@@ -2018,6 +2165,8 @@ def render_markdown(report: dict) -> str:
         lines.append("")
         lines.extend(_incomplete_lines(report))
         lines.append("")
+
+    lines.extend(_timing_lines(report.get("timing") or []))
 
     lines.append("## Scanner coverage")
     lines.append("")
