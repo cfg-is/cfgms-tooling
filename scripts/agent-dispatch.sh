@@ -3349,9 +3349,13 @@ PROMPT_EOF
     # actually got mounted where. Runs on the host, before the docker run
     # call, using the same $REPO_ROOT the mount flags above are already built
     # from. This is recording, not freezing: the value is written fresh on
-    # every call and never compared against a prior one -- binding it into a
-    # step envelope and quarantining a mismatch on resume is STORY-12 (D6),
-    # which consumes this value; it is not produced here.
+    # every call and never compared against a prior one. STORY-12 (D6) landed
+    # the envelope side -- every step envelope now carries this value -- but
+    # Issue #4136 removed the quarantine-on-mismatch half deliberately: the
+    # harness is the instrument, not the specimen, so its drift is REPORTED
+    # (`resume.provenance_by_step`, the report's `## Provenance` section) and
+    # never gated on. Nothing anywhere compares this value against a prior
+    # dispatch.
     inv_entrypoint_host_path="${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh"
     inv_harness_identity_hash=$(python3 - "$REPO_ROOT" "$inv_entrypoint_host_path" "$inv_lane_entrypoint" "$inv_agent_profile_host_path" "${inv_sweep_dir}/harness_identity.json" <<'PY'
 import hashlib
@@ -3367,7 +3371,11 @@ files = []
 paths = [entrypoint_path, lane_entrypoint_path, agent_profile_path]
 # Issue #3982: a lane runs the whole trusted harness tree (mounted at
 # /opt/cfgms-harness/security-review), not just its entrypoint file, so
-# every Python module in it is part of the harness identity a resume checks.
+# every Python module in it is part of the harness identity RECORDED on each
+# envelope. Since Issue #4136 a resume does not check that identity -- the
+# harness is the instrument, not the specimen -- but the identity still has to
+# cover the whole tree, because its job is to say WHICH harness produced a
+# step, and a digest over the entrypoint alone could not answer that.
 if lane_entrypoint_path:
     paths.append(os.path.join(repo_root, "docs", "security-review", "methodology.md"))
     harness_dir = os.path.join(repo_root, ".claude", "scripts", "security-review")

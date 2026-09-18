@@ -132,6 +132,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import basedir  # noqa: E402
 import planner  # noqa: E402
+import resume  # noqa: E402
 import schema  # noqa: E402
 import source_leak  # noqa: E402
 
@@ -1438,6 +1439,106 @@ def _failed_step_tails(
     return entries
 
 
+def build_provenance(sweep_dir: str, lanes: list, step_ids: list) -> list:
+    """Per-lane instrument provenance for the report (Issue #4136).
+
+    One row per lane: `{lane, harness_identity: {value: [step_id,...]},
+    prompt_version: {...}, mixed: bool}`. `mixed` is true when ANY tracked
+    field has more than one distinct value in that lane.
+
+    This is the other half of not gating on drift, and it is the half that
+    makes the first half safe. A sweep is now ALLOWED to run two harness
+    versions or two prompt versions, which is a real gain -- and would be a
+    silent hazard if the report did not say so. A reader comparing two lanes
+    has to be able to see that one of them changed instrument partway.
+
+    Reads `resume.provenance_by_step`, never its own walk of the envelopes, so
+    the resume-time answer and the report-time answer cannot drift apart.
+    """
+    rows = []
+    for lane in lanes:
+        by_field = resume.provenance_by_step(os.path.join(sweep_dir, "lanes", lane), step_ids)
+        rows.append(
+            {
+                "lane": lane,
+                **by_field,
+                "mixed": any(len(values) > 1 for values in by_field.values()),
+            }
+        )
+    return rows
+
+
+def _provenance_lines(report: dict) -> list:
+    """`## Provenance` -- which instrument produced which steps.
+
+    Says something in every case rather than only on drift: "one version
+    throughout" is the answer to the same question, and a section that appears
+    only when there is bad news teaches a reader to skim for its absence.
+    """
+    rows = report.get("provenance") or []
+    lines = []
+    if not rows:
+        return ["_(no lane output found for this sweep)_"]
+
+    mixed_rows = [row for row in rows if row["mixed"]]
+    if mixed_rows:
+        lines.append(
+            "**{names} changed instrument partway through this sweep.** That is allowed "
+            "(Issue #4136): the target tree is the specimen and stays pinned, while the "
+            "harness is the instrument, and improving an instrument mid-sweep does not "
+            "invalidate readings already taken. It is recorded here because a reader "
+            "comparing steps must be able to see it. A finding is a finding whichever "
+            "version found it -- but a rate is not a rate across two.".format(
+                names=", ".join(f"`{_md_escape_inline(row['lane'])}`" for row in mixed_rows)
+            )
+        )
+    else:
+        lines.append(
+            "Each lane ran ONE harness version and ONE prompt version from start to "
+            "finish. Recorded rather than assumed."
+        )
+    lines.append("")
+    # Measured, not styled. On sweep 2026-09-16T1843Z-a17e6fcc the codex and
+    # ollama lanes carry DIFFERENT `harness_identity` values while neither lane
+    # drifted -- the identity is per-harness, so two lanes never share one. An
+    # earlier draft of the clean-sweep sentence said "every lane ran the same
+    # harness", which that real report falsified on its first render. Drift is
+    # a WITHIN-lane property, and saying so stops a reader reading the two
+    # values below as a problem.
+    lines.append(
+        "Drift is measured **within** a lane. Two lanes on different harnesses always "
+        "carry different `harness_identity` values -- that is normal and expected, not "
+        "drift, because the identity covers the harness that ran. Stated here rather "
+        "than left as an absence of a warning: this section is read by someone deciding "
+        "whether to trust a sweep, and a false alarm does not cost them a minute -- it "
+        "teaches them the section cries wolf, and a real drift then lands somewhere "
+        "nobody looks."
+    )
+    lines.append("")
+    lines.append("| Lane | Field | Value | Steps |")
+    lines.append("|---|---|---|---|")
+    for row in rows:
+        for field in resume.PROVENANCE_FIELDS:
+            values = row.get(field) or {}
+            if not values:
+                lines.append(
+                    "| {lane} | `{field}` | _(no completed steps)_ | 0 |".format(
+                        lane=_md_escape_inline(row["lane"]), field=field
+                    )
+                )
+                continue
+            for value, steps in values.items():
+                lines.append(
+                    "| {lane} | `{field}` | `{value}` | {n} |".format(
+                        lane=_md_escape_inline(row["lane"]),
+                        field=field,
+                        value=_md_escape_inline(value),
+                        n=len(steps),
+                    )
+                )
+    return lines
+
+
 def consolidate(sweep_dir: str, repo_root: str) -> dict:
     """Read `sweep_dir` and return the full consolidated report as a dict --
     the exact shape written to `report/consolidated.json`."""
@@ -1446,6 +1547,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     consolidated_findings = _finalize_findings(groups, lane_step_state)
     coverage = build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
     scanner_coverage = build_scanner_coverage(lanes, step_ids, load_scan_summaries(sweep_dir, lanes, step_ids))
+    provenance = build_provenance(sweep_dir, lanes, step_ids)
     sweep_id = os.path.basename(os.path.normpath(sweep_dir))
     dispatch = _load_dispatch_report(sweep_dir)
 
@@ -1488,6 +1590,7 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
         "scope_paths": _sweep_scope_paths(sweep_dir),
         "coverage": coverage,
         "scanner_coverage": scanner_coverage,
+        "provenance": provenance,
         "dispatch": dispatch,
         "rejected_proposals": _load_rejected_proposals(sweep_dir),
         "coverage_gates": load_coverage_gates(sweep_dir),
@@ -1904,6 +2007,11 @@ def render_markdown(report: dict) -> str:
         else:
             lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0 |")
         lines.append("")
+
+    lines.append("## Provenance")
+    lines.append("")
+    lines.extend(_provenance_lines(report))
+    lines.append("")
 
     if not sweep_complete:
         lines.append("## Incomplete")

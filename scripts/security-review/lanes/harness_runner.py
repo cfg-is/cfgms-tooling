@@ -563,8 +563,9 @@ def prompt_corpus(anchors: tuple | None = None) -> str:
 
 def compute_plan_hash(plan_dir: str, step_id: str) -> str:
     """SHA-256 hex digest of `<plan_dir>/<step_id>.json`'s own raw bytes on
-    disk (Issue #3962) -- one of the two identity bindings a step's envelope
-    carries alongside `harness_identity`, recomputed by
+    disk (Issue #3962) -- since Issue #4136 the ONLY binding a step's envelope
+    carries that is checked on resume (`harness_identity` and `prompt_version`
+    are recorded beside it and neither gates), recomputed by
     `resume.missing_steps()` on a later invocation to detect a plan step
     whose content changed since a lane last wrote a `complete` envelope for
     it. Hashed over the file's own bytes, not a re-serialization of the
@@ -584,10 +585,12 @@ def compute_prompt_version() -> str:
     anchor's id/severity/tags/text, output-schema description) -- recorded
     on every envelope so a changed prompt, rubric, worked example or
     selection tag is visible directly on the envelope, without a human
-    needing to diff two envelopes' worth of embedded prompt text. Unlike `plan_hash`/`harness_identity`,
+    needing to diff two envelopes' worth of embedded prompt text. Like
+    `harness_identity` since Issue #4136, and unlike `plan_hash`,
     `resume.missing_steps()` does not check this value against a current
-    one -- it is provenance recorded on the envelope, not a third
-    resume-time binding.
+    one -- it is provenance recorded on the envelope, not a resume-time
+    binding. Both describe the INSTRUMENT; only `plan_hash` describes the
+    question. `resume.provenance_by_step()` reads them back.
     """
     return hashlib.sha256(prompt_corpus().encode("utf-8")).hexdigest()
 
@@ -654,10 +657,19 @@ def build_envelope(
     `plan_hash`/`prompt_version`/`harness_identity` (Issue #3962) are also
     always present, regardless of `state`, for the same reason: a step that
     refused or failed still ran against a specific frozen plan step, system
-    prompt, and harness code, and that binding is exactly what a later
-    `resume` needs to decide whether re-running this step (rather than
-    trusting whatever is already on disk) is required, including for the
-    non-`complete` states `resume.missing_steps` already always retries.
+    prompt, and harness code, and that record is what makes a sweep readable
+    after the fact. Only `plan_hash` drives the re-run decision (Issue #4136);
+    `prompt_version` and `harness_identity` are recorded for provenance, never
+    compared against a current value.
+
+    All three are written for the non-`complete` states too, which
+    `resume.missing_steps` already always retries -- but note
+    `resume.provenance_by_step()` reads only `complete` envelopes, so a
+    non-complete step's recorded values are kept on disk and are NOT part of
+    the provenance answer. That is deliberate: a parked or failed step produced
+    no reading, so counting its instrument would report a lane as having
+    "changed instrument partway" when only one instrument ever produced a
+    result.
     Sourced from `context` rather than being separate parameters -- like
     `sweep_id`/`commit_sha`/`lane`/`step_id`, they are identity the caller
     already owns for this step, never invented here.
@@ -2654,19 +2666,24 @@ def run_lane(
     call_harness_fn = call_harness_fn or spec.call_harness
     step_ids = discover_step_ids(plan_dir)
 
-    # Issue #3962: the two resume-time binding checks. `harness_identity`
-    # comes straight from the env var #3952's `launch-investigator` injects
-    # (falling back to "unknown" for a standalone invocation outside the
-    # container, e.g. these tests) -- the same value this lane records on
-    # every envelope it writes below, so a later invocation launched under
-    # different harness code sees a mismatch against envelopes this run
-    # writes. `prompt_version` is recorded on every envelope but is not
-    # itself a resume-time check (see `compute_prompt_version`).
+    # Issue #3962 added two resume-time binding checks here; since Issue #4136
+    # there is ONE. `plan_hash` still binds, because a changed plan means
+    # different files and different hypotheses, so a recorded answer answers a
+    # different question.
+    #
+    # `harness_identity` and `prompt_version` are both RECORDED on every
+    # envelope below and neither is checked. They describe the instrument, not
+    # the question, and quarantining on the instrument discarded 611 completed
+    # steps of one real sweep on any harness edit. `resume.provenance_by_step()`
+    # is how they are read back; `resume._binding_mismatches` carries the full
+    # reasoning.
+    #
+    # `harness_identity` comes straight from the env var #3952's
+    # `launch-investigator` injects, falling back to "unknown" for a standalone
+    # invocation outside the container (e.g. these tests).
     harness_identity = os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_IDENTITY", "unknown")
     prompt_version = compute_prompt_version()
-    outstanding = resume.missing_steps(
-        out_dir, step_ids, plan_dir=plan_dir, current_harness_identity=harness_identity
-    )
+    outstanding = resume.missing_steps(out_dir, step_ids, plan_dir=plan_dir)
 
     written: list = []
     for step_id in outstanding:

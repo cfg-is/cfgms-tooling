@@ -23,7 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import basedir  # noqa: E402
-import consolidate  # noqa: E402
+import consolidate
+import resume  # noqa: E402
 import schema  # noqa: E402
 
 FAILURES: list[str] = []
@@ -152,6 +153,525 @@ def status_envelope(commit_sha: str, lane: str, step_id: str, state: str) -> dic
         "harness_identity": "c" * 64,
         "stop_reason_raw": "rate_limited" if state == "parked" else "policy_declined" if state == "refused" else "auth_error",
     }
+
+
+def test_two_lanes_with_different_identities_and_no_drift_is_NOT_mixed():
+    """REQUIRED TEST (Issue #4136): drift is a WITHIN-lane property, and this
+    is the fixture that actually proves the code computes it that way.
+
+    Every other provenance test here is single-lane, which makes per-lane and
+    sweep-wide `mixed` INDISTINGUISHABLE. A sweep-wide implementation --
+
+        sweep_mixed = any(len(v) > 1 for v in every_value_seen_anywhere)
+        for lane in lanes: row["mixed"] = sweep_mixed
+
+    -- passes every single-lane assertion in this file. It is also wrong in
+    exactly the way the feature exists to prevent: two lanes on different
+    harnesses ALWAYS carry different `harness_identity` values, so it declares
+    "`laneA`, `laneB` changed instrument partway" while printing one identity
+    per lane directly underneath. Self-contradictory, and the false alarm that
+    teaches a reader to stop reading the section.
+
+    This is the shape of the REAL sweep 2026-09-16T1843Z-a17e6fcc: codex and
+    ollama, different identities, neither lane drifted. The prose bug that
+    shipped in the first draft of this section was caught by rendering against
+    that sweep, not by a fixture -- so the fixture is now here.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write_plan_step(sweep, "step-002", sha, scope="pkg/example")
+
+        # Two lanes, DIFFERENT harness identities -- normal, since the identity
+        # covers the harness that ran and no two harnesses share one. Each lane
+        # is internally consistent across both its steps.
+        for step in ("step-001", "step-002"):
+            write(
+                os.path.join(sweep, "lanes", "codex-lane", f"{step}.findings.json"),
+                complete_envelope(sha, "codex-lane", step, []),
+            )
+            ollama = complete_envelope(sha, "ollama-lane", step, [])
+            ollama["harness_identity"] = "d" * 64
+            write(os.path.join(sweep, "lanes", "ollama-lane", f"{step}.findings.json"), ollama)
+
+        report = consolidate.consolidate(sweep, repo)
+        rows = {row["lane"]: row for row in report["provenance"]}
+        check(len(rows) == 2, "provenance: both lanes present", str(list(rows)))
+        for lane, row in sorted(rows.items()):
+            check(
+                row["mixed"] is False,
+                f"provenance: {lane} is NOT mixed -- it ran one identity throughout",
+                str(row),
+            )
+        check(
+            rows["codex-lane"]["harness_identity"] != rows["ollama-lane"]["harness_identity"],
+            "provenance: the two lanes really do carry different identities (else this proves nothing)",
+            str(rows),
+        )
+
+        md = consolidate.render_markdown(report)
+        section = md.split("## Provenance")[1].split("\n## ")[0]
+        check(
+            "changed instrument partway" not in section,
+            "provenance: two lanes differing is NEVER announced as drift",
+            section,
+        )
+        check(
+            "ONE harness version and ONE prompt version from start to finish" in section,
+            "provenance: it is reported as the clean sweep it is",
+            section,
+        )
+
+        # The TABLE is the artifact AC5 is about -- "naming which steps ran
+        # under which version". Asserting `mixed` and the headline leaves it
+        # entirely unchecked: render every row under `rows[0]["lane"]` and the
+        # table attributes one lane's values to another, showing that lane with
+        # two identities directly beneath a sentence saying each ran one. Same
+        # self-contradiction this fixture's sibling exists to prevent, mirrored
+        # into the rows.
+        for row in report["provenance"]:
+            for field in ("harness_identity", "prompt_version"):
+                for value, steps in row[field].items():
+                    expected = "| {} | `{}` | `{}` | {} |".format(
+                        row["lane"], field, value, len(steps)
+                    )
+                    check(
+                        expected in section,
+                        f"provenance table: {row['lane']}/{field} is attributed to its OWN lane",
+                        section,
+                    )
+        # And no lane is given a value it did not produce.
+        for row in report["provenance"]:
+            foreign = [
+                other for other in report["provenance"]
+                if other["lane"] != row["lane"]
+                for v in other["harness_identity"]
+                if v not in row["harness_identity"]
+                and f"| {row['lane']} | `harness_identity` | `{v}` |" in section
+            ]
+            check(
+                not foreign,
+                f"provenance table: {row['lane']} is never shown another lane's identity",
+                section,
+            )
+
+
+def test_only_the_lane_that_actually_drifted_is_named():
+    """REQUIRED TEST (Issue #4136): the companion to the case above. When one
+    lane really does change instrument, the report names THAT lane and not its
+    clean neighbour.
+
+    Together these two pin the criterion rather than the implementation: the
+    first fails any sweep-wide `mixed`, the second fails a `mixed` that is
+    always true, and neither can be satisfied by a constant.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write_plan_step(sweep, "step-002", sha, scope="pkg/example")
+
+        # `clean-lane` holds one identity across both steps.
+        for step in ("step-001", "step-002"):
+            write(
+                os.path.join(sweep, "lanes", "clean-lane", f"{step}.findings.json"),
+                complete_envelope(sha, "clean-lane", step, []),
+            )
+        # `drifted-lane` changed harness between its two steps.
+        first = complete_envelope(sha, "drifted-lane", "step-001", [])
+        first["harness_identity"] = "d" * 64
+        write(os.path.join(sweep, "lanes", "drifted-lane", "step-001.findings.json"), first)
+        second = complete_envelope(sha, "drifted-lane", "step-002", [])
+        second["harness_identity"] = "e" * 64
+        write(os.path.join(sweep, "lanes", "drifted-lane", "step-002.findings.json"), second)
+
+        report = consolidate.consolidate(sweep, repo)
+        rows = {row["lane"]: row for row in report["provenance"]}
+        check(rows["drifted-lane"]["mixed"] is True,
+              "provenance: the lane that changed identity is mixed", str(rows["drifted-lane"]))
+        check(rows["clean-lane"]["mixed"] is False,
+              "provenance: its neighbour is NOT dragged in", str(rows["clean-lane"]))
+
+        md = consolidate.render_markdown(report)
+        section = md.split("## Provenance")[1].split("\n## ")[0]
+        headline = section.split("Drift is measured")[0]
+        check(
+            "`drifted-lane` changed instrument partway" in headline,
+            "provenance: the drifted lane is named in the headline",
+            headline,
+        )
+        # NOT a substring negative on "`clean-lane` changed instrument".
+        # That phrasing cannot fail for the case it exists to catch: widen the
+        # headline to every lane and it renders "`clean-lane`, `drifted-lane`
+        # changed instrument", in which the searched substring is absent. The
+        # check would pass against the exact output it was written to reject.
+        #
+        # Assert the property instead -- no lane the report itself calls clean
+        # may appear anywhere in the sentence that announces drift -- and derive
+        # the lane list from the rows rather than hardcoding it, so this keeps
+        # holding if the fixture grows a third lane.
+        for row in report["provenance"]:
+            if row["mixed"]:
+                continue
+            check(
+                f"`{row['lane']}`" not in headline,
+                f"provenance: {row['lane']} is not mixed, so it is not named in the drift sentence",
+                headline,
+            )
+
+
+def test_a_mixed_sweep_names_which_steps_ran_which_instrument():
+    """REQUIRED TEST (Issue #4136, AC5): a sweep that ran two harness versions
+    or two prompt versions says so in the report, naming both.
+
+    This is the test that makes dropping the resume-time gate safe. Allowing a
+    sweep to change instrument mid-run is a real gain; allowing it SILENTLY is
+    a hazard, because a reader comparing lanes would have no way to see that
+    one of them changed partway. The gate and this section are two halves of
+    one decision, so they are tested together or neither is honest.
+
+    Both fields are exercised here because `harness_identity` used to
+    quarantine and `prompt_version` used to be ignored entirely -- the harness
+    was too strict about one and too loose about the other, and the
+    inconsistency can return in whichever direction is untested.
+
+    **This fixture alone does not prevent that, and an earlier version of this
+    docstring claimed it did.** It drifts both fields in the SAME envelope, so
+    a `mixed` computed from `harness_identity` alone satisfies every assertion
+    below. Asserting both jointly is not asserting each independently.
+    `test_prompt_version_drift_alone_is_mixed` covers the direction this one
+    cannot.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        for step in ("step-001", "step-002", "step-003"):
+            write_plan_step(sweep, step, sha, scope="pkg/example")
+
+        # step-001 and step-002 ran the ORIGINAL instrument.
+        for step in ("step-001", "step-002"):
+            write(
+                os.path.join(sweep, "lanes", "laneA", f"{step}.findings.json"),
+                complete_envelope(sha, "laneA", step, []),
+            )
+        # step-003 ran after a harness fix AND a prompt change landed.
+        drifted = complete_envelope(sha, "laneA", "step-003", [])
+        drifted["harness_identity"] = "d" * 64
+        drifted["prompt_version"] = "e" * 64
+        write(os.path.join(sweep, "lanes", "laneA", "step-003.findings.json"), drifted)
+
+        report = consolidate.consolidate(sweep, repo)
+        row = report["provenance"][0]
+        check(row["mixed"] is True, "provenance: a sweep with two instruments is marked mixed", str(row))
+        check(
+            row["harness_identity"] == {"c" * 64: ["step-001", "step-002"], "d" * 64: ["step-003"]},
+            "provenance: each harness identity names exactly the steps it produced",
+            str(row["harness_identity"]),
+        )
+        check(
+            row["prompt_version"] == {"b" * 64: ["step-001", "step-002"], "e" * 64: ["step-003"]},
+            "provenance: prompt_version is tracked too -- drift in it used to be invisible",
+            str(row["prompt_version"]),
+        )
+
+        md = consolidate.render_markdown(report)
+        section = md.split("## Provenance")[1].split("##")[0]
+        check(
+            "`laneA` changed instrument partway" in section,
+            "provenance: the report NAMES the lane that drifted, not just that some lane did",
+            section,
+        )
+        check(
+            "Drift is measured **within** a lane" in section,
+            "provenance: and says drift is within-lane, so two lanes differing is not read as drift",
+            section,
+        )
+        for field, value, count in (
+            ("harness_identity", "c" * 64, 2),
+            ("harness_identity", "d" * 64, 1),
+            ("prompt_version", "e" * 64, 1),
+        ):
+            check(
+                f"| laneA | `{field}` | `{value}` | {count} |" in section,
+                f"provenance: the table row for {field}={value[:6]}... names its step count",
+                section,
+            )
+
+
+def test_every_drifted_lane_is_named_not_just_the_first():
+    """REQUIRED TEST (Issue #4136): the CONVERSE of the clean-lane property.
+
+    `test_only_the_lane_that_actually_drifted_is_named` asserts that no clean
+    lane appears in the drift sentence. That is one direction. Truncate the
+    sentence to the first drifted lane --
+
+        mixed_rows = [row for row in rows if row["mixed"]][:1]
+
+    -- and every existing check still passes, because no fixture had TWO
+    drifted lanes. A lane changes instrument and the report says nothing about
+    it, which is worse than the false alarm the other direction guards: a false
+    alarm is visible and annoying, a silent omission is invisible and trusted.
+
+    Three lanes here on purpose -- two drifted, one clean -- so the assertion
+    is "every mixed lane appears AND no clean lane does", both derived from the
+    rows rather than hardcoded.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write_plan_step(sweep, "step-002", sha, scope="pkg/example")
+
+        # Two lanes that each changed harness between their two steps.
+        for lane, second_identity in (("lane-one", "d" * 64), ("lane-two", "e" * 64)):
+            write(
+                os.path.join(sweep, "lanes", lane, "step-001.findings.json"),
+                complete_envelope(sha, lane, "step-001", []),
+            )
+            drifted = complete_envelope(sha, lane, "step-002", [])
+            drifted["harness_identity"] = second_identity
+            write(os.path.join(sweep, "lanes", lane, "step-002.findings.json"), drifted)
+        # One that did not.
+        for step in ("step-001", "step-002"):
+            write(
+                os.path.join(sweep, "lanes", "lane-steady", f"{step}.findings.json"),
+                complete_envelope(sha, "lane-steady", step, []),
+            )
+
+        report = consolidate.consolidate(sweep, repo)
+        rows = {row["lane"]: row for row in report["provenance"]}
+        check(
+            sum(1 for r in rows.values() if r["mixed"]) == 2,
+            "provenance: exactly two lanes drifted (else this proves nothing)",
+            str({k: v["mixed"] for k, v in rows.items()}),
+        )
+
+        md = consolidate.render_markdown(report)
+        section = md.split("## Provenance")[1].split("\n## ")[0]
+        headline = section.split("Drift is measured")[0]
+        for lane, row in sorted(rows.items()):
+            if row["mixed"]:
+                check(
+                    f"`{lane}`" in headline,
+                    f"provenance: {lane} drifted, so it MUST be named in the drift sentence",
+                    headline,
+                )
+            else:
+                check(
+                    f"`{lane}`" not in headline,
+                    f"provenance: {lane} did not drift, so it is not named",
+                    headline,
+                )
+
+
+def test_only_COMPLETE_steps_count_as_provenance():
+    """REQUIRED TEST (Issue #4136): a step that parked or failed produced no
+    reading, so its recorded instrument is not a version this lane ran ON.
+
+    Drop the `state != "complete"` filter and a lane that PARKED under one
+    harness and then COMPLETED under the next is reported as "changed
+    instrument partway" -- when only one instrument ever produced a result.
+    That is the cry-wolf false alarm this section's own prose warns about,
+    manufactured out of a step that read nothing.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write_plan_step(sweep, "step-002", sha, scope="pkg/example")
+
+        # step-001 PARKED under the original harness -- it reviewed nothing.
+        #
+        # Written to the `.findings.json` PATH deliberately. `provenance_by_step`
+        # only opens that path, so a parked envelope at `.status.json` is
+        # already invisible to it and proves nothing about the state filter --
+        # an earlier version of this fixture made exactly that mistake and the
+        # mutation survived. The filter guards a non-complete envelope sitting
+        # where a complete one would, which is the case that can actually reach
+        # it.
+        parked = status_envelope(sha, "laneA", "step-001", "parked")
+        parked["harness_identity"] = "c" * 64
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), parked)
+        # step-002 COMPLETED under a newer harness.
+        done = complete_envelope(sha, "laneA", "step-002", [])
+        done["harness_identity"] = "d" * 64
+        write(os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"), done)
+
+        report = consolidate.consolidate(sweep, repo)
+        row = report["provenance"][0]
+        check(
+            row["harness_identity"] == {"d" * 64: ["step-002"]},
+            "provenance: only the COMPLETE step's instrument is recorded",
+            str(row["harness_identity"]),
+        )
+        check(
+            row["mixed"] is False,
+            "provenance: a parked step under an older harness is not drift -- it produced no reading",
+            str(row),
+        )
+
+
+def test_harness_versions_by_step_DELEGATES_rather_than_re_walking():
+    """REQUIRED TEST (Issue #4136): `harness_versions_by_step()` must agree
+    with `provenance_by_step()` because it IS it, not because both happen to
+    be written correctly.
+
+    The docstring claims "delegates rather than re-walking the lane, so the
+    two answers cannot disagree about the same artifacts". That claim was
+    load-bearing and lived only in the docstring: replace the delegation with
+    an independent walk using different rules and every test still passed,
+    because the existing coverage exercises it on complete-only fixtures where
+    any reasonable walk agrees.
+
+    A caption is not a check. This drives the two functions over artifacts a
+    divergent re-walk would treat differently -- a parked step, and an
+    envelope with no recorded identity -- and asserts equality of the results
+    rather than of their values.
+    """
+    with tempfile.TemporaryDirectory() as lane_dir:
+        # A completed step, a parked one, and a completed one with no identity:
+        # exactly the cases where two independent walks tend to diverge.
+        write(
+            os.path.join(lane_dir, "step-001.findings.json"),
+            {"state": "complete", "harness_identity": "a" * 64, "prompt_version": "b" * 64},
+        )
+        write(
+            os.path.join(lane_dir, "step-002.status.json"),
+            {"state": "parked", "harness_identity": "c" * 64, "prompt_version": "b" * 64},
+        )
+        write(
+            os.path.join(lane_dir, "step-003.findings.json"),
+            {"state": "complete", "prompt_version": "b" * 64},
+        )
+        step_ids = ["step-001", "step-002", "step-003"]
+
+        delegated = resume.harness_versions_by_step(lane_dir, step_ids)
+        full = resume.provenance_by_step(lane_dir, step_ids)["harness_identity"]
+        check(
+            delegated == full,
+            "provenance: harness_versions_by_step IS provenance_by_step's harness half, not a second walk",
+            f"{delegated!r} vs {full!r}",
+        )
+        check(
+            delegated == {"a" * 64: ["step-001"], "unrecorded": ["step-003"]},
+            "provenance: and both agree on the parked step (excluded) and the unrecorded one (kept)",
+            str(delegated),
+        )
+
+
+def test_prompt_version_drift_alone_is_mixed():
+    """REQUIRED TEST (Issue #4136): a lane whose PROMPT changed but whose
+    harness did not is still a mixed lane.
+
+    `test_a_mixed_sweep_names_which_steps_ran_which_instrument` drifts both
+    fields in one envelope, so this implementation --
+
+        "mixed": len(by_field.get("harness_identity") or {}) > 1
+
+    -- passes it, and every other check in this file. It renders "Each lane ran
+    ONE harness version and ONE prompt version from start to finish" directly
+    above a table listing two prompt versions for that lane: the sentence
+    falsified by the rows beneath it, which is the precise failure this section
+    exists to prevent.
+
+    `prompt_version` is the direction that needs its own fixture, because it is
+    the field that was historically ignored. A suite that only ever drifts it
+    alongside `harness_identity` cannot tell the two apart.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write_plan_step(sweep, "step-002", sha, scope="pkg/example")
+
+        # Same harness both steps. Only the prompt changed.
+        first = complete_envelope(sha, "laneA", "step-001", [])
+        write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), first)
+        second = complete_envelope(sha, "laneA", "step-002", [])
+        second["prompt_version"] = "f" * 64
+        write(os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"), second)
+
+        report = consolidate.consolidate(sweep, repo)
+        row = report["provenance"][0]
+        check(
+            len(row["harness_identity"]) == 1,
+            "provenance: the harness really did stay constant (else this proves nothing)",
+            str(row["harness_identity"]),
+        )
+        check(
+            len(row["prompt_version"]) == 2,
+            "provenance: two prompt versions recorded",
+            str(row["prompt_version"]),
+        )
+        check(
+            row["mixed"] is True,
+            "provenance: prompt_version drift ALONE makes a lane mixed",
+            str(row),
+        )
+
+        md = consolidate.render_markdown(report)
+        section = md.split("## Provenance")[1].split("\n## ")[0]
+        check(
+            "ONE harness version and ONE prompt version from start to finish" not in section,
+            "provenance: a prompt-drifted sweep is never reported as consistent",
+            section,
+        )
+        check(
+            "`laneA` changed instrument partway" in section,
+            "provenance: and the lane is named",
+            section,
+        )
+
+
+def test_a_single_instrument_sweep_says_so_rather_than_staying_quiet():
+    """The section renders on EVERY sweep, not only a drifted one.
+
+    A section that appears only when there is bad news teaches a reader to
+    skim for its absence, and absence is indistinguishable from "this harness
+    version does not record provenance at all". "One version throughout" is
+    the answer to the same question and is worth stating.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", []),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(report["provenance"][0]["mixed"] is False,
+              "provenance: one instrument throughout is not marked mixed",
+              str(report["provenance"][0]))
+        md = consolidate.render_markdown(report)
+        check("## Provenance" in md,
+              "provenance: the section is present on an undrifted sweep too", md)
+        check("ONE harness version and ONE prompt version from start to finish" in md,
+              "provenance: and states each lane was consistent end to end", md)
+
+
+def test_a_step_with_no_recorded_provenance_is_a_row_not_a_silence():
+    """An envelope missing the field records `unrecorded` rather than being
+    skipped. "We do not know which version produced these steps" is itself a
+    fact about the sweep, and dropping the step would make an unknown look
+    like an absence of steps.
+
+    Asserted for EVERY tracked field, driven off `resume.PROVENANCE_FIELDS`
+    rather than naming one. Deleting only `harness_identity` left the same
+    asymmetry that made a `harness_identity`-only `mixed` invisible: the
+    guarantee held for the field that happened to be tested and nothing
+    noticed when it stopped holding for the other. Driving the loop off the
+    tuple also means a field added later is covered without anyone
+    remembering to extend this.
+    """
+    for field in resume.PROVENANCE_FIELDS:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+            sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+            write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+            env = complete_envelope(sha, "laneA", "step-001", [])
+            del env[field]
+            write(os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"), env)
+            report = consolidate.consolidate(sweep, repo)
+            row = report["provenance"][0]
+            check(
+                row[field] == {"unrecorded": ["step-001"]},
+                f"provenance: a missing {field} is recorded as unrecorded, never dropped",
+                str(row),
+            )
 
 
 def test_dedup_across_lanes_on_file_symbol_vuln_class():

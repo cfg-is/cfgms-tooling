@@ -56,12 +56,16 @@ Three shapes are validated here:
   `harness_identity` (Issue #3962) are required on every envelope regardless
   of `state`, exactly like `sweep_id`/`commit_sha`/`lane`/`step_id`/`model_id`
   — the identity of the frozen plan step, system prompt, and harness code a
-  step ran against, so `resume.missing_steps()` can bind a `complete`
-  envelope to the sweep that is actually resuming rather than trusting one
-  written under a since-changed plan or harness. This module only validates
-  that the three fields are present and non-empty strings; recomputing and
-  comparing them against the current sweep's values is `resume.py`'s job,
-  not this module's.
+  step ran against. `resume.missing_steps()` binds a `complete` envelope to
+  the sweep that is actually resuming via `plan_hash`, rather than trusting
+  one written under a since-changed PLAN. Since Issue #4136 `prompt_version`
+  and `harness_identity` are **not** compared against anything: they describe
+  the instrument rather than the question, and quarantining on the instrument
+  discarded 611 completed steps of one real sweep on any harness edit. They
+  are read back by `resume.provenance_by_step()` and reported, never gated on.
+  This module only validates that the three fields are present and non-empty
+  strings; deciding what to do with them is `resume.py`'s job, not this
+  module's.
 
 - A **plan step** (`validate_plan_step`): the one shape the planner writes and
   every lane reads (epic #3927's contract C1). Before this story, the planner
