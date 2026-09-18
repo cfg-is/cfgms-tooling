@@ -1148,6 +1148,15 @@ def write_step_diagnostic(lane_dir: str, name: str, text: str) -> "str | None":
     full-repository sweep would cost hundreds of megabytes to answer a
     question nobody asked.
 
+    ONE EXCEPTION since Issue #4133: the ollama lane's per-step `meta.json` is
+    written for every step, complete or not. It carries
+    `prompt_eval_count`/`eval_count`, and a lane's throughput is a property of
+    the steps that WORKED -- gating it on failure made the common case record
+    nothing. The cost rationale above is about prompts and raw harness output;
+    it does not apply to a ~600-byte meta. That lane's bulky `stdout.txt` /
+    `stderr.txt` dumps remain failure-only, so the rule holds for everything
+    the size argument was written about.
+
     This exists because the alternative is inference. The lanes delete every
     per-step scratch file on both the success and the failure path, so the
     one artifact that explains an `invalid_findings_schema` -- what the model

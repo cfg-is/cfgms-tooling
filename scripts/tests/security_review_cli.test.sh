@@ -1448,37 +1448,110 @@ mkdir -p "$OLLAMA_ENTRYPOINT_DIR"
 cp "$CLAUDE_LANE_SCRIPT" "${OLLAMA_ENTRYPOINT_DIR}/claude_lane.py"
 cp "$OLLAMA_LANE_SCRIPT" "${OLLAMA_ENTRYPOINT_DIR}/ollama_lane.py"
 
-# Stub `ollama` binary (Issue #3976): reads the prompt on stdin (discarded --
-# this stub's answer does not depend on it) and prints the findings JSON
-# object to stdout, exactly the contract `call_ollama_harness` expects back.
+# Stub ollama DAEMON: the lane POSTs to the local daemon's /api/generate
+# rather than shelling out, so the stand-in is a tiny HTTP server, not a
+# binary on PATH. `OLLAMA_HOST` points the lane at it -- which is exactly what
+# that variable is for: selecting WHICH local daemon to talk to. (It cannot be
+# aimed at ollama.com; only a daemon holding the `ollama signin` keypair can
+# sign a Cloud request.) The answer is still wrapped in prose either side of
+# the JSON, so this keeps exercising extraction rather than assuming a clean
+# body.
 OLLAMA_BIN_DIR="${SANDBOX}/ollama-harness-bins"
 mkdir -p "$OLLAMA_BIN_DIR"
 cp "${STUB_CLAUDE_BIN_DIR}/claude" "${OLLAMA_BIN_DIR}/claude"
-cat > "${OLLAMA_BIN_DIR}/ollama" <<'OLLAMA_STUB'
-#!/usr/bin/env bash
-set -euo pipefail
-cat >/dev/null
-outcome="${STUB_OLLAMA_OUTCOME:-complete}"
-case "$outcome" in
-  complete)
-    printf 'Sure, here is my review:\n\n{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}\n\nLet me know if you need more detail.'
-    exit 0
-    ;;
-  unauthenticated)
-    printf 'You need to be signed in to Ollama to run Cloud models.'
-    exit 0
-    ;;
-  *)
-    echo "stub ollama: unrecognized STUB_OLLAMA_OUTCOME=${outcome}" >&2
-    exit 1
-    ;;
-esac
-OLLAMA_STUB
-chmod +x "${OLLAMA_BIN_DIR}/claude" "${OLLAMA_BIN_DIR}/ollama"
+chmod +x "${OLLAMA_BIN_DIR}/claude"
+
+cat > "${SANDBOX}/ollama_stub_server.py" <<'PYSTUB'
+"""Minimal stand-in for the local ollama daemon's /api/generate."""
+import json
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+COMPLETE = (
+    "Sure, here is my review:\n\n"
+    '{"findings":[],"dispositions":[{"hypothesis_id":"h1",'
+    '"disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}'
+    "\n\nLet me know if you need more detail."
+)
+UNAUTHENTICATED = "You need to be signed in to Ollama to run Cloud models."
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        outcome = os.environ.get("STUB_OLLAMA_OUTCOME", "complete")
+        answer = UNAUTHENTICATED if outcome == "unauthenticated" else COMPLETE
+        # The real daemon answers 200 even when unauthenticated -- the failure
+        # is in the body, not the status. Preserving that is the point: it is
+        # the case the lane must still record as failed rather than refused.
+        body = json.dumps(
+            {"response": answer, "prompt_eval_count": 11, "eval_count": 7,
+             "total_duration": 1_000_000_000, "done": True, "done_reason": "stop"}
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # silence per-request logging
+        return
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(sys.argv[1], "w") as f:
+    f.write(str(server.server_port))
+server.serve_forever()
+PYSTUB
+
+OLLAMA_PORT_FILE="${SANDBOX}/ollama_stub_port"
+# stdout/stderr go to a file, never the test's own: a background process
+# holding the script's stdout open makes any pipe over this suite hang forever
+# waiting for a writer that never closes.
+python3 "${SANDBOX}/ollama_stub_server.py" "$OLLAMA_PORT_FILE" \
+  >"${SANDBOX}/ollama_stub_server.log" 2>&1 </dev/null &
+OLLAMA_STUB_PID=$!
+# Reap it however this suite ends, including on an early failure exit -- and
+# keep reaping the FIXTURES, which a bare `trap ... EXIT` here would silently
+# stop doing.
+#
+# Bash EXIT traps are NOT additive. A second `trap ... EXIT` REPLACES the
+# first, it does not chain:
+#
+#   $ bash -c 'trap "echo A" EXIT; trap "echo B" EXIT'
+#   B
+#
+# The first version of this line installed only the kill, which discarded
+# `trap cleanup_fixtures EXIT` from earlier in this file. Nothing failed
+# visibly: the remaining ~950 lines simply leaked $FAKEBIN, $SANDBOX and
+# $STUB_CLAUDE_BIN_DIR on every exit, including every early failure exit.
+#
+# Those dirs cannot be reaped by anything else either. `create_snapshot()`
+# strips write bits from every extracted file AND directory on purpose, and
+# `rm -rf` cannot unlink an entry without write permission on its parent, so
+# an ordinary TMPDIR sweeper leaves them behind too. `cleanup_fixtures` exists
+# precisely because it `chmod -R u+w` first.
+#
+# So this trap must do BOTH, and any future trap in this file must re-arm
+# whatever it displaces.
+trap 'kill "$OLLAMA_STUB_PID" 2>/dev/null || true; cleanup_fixtures' EXIT
+# The port is chosen by the kernel and written once the socket is bound, so
+# wait for the file rather than racing the server's startup.
+for _ in $(seq 1 100); do
+  [[ -s "$OLLAMA_PORT_FILE" ]] && break
+  sleep 0.05
+done
+OLLAMA_STUB_PORT="$(cat "$OLLAMA_PORT_FILE" 2>/dev/null || true)"
+if [[ -z "$OLLAMA_STUB_PORT" ]]; then
+  bad "ollama stub daemon binds a port" "no port file written"
+fi
 
 ollama_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x,ollama:model-y:cloud" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$OLLAMA_ENTRYPOINT_DIR" \
   STUB_CLAUDE_BIN_DIR="$OLLAMA_BIN_DIR" \
+  OLLAMA_HOST="http://127.0.0.1:${OLLAMA_STUB_PORT}" \
   run_cli "$SUB_OLLAMA" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_OLLAMA}/stderr.log")
 ollama_rc=$?
 check_eq "ollama roster launch exits 0" "$ollama_rc" "0"
