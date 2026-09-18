@@ -878,8 +878,10 @@ def test_low_severity_low_confidence_single_lane_finding_survives_to_report():
         report = consolidate.consolidate(sweep, repo)
         match = [
             f for f in report["findings"]
+            # Since Issue #4134 the consolidated `vuln_class` is the
+            # normalised cwe, not the lane's prose ("info-disclosure").
             if (f["file"], f["symbol"], f["vuln_class"])
-            == ("pkg/quiet/whisper.go", "Whisper.Maybe", "info-disclosure")
+            == ("pkg/quiet/whisper.go", "Whisper.Maybe", "CWE-863")
         ]
         check(
             len(match) == 1,
@@ -1924,10 +1926,396 @@ def _thing_adjudication(severity: str = "critical", rationale: str = "Critical p
     return {
         "file": "pkg/example/thing.go",
         "symbol": "Thing.DoSomething",
-        "vuln_class": "tenant-scoping",
+        "vuln_class": "CWE-863",
         "severity": severity,
         "rationale": rationale,
     }
+
+
+def test_two_lanes_naming_one_defect_differently_are_one_finding():
+    """REQUIRED TEST (Issue #4134): two lanes report the same defect in the
+    same file and symbol, with the same cwe, but describe the class in
+    incompatible registers -- prose against an identifier. That is not a
+    contrived case: measured across the 142 steps two lanes both completed in
+    sweep 2026-09-16T1843Z-a17e6fcc, codex wrote phrases and ollama wrote CWE
+    ids, 122 distinct values against 203 with 14 in common, and the two lanes
+    agreed on 12 findings out of a 974 union -- 1.2%.
+
+    Keyed on prose these are two single-lane findings and the report's
+    agreement sort carries no information. Keyed on the normalised cwe they
+    are one finding both lanes reported, which is the entire point of running
+    more than one lane.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x"})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001",
+                        vuln_class="Incorrect authorization", cwe="CWE-863"),
+            ]),
+        )
+        write(
+            os.path.join(sweep, "lanes", "laneB", "step-001.findings.json"),
+            complete_envelope(sha, "laneB", "step-001", [
+                # Same defect, same cwe -- written the way the other lane writes
+                # it, including the formatting variation normalize_cwe absorbs.
+                finding(sha, "laneB", "step-001",
+                        vuln_class="CWE-863", cwe="cwe-863: Incorrect authorization"),
+            ]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+
+        check(
+            len(report["findings"]) == 1,
+            "vocabulary: two registers for one defect collapse to a single finding",
+            str([(f["file"], f["symbol"], f["vuln_class"]) for f in report["findings"]]),
+        )
+        f = report["findings"][0]
+        check(
+            f["lanes"] == ["laneA", "laneB"],
+            "vocabulary: the finding is credited to BOTH lanes",
+            str(f["lanes"]),
+        )
+        check(
+            f["agreement"]["reported"] == 2,
+            "vocabulary: agreement counts two lanes, which is what the report sorts on",
+            str(f["agreement"]),
+        )
+        check(
+            f["vuln_class"] == "CWE-863",
+            "vocabulary: the consolidated class is the normalised cwe, not either lane's prose",
+            str(f["vuln_class"]),
+        )
+        check(
+            {o["vuln_class"] for o in f["occurrences"]} == {"Incorrect authorization", "CWE-863"},
+            "vocabulary: each lane's own wording survives on its occurrence",
+            str([o.get("vuln_class") for o in f["occurrences"]]),
+        )
+        md = consolidate.render_markdown(report)
+        check(
+            "### Incorrect authorization (CWE-863)" in md,
+            "vocabulary: the heading leads with prose, never 'CWE-863 (CWE-863)'",
+            md,
+        )
+
+
+def test_heading_prose_does_not_depend_on_lane_name_ordering():
+    """REQUIRED TEST (Issue #4134): the heading shows prose whichever lane
+    happens to sort first, and for a single-lane identifier-only finding.
+
+    The first version of this passed by luck. It picked the first occurrence in
+    lane order, and the fixture named the prose lane `laneA` and the identifier
+    lane `laneB` -- so prose won alphabetically. Name them `alpha` (identifier)
+    and `zeta` (prose) and the heading renders `CWE-863 (CWE-863)`: the exact
+    string the code says cannot occur. The same happens for any single-lane
+    ollama finding, since ollama writes identifiers into `vuln_class`; the real
+    sweep was saved only by `codex` < `ollama`.
+
+    So this fixture deliberately inverts the ordering the implementation used
+    to rely on.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        # `alpha` sorts FIRST and writes the identifier.
+        write(
+            os.path.join(sweep, "lanes", "alpha", "step-001.findings.json"),
+            complete_envelope(sha, "alpha", "step-001", [
+                finding(sha, "alpha", "step-001", vuln_class="CWE-863", cwe="CWE-863"),
+            ]),
+        )
+        write(
+            os.path.join(sweep, "lanes", "zeta", "step-001.findings.json"),
+            complete_envelope(sha, "zeta", "step-001", [
+                finding(sha, "zeta", "step-001", vuln_class="Incorrect authorization", cwe="CWE-863"),
+            ]),
+        )
+        md = consolidate.render_markdown(consolidate.consolidate(sweep, repo))
+        check(
+            "CWE-863 (CWE-863)" not in md,
+            "heading: the identifier is never rendered as its own label, whatever the lane names",
+            md,
+        )
+        check(
+            "### Incorrect authorization (CWE-863)" in md,
+            "heading: prose is preferred even when the identifier lane sorts first",
+            md,
+        )
+
+
+def test_heading_falls_back_when_every_lane_wrote_an_identifier():
+    """A finding whose only label anywhere IS the identifier still needs a
+    non-empty heading -- the fallback must not render blank."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write(
+            os.path.join(sweep, "lanes", "alpha", "step-001.findings.json"),
+            complete_envelope(sha, "alpha", "step-001", [
+                finding(sha, "alpha", "step-001", vuln_class="CWE-863", cwe="CWE-863"),
+            ]),
+        )
+        md = consolidate.render_markdown(consolidate.consolidate(sweep, repo))
+        check(
+            "### CWE-863 (CWE-863)" in md,
+            "heading: with no prose anywhere the identifier is used rather than an empty heading",
+            md,
+        )
+
+
+def test_heading_label_tests_identifier_SHAPE_not_vocabulary_membership():
+    """REQUIRED TEST (Issue #4134): `_prose_label` decides "is this an
+    identifier" by SHAPE. Asking `schema.normalize_cwe(label) is None` asked
+    about VOCABULARY, and the two disagree in BOTH directions -- each way a
+    real defect that reached the report.
+
+    A vocabulary test is wrong going in: `CWE-863: Incorrect authorization`
+    normalises, so it was SKIPPED and the finding's only prose was thrown away.
+    It is wrong coming out too: `CWE-99999` (out of the list) and
+    `CWE_863 Incorrect authorization` (underscore, no colon) do NOT normalise,
+    so they were taken for prose and rendered verbatim -- producing exactly the
+    `CWE-99999 (CWE-863)` heading the helper exists to prevent.
+
+    Each case is asserted on `_prose_label` directly rather than through a
+    rendered report, because the point is the decision, not the formatting.
+    """
+    cases = [
+        # (label, expected, what this case is about)
+        ("CWE-863: Incorrect authorization", "Incorrect authorization",
+         "an identifier prefix is stripped and the prose tail kept"),
+        ("CWE_863 Incorrect authorization", "Incorrect authorization",
+         "punctuation the vocabulary does not accept is still an identifier prefix"),
+        ("cwe 863 - incorrect authorization", "incorrect authorization",
+         "case and separator do not change the decision"),
+        ("CWE-863", "CWE-863 (fallback)",
+         "a bare in-vocabulary identifier is skipped"),
+        ("CWE-99999", "CWE-863 (fallback)",
+         "an OUT-of-vocabulary identifier is skipped too -- shape, not membership"),
+        ("295", "CWE-863 (fallback)",
+         "a bare number is an identifier and never a heading"),
+        ("Incorrect authorization", "Incorrect authorization",
+         "plain prose is returned unchanged"),
+        # The vocabulary's escape hatch. methodology.md calls it "allowed and
+        # expected", so a lane using it is behaving correctly -- and it used to
+        # render "### other: foo (other: foo)", the exact duplication this
+        # helper exists to prevent. `other:` is a marker, not prose.
+        ("other: tenant path confusion", "tenant path confusion",
+         "the `other:` escape yields its LABEL, never the marker"),
+        ("OTHER: Broken flow", "Broken flow",
+         "and the marker match is case-insensitive"),
+        ("other:", "CWE-863 (fallback)",
+         "a bare `other:` carries no label, so it is skipped"),
+        ("   ", "CWE-863 (fallback)",
+         "a whitespace-only label is not prose"),
+    ]
+    for label, expected, description in cases:
+        got = consolidate._prose_label(
+            {"occurrences": [{"vuln_class": label}], "vuln_class": "CWE-863 (fallback)"}
+        )
+        check(got == expected, f"heading label: {description}", f"{label!r} -> {got!r}")
+
+    # The skip must be a CONTINUE, not a return: a later occurrence still wins.
+    got = consolidate._prose_label({
+        "occurrences": [{"vuln_class": "CWE-863"}, {"vuln_class": "Missing authorization check"}],
+        "vuln_class": "CWE-863",
+    })
+    check(got == "Missing authorization check",
+          "heading label: skipping an identifier occurrence does not abandon the search", got)
+
+
+def test_cross_step_group_members_render_prose_and_carry_no_evidence():
+    """REQUIRED TEST (Issue #4134): `_prose_label` is used at the cross-step
+    member site, and it must actually WORK there.
+
+    It did not. `_cross_step_groups()` projects four fields onto each member
+    and `occurrences` was not one of them, so the helper iterated an absent
+    list and fell straight through to the key -- rendering the
+    `CWE-117 (CWE-117)` it was called to prevent. Wired in, but inert: a test
+    that only checked the helper was CALLED would have passed.
+
+    The projection is labels only. These members travel to the adjudicator in
+    `build_adjudication_input`, and Issue #4080 keeps finder evidence out of
+    that payload, so copying whole occurrences would carry `evidence` straight
+    past that guard. Both halves are asserted here -- the label is present AND
+    the evidence is not -- because fixing the first by copying everything would
+    silently break the second.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/a/a.go": "a" * 200, "pkg/b/b.go": "b" * 200})
+        write_plan_step(sweep, "step-001", sha)
+        write_plan_step(sweep, "step-002", sha)
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001", file="pkg/a/a.go", symbol="A",
+                        vuln_class="Log output neutralization", cwe="CWE-117"),
+            ]),
+        )
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-002.findings.json"),
+            complete_envelope(sha, "laneA", "step-002", [
+                finding(sha, "laneA", "step-002", file="pkg/b/b.go", symbol="B",
+                        vuln_class="CWE-117", cwe="CWE-117"),
+            ]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        section = md.split("## Cross-step groups")[1].split("## Findings")[0]
+        check("`pkg/a/a.go` :: A (Log output neutralization;" in section,
+              "cross-step members: a member with prose renders that prose", section)
+        # Member B's ONLY label anywhere is the identifier, so the documented
+        # fallback applies and it renders the key -- a heading must not be
+        # blank. That is the fallback firing, not the inert-helper bug: before
+        # the projection, member A rendered `CWE-117` too, and A is the
+        # assertion that tells the two apart.
+        check("`pkg/b/b.go` :: B (CWE-117;" in section,
+              "cross-step members: a member with no prose anywhere falls back to the key, not blank",
+              section)
+
+        members = report["cross_step_groups"][0]["members"]
+        check(all("occurrences" in m for m in members),
+              "cross-step members: the class labels are projected, so the helper is not inert",
+              str(members))
+        serialized = json.dumps(members)
+        check("evidence" not in serialized and "suggested_fix" not in serialized,
+              "cross-step members: labels ONLY -- finder evidence never reaches the adjudicator here",
+              serialized[:200])
+
+
+def test_same_lane_findings_at_one_key_merge_KNOWN_GAP():
+    """Two findings from ONE lane at the same file+symbol+cwe still merge, and
+    that is a KNOWN, UNFIXED gap -- pinned here so it cannot change silently.
+
+    Measured on sweep 2026-09-16T1843Z-a17e6fcc: 107 same-lane keys held two or
+    more findings, swallowing 116 of the 2,079 occurrences that reach grouping -- 5.6% of everything reported. Real
+    example, codex on `acquireCASLock`, both CWE-362: race windows at line 83
+    and line 103. The second survives as an occurrence, so the evidence is
+    visible, but the top-level record and the finding COUNT describe only the
+    first.
+
+    A per-lane ordinal in the key fixed this and was REMOVED, because it broke
+    something worse. `_finding_key()` stays a three-tuple, and
+    `_merge_verification` and `_apply_adjudication` both assume it is unique;
+    with an ordinal, two consolidated findings shared one `_finding_key`, so a
+    verdict written about line 83 was applied to line 103 as well. A fabricated
+    `guarded` is a false CLEAN in a security artifact -- worse than a merge,
+    whose loss is at least visible in the occurrences. `schema.py`'s duplicate
+    rule also rejected the correct adjudicator response, invalidating the
+    envelope and losing adjudication for the WHOLE sweep.
+
+    Fixing it properly means giving a consolidated finding an explicit identity
+    the adjudicator and verifier can echo, rather than a semantic tuple. That
+    is a deliberate design decision across six files, not a patch to make here.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001", line=83, cwe="CWE-362",
+                        vuln_class="Race condition, check-then-act", title="first window"),
+                finding(sha, "laneA", "step-001", line=103, cwe="CWE-362",
+                        vuln_class="Race condition, check-then-act", title="second window"),
+            ]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            len(report["findings"]) == 1,
+            "known gap: same-lane findings at one key still merge (see docstring)",
+            str(len(report["findings"])),
+        )
+        check(
+            len(report["findings"][0]["occurrences"]) == 2,
+            "known gap: BOTH remain visible as occurrences, so the evidence is not lost",
+            str(len(report["findings"][0]["occurrences"])),
+        )
+        # Identity stays unique, which is the property the ordinal broke.
+        keys = [consolidate._finding_key(f) for f in report["findings"]]
+        check(
+            len(keys) == len(set(keys)),
+            "known gap: every consolidated finding still has a UNIQUE key, so no "
+            "verdict can cross-apply between findings",
+            str(keys),
+        )
+
+
+def test_same_lane_findings_never_fabricate_a_severity_disagreement():
+    """REQUIRED TEST (Issue #4134): a single lane cannot disagree with itself.
+
+    `_severity_range`'s `by_lane` is last-write-wins per lane, so two same-lane
+    findings at `low` and `critical` used to render "DISAGREEMENT low ->
+    critical ... until a human resolves it" -- from ONE lane, with `low`
+    unattributable in `by_lane` while `lowest` still reported it. The reader
+    was told to escalate a dispute that did not exist.
+
+    Keying per-lane makes the shape unreachable rather than merely unlikely: a
+    group can hold at most one finding per lane.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x" * 200})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001", line=20, cwe="CWE-863",
+                        severity="low", vuln_class="Read path"),
+                finding(sha, "laneA", "step-001", line=90, cwe="CWE-863",
+                        severity="critical", vuln_class="Delete path"),
+            ]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        for f in report["findings"]:
+            check(
+                f["severity_range"]["disagreement"] is False,
+                "same-lane: no finding reports a disagreement",
+                str(f["severity_range"]),
+            )
+            # Every severity the range names must be attributable to a lane.
+            # `lowest` reporting a value `by_lane` has dropped is the exact
+            # shape that made the old output unreadable.
+            by_lane = set(f["severity_range"]["by_lane"].values())
+            check(
+                {f["severity_range"]["lowest"], f["severity_range"]["highest"]} <= by_lane,
+                "same-lane: every severity in the range is attributable to a lane",
+                str(f["severity_range"]),
+            )
+        md = consolidate.render_markdown(report)
+        check(
+            "DISAGREEMENT" not in md,
+            "same-lane: the report never tells a reader to resolve a dispute that does not exist",
+            md,
+        )
+
+
+def test_same_file_and_symbol_with_different_cwe_stay_separate():
+    """REQUIRED TEST (Issue #4134): re-keying must not over-merge. Two
+    findings on the same file and symbol but a different cwe are different
+    defects and must stay two findings -- otherwise this trades a missed
+    agreement for a lost finding, which is the worse error of the two."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "x"})
+        write_plan_step(sweep, "step-001", sha, scope="pkg/example")
+        write(
+            os.path.join(sweep, "lanes", "laneA", "step-001.findings.json"),
+            complete_envelope(sha, "laneA", "step-001", [
+                finding(sha, "laneA", "step-001", vuln_class="auth", cwe="CWE-863"),
+                finding(sha, "laneA", "step-001", vuln_class="auth", cwe="CWE-89"),
+            ]),
+        )
+        report = consolidate.consolidate(sweep, repo)
+        check(
+            len(report["findings"]) == 2,
+            "vocabulary: one file+symbol with two cwes stays two findings",
+            str([(f["vuln_class"], f.get("cwe")) for f in report["findings"]]),
+        )
+        check(
+            {f["vuln_class"] for f in report["findings"]} == {"CWE-863", "CWE-89"},
+            "vocabulary: each keeps its own normalised class",
+            str([f["vuln_class"] for f in report["findings"]]),
+        )
 
 
 def test_severity_disagreement_is_surfaced_not_collapsed_when_no_adjudicator():
@@ -2130,8 +2518,8 @@ def test_cross_step_group_assessment_is_merged_from_adjudication():
         _write_adjudication_envelope(
             sweep, repo, sha,
             [
-                {"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
-                {"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
+                {"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "CWE-863", "severity": "high", "rationale": "r"},
+                {"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "CWE-863", "severity": "high", "rationale": "r"},
             ],
             group_assessments=[{"group_id": "group-001", "assessment": "same_defect", "rationale": "one tenant id flows through both"}],
         )
@@ -2155,8 +2543,8 @@ def test_cross_step_group_not_assessed_is_a_gap():
         _write_adjudication_envelope(
             sweep, repo, sha,
             [
-                {"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
-                {"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"},
+                {"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "CWE-863", "severity": "high", "rationale": "r"},
+                {"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "CWE-863", "severity": "high", "rationale": "r"},
             ],
             group_assessments=[],
         )
@@ -2210,7 +2598,7 @@ def test_malformed_nested_json_types_are_excluded_not_crashed_on():
         # Re-review finding on 78bbbe84: the optional bookkeeping lists feed
         # set construction in the merge; malformed nested values must reach
         # the invalid-envelope fallback, never a TypeError.
-        for field, value in (("unassessed_groups", [{}]), ("unsent_findings", [[[], "F", "tenant-scoping"]]), ("unsolicited_verdicts", [])):
+        for field, value in (("unassessed_groups", [{}]), ("unsent_findings", [[[], "F", "CWE-863"]]), ("unsolicited_verdicts", [])):
             _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()])
             with open(path) as fh:
                 envelope = json.load(fh)
@@ -2239,12 +2627,12 @@ def test_unsent_findings_and_groups_are_explained_in_incomplete():
         _record_adjudicator_dispatch(sweep)
         path = _write_adjudication_envelope(
             sweep, repo, sha,
-            [{"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "tenant-scoping", "severity": "high", "rationale": "r"}],
+            [{"file": "pkg/a/a.go", "symbol": "A", "vuln_class": "CWE-863", "severity": "high", "rationale": "r"}],
             group_assessments=[],
         )
         with open(path) as fh:
             envelope = json.load(fh)
-        envelope["unsent_findings"] = [["pkg/b/b.go", "B", "tenant-scoping"]]
+        envelope["unsent_findings"] = [["pkg/b/b.go", "B", "CWE-863"]]
         envelope["unassessed_groups"] = ["group-001"]
         write(path, envelope)
         report = consolidate.consolidate(sweep, repo)
@@ -2258,7 +2646,7 @@ def test_unsent_findings_and_groups_are_explained_in_incomplete():
         # Defence in depth (re-review of ee8c9731): even if a lane bug let a
         # verdict for an unsent finding or an unassessed group onto the
         # envelope, the consolidator must not merge it.
-        envelope["adjudications"].append({"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "tenant-scoping", "severity": "critical", "rationale": "guess"})
+        envelope["adjudications"].append({"file": "pkg/b/b.go", "symbol": "B", "vuln_class": "CWE-863", "severity": "critical", "rationale": "guess"})
         envelope["group_assessments"] = [{"group_id": "group-001", "assessment": "same_defect", "rationale": "guess"}]
         write(path, envelope)
         with redirect_stderr(io.StringIO()):
@@ -2294,7 +2682,7 @@ def test_adjudication_cannot_delete_a_finding():
             sweep, repo, sha,
             [
                 _thing_adjudication(severity="high"),
-                {"file": "pkg/example/invented.go", "symbol": "Nope", "vuln_class": "tenant-scoping", "severity": "critical", "rationale": "invented"},
+                {"file": "pkg/example/invented.go", "symbol": "Nope", "vuln_class": "CWE-863", "severity": "critical", "rationale": "invented"},
             ],
         )
         with redirect_stderr(io.StringIO()):
@@ -2328,7 +2716,7 @@ def test_report_sorts_by_adjudicated_severity_once_present():
             sweep, repo, sha,
             [
                 _thing_adjudication(severity="critical"),
-                {"file": "pkg/example/other.go", "symbol": "Other", "vuln_class": "tenant-scoping", "severity": "low", "rationale": "r"},
+                {"file": "pkg/example/other.go", "symbol": "Other", "vuln_class": "CWE-863", "severity": "low", "rationale": "r"},
             ],
         )
         report = consolidate.consolidate(sweep, repo)

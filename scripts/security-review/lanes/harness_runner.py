@@ -190,8 +190,20 @@ def _build_output_schema_description() -> str:
         '  "evidence"       why this is a real, exploitable issue\n'
         '  "suggested_fix"  what to change\n'
         "\n"
+        # Measured, not styled. This sentence named "vuln_class" while the
+        # consolidator keyed on the normalised "cwe" (Issue #4134), and a model
+        # obeying it split one defect across two prose labels believing they
+        # would stay separate. Real example from sweep 2026-09-16T1843Z-a17e6fcc:
+        # HandleGRPC line 204 reported twice, once as "Log output
+        # neutralization" and once as "CWE-117". Naming the real key is what
+        # stops that at the source.
         '"line" is a hint; get it close. Report each defect once -- duplicates '
-        'are matched on "file" + "symbol" + "vuln_class".'
+        'are matched on "file" + "symbol" + "cwe", so two findings that share '
+        'all three are treated as one. If one symbol really does hold two '
+        'distinct defects of the same "cwe", say so in a SINGLE finding rather '
+        'than splitting it: name both locations in "evidence" and give the '
+        'more serious one as "line". Splitting them loses the second one -- '
+        'see `consolidate._group_findings`.'
     )
 
 

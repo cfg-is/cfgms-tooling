@@ -10,10 +10,12 @@ denominator -- a sweep in any state of completeness, mid-run, fully complete,
 or partially parked -- and produces two files under `<sweep_dir>/report/`:
 
 - `consolidated.json` -- machine-readable findings, de-duplicated on
-  `file` + `symbol` + `vuln_class` (never a line number, per
-  docs/architecture/security-review-harness.md), each annotated with exactly
-  the lanes that independently reported it and the number of lanes that
-  actually completed the step it came from.
+  `file` + `symbol` + normalised `cwe` (never a line number, per
+  docs/architecture/security-review-harness.md; never the free-text
+  `vuln_class`, per Issue #4134 -- two lanes describing one defect in
+  different registers are the same defect, and keying on prose made them two),
+  each annotated with exactly the lanes that independently reported it and the
+  number of lanes that actually completed the step it came from.
 - `consolidated.md` -- a per-lane x per-step coverage table followed by the
   de-duplicated findings, rendered as literal Markdown text (no raw HTML, no
   unescaped table/heading syntax from model-generated content).
@@ -121,6 +123,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -408,7 +411,85 @@ def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> di
             )
             continue
 
-        key = (file_value, finding["symbol"], finding["vuln_class"])
+        # The class component of the key is the NORMALISED `cwe`, not the
+        # free-text `vuln_class` (Issue #4134).
+        #
+        # `vuln_class` is described to the model as a "short vulnerability-class
+        # label" -- free prose, and models write it in incompatible registers.
+        # Measured across the 142 steps two lanes both completed in sweep
+        # 2026-09-16T1843Z-a17e6fcc: codex wrote phrases ("Improper input
+        # validation at a trust boundary"), ollama wrote identifiers
+        # ("CWE-20"), 122 distinct values against 203 with only 14 in common.
+        # Keyed on that, the two lanes agreed on 12 findings out of a 974
+        # union -- 1.2%. The report sorts by multi-lane agreement first, so
+        # that sort carried almost no information and the same defect found
+        # twice rendered twice, unlinked.
+        #
+        # `cwe` is the field that was already comparable: required on every
+        # finding, drawn from a closed list, and put through
+        # `schema.normalize_cwe()` so case and formatting variants collapse.
+        # Re-keying on it lifts agreement to 42 of a 927 union (4.5%) on the
+        # same data. The sharper number is the population where it can help at
+        # all: of the 68 file+symbol pairs BOTH lanes flagged, 39 (57%) share a
+        # cwe. That agreement existed all along and was being discarded.
+        #
+        # `_defect_class` below already prefers `cwe` for cross-step grouping,
+        # so this makes one rule out of two that disagreed.
+        #
+        # Falling back to `vuln_class` when `cwe` will not normalise keeps a
+        # pre-#3983 envelope groupable. Not reachable from a current sweep --
+        # `validate_finding` requires a well-formed `cwe`, and 0 of 1,019
+        # findings in the measured sweep failed to normalise -- but a fallback
+        # costs nothing and a KeyError on old data costs a re-run.
+        normalized_cwe = schema.normalize_cwe(finding.get("cwe"))
+        defect_class = normalized_cwe or finding["vuln_class"]
+
+        # De-duplication reconciles DIFFERENT lanes. It must never collapse two
+        # findings from the SAME lane (Issue #4134).
+        #
+        # A lane reporting two findings is that lane asserting they are two
+        # things. Merging them overrules the only judgement in the system that
+        # actually read the code, and it loses a defect: the second one
+        # survives as an occurrence bullet while the consolidated record --
+        # title, line, the count itself -- describes only the first.
+        #
+        # Measured on sweep 2026-09-16T1843Z-a17e6fcc: 107 same-lane keys held
+        # two or more findings, swallowing 116 of the 2,079 occurrences that
+        # reach grouping -- 5.6%.
+        #
+        # An earlier revision divided by 2,133, which is the PRE-validation
+        # count across all 631 envelopes. 54 findings are dropped by path and
+        # schema validation before `_group_findings` ever sees them, so 2,133
+        # is not the population 116 was measured over. Wrong denominator, in a
+        # comment arguing for measurement discipline. Example, codex on pkg/secrets/providers/sops/lock.go
+        # ::acquireCASLock, both CWE-362: one race window at line 83 and
+        # another at line 103. Two defects, twenty lines apart, one record.
+        #
+        # THIS IS A KNOWN GAP, LEFT OPEN DELIBERATELY. The fix tried first was
+        # a per-lane ordinal in the key -- the Nth finding a lane reports at a
+        # key pairs with the Nth from every other lane. It does stop the
+        # over-merge. It was REVERTED, because it breaks finding IDENTITY,
+        # which two downstream stages depend on:
+        #
+        #   - `_finding_key` re-derives this key from an already-consolidated
+        #     finding to attach the adjudicator's verdict and the verifier's.
+        #     An ordinal is not recoverable from the consolidated record, so
+        #     keys collided and a verdict attached to the WRONG finding. A
+        #     `guarded` verdict landing on a different defect reads as CLEAN.
+        #   - the adjudication response schema rejects duplicate keys, so a
+        #     correct adjudicator reply was rejected and the whole envelope
+        #     invalidated.
+        #
+        # Losing a second same-lane finding is bad. Silently marking an
+        # unrelated real finding as guarded is worse, so the merge stays until
+        # findings carry an explicit `finding_id` end to end.
+        #
+        # What IS fixed: `_severity_range` no longer fabricates a disagreement
+        # out of this. It reads the per-lane values, so two same-lane findings
+        # at `low` and `critical` can no longer render "DISAGREEMENT low ->
+        # critical ... until a human resolves it" from ONE lane. Both
+        # severities stay visible on `occurrences`.
+        key = (file_value, finding["symbol"], defect_class)
         group = groups.setdefault(key, {"lanes": set(), "step_ids": set(), "occurrences": []})
         group["lanes"].add(lane)
         group["step_ids"].add(step_id)
@@ -420,6 +501,10 @@ def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> di
             "title": finding["title"],
             "evidence": finding["evidence"],
             "suggested_fix": finding["suggested_fix"],
+            # Carried per-occurrence now that it no longer keys the group: each
+            # lane's own wording is worth showing a reader, and losing it would
+            # trade one kind of information for another rather than gaining.
+            "vuln_class": finding["vuln_class"],
         }
         # Issue #3983's normalised defect classification and location. Every
         # finding this loop sees already passed `schema.validate_finding`
@@ -432,8 +517,9 @@ def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> di
         # `schema.normalize_cwe()` rather than stored raw, so two lanes
         # naming the same identifier with different case or formatting
         # (`cwe-295` vs `CWE-295: ...`) group together downstream instead of
-        # reading as two distinct classes.
-        normalized_cwe = schema.normalize_cwe(finding.get("cwe"))
+        # reading as two distinct classes. Since #4134 that same normalised
+        # value is computed above and used as the key's class component, so it
+        # is reused here rather than recomputed -- one value, one definition.
         if normalized_cwe:
             occurrence["cwe"] = normalized_cwe
         line = finding.get("line")
@@ -462,7 +548,7 @@ def _eligible_lanes(step_ids: list[str], lane_step_state: dict[str, dict[str, st
 def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
     """Sort key for one consolidated finding, matching `SKILL.md`'s documented
     order exactly: multi-lane agreement first, then severity, then
-    confidence -- each descending -- with the `file`/`symbol`/`vuln_class`
+    confidence -- each descending -- with the `file`/`symbol`/`cwe`
     key retained only as the final tiebreaker for two findings tied on all
     three ranked fields, so output stays deterministic.
 
@@ -485,20 +571,22 @@ def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
         -finding["agreement"]["reported"],
         -severity_rank,
         -confidence_rank,
-        finding["file"],
-        finding["symbol"],
-        finding["vuln_class"],
+        # Tie-break on the de-duplication key itself, not on the picked
+        # `vuln_class`: the key is what makes two findings distinct, so
+        # ordering by anything else can put two distinct findings in an order
+        # that does not follow from what separates them (Issue #4134).
+        *_finding_key(finding),
     )
 
 
 def _first_occurrence_field(occurrences: list[dict], field: str) -> object:
     """The value of `field` on the first occurrence (in the given, already
     deterministic order) that carries it, or `None` if none do. Used to pick
-    one `cwe`/`line`/`end_line` to show at the consolidated-finding level
-    beside `file` -- a deterministic pick, never a merge, since these are
+    one `cwe`/`line`/`end_line` to show at the consolidated-finding
+    level beside `file` -- a deterministic pick, never a merge, since these are
     model-generated hints for a human reader, not part of what makes two
-    findings the same finding (that stays the `file`+`symbol`+`vuln_class`
-    key, computed independently of this)."""
+    findings the same finding (that is the `file`+`symbol`+`cwe` key since
+    Issue #4134, computed independently of this)."""
     for occurrence in occurrences:
         value = occurrence.get(field)
         if value is not None:
@@ -508,7 +596,7 @@ def _first_occurrence_field(occurrences: list[dict], field: str) -> object:
 
 def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]]) -> list[dict]:
     consolidated = []
-    for (file_value, symbol, vuln_class), group in sorted(groups.items()):
+    for (file_value, symbol, defect_class), group in sorted(groups.items()):
         step_ids = sorted(group["step_ids"])
         reported_lanes = sorted(group["lanes"])
         eligible_lanes = _eligible_lanes(step_ids, lane_step_state)
@@ -517,7 +605,22 @@ def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]])
             {
                 "file": file_value,
                 "symbol": symbol,
-                "vuln_class": vuln_class,
+                # The consolidated `vuln_class` IS the key's class component --
+                # the normalised `cwe` -- not a pick from one lane's prose
+                # (Issue #4134).
+                #
+                # Setting it here rather than re-keying every downstream
+                # consumer is what keeps a finding's identity single. The
+                # verifier and the adjudicator both identify a finding by
+                # `file`/`symbol`/`vuln_class` and echo it back, and both
+                # merges look it up that way; had this stayed one lane's
+                # wording while the key became the cwe, two findings sharing a
+                # file and symbol but differing in cwe could present the same
+                # vuln_class and make those merges ambiguous.
+                #
+                # Each lane's own wording is not lost -- it is on every
+                # occurrence below, which is where a per-lane value belongs.
+                "vuln_class": defect_class,
                 "cwe": _first_occurrence_field(occurrences, "cwe"),
                 "line": _first_occurrence_field(occurrences, "line"),
                 "end_line": _first_occurrence_field(occurrences, "end_line"),
@@ -548,16 +651,33 @@ def _severity_range(occurrences: list[dict]) -> dict:
     """The deterministic severity record for one consolidated finding (Issue
     #3984): the lowest and highest severity any occurrence carries, the
     highest severity each lane reported (a lane can report the same key from
-    two steps), and whether the lanes disagree at all. Computed from the
-    occurrences alone, never from an adjudication, so it always says what the
-    lanes actually reported."""
+    two steps), and whether the LANES disagree. Computed from the occurrences
+    alone, never from an adjudication, so it always says what the lanes
+    actually reported.
+
+    Every value it names is attributable to a lane (Issue #4134). `by_lane`
+    keeps the highest severity per lane, so a lane that reported the same key
+    twice at `low` and `critical` contributes only `critical` -- but `lowest`
+    used to be computed from the raw occurrence list, so it reported a `low`
+    that `by_lane` had already dropped. The result rendered "DISAGREEMENT low
+    -> critical ... until a human resolves it" with `by_lane: {codex:
+    critical}`: a dispute with one participant, and an unattributable number
+    beside it. A reader was told to escalate something that did not exist.
+
+    `lowest`/`highest`/`disagreement` are therefore taken from the per-lane
+    values, which is what "the lanes disagree" means. A single lane can never
+    disagree with itself, and the span shown is always a span between lanes.
+    The full set of raw occurrence severities is unchanged and still carried on
+    `occurrences`, so nothing is lost -- it just stops being presented as a
+    conflict.
+    """
     by_lane: dict[str, int] = {}
     for occ in occurrences:
         rank = _SEVERITY_RANK[occ["severity"]]
         if rank > by_lane.get(occ["lane"], -1):
             by_lane[occ["lane"]] = rank
-    ranks = [_SEVERITY_RANK[occ["severity"]] for occ in occurrences]
-    lowest, highest = min(ranks), max(ranks)
+    lane_ranks = list(by_lane.values())
+    lowest, highest = min(lane_ranks), max(lane_ranks)
     return {
         "lowest": _SEVERITY_BY_RANK[lowest],
         "highest": _SEVERITY_BY_RANK[highest],
@@ -566,7 +686,94 @@ def _severity_range(occurrences: list[dict]) -> dict:
     }
 
 
+# Identifier SHAPE, not vocabulary membership -- see `_prose_label`.
+# `CWE-863: Incorrect authorization`, `cwe_863 - incorrect authorization`,
+# `CWE 863` all match; `prose` is whatever readable tail follows, empty when
+# the label is nothing but the identifier.
+_IDENTIFIER_PREFIX_RE = re.compile(
+    r"^\s*cwe[\s_-]*\d+\s*[:.,;)\]\s-]*(?P<prose>.*)$", re.IGNORECASE
+)
+# A bare number with no `CWE` at all, which is still not a heading.
+_BARE_IDENTIFIER_RE = re.compile(r"^\s*\d+\s*$")
+# `other: <short label>` is the vocabulary's escape hatch, which
+# `docs/security-review/methodology.md` calls "allowed and expected" -- so a
+# lane using it is behaving correctly, and it must not produce
+# "### other: foo (other: foo)", the exact duplication this helper exists to
+# prevent. The label is the tail; `other:` is the marker, not prose.
+_OTHER_ESCAPE_RE = re.compile(r"^\s*other\s*:\s*(?P<prose>.*)$", re.IGNORECASE)
+
+
+def _prose_label(finding: dict) -> str:
+    """A human-readable class label for a heading, never the bare identifier.
+
+    Since Issue #4134 the consolidated `vuln_class` IS the normalised cwe, so
+    rendering it beside `cwe` gives "CWE-863 (CWE-863)" -- correct, and useless
+    to read. Each lane's own prose is on its occurrence, so one is picked from
+    there.
+
+    Explicitly SKIPS an occurrence whose label is itself an identifier. Taking
+    the first occurrence in lane order looked right only because `codex` sorts
+    before `ollama` and codex writes prose: rename the lanes, or take a
+    single-lane ollama finding (ollama writes CWE ids into `vuln_class`), and
+    the identifier wins again. That is luck, not design, and this is the line
+    that removes the luck.
+
+    "Is this an identifier" is a question about SHAPE, and asking
+    `schema.normalize_cwe(label) is None` asked about VOCABULARY instead. The
+    two disagree in both directions, and each way is a real defect:
+
+    - `"CWE-863: Incorrect authorization"` normalises, so it was skipped --
+      throwing away "Incorrect authorization", the one piece of prose the
+      finding had. Measured on sweep 2026-09-16T1843Z-a17e6fcc, this is the
+      commonest label shape codex writes.
+    - `"CWE-99999"` and `"CWE_863 Incorrect authorization"` do NOT normalise
+      (out of the vocabulary; underscore-and-space punctuation), so they were
+      taken as prose and rendered verbatim -- producing exactly the
+      "CWE-99999 (CWE-863)" heading this helper exists to prevent. So did the
+      bare `"295"`.
+
+    So the label is stripped of an identifier prefix and the prose tail kept
+    when there is one, and skipped when what remains is only an identifier.
+
+    Falls back to the key when no occurrence carries prose -- a finding with no
+    human label anywhere still needs a non-empty heading.
+    """
+    for occurrence in finding.get("occurrences") or []:
+        label = occurrence.get("vuln_class")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        escaped = _OTHER_ESCAPE_RE.match(label)
+        if escaped:
+            tail = escaped.group("prose").strip()
+            # "other: tenant path confusion" -> "tenant path confusion".
+            # A bare "other:" with no label has no prose to offer and skips.
+            if tail:
+                return tail
+            continue
+        prefixed = _IDENTIFIER_PREFIX_RE.match(label)
+        if prefixed:
+            tail = prefixed.group("prose").strip()
+            # "CWE-863: Incorrect authorization" -> "Incorrect authorization".
+            # A bare "CWE-863" matches with an empty tail and is skipped.
+            if tail:
+                return tail
+            continue
+        if _BARE_IDENTIFIER_RE.match(label):
+            continue
+        return label
+    return finding["vuln_class"]
+
+
 def _finding_key(finding: dict) -> tuple[str, str, str]:
+    """The de-duplication key of an already-consolidated finding.
+
+    Still reads `vuln_class`, and still matches the key `_group_findings`
+    built, because since Issue #4134 a CONSOLIDATED finding's `vuln_class` is
+    the normalised class that keyed it -- not the prose one lane happened to
+    write. That is the whole point of setting it in `_finalize_findings`: one
+    identity, readable the same way by this function, by the verifier merge,
+    and by the adjudicator merge.
+    """
     return (finding["file"], finding["symbol"], finding["vuln_class"])
 
 
@@ -616,6 +823,35 @@ def build_cross_step_groups(findings: list[dict]) -> list[dict]:
                         "file": member["file"],
                         "symbol": member["symbol"],
                         "vuln_class": member["vuln_class"],
+                        # LABELS ONLY, never the whole occurrence. `_prose_label`
+                        # reads `occurrences[].vuln_class`, and without this the
+                        # helper was wired in at the render site but INERT here:
+                        # it iterated an absent list and fell through to the
+                        # normalised cwe, rendering the "CWE-863 (CWE-863)" it
+                        # exists to prevent (Issue #4134).
+                        #
+                        # These members travel to the adjudicator (see
+                        # `adjudication_input`), and Issue #4080 keeps verbatim
+                        # SOURCE out of that payload -- not evidence as such.
+                        # The #4080 note below this function is explicit that
+                        # finder evidence DOES travel to the adjudicator; what
+                        # is redacted is a run copied verbatim out of the file
+                        # a finding names. An earlier version of this comment
+                        # said "finder evidence", contradicting that note
+                        # eighteen lines away.
+                        #
+                        # The guard is real and this projection is load-bearing
+                        # for it: `_redact_source_from_reports` runs only over
+                        # `built_findings[].reports` and never over
+                        # `group["members"]`, which `build_adjudication_input`
+                        # passes through verbatim. So copying `occurrences`
+                        # wholesale would carry `evidence` past the redaction
+                        # entirely, not merely duplicate it. Only the class
+                        # label is projected.
+                        "occurrences": [
+                            {"vuln_class": occurrence["vuln_class"]}
+                            for occurrence in member.get("occurrences") or []
+                        ],
                         "step_ids": member["step_ids"],
                     }
                     for member in members
@@ -1773,8 +2009,18 @@ def render_markdown(report: dict) -> str:
         agreement = finding["agreement"]
         cwe = finding.get("cwe")
         cwe_suffix = f" ({_md_escape_inline(cwe)})" if cwe else ""
+        # The heading leads with a lane's own prose label, not the key.
+        #
+        # Since Issue #4134 the consolidated `vuln_class` IS the normalised
+        # cwe, so leading with it would render "CWE-863 (CWE-863)" -- correct,
+        # and useless to read. A reader scanning a few hundred headings wants
+        # the human description; the identifier follows in parentheses where it
+        # always was. The prose is per-lane now, so it comes off an occurrence:
+        # a deterministic pick, exactly as `line`/`cwe` already are.
+        #
+        heading_label = _prose_label(finding)
         lines.append(
-            f"### {_md_escape_inline(finding['vuln_class'])}{cwe_suffix} — "
+            f"### {_md_escape_inline(heading_label)}{cwe_suffix} — "
             f"{_md_escape_inline(finding['file'])}{_location_suffix(finding)} :: "
             f"{_md_escape_inline(finding['symbol'])}"
         )
@@ -1978,7 +2224,7 @@ def _cross_step_group_lines(groups: list[dict]) -> list[str]:
             member_steps = ", ".join(_md_escape_inline(s) for s in member["step_ids"])
             lines.append(
                 f"- `{_md_escape_inline(member['file'])}` :: "
-                f"{_md_escape_inline(member['symbol'])} ({_md_escape_inline(member['vuln_class'])}; "
+                f"{_md_escape_inline(member['symbol'])} ({_md_escape_inline(_prose_label(member))}; "
                 f"step(s) {member_steps})"
             )
         assessment = group.get("assessment")

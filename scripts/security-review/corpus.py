@@ -14,8 +14,20 @@ and "this harness change made it worse" answerable with a number instead of an
 impression.
 
 **Line numbers are never compared.** They rot as the tree moves, and a corpus
-that rots silently is worse than none. The key is file plus `vuln_class`, the
-same key `consolidate.py` already de-duplicates findings on.
+that rots silently is worse than none. The key is file plus `vuln_class`, which since
+Issue #4134 is the normalised `cwe` a consolidated finding carries -- the
+same class `consolidate.py` de-duplicates on.
+
+**Scores from before Issue #4134 are not comparable with scores after it.**
+That change made a consolidated finding's `vuln_class` the normalised `cwe`
+rather than a model's prose, and corpus entries already store `CWE-NNN`. So a
+comparison that could only ever return `near` -- prose never equals `CWE-863`
+-- now returns `found` for the same defect. That is the intended behaviour and
+the reason the corpus stored identifiers in the first place, but it is a step
+change, not a gradual one: a recorded score of 4/10 from before that change and
+6/10 from after may describe identical harness performance. Re-run the corpus
+against any baseline you intend to compare to, rather than trusting a number
+recorded earlier.
 
 A finding on the right file with the wrong class is `near`, counted
 separately: the reviewer looked in the right place and named the wrong thing,
@@ -115,6 +127,13 @@ def score_findings(entry: dict, files: "list[str]", findings: "list[dict]") -> d
     if not on_file:
         return {"id": entry["id"], "outcome": "missed", "matched": []}
 
+    # Compares against the consolidated `vuln_class`, which since Issue #4134 is
+    # the NORMALISED cwe rather than a model's prose. Corpus entries store
+    # `CWE-NNN`, so this comparison used to be unsatisfiable by construction --
+    # prose is never equal to `CWE-863` -- and every entry scored `near` at
+    # best. It can now return `found`, which is what the corpus was always
+    # for. See the module docstring: it makes scores recorded before that
+    # change incomparable with ones after.
     exact = [f for f in on_file if str(f.get("vuln_class", "")).strip().lower() == want_class]
     if exact:
         return {"id": entry["id"], "outcome": "found", "matched": exact}

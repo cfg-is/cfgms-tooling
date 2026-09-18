@@ -475,7 +475,7 @@ case "$outcome" in
   adjudication)
     # The adjudicator harness's raw output shape (Issue #3984): one verdict
     # for the key the two finder outcomes above report.
-    printf '{"adjudications":[{"file":"pkg/example/file.go","symbol":"Do","vuln_class":"tenant-scoping","severity":"high","rationale":"stub rubric: high, authenticated cross-tenant read"}],"group_assessments":[]}' > "$output_path"
+    printf '{"adjudications":[{"file":"pkg/example/file.go","symbol":"Do","vuln_class":"CWE-863","severity":"high","rationale":"stub rubric: high, authenticated cross-tenant read"}],"group_assessments":[]}' > "$output_path"
     exit 0
     ;;
   parked)

@@ -101,9 +101,16 @@ def test_validate_finding_rejects_bad_confidence():
     )
 
 
-def test_validate_finding_dedup_key_excludes_location_and_cwe():
-    # AC: `cwe` and `line` are recorded but never part of what makes two
-    # findings the same finding -- that stays file+symbol+vuln_class. This
+def test_validate_finding_treats_cwe_and_line_as_ordinary_fields():
+    # Since Issue #4134 the de-duplication key IS `file` + `symbol` +
+    # normalised `cwe`; `line` is still never part of it, because line ranges
+    # rot as `develop` advances. The old name and comment said the key
+    # "excludes cwe", which is now the opposite of the truth.
+    #
+    # What this test actually asserts is unchanged and still worth asserting:
+    # this module does not compute the key (consolidate.py does), so the
+    # schema-level half of the guarantee is that `cwe`/`line`/`end_line` are
+    # ordinary validated fields rather than enum-like identity fields. This
     # module does not compute the key itself (consolidate.py does), so this
     # asserts the schema-level half of the guarantee: `cwe`/`line`/`end_line`
     # are ordinary validated fields, not enum-like identity fields, and two
