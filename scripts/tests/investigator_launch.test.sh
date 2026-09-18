@@ -386,7 +386,7 @@ check_not_contains "rendered disallowed-tools env var never lists the unknown Mu
 check_contains "rendered docker run grants NET_ADMIN" "$run_call" "--cap-add NET_ADMIN"
 check_contains "rendered disallowed-tools env var refuses curl" "$run_call" "Bash(curl:*)"
 check_contains "rendered disallowed-tools env var refuses wget" "$run_call" "Bash(wget:*)"
-check_contains "plan mode without --harness mounts the Claude credential read-only" "$run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "plan mode without --harness mounts the Claude credential read-only" "$run_call" "${SANDBOX}/HOME/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 check_cred_mount_count "plan mode without --harness renders exactly one credential mount" "$run_call" 1
 echo ""
 echo "== REQUIRED TEST (Issue #4003) — plan mode mounts .claude/agents/investigator.md"
@@ -429,7 +429,7 @@ check_not_contains "lane mode never mounts the bundle at /workspace" "$lane_run_
 check_not_contains "lane mode never mounts the bundle dir anywhere at all" "$lane_run_call" "$BUNDLE_DIR"
 check_not_contains "lane mode has no GH_TOKEN" "$lane_run_call" "GH_TOKEN"
 check_not_contains "lane mode never mounts the agent profile (plan-mode-only, Issue #4003; lanes get it via the snapshot instead)" "$lane_run_call" "/home/agent/.claude/agents/investigator.md"
-check_contains "lane mode delivers harness credentials read-only" "$lane_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "lane mode delivers harness credentials read-only" "$lane_run_call" "${SANDBOX}/HOME/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 # Lane mode reads raw third-party model output, so its egress containment
 # matters at least as much as the planner's.
 check_contains "lane mode grants NET_ADMIN for the firewall init" "$lane_run_call" "--cap-add NET_ADMIN"
@@ -444,9 +444,9 @@ check_contains "usage() documents --harness/--model" "$dispatch_src" '--harness 
 # Issue #3937's multi-planner dispatch, `--mode plan` is reachable with
 # `--harness`, so a writable Claude credential in plan mode would be handed
 # to whichever harness the roster names.
-check_not_contains "no credential mount in this block is writable" "$launch_block_code" '.credentials.json:/home/agent/.claude/.credentials.json"'
-check_contains "plan mode's own credential mount is read-only" "$launch_block_code" 'claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
-check_contains "the --harness claude mount is read-only" "$launch_block_code" 'inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
+check_not_contains "no credential mount in this block is writable" "$launch_block_code" '${CREDS_MIRROR_FILE}:${CREDS_MIRROR_MOUNT}"'
+check_contains "plan mode's own credential mount is read-only" "$launch_block_code" 'claude_creds_mount=(-v "${CREDS_MIRROR_FILE}:${CREDS_MIRROR_MOUNT}:ro")'
+check_contains "the --harness claude mount is read-only" "$launch_block_code" 'inv_harness_creds_mount=(-v "${CREDS_MIRROR_FILE}:${CREDS_MIRROR_MOUNT}:ro")'
 
 : > "$DOCKER_CALL_LOG"
 harness_out=$(PATH="${FAKEBIN}:${PATH}" \
@@ -458,7 +458,7 @@ harness_out=$(PATH="${FAKEBIN}:${PATH}" \
 check_contains "harness-mode launch reports LAUNCHED_INVESTIGATOR" "$harness_out" "LAUNCHED_INVESTIGATOR:claude-sonnet5:fake-container-id"
 
 harness_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
-check_contains "--harness claude mounts ~/.claude/.credentials.json read-only" "$harness_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "--harness claude mounts ~/.claude/.credentials.json read-only" "$harness_run_call" "${SANDBOX}/HOME/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 check_contains "--harness claude sets CFGMS_SECURITY_REVIEW_HARNESS=claude" "$harness_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
 check_contains "--model sonnet-5 sets CFGMS_SECURITY_REVIEW_MODEL=sonnet-5" "$harness_run_call" "CFGMS_SECURITY_REVIEW_MODEL=sonnet-5"
 check_contains "--mode claude-sonnet5 sets CFGMS_SECURITY_REVIEW_LANE_ID=claude-sonnet5" "$harness_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=claude-sonnet5"
@@ -474,7 +474,10 @@ unwired_out=$(PATH="${FAKEBIN}:${PATH}" \
 check_contains "an unwired --harness still dispatches (env vars set, no error)" "$unwired_out" "LAUNCHED_INVESTIGATOR:stub-lane:fake-container-id"
 unwired_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "an unwired --harness still sets CFGMS_SECURITY_REVIEW_HARNESS" "$unwired_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
-check_not_contains "an unwired --harness gets no claude credential mount" "$unwired_run_call" ".claude/.credentials.json"
+# Asserted on the DESTINATION path: since the mirror source lives outside
+# ~/.claude, a needle of ".claude/.credentials.json" would match nothing
+# whatever the launcher did, and pass unconditionally.
+check_not_contains "an unwired --harness gets no claude credential mount" "$unwired_run_call" ":/home/agent/.claude/.credentials.json"
 
 echo ""
 echo '== REQUIRED TEST evidence — "--mode plan --harness <id>" is harness-gated'
@@ -500,7 +503,7 @@ plan_harness_out=$(PATH="${FAKEBIN}:${PATH}" \
 check_contains "plan mode with --harness claude launches" "$plan_harness_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
 plan_harness_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_cred_mount_count "plan --harness claude renders exactly one credential mount" "$plan_harness_run_call" 1
-check_contains "plan --harness claude mounts the credential read-only" "$plan_harness_run_call" "${SANDBOX}/HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "plan --harness claude mounts the credential read-only" "$plan_harness_run_call" "${SANDBOX}/HOME/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 check_contains "plan --harness claude sets CFGMS_SECURITY_REVIEW_HARNESS=claude" "$plan_harness_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
 check_contains "plan --harness claude still mounts plan/ as /workspace-out:rw" "$plan_harness_run_call" "${SWEEP_DIR}/plan:/workspace-out:rw"
 check_contains "plan --harness claude still mounts the agent profile (Issue #4003, harness-independent)" "$plan_harness_run_call" "${AGENT_PROFILE}:/home/agent/.claude/agents/investigator.md:ro"
@@ -516,7 +519,7 @@ plan_foreign_out=$(PATH="${FAKEBIN}:${PATH}" \
 check_contains "plan mode with a non-claude --harness launches" "$plan_foreign_out" "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
 plan_foreign_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_cred_mount_count "plan --harness stub renders NO credential mount" "$plan_foreign_run_call" 0
-check_not_contains "plan --harness stub never sees the host Claude credential" "$plan_foreign_run_call" ".claude/.credentials.json"
+check_not_contains "plan --harness stub never sees the host Claude credential" "$plan_foreign_run_call" ":/home/agent/.claude/.credentials.json"
 check_contains "plan --harness stub still sets CFGMS_SECURITY_REVIEW_HARNESS" "$plan_foreign_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=stub"
 check_contains "plan --harness stub still mounts the agent profile (Issue #4003, harness-independent)" "$plan_foreign_run_call" "${AGENT_PROFILE}:/home/agent/.claude/agents/investigator.md:ro"
 
@@ -541,7 +544,7 @@ check_contains "--harness codex mounts ~/.codex/auth.json read-only" "$codex_run
 check_contains "--harness codex sets CFGMS_SECURITY_REVIEW_HARNESS=codex" "$codex_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=codex"
 check_contains "--model gpt-5-codex sets CFGMS_SECURITY_REVIEW_MODEL=gpt-5-codex" "$codex_run_call" "CFGMS_SECURITY_REVIEW_MODEL=gpt-5-codex"
 check_contains "--mode codex-gpt5codex sets CFGMS_SECURITY_REVIEW_LANE_ID=codex-gpt5codex" "$codex_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=codex-gpt5codex"
-check_not_contains "--harness codex never mounts the Claude credential file" "$codex_run_call" ".claude/.credentials.json"
+check_not_contains "--harness codex never mounts the Claude credential file" "$codex_run_call" ":/home/agent/.claude/.credentials.json"
 check_not_contains "--harness codex launch has no GH_TOKEN" "$codex_run_call" "GH_TOKEN"
 
 echo ""
@@ -594,7 +597,7 @@ claude_still_out=$(PATH="${FAKEBIN}:${PATH}" \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "a claude lane on the same (codex-credential-less) host still dispatches" "$claude_still_out" "LAUNCHED_INVESTIGATOR:claude-still-fine:fake-container-id"
 claude_still_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
-check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call" "${NO_CODEX_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call" "${NO_CODEX_HOME}/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 
 echo ""
 echo "== REQUIRED TEST — --harness opencode mounts"
@@ -618,7 +621,7 @@ check_contains "--harness opencode mounts ~/.local/share/opencode/auth.json read
 check_contains "--harness opencode sets CFGMS_SECURITY_REVIEW_HARNESS=opencode" "$opencode_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=opencode"
 check_contains "--model big-pickle sets CFGMS_SECURITY_REVIEW_MODEL=big-pickle" "$opencode_run_call" "CFGMS_SECURITY_REVIEW_MODEL=big-pickle"
 check_contains "--mode opencode-bigpickle sets CFGMS_SECURITY_REVIEW_LANE_ID=opencode-bigpickle" "$opencode_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=opencode-bigpickle"
-check_not_contains "--harness opencode never mounts the Claude credential file" "$opencode_run_call" ".claude/.credentials.json"
+check_not_contains "--harness opencode never mounts the Claude credential file" "$opencode_run_call" ":/home/agent/.claude/.credentials.json"
 check_not_contains "--harness opencode never mounts the Codex credential file" "$opencode_run_call" ".codex/auth.json"
 check_not_contains "--harness opencode launch has no GH_TOKEN" "$opencode_run_call" "GH_TOKEN"
 
@@ -661,7 +664,7 @@ claude_still_out2=$(PATH="${FAKEBIN}:${PATH}" \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "a claude lane on the same (opencode-credential-less) host still dispatches" "$claude_still_out2" "LAUNCHED_INVESTIGATOR:claude-still-fine-2:fake-container-id"
 claude_still_run_call2="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
-check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call2" "${NO_OPENCODE_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call2" "${NO_OPENCODE_HOME}/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 
 echo ""
 echo "== REQUIRED TEST — --harness ollama mounts ~/.ollama/id_ed25519 and"
@@ -688,7 +691,7 @@ check_not_contains "--harness ollama never mounts the ~/.ollama directory itself
 check_contains "--harness ollama sets CFGMS_SECURITY_REVIEW_HARNESS=ollama" "$ollama_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=ollama"
 check_contains "--model glm-5.3-flash:cloud sets CFGMS_SECURITY_REVIEW_MODEL" "$ollama_run_call" "CFGMS_SECURITY_REVIEW_MODEL=glm-5.3-flash:cloud"
 check_contains "--mode ollama-glm-5.3-flash-cloud sets CFGMS_SECURITY_REVIEW_LANE_ID=ollama-glm-5.3-flash-cloud" "$ollama_run_call" "CFGMS_SECURITY_REVIEW_LANE_ID=ollama-glm-5.3-flash-cloud"
-check_not_contains "--harness ollama never mounts the Claude credential file" "$ollama_run_call" ".claude/.credentials.json"
+check_not_contains "--harness ollama never mounts the Claude credential file" "$ollama_run_call" ":/home/agent/.claude/.credentials.json"
 check_not_contains "--harness ollama never mounts the Codex credential file" "$ollama_run_call" ".codex/auth.json"
 check_not_contains "--harness ollama never mounts the OpenCode credential file" "$ollama_run_call" "opencode/auth.json"
 check_not_contains "--harness ollama launch has no GH_TOKEN" "$ollama_run_call" "GH_TOKEN"
@@ -759,7 +762,7 @@ claude_still_out3=$(PATH="${FAKEBIN}:${PATH}" \
     --harness claude --model sonnet-5 --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "a claude lane on the same (ollama-credential-less) host still dispatches" "$claude_still_out3" "LAUNCHED_INVESTIGATOR:claude-still-fine-3:fake-container-id"
 claude_still_run_call3="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
-check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call3" "${NO_OLLAMA_HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro"
+check_contains "the claude lane still mounts its own credential read-only" "$claude_still_run_call3" "${NO_OLLAMA_HOME}/.cache/cfgms-agent-creds/.credentials.json:/home/agent/.claude/.credentials.json:ro"
 
 echo ""
 echo "== REQUIRED TEST (Issue #4005) — on a systemd-service-managed ollama host,"

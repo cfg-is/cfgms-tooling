@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Hermetic tests for the agent credentials model: bind-mount the host's live
-# ~/.claude/.credentials.json into agent containers instead of copying a
-# frozen snapshot into the claude-creds volume at dispatch time (the frozen
-# copy silently went stale on the host's next token rotation, causing 401s
-# mid-run — cfg-agent-1570, review-pr-1589, #1594).
+# Hermetic tests for the agent credentials model: agent containers receive the
+# credential through a dedicated read-only MIRROR (T6), not the host's live
+# ~/.claude/.credentials.json and not a frozen snapshot in a volume.
+#
+# Both earlier models failed the same way. The volume snapshot went stale on
+# the host's next rotation (cfg-agent-1570, review-pr-1589, #1594). Its
+# replacement -- bind-mounting the live file -- had the SAME defect, because
+# the host rotates by rename and a file bind mount pins the original inode;
+# #1594 was believed to have removed a staleness bug it had only relocated.
+# The mirror is written in place, so the inode never changes.
 #
 # gate_credentials_for_launch is not a standalone CLI subcommand (it runs
 # inline at the top of launch/launch-generic/health-check), and exercising it
@@ -63,20 +68,60 @@ check_not_contains "po-act.sh no longer copies creds into a volume before launch
   'cp /host-creds.json /persist/.credentials.json'
 
 echo ""
-echo "== every dispatch launch path bind-mounts the host's live credentials file =="
-cred_mount='.claude/.credentials.json:/home/agent/.claude/.credentials.json'
-dispatch_mount_count=$(grep -c "$cred_mount" "$DISPATCH")
-# 6 since Issue #3932 added a distinct --harness claude mount
-# (inv_harness_creds_mount) alongside the 5 pre-existing ones
-# (launch/launch-generic/launch-interactive/po-live/launch-investigator plan
-# mode), so the count grew rather than one of the 5 being replaced. Both
-# investigator mounts are read-only; the other 4 remain writable. This check
-# asserts only that a live-file bind mount exists on every launch path --
-# the :ro-ness of the investigator ones is asserted in
-# investigator_launch.test.sh, which is where that distinction lives.
-check_contains "agent-dispatch.sh bind-mounts host creds at least 6x (launch/launch-generic/launch-interactive/po-live/launch-investigator plan mode/launch-investigator --harness claude)" \
-  "$dispatch_mount_count" "6"
-check_contains "po-act.sh bind-mounts host creds for its inlined launch" "$po_act_src" "$cred_mount"
+echo "== every dispatch launch path mounts the credential MIRROR, read-only =="
+# INVERTED (T6). This section used to be titled "every dispatch launch path
+# bind-mounts the host's LIVE credentials file" and asserted exactly 6 such
+# mounts. That is the defect, not the contract: the host rotates its token by
+# RENAME, and a file bind mount pins the original inode, so a running
+# container never saw the replacement and kept presenting a revoked
+# credential. Measured -- a container 401'd 36 seconds after a host rotation.
+#
+# The guarantee worth keeping is unchanged in shape: every launch path still
+# gets a credential, and the count is still pinned so a new launch path
+# cannot quietly ship without one. What changed is WHICH file, and that it is
+# read-only.
+#
+# `grep -c` deliberately guarded with `|| true`: it exits 1 on zero matches,
+# and under `set -e` the original killed this whole suite mid-run rather than
+# reporting a failure -- which is how a real regression here would have
+# looked like an infrastructure problem.
+live_mount='${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json'
+mirror_mount='${CREDS_MIRROR_FILE}:${CREDS_MIRROR_MOUNT}:ro'
+
+live_count=$(grep -cF "$live_mount" "$DISPATCH" || true)
+check_contains "agent-dispatch.sh mounts the host's LIVE credential 0x -- a file mount pins the inode across a rotation" \
+  "$live_count" "0"
+po_live_count=$(grep -cF "$live_mount" "$PO_ACT" || true)
+check_contains "po-act.sh mounts the host's LIVE credential 0x (its inlined dev-agent launch was the 7th site)" \
+  "$po_live_count" "0"
+
+mirror_count=$(grep -cF "$mirror_mount" "$DISPATCH" || true)
+check_contains "agent-dispatch.sh mounts the mirror read-only 6x (launch/launch-generic/launch-interactive/po-live/launch-investigator plan mode/launch-investigator --harness claude)" \
+  "$mirror_count" "6"
+check_contains "po-act.sh mounts the mirror read-only for its inlined launch" "$po_act_src" "$mirror_mount"
+
+# One-way: no mirror mount may be writable. A container that can write the
+# host's credential can revoke it, turning a one-agent fault into a
+# pipeline-wide outage.
+writable_mirror=$(grep -cF '${CREDS_MIRROR_FILE}:${CREDS_MIRROR_MOUNT}"' "$DISPATCH" || true)
+check_contains "no agent-dispatch.sh mirror mount is writable" "$writable_mirror" "0"
+
+# Every mount site is guarded, because Docker creates an absent bind source
+# as a DIRECTORY -- which would mount a directory over the credential path
+# and break auth for a reason that looks nothing like its cause.
+guard_count=$(grep -cE '^\s*ensure_creds_mirror_for_mount$' "$DISPATCH" || true)
+check_contains "agent-dispatch.sh guards all 6 mount sites against an absent mirror" "$guard_count" "6"
+check_contains "po-act.sh guards its mount site too" "$po_act_src" "ensure_creds_mirror_for_mount"
+
+# The mirror check must NOT sit in the launch gate: several arms call that
+# gate early and then refuse before launching anything, and a refused review
+# has no business needing a credential. This is the regression that broke
+# seven suites.
+gate_body=$(sed -n '/^gate_credentials_for_launch() {/,/^}/p' "$DISPATCH")
+check_not_contains "the launch gate does not refresh the mirror (it pre-empts paths that never launch)" \
+  "$gate_body" "refresh_creds_mirror"
+check_not_contains "the launch gate does not check mirror freshness either" \
+  "$gate_body" "creds_mirror_is_fresh"
 
 echo ""
 echo "== check-creds reads the host file directly, no docker run needed =="

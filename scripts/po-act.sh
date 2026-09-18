@@ -787,6 +787,7 @@ except Exception: print('')" 2>/dev/null || echo "")
 
     ledger_append_launch "$container_name" "issue" "${story:-}" "" "" "dev-agent" "story-${item_id}"
 
+    ensure_creds_mirror_for_mount
     if container_id=$(docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
@@ -796,7 +797,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      -v "${CREDS_MIRROR_FILE}:${CREDS_MIRROR_MOUNT}:ro" \
       -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
