@@ -2420,6 +2420,8 @@ def _write_adjudication_envelope(
     group_assessments: list[dict] | None = None,
     state: str = "complete",
     input_hash: str | None = None,
+    stop_reason: str | None = None,
+    partial: bool = False,
 ) -> str:
     envelope = {
         "sweep_id": os.path.basename(sweep),
@@ -2436,7 +2438,13 @@ def _write_adjudication_envelope(
         envelope["adjudications"] = adjudications
         envelope["group_assessments"] = group_assessments or []
     else:
-        envelope["stop_reason_raw"] = f"stub {state}"
+        envelope["stop_reason_raw"] = stop_reason if stop_reason is not None else f"stub {state}"
+        # Issue #4144: a non-complete envelope may carry the batches that did
+        # finish. `partial=True` writes that shape so the consolidator can be
+        # tested against it.
+        if partial:
+            envelope["adjudications"] = adjudications
+            envelope["group_assessments"] = group_assessments or []
     path = consolidate.adjudication_output_path(sweep)
     write(path, envelope)
     return path
@@ -2926,6 +2934,174 @@ def test_failed_adjudication_stage_renders_raw_findings_and_incomplete():
         check(report["adjudication"]["status"] == "failed", "consolidate: a `failed` envelope reports status failed", str(report["adjudication"]))
         check("stub failed" in md, "consolidate.md: the envelope's stop_reason_raw is surfaced", md)
         check("Severity (adjudicated)" not in md, "consolidate.md: nothing is rendered as adjudicated after a failed stage")
+
+
+def test_auth_revoked_renders_as_recoverable():
+    """REQUIRED TEST (Issue #4144 AC9): a credential failure renders as a
+    distinctly labelled known-recoverable cause, separate from a real
+    failure, and is excluded from the finding-coverage tallies.
+
+    It is still a gap -- severities stay raw and the sweep still reads as
+    incomplete, because no adjudication happened. What changes is that an
+    operator can tell "restore the credential and resume" from "investigate
+    this" without opening container stderr.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(
+            sweep,
+            repo,
+            sha,
+            [],
+            state="failed",
+            stop_reason="harness_exit_1: OAuth token has been revoked; run `claude setup-token`",
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+
+        check(
+            report["adjudication"]["status"] == consolidate.ADJUDICATION_AUTH_REVOKED,
+            "auth_revoked: a revoked-token stop reason classifies as auth_revoked, not a bare `failed`",
+            str(report["adjudication"]["status"]),
+        )
+        check(
+            "Adjudication stage stopped on a credential failure" in md,
+            "auth_revoked: rendered with its own distinct label",
+            md,
+        )
+        check(
+            "known-recoverable cause, not a defect in the code under review" in md,
+            "auth_revoked: the line says the cause is not a defect in the reviewed code",
+            md,
+        )
+        check(
+            "security-review.sh resume" in md,
+            "auth_revoked: the line names the actual remedy",
+            md,
+        )
+        check(
+            "Adjudication stage did not complete" not in md,
+            "auth_revoked: the generic real-failure bullet is NOT also emitted",
+            md,
+        )
+        check(
+            "Adjudicator omitted" not in md,
+            "auth_revoked: not counted as a finding-coverage gap -- no omitted-findings bullet",
+            md,
+        )
+        check(
+            "Severity (raw)" in md and "Severity (adjudicated)" not in md,
+            "auth_revoked: severities stay raw -- the stage produced no verdicts",
+            md,
+        )
+
+        # The negative direction: a failure that is NOT a credential problem
+        # must keep the generic label. Without this, a rule that classified
+        # everything as auth_revoked would pass every assertion above.
+        _write_adjudication_envelope(
+            sweep, repo, sha, [], state="failed", stop_reason="harness_exit_1: segmentation fault"
+        )
+        other = consolidate.render_markdown(consolidate.consolidate(sweep, repo))
+        check(
+            "Adjudication stage did not complete" in other
+            and "stopped on a credential failure" not in other,
+            "auth_revoked: an unrelated failure still renders as a real failure",
+            other,
+        )
+
+
+def test_the_adjudicator_checkpoint_is_not_discovered_as_a_lane_output():
+    """Issue #4144 implementation note: the checkpoint is internal harness
+    state, so consolidation must not see it.
+
+    Asserted rather than reasoned about. It holds for two independent
+    reasons -- it is a dotfile, and it lives in the adjudication sub-sweep
+    tree, which `_discover_lanes()` never walks -- and a test pins both,
+    since either could be undone by a later change that looks harmless.
+    """
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(sweep, repo, sha, [_thing_adjudication()])
+        before = consolidate.consolidate(sweep, repo)
+
+        checkpoint = os.path.join(
+            os.path.dirname(consolidate.adjudication_output_path(sweep)),
+            ".adjudication-checkpoint.json",
+        )
+        write(
+            checkpoint,
+            {
+                "input_hash": "x",
+                "plan_fingerprint": "y",
+                "completed_batches": [0],
+                "adjudications": [_thing_adjudication(severity="low")],
+                "group_assessments": [],
+            },
+        )
+        after = consolidate.consolidate(sweep, repo)
+
+        check(
+            before["coverage"] == after["coverage"],
+            "checkpoint: writing one adds no lane to the coverage table",
+            f"{before['coverage']} -> {after['coverage']}",
+        )
+        check(
+            before["findings"] == after["findings"],
+            "checkpoint: the findings are byte-identical with a checkpoint present",
+        )
+        check(
+            after["adjudication"]["status"] == "complete",
+            "checkpoint: a leftover checkpoint does not disturb a complete adjudication",
+            str(after["adjudication"]["status"]),
+        )
+
+
+def test_partial_adjudications_are_reported_on_an_early_exit():
+    """Issue #4144: the batches that finished are preserved on a non-complete
+    envelope, and the report says how many, so an operator can weigh a resume
+    against a re-run."""
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = _two_lane_disagreement_sweep(repo, sweep)
+        _record_adjudicator_dispatch(sweep)
+        _write_adjudication_envelope(
+            sweep,
+            repo,
+            sha,
+            [_thing_adjudication()],
+            state="failed",
+            stop_reason="harness_exit_1: segmentation fault",
+            partial=True,
+        )
+        report = consolidate.consolidate(sweep, repo)
+        md = consolidate.render_markdown(report)
+        check(
+            report["adjudication"]["partial_adjudications"] == 1,
+            "partial: the surviving verdict count is recorded",
+            str(report["adjudication"].get("partial_adjudications")),
+        )
+        check(
+            "The batches that did finish are preserved" in md and "1 finding verdict(s)" in md,
+            "partial: the report says how much survived",
+            md,
+        )
+        check(
+            "Severity (adjudicated)" not in md,
+            "partial: a preserved verdict is NOT applied to the findings -- the stage is still incomplete",
+            md,
+        )
+
+        # Nothing survived: no partial clause at all, rather than "0 verdicts".
+        _write_adjudication_envelope(
+            sweep, repo, sha, [], state="failed", stop_reason="harness_exit_1: segmentation fault"
+        )
+        none_md = consolidate.render_markdown(consolidate.consolidate(sweep, repo))
+        check(
+            "The batches that did finish are preserved" not in none_md,
+            "partial: an exit that finished no batch gains no partial clause",
+            none_md,
+        )
 
 
 def _write_step_meta(sweep: str, lane: str, step_id: str, **fields) -> None:

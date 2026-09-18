@@ -937,6 +937,70 @@ def test_adjudication_envelope_valid_complete_and_non_complete():
     check(any("stop_reason_raw" in e for e in schema.validate_adjudication_envelope(env)), "adjudication: a non-complete envelope needs stop_reason_raw")
 
 
+def test_a_non_complete_envelope_validates_the_verdicts_it_carries():
+    """Issue #4144: a non-complete envelope may carry the batches that
+    finished, and those verdicts must be validated by the same rules.
+
+    Found by mutation: gating the verdict validation on `state == complete`
+    passed every suite, because nothing fed a non-complete envelope a
+    malformed verdict. That is the failure path -- the one nobody re-reads --
+    so an unvalidated verdict there would reach the consolidator unchecked.
+    """
+    valid = _adjudication_envelope(state="failed", stop_reason_raw="harness_exit_1")
+    check(
+        schema.validate_adjudication_envelope(valid) == [],
+        "adjudication: a non-complete envelope MAY carry verdicts",
+        str(schema.validate_adjudication_envelope(valid)),
+    )
+
+    bad_severity = _adjudication_envelope(
+        state="failed",
+        stop_reason_raw="harness_exit_1",
+        adjudications=[
+            {"file": "pkg/a.go", "symbol": "A", "vuln_class": "x", "severity": "catastrophic", "rationale": "r"}
+        ],
+    )
+    check(
+        any("severity" in e for e in schema.validate_adjudication_envelope(bad_severity)),
+        "adjudication: an INVALID verdict on a non-complete envelope is rejected, not waved through",
+        str(schema.validate_adjudication_envelope(bad_severity)),
+    )
+
+    dupes = _adjudication_envelope(
+        state="parked",
+        stop_reason_raw="rate_limited",
+        adjudications=[
+            {"file": "pkg/a.go", "symbol": "A", "vuln_class": "x", "severity": "high", "rationale": "r"},
+            {"file": "pkg/a.go", "symbol": "A", "vuln_class": "x", "severity": "low", "rationale": "r"},
+        ],
+    )
+    check(
+        any("duplicate finding key" in e for e in schema.validate_adjudication_envelope(dupes)),
+        "adjudication: duplicate-key detection applies on a non-complete envelope too",
+        str(schema.validate_adjudication_envelope(dupes)),
+    )
+
+    bad_group = _adjudication_envelope(
+        state="refused",
+        stop_reason_raw="no_valid_adjudication_file",
+        group_assessments=[{"group_id": "group-001", "assessment": "nonsense", "rationale": "r"}],
+    )
+    check(
+        any("assessment" in e for e in schema.validate_adjudication_envelope(bad_group)),
+        "adjudication: group assessments on a non-complete envelope are validated too",
+        str(schema.validate_adjudication_envelope(bad_group)),
+    )
+
+    not_a_list = _adjudication_envelope(
+        state="failed", stop_reason_raw="harness_exit_1", adjudications="nope"
+    )
+    check(
+        any("adjudications must be a list" in e for e in schema.validate_adjudication_envelope(not_a_list)),
+        "adjudication: a non-list `adjudications` is rejected on a non-complete envelope",
+        str(schema.validate_adjudication_envelope(not_a_list)),
+    )
+
+
 def test_adjudication_envelope_rejects_bad_shapes():
     check(schema.validate_adjudication_envelope("x") == ["adjudication envelope must be a JSON object"], "adjudication: non-object rejected")
     for field in schema.REQUIRED_ADJUDICATION_ENVELOPE_FIELDS:

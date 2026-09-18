@@ -722,6 +722,67 @@ def validate_group_assessment(assessment: object) -> list[str]:
     return errors
 
 
+def _validate_adjudication_list(adjudications: object, required: bool) -> list[str]:
+    """Validate an `adjudications` list: every entry valid, no duplicate key.
+
+    `required` distinguishes "must be a list" (a `complete` envelope) from
+    "must be a list IF PRESENT" (any other state, where the list is the
+    partial-progress record and may legitimately be absent).
+    """
+    errors: list[str] = []
+    if adjudications is None and not required:
+        return errors
+    if not isinstance(adjudications, list):
+        errors.append(
+            "adjudications must be a list (may be empty) when state is complete, "
+            f"got {adjudications!r}"
+            if required
+            else f"adjudications must be a list when present, got {adjudications!r}"
+        )
+        return errors
+    seen_keys: set = set()
+    for index, adjudication in enumerate(adjudications):
+        for error in validate_adjudication(adjudication):
+            errors.append(f"adjudications[{index}]: {error}")
+        if isinstance(adjudication, dict):
+            key = (
+                adjudication.get("file"),
+                adjudication.get("symbol"),
+                adjudication.get("vuln_class"),
+            )
+            if all(isinstance(part, str) and part for part in key):
+                if key in seen_keys:
+                    errors.append(f"adjudications[{index}]: duplicate finding key {key!r}")
+                seen_keys.add(key)
+    return errors
+
+
+def _validate_group_assessment_list(assessments: object, required: bool) -> list[str]:
+    """Validate a `group_assessments` list. `required` as above."""
+    errors: list[str] = []
+    if assessments is None and not required:
+        return errors
+    if not isinstance(assessments, list):
+        errors.append(
+            "group_assessments must be a list (may be empty) when state is complete, "
+            f"got {assessments!r}"
+            if required
+            else f"group_assessments must be a list when present, got {assessments!r}"
+        )
+        return errors
+    seen_groups: set = set()
+    for index, assessment in enumerate(assessments):
+        for error in validate_group_assessment(assessment):
+            errors.append(f"group_assessments[{index}]: {error}")
+        if isinstance(assessment, dict):
+            group_id = assessment.get("group_id")
+            if isinstance(group_id, str) and group_id:
+                if group_id in seen_groups:
+                    errors.append(f"group_assessments[{index}]: duplicate group_id {group_id!r}")
+                seen_groups.add(group_id)
+    return errors
+
+
 def validate_adjudication_envelope(envelope: object) -> list[str]:
     """Return a list of validation errors; empty list means valid.
 
@@ -731,6 +792,14 @@ def validate_adjudication_envelope(envelope: object) -> list[str]:
     and a `group_assessments` list (may be empty), every entry of which
     validates; any other terminal state must carry a non-empty
     `stop_reason_raw`, exactly as `validate_step_envelope` requires.
+
+    **A non-complete envelope MAY also carry those two lists** (Issue #4144):
+    the batches that finished before the stage died are attached rather than
+    discarded. They are then validated by exactly the same rules. The
+    alternative -- accepting them unvalidated because the state is not
+    `complete` -- would admit the malformed nested values this function
+    exists to keep away from the consolidator, and would admit them on the
+    failure path, which is the one nobody re-reads.
     """
     if not isinstance(envelope, dict):
         return ["adjudication envelope must be a JSON object"]
@@ -782,50 +851,17 @@ def validate_adjudication_envelope(envelope: object) -> list[str]:
                 f"unsolicited_verdicts must be a non-negative integer when present, got {unsolicited!r}"
             )
 
-    if state == "complete":
-        adjudications = envelope.get("adjudications")
-        if not isinstance(adjudications, list):
-            errors.append(
-                "adjudications must be a list (may be empty) when state is complete, "
-                f"got {adjudications!r}"
-            )
-        else:
-            seen_keys: set = set()
-            for index, adjudication in enumerate(adjudications):
-                for error in validate_adjudication(adjudication):
-                    errors.append(f"adjudications[{index}]: {error}")
-                if isinstance(adjudication, dict):
-                    key = (
-                        adjudication.get("file"),
-                        adjudication.get("symbol"),
-                        adjudication.get("vuln_class"),
-                    )
-                    if all(isinstance(part, str) and part for part in key):
-                        if key in seen_keys:
-                            errors.append(
-                                f"adjudications[{index}]: duplicate finding key {key!r}"
-                            )
-                        seen_keys.add(key)
-        assessments = envelope.get("group_assessments")
-        if not isinstance(assessments, list):
-            errors.append(
-                "group_assessments must be a list (may be empty) when state is complete, "
-                f"got {assessments!r}"
-            )
-        else:
-            seen_groups: set = set()
-            for index, assessment in enumerate(assessments):
-                for error in validate_group_assessment(assessment):
-                    errors.append(f"group_assessments[{index}]: {error}")
-                if isinstance(assessment, dict):
-                    group_id = assessment.get("group_id")
-                    if isinstance(group_id, str) and group_id:
-                        if group_id in seen_groups:
-                            errors.append(
-                                f"group_assessments[{index}]: duplicate group_id {group_id!r}"
-                            )
-                        seen_groups.add(group_id)
-    elif _is_member(state, STEP_STATES):
+    is_complete = state == "complete"
+    # Required on a `complete` envelope, validated-if-present on every other
+    # state. `required=False` with the key absent is the ordinary case for a
+    # stage that died before its first batch finished.
+    if is_complete or "adjudications" in envelope:
+        errors.extend(_validate_adjudication_list(envelope.get("adjudications"), is_complete))
+    if is_complete or "group_assessments" in envelope:
+        errors.extend(
+            _validate_group_assessment_list(envelope.get("group_assessments"), is_complete)
+        )
+    if not is_complete and _is_member(state, STEP_STATES):
         raw_reason = envelope.get("stop_reason_raw")
         if not isinstance(raw_reason, str) or raw_reason == "":
             errors.append(

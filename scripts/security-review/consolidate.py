@@ -170,9 +170,45 @@ ADJUDICATION_COMPLETE = "complete"
 ADJUDICATION_MISSING = "missing"
 ADJUDICATION_INVALID = "invalid"
 ADJUDICATION_STALE = "stale"
+# Issue #4144: a revoked or expired credential, told apart from a real
+# defect. Deliberately NOT in ADJUDICATION_OK_STATUSES -- the stage did not
+# produce verdicts, so every severity below is still a raw lane value and the
+# sweep is still incomplete. What this status buys is that a reader can tell
+# "credential blip, just resume" from "investigate this" without opening
+# container stderr by hand. Calling it OK would make the report claim an
+# adjudication that never happened.
+ADJUDICATION_AUTH_REVOKED = "auth_revoked"
 ADJUDICATION_OK_STATUSES = frozenset(
     {ADJUDICATION_NOT_CONFIGURED, ADJUDICATION_SKIPPED_NO_FINDINGS, ADJUDICATION_COMPLETE}
 )
+
+# Matches a credential failure in a harness's own error text. Modelled on
+# `harness_runner._RATE_LIMIT_RE`, and deliberately narrow: a false positive
+# here tells an operator "just re-run it" about a real defect, which is worse
+# than no classification at all.
+#
+# `401` is required to carry an http/status/code/error prefix so a bare
+# `401` inside an unrelated number or path cannot trigger it. `403` is NOT
+# matched on its own -- forbidden is an authorization outcome that a resume
+# will not fix -- only alongside explicit authentication wording.
+_AUTH_REVOKED_RE = re.compile(
+    r"(?:http|https|status(?:\s+code)?|code|error)\s*[:/]?\s*401\b"
+    r"|unauthorized"
+    r"|authentication\s+(?:failed|error|required)"
+    r"|invalid[\s_-]api[\s_-]key"
+    r"|(?:oauth\s+)?(?:token|credential|session)s?\s+(?:has\s+|have\s+)?(?:been\s+)?(?:expired|revoked|invalid)"
+    r"|(?:expired|revoked|invalid)\s+(?:oauth\s+)?(?:token|credential|session)"
+    r"|(?:please\s+)?(?:re-?)?(?:log\s*in|login|authenticate)\s+again"
+    r"|not\s+logged\s+in"
+    r"|setup-token",
+    re.IGNORECASE,
+)
+
+
+def looks_auth_revoked(text: str) -> bool:
+    """True when a harness's error text names a credential problem a resume
+    can fix once the credential is restored."""
+    return bool(_AUTH_REVOKED_RE.search(text or ""))
 
 
 def _load_json(path: str):
@@ -1333,9 +1369,26 @@ def load_adjudication(
     record["harness"] = envelope["harness"]
     record["model_id"] = envelope["model_id"]
     if envelope["state"] != "complete":
-        record["status"] = envelope["state"]
-        record["errors"].append(
-            f"adjudicator ended {envelope['state']}: {envelope.get('stop_reason_raw', '')}"
+        stop_reason = str(envelope.get("stop_reason_raw", ""))
+        # Issue #4144: the harness's own error text now reaches
+        # `stop_reason_raw` (the adjudicator was discarding it), so a revoked
+        # credential can be told apart from a real defect here rather than by
+        # a human reading container stderr.
+        record["status"] = (
+            ADJUDICATION_AUTH_REVOKED
+            if looks_auth_revoked(stop_reason)
+            else envelope["state"]
+        )
+        record["errors"].append(f"adjudicator ended {envelope['state']}: {stop_reason}")
+        # How much survived the early exit. The stage attaches the batches it
+        # finished even on a non-complete envelope, so this is the difference
+        # between "28 minutes of model work, all discarded" and a number an
+        # operator can weigh against re-running.
+        partial = envelope.get("adjudications")
+        record["partial_adjudications"] = len(partial) if isinstance(partial, list) else 0
+        partial_groups = envelope.get("group_assessments")
+        record["partial_group_assessments"] = (
+            len(partial_groups) if isinstance(partial_groups, list) else 0
         )
         return record, None
     if envelope["input_hash"] != expected_input_hash:
@@ -1910,15 +1963,51 @@ def _sweep_complete(report: dict) -> bool:
     return True
 
 
+def _adjudication_partial_clause(adjudication: dict) -> str:
+    """How many verdicts survived an early exit, as a trailing sentence.
+
+    Empty when none did, so an exit that finished no batch reads exactly as
+    it did before Issue #4144 rather than gaining a "0 verdicts" line.
+    """
+    kept = adjudication.get("partial_adjudications", 0)
+    groups = adjudication.get("partial_group_assessments", 0)
+    if not kept and not groups:
+        return ""
+    parts = []
+    if kept:
+        parts.append(f"{kept} finding verdict(s)")
+    if groups:
+        parts.append(f"{groups} group assessment(s)")
+    return (
+        f" The batches that did finish are preserved on the envelope ({', '.join(parts)}), "
+        "so a resume re-runs only what is missing."
+    )
+
+
 def _adjudication_incomplete_lines(adjudication: dict) -> list[str]:
     status = adjudication.get("status")
     lines = []
-    if status not in ADJUDICATION_OK_STATUSES:
+    if status == ADJUDICATION_AUTH_REVOKED:
+        # Issue #4144: a known-recoverable cause, labelled as such. It is
+        # still a gap -- severities below are raw -- but it is a gap with a
+        # known fix, and saying so is the difference between an operator
+        # re-running the stage and an operator opening an investigation.
+        reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
+        lines.append(
+            "- **Adjudication stage stopped on a credential failure** "
+            "(`auth_revoked`, a known-recoverable cause, not a defect in the code under "
+            f"review): {reasons or 'no detail recorded'}. Restore the adjudicator's "
+            "credential and re-run `security-review.sh resume <sweep-id>`. Every severity "
+            "below is a raw lane value until that happens."
+            + _adjudication_partial_clause(adjudication)
+        )
+    elif status not in ADJUDICATION_OK_STATUSES:
         reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
         lines.append(
             f"- **Adjudication stage did not complete** (`{_md_escape_inline(status)}`): "
             f"{reasons or 'no detail recorded'}. Every severity below is a raw lane value, "
             "not an adjudicated one."
+            + _adjudication_partial_clause(adjudication)
         )
     else:
         if adjudication.get("omitted", 0) > 0:

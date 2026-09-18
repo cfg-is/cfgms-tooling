@@ -394,7 +394,15 @@ def test_batching_splits_large_inputs_and_attaches_each_group_once():
         check(envelope["batches"] == 3, "batches: count recorded on the envelope")
 
 
-def test_non_complete_outcomes_are_classified_like_a_lane_and_carry_no_adjudications():
+def test_non_complete_outcomes_are_classified_like_a_lane():
+    """Every case here dies on batch 0, so nothing was ever accumulated.
+
+    The envelope therefore carries an EMPTY `adjudications` list, not an
+    absent one. Issue #4144: before, the field was absent on every
+    non-complete state, which made "no verdicts survived" and "this harness
+    predates the fix" the same observation. Present-and-empty distinguishes
+    them, and is what lets the next test's non-empty list mean something.
+    """
     cases = [
         ("parked", lambda m, p, o: (0, True), "rate_limited"),
         ("failed", lambda m, p, o: (1, False), "harness_exit_1"),
@@ -406,12 +414,29 @@ def test_non_complete_outcomes_are_classified_like_a_lane_and_carry_no_adjudicat
             envelope = adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
             on_disk = _read_envelope(out_dir)
             check(on_disk["state"] == expected_state and reason in on_disk["stop_reason_raw"], f"run: {expected_state} is classified with reason {reason}", str(on_disk))
-            check("adjudications" not in on_disk, f"run: a {expected_state} envelope carries no adjudications")
+            check(
+                on_disk.get("adjudications") == [] and on_disk.get("group_assessments") == [],
+                f"run: a {expected_state} envelope that finished no batch carries empty verdict lists, not absent ones",
+                str(on_disk.get("adjudications")),
+            )
             check(schema.validate_adjudication_envelope(on_disk) == [], f"run: the {expected_state} envelope validates")
             check(envelope == on_disk, f"run: {expected_state} envelope returned equals the one written")
 
 
-def test_schema_invalid_output_is_failed_and_partial_batches_are_not_kept():
+def test_early_exit_preserves_prior_batches():
+    """[REQUIRED TEST -- Issue #4144 AC2] A non-complete terminal state after
+    N successful batches still carries those N batches' verdicts.
+
+    45 findings split into two batches. Batch 1 returns 40 valid verdicts;
+    batch 2 returns a schema-invalid severity, which fails the stage. The
+    40 real model verdicts from batch 1 must survive onto the envelope.
+
+    **This inverts an assertion that used to read "all-or-nothing".** That
+    was not a crash-recovery gap -- no container restarted here, the stage
+    handled the bad batch cleanly and threw away 40 finished verdicts on its
+    way out. The old test named the behaviour accurately and asserted it was
+    correct; #4144 is the decision that it is not.
+    """
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         data = _input(45)
         _write_input(plan_dir, data)
@@ -429,7 +454,24 @@ def test_schema_invalid_output_is_failed_and_partial_batches_are_not_kept():
 
         envelope = adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
         check(envelope["state"] == terminal_state.FAILED and "invalid_adjudication_schema" in envelope["stop_reason_raw"] and "severity must be one of" in envelope["stop_reason_raw"], "run: a schema-invalid batch fails the stage with the validation error", str(envelope))
-        check("adjudications" not in envelope, "run: adjudications from the good batch are not kept on a failed envelope (all-or-nothing)")
+        kept = envelope.get("adjudications") or []
+        check(
+            len(kept) == 40,
+            "early exit: the 40 verdicts from the batch that succeeded survive onto the failed envelope",
+            str(len(kept)),
+        )
+        # Not just a count: they must be the real verdicts, and they must
+        # still validate, because the consolidator will read them.
+        expected_keys = {(f["file"], f["symbol"], f["vuln_class"]) for f in data["findings"][:40]}
+        check(
+            {(a["file"], a["symbol"], a["vuln_class"]) for a in kept} == expected_keys,
+            "early exit: the kept verdicts are batch 1's own findings, not a placeholder",
+        )
+        check(
+            schema.validate_adjudication_envelope(envelope) == [],
+            "early exit: an envelope carrying partial verdicts still validates",
+            str(schema.validate_adjudication_envelope(envelope)),
+        )
 
         with open(os.path.join(out_dir, "junk"), "w") as f:
             f.write("x")
@@ -514,6 +556,342 @@ def test_main_reads_the_lane_env_contract():
                     os.environ[k] = v
         on_disk = _read_envelope(out_dir)
         check(rc == 0 and on_disk["state"] == terminal_state.FAILED and on_disk["harness"] == "not-wired", "main: honours the CFGMS_SECURITY_REVIEW_* env contract and always exits 0 having written an envelope", str(on_disk))
+
+
+def _checkpoint(out_dir: str) -> dict:
+    with open(os.path.join(out_dir, adjudicator.CHECKPOINT_FILENAME)) as f:
+        return json.load(f)
+
+
+def _die_after_first_batch(data: dict):
+    """Batch 0 answers correctly, then the container dies."""
+    n = {"calls": 0}
+
+    def call(model, prompt, output_path):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            with open(output_path, "w") as f:
+                json.dump(
+                    {"adjudications": _adjudications_for({"findings": data["findings"][:40]}), "group_assessments": []},
+                    f,
+                )
+            return 0, False
+        raise RuntimeError("container died mid-batch")
+
+    return call, n
+
+
+def test_checkpoint_persists_per_batch():
+    """[REQUIRED TEST -- Issue #4144 AC4] Fail after N of M batches; the
+    checkpoint holds exactly N batches' verdicts."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        data = _input(45)
+        _write_input(plan_dir, data)
+        call, _n = _die_after_first_batch(data)
+        envelope = adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
+        check(
+            envelope["state"] == terminal_state.FAILED and "launch_exception" in envelope["stop_reason_raw"],
+            "checkpoint: the run that died is a failed envelope",
+            str(envelope.get("stop_reason_raw")),
+        )
+        path = os.path.join(out_dir, adjudicator.CHECKPOINT_FILENAME)
+        check(os.path.isfile(path), "checkpoint: written after the batch that completed, not after the loop")
+        saved = _checkpoint(out_dir)
+        check(
+            saved["completed_batches"] == [0],
+            "checkpoint: records exactly the one batch that finished",
+            str(saved.get("completed_batches")),
+        )
+        check(
+            len(saved["adjudications"]) == 40,
+            "checkpoint: holds that batch's 40 verdicts",
+            str(len(saved.get("adjudications", []))),
+        )
+        check(
+            schema._validate_adjudication_list(saved["adjudications"], True) == [],
+            "checkpoint: the persisted verdicts validate",
+        )
+
+
+def test_resume_skips_completed_batches():
+    """[REQUIRED TEST -- Issue #4144 AC6] A second run against the same input
+    and out_dir resumes, re-runs only the missing batch, and reaches a
+    complete envelope containing ALL batches' verdicts."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        data = _input(45)
+        _write_input(plan_dir, data)
+        first_call, _n = _die_after_first_batch(data)
+        adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=first_call)
+
+        seen: list = []
+
+        def resume_call(model, prompt, output_path):
+            seen.append(output_path)
+            with open(output_path, "w") as f:
+                json.dump(
+                    {"adjudications": _adjudications_for({"findings": data["findings"][40:]}), "group_assessments": []},
+                    f,
+                )
+            return 0, False
+
+        envelope = adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=resume_call)
+        check(
+            len(seen) == 1,
+            "resume: only the missing batch is sent to the harness -- batch 0 is not re-run",
+            f"{len(seen)} harness calls",
+        )
+        check(
+            seen and seen[0].endswith("batch1.json"),
+            "resume: the batch that ran is batch 1, the one that never finished",
+            str(seen),
+        )
+        check(envelope["state"] == terminal_state.COMPLETE, "resume: reaches a complete envelope", str(envelope.get("stop_reason_raw")))
+        check(
+            len(envelope["adjudications"]) == 45,
+            "resume: the complete envelope carries all 45 verdicts, both runs merged",
+            str(len(envelope.get("adjudications", []))),
+        )
+        expected = {(f["file"], f["symbol"], f["vuln_class"]) for f in data["findings"]}
+        check(
+            {(a["file"], a["symbol"], a["vuln_class"]) for a in envelope["adjudications"]} == expected,
+            "resume: the merged set is every finding exactly once",
+        )
+        check(
+            not os.path.exists(os.path.join(out_dir, adjudicator.CHECKPOINT_FILENAME)),
+            "resume: a complete run removes the spent checkpoint",
+        )
+
+
+def test_checkpoint_is_invalidated_when_the_input_changes():
+    """A checkpoint records batch INDICES. Applying them to a different input
+    would mark work done that was never done for these findings."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        data = _input(45)
+        _write_input(plan_dir, data)
+        call, _n = _die_after_first_batch(data)
+        adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
+        check(os.path.isfile(os.path.join(out_dir, adjudicator.CHECKPOINT_FILENAME)), "invalidate: precondition -- a checkpoint exists")
+
+        # Same batch COUNT, different findings: the plan fingerprint changes
+        # even though the shape does not, so a count-based guard would miss
+        # this and a hash does not.
+        changed = _input(45)
+        for finding in changed["findings"]:
+            finding["symbol"] = finding["symbol"] + "Renamed"
+        _write_input(plan_dir, changed)
+
+        seen: list = []
+
+        def call2(model, prompt, output_path):
+            seen.append(output_path)
+            index = len(seen) - 1
+            chunk = changed["findings"][:40] if index == 0 else changed["findings"][40:]
+            with open(output_path, "w") as f:
+                json.dump({"adjudications": _adjudications_for({"findings": chunk}), "group_assessments": []}, f)
+            return 0, False
+
+        envelope = adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call2)
+        check(
+            len(seen) == 2,
+            "invalidate: a changed input re-runs EVERY batch, including batch 0",
+            f"{len(seen)} harness calls",
+        )
+        check(
+            len(envelope["adjudications"]) == 45
+            and all(a["symbol"].endswith("Renamed") for a in envelope["adjudications"]),
+            "invalidate: the verdicts are the NEW input's, with no stale ones carried over",
+        )
+
+
+def test_checkpoint_is_invalidated_when_the_evidence_changes_but_the_keys_do_not():
+    """The two bindings are not redundant, and this is the case that proves it.
+
+    `_plan_fingerprint` hashes finding KEYS. Change only a report's evidence
+    text and every key is identical, so the fingerprint matches -- but the
+    model would be judging different evidence, and the old verdicts were
+    formed over text that is no longer there. Only `input_hash` catches this.
+
+    Found by mutation: deleting the `input_hash` comparison passed the whole
+    suite, because every other invalidation test also changed the keys and so
+    was really exercising the fingerprint.
+    """
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        data = _input(45)
+        _write_input(plan_dir, data)
+        call, _n = _die_after_first_batch(data)
+        adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
+
+        changed = _input(45)
+        for finding in changed["findings"]:
+            finding["reports"][0]["evidence"] = "COMPLETELY DIFFERENT EVIDENCE"
+        _write_input(plan_dir, changed)
+
+        # Precondition: the plan shape really is unchanged, so this test can
+        # only pass because of the input hash.
+        check(
+            adjudicator._plan_fingerprint(adjudicator.plan_batches(data, harness="claude")["batches"])
+            == adjudicator._plan_fingerprint(adjudicator.plan_batches(changed, harness="claude")["batches"]),
+            "evidence-change: precondition -- the batch plan fingerprint is unchanged",
+        )
+
+        seen: list = []
+
+        def call2(model, prompt, output_path):
+            seen.append(output_path)
+            index = len(seen) - 1
+            chunk = changed["findings"][:40] if index == 0 else changed["findings"][40:]
+            with open(output_path, "w") as f:
+                json.dump({"adjudications": _adjudications_for({"findings": chunk}), "group_assessments": []}, f)
+            return 0, False
+
+        adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call2)
+        check(
+            len(seen) == 2,
+            "evidence-change: changed evidence under identical keys still re-runs every batch",
+            f"{len(seen)} harness calls",
+        )
+
+
+def test_load_checkpoint_requires_both_bindings():
+    """Each binding is checked directly, so neither can be removed while the
+    other silently covers for it."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        data = _input(45)
+        _write_input(plan_dir, data)
+        call, _n = _die_after_first_batch(data)
+        adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
+        saved = _checkpoint(out_dir)
+        good_hash = saved["input_hash"]
+        good_fingerprint = saved["plan_fingerprint"]
+
+        check(
+            adjudicator._load_checkpoint(out_dir, good_hash, good_fingerprint) is not None,
+            "bindings: the checkpoint loads when BOTH bindings match",
+        )
+        check(
+            adjudicator._load_checkpoint(out_dir, "a-different-input-hash", good_fingerprint) is None,
+            "bindings: a mismatched input_hash alone discards it, with the fingerprint still matching",
+        )
+        check(
+            adjudicator._load_checkpoint(out_dir, good_hash, "a-different-fingerprint") is None,
+            "bindings: a mismatched plan_fingerprint alone discards it, with the input_hash still matching",
+        )
+
+
+def test_checkpoint_is_invalidated_when_the_batch_plan_changes():
+    """`input_hash` alone does not bind a batch index: the same input split
+    with a different `batch_size` puts different findings in batch 0."""
+    data = _input(45)
+    wide = adjudicator.plan_batches(data, harness="claude")["batches"]
+    narrow = adjudicator.plan_batches(data, harness="claude", batch_size=10)["batches"]
+    check(len(wide) != len(narrow), "fingerprint: precondition -- the two plans really do differ", f"{len(wide)} vs {len(narrow)}")
+    check(
+        adjudicator._plan_fingerprint(wide) != adjudicator._plan_fingerprint(narrow),
+        "fingerprint: a different batch plan over the SAME input hashes differently",
+    )
+
+
+def test_plan_batches_is_deterministic():
+    """The checkpoint relies on stable batch indices across runs. Verified
+    rather than assumed -- `plan_batches()` uses sets internally, and set
+    iteration order is what would silently break this."""
+    data = _input(45)
+    again = json.loads(json.dumps(data))
+    first = adjudicator.plan_batches(data, harness="claude")["batches"]
+    second = adjudicator.plan_batches(again, harness="claude")["batches"]
+    check(
+        adjudicator._plan_fingerprint(first) == adjudicator._plan_fingerprint(second),
+        "determinism: the same input bytes produce the same batch plan",
+    )
+    groups = [
+        {
+            "group_id": "group-001",
+            "defect_class": "tenant-scoping",
+            "step_ids": ["step-001"],
+            "members": [{"file": "pkg/example/f3.go", "symbol": "Sym3", "vuln_class": "tenant-scoping"}],
+        }
+    ]
+    grouped_a = adjudicator.plan_batches(_input(45, groups=groups), harness="claude")["batches"]
+    grouped_b = adjudicator.plan_batches(_input(45, groups=groups), harness="claude")["batches"]
+    check(
+        adjudicator._plan_fingerprint(grouped_a) == adjudicator._plan_fingerprint(grouped_b),
+        "determinism: stable with cross-step groups too, where the set-based placement logic runs",
+    )
+
+
+def test_a_corrupt_checkpoint_is_discarded_rather_than_trusted():
+    """A checkpoint is read straight back onto the envelope, so a malformed
+    one would inject verdicts nothing validated. Redoing work is the cheaper
+    error."""
+    cases = {
+        "not_an_object": "[1,2,3]",
+        "bad_completed_batches": json.dumps({"input_hash": "x", "plan_fingerprint": "y", "completed_batches": "nope", "adjudications": [], "group_assessments": []}),
+        "invalid_verdicts": json.dumps(
+            {
+                "input_hash": "x",
+                "plan_fingerprint": "y",
+                "completed_batches": [0],
+                "adjudications": [{"file": "a", "symbol": "b", "vuln_class": "c", "severity": "catastrophic", "rationale": "r"}],
+                "group_assessments": [],
+            }
+        ),
+        "truncated_json": '{"input_hash": "x", "completed',
+    }
+    for name, payload in cases.items():
+        with tempfile.TemporaryDirectory() as out_dir:
+            with open(os.path.join(out_dir, adjudicator.CHECKPOINT_FILENAME), "w") as f:
+                f.write(payload)
+            # A matching hash/fingerprint for the two cases that get that far,
+            # so the rejection is by CONTENT, not by the binding check.
+            loaded = adjudicator._load_checkpoint(out_dir, "x", "y")
+            check(loaded is None, f"corrupt checkpoint ({name}): discarded, not trusted", str(loaded))
+
+
+def test_the_harness_output_tail_reaches_stop_reason_raw():
+    """[Issue #4144 AC7, part 1] `call_harness_fn`'s third element was being
+    discarded, so the harness's own error text never reached the envelope.
+
+    The tail is kept from its END: `sanitize_harness_output_tail()` keeps the
+    last 4,000 characters because that is where the explanation is, and
+    `stop_reason_raw` caps at 500 -- so appending and head-truncating would
+    throw away the very text the tail exists to carry.
+    """
+    auth_error = "OAuth token has been revoked; run `claude setup-token` to re-authenticate"
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        _write_input(plan_dir, _input(2))
+
+        def call(model, prompt, output_path):
+            return 1, False, "noise\n" * 400 + auth_error
+
+        envelope = adjudicator.run_adjudication(plan_dir, out_dir, "claude", "m", call_harness_fn=call)
+        check(envelope["state"] == terminal_state.FAILED, "tail: a non-zero exit is still failed")
+        check(
+            auth_error in envelope["stop_reason_raw"],
+            "tail: the END of a 4,000-char tail survives into a 500-char stop_reason_raw",
+            envelope.get("stop_reason_raw", "")[:120],
+        )
+        check(
+            "harness_exit_1" in envelope["stop_reason_raw"],
+            "tail: the classification is kept alongside the harness's own text",
+        )
+        check(
+            len(envelope["stop_reason_raw"]) <= adjudicator.MAX_STOP_REASON_CHARS,
+            "tail: the cap is still respected",
+            str(len(envelope.get("stop_reason_raw", ""))),
+        )
+
+
+def test_a_two_tuple_harness_stub_still_works():
+    """Every other test in this file returns a 2-tuple. The tail capture must
+    not make a 2-tuple a TypeError -- that would break every existing lane
+    stub at once."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        data = _input(2)
+        _write_input(plan_dir, data)
+        envelope = adjudicator.run_adjudication(
+            plan_dir, out_dir, "claude", "m", call_harness_fn=_complete_call(_adjudications_for(data))[0]
+        )
+        check(envelope["state"] == terminal_state.COMPLETE, "2-tuple: a stub without a tail still completes", str(envelope.get("stop_reason_raw")))
 
 
 def main() -> int:

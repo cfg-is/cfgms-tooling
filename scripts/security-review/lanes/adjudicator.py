@@ -32,10 +32,21 @@ a finder lane's does, classified the same way from the harness's exit code
 and the artifact it left behind: a rate-limit signal is `parked`, a non-zero
 exit is `failed`, no output file is `refused`, an unparseable or
 schema-invalid output is `failed`, and only a fully parsed output is
-`complete`. A non-`complete` envelope carries no adjudications at all --
-partial adjudication would leave a reader unable to tell which severities
-were judged -- and `consolidate.py` renders raw severities plus an entry in
-`## Incomplete`. Provenance on every envelope: `harness`, `model_id`, the
+`complete`. A non-`complete` envelope carries the batches that DID finish
+(Issue #4144) -- present and possibly empty, never absent -- and
+`consolidate.py` still renders raw severities plus an entry in
+`## Incomplete`, because preserved verdicts are never applied to a finding.
+The rule this replaced said partial adjudication would leave a reader unable
+to tell which severities were judged; since nothing partial is ever applied,
+no severity was ever ambiguous, and the rule only discarded finished model
+work -- 7 batches of 57, over 28 minutes, on one observed sweep, and on every
+clean early exit with no crash involved.
+
+**Checkpointing.** Each completed batch is persisted to
+`.adjudication-checkpoint.json` immediately, so a later run skips it. The
+file is bound to its batch plan by `input_hash` AND `plan_fingerprint`;
+either mismatching discards the whole checkpoint, because a batch index means
+nothing against a different plan. Provenance on every envelope: `harness`, `model_id`, the
 `input_hash` over the exact input file bytes this lane read (so a stale
 adjudication is detectable), `prompt_version`, and `harness_identity`.
 
@@ -124,6 +135,12 @@ DEFAULT_OUT_DIR = "/workspace-out"
 INPUT_FILENAME = "adjudication-input.json"
 OUTPUT_FILENAME = "adjudication.json"
 RAW_OUTPUT_PREFIX = ".adjudication-raw"
+# Internal harness state, not a report artifact: a dotfile, like the raw
+# batch output, so nothing that discovers report files picks it up. It lives
+# in `out_dir` deliberately -- `adjudicate.prepare()` removes only
+# `adjudication.json`, so this survives the next `resume` and is what that
+# resume reads. It is removed on a `complete` run, when it is spent.
+CHECKPOINT_FILENAME = ".adjudication-checkpoint.json"
 
 BATCH_SIZE = 40
 # Hard ceiling on one batch's rendered prompt, in UTF-8 bytes. Since Issue
@@ -592,6 +609,145 @@ def _remove(path: str) -> None:
         pass
 
 
+def _checkpoint_path(out_dir: str) -> str:
+    return os.path.join(out_dir, CHECKPOINT_FILENAME)
+
+
+def _plan_fingerprint(batches: list) -> str:
+    """A hash over the batch plan's SHAPE -- which findings and groups sit in
+    which batch, in order.
+
+    A checkpoint records progress as batch INDICES, so an index is only
+    meaningful against the plan it was produced from. `input_hash` alone does
+    not bind that: `plan_batches()` is deterministic given the same input
+    bytes, but its output also depends on `harness` (prompt bytes differ per
+    harness), on `max_prompt_bytes`/`batch_size`, and on its own code. Change
+    any of those and batch 3 is a different set of findings while the input
+    hash is unchanged -- so "batches 0-2 are done" would silently skip work
+    that was never done.
+
+    Hashing the plan itself covers all of those causes at once, including the
+    ones nobody thought to enumerate.
+    """
+    shape = [
+        {
+            "findings": [list(_key(finding)) for finding in batch["findings"]],
+            "groups": [group.get("group_id") for group in batch["cross_step_groups"]],
+        }
+        for batch in batches
+    ]
+    canonical = json.dumps(shape, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _write_checkpoint(
+    out_dir: str,
+    input_hash: str,
+    fingerprint: str,
+    completed: set,
+    adjudications: list,
+    assessments: list,
+    unsolicited: int,
+) -> None:
+    """Persist progress after a batch. Best-effort by design: a checkpoint
+    that cannot be written degrades the run to "no resume", which is exactly
+    today's behaviour, and must never be the thing that kills a stage that is
+    otherwise succeeding."""
+    payload = {
+        "input_hash": input_hash,
+        "plan_fingerprint": fingerprint,
+        "completed_batches": sorted(completed),
+        "adjudications": adjudications,
+        "group_assessments": assessments,
+        "unsolicited_verdicts": int(unsolicited),
+    }
+    try:
+        atomic_write.write_json_atomic(_checkpoint_path(out_dir), payload)
+    except (OSError, ValueError, TypeError) as exc:
+        schema.log_event("adjudication_checkpoint_unwritable", error=str(exc))
+
+
+def _load_checkpoint(out_dir: str, input_hash: str, fingerprint: str) -> "dict | None":
+    """Read a checkpoint that is valid FOR THIS RUN, else None.
+
+    Returns None -- meaning "start from batch 0" -- for a checkpoint that is
+    absent, unreadable, not an object, bound to a different input or a
+    different batch plan, or whose stored verdicts do not validate. The last
+    case matters: a checkpoint is read back into the envelope, so a corrupt
+    one would inject unvalidated verdicts into the report. Discarding the
+    whole checkpoint costs re-running batches that already ran; accepting a
+    partial one risks a verdict nothing checked. Redoing work is the cheaper
+    error.
+    """
+    path = _checkpoint_path(out_dir)
+    try:
+        with open(path, "rb") as f:
+            data = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        schema.log_event("adjudication_checkpoint_discarded", reason="not_an_object")
+        return None
+    if data.get("input_hash") != input_hash:
+        schema.log_event("adjudication_checkpoint_discarded", reason="input_hash_mismatch")
+        return None
+    if data.get("plan_fingerprint") != fingerprint:
+        schema.log_event("adjudication_checkpoint_discarded", reason="plan_fingerprint_mismatch")
+        return None
+
+    completed = data.get("completed_batches")
+    if not isinstance(completed, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) and i >= 0 for i in completed
+    ):
+        schema.log_event("adjudication_checkpoint_discarded", reason="bad_completed_batches")
+        return None
+    adjudications = data.get("adjudications")
+    assessments = data.get("group_assessments")
+    if not isinstance(adjudications, list) or not isinstance(assessments, list):
+        schema.log_event("adjudication_checkpoint_discarded", reason="bad_verdict_lists")
+        return None
+    errors = schema._validate_adjudication_list(adjudications, True)
+    errors += schema._validate_group_assessment_list(assessments, True)
+    if errors:
+        schema.log_event("adjudication_checkpoint_discarded", reason="invalid_verdicts", errors=errors[:3])
+        return None
+    unsolicited = data.get("unsolicited_verdicts", 0)
+    if not isinstance(unsolicited, int) or isinstance(unsolicited, bool) or unsolicited < 0:
+        unsolicited = 0
+    return {
+        "completed_batches": set(completed),
+        "adjudications": [
+            {field: entry[field] for field in schema.REQUIRED_ADJUDICATION_FIELDS}
+            for entry in adjudications
+        ],
+        "group_assessments": [
+            {field: entry[field] for field in schema.REQUIRED_GROUP_ASSESSMENT_FIELDS}
+            for entry in assessments
+        ],
+        "unsolicited_verdicts": unsolicited,
+    }
+
+
+def _stop_reason_with_tail(reason: str, tail: str) -> str:
+    """Combine a classification with the harness's own output tail, keeping
+    the END of that tail.
+
+    `sanitize_harness_output_tail()` already keeps the last 4,000 characters
+    because "the signal that actually explains a failure ... is
+    overwhelmingly at the end". `stop_reason_raw` caps at 500, so appending
+    the tail and head-truncating the result would throw away the very text
+    the tail was kept for -- an auth error would be cut off and
+    `auth_revoked` would never classify. Trim from the front instead.
+    """
+    if not tail:
+        return reason[:MAX_STOP_REASON_CHARS]
+    prefix = f"{reason}: "
+    room = MAX_STOP_REASON_CHARS - len(prefix)
+    if room <= 0:
+        return prefix[:MAX_STOP_REASON_CHARS]
+    return prefix + tail[-room:]
+
+
 def run_adjudication(
     plan_dir: str,
     out_dir: str,
@@ -620,6 +776,14 @@ def run_adjudication(
         "harness_identity": harness_identity,
     }
 
+    # Progress accumulated so far, readable by `finish()` on any exit path.
+    # `finish()` is defined before the batch loop that fills these, so a
+    # mutable holder is what lets AC1 live inside `finish()` -- the gate the
+    # story names -- rather than being threaded through all eight early
+    # `return finish(...)` call sites, where one missed site would silently
+    # restore the bug.
+    progress: dict = {"adjudications": [], "assessments": [], "unsolicited": 0}
+
     def finish(
         state: str,
         stop_reason: "str | None" = None,
@@ -640,12 +804,22 @@ def run_adjudication(
         envelope["unassessed_groups"] = list(unassessed_groups or [])
         # Verdicts the model returned for items the batch never carried;
         # dropped before they reach the envelope, counted for the record.
-        envelope["unsolicited_verdicts"] = int(unsolicited)
+        envelope["unsolicited_verdicts"] = int(unsolicited or progress["unsolicited"])
         if state == terminal_state.COMPLETE:
             envelope["adjudications"] = adjudications or []
             envelope["group_assessments"] = assessments or []
         else:
             envelope["stop_reason_raw"] = (str(stop_reason) if stop_reason else state)[:MAX_STOP_REASON_CHARS]
+            # Issue #4144: the batches that DID finish are attached, not
+            # discarded. This is a live defect independent of crash recovery
+            # -- every non-complete terminal state hit this, with no
+            # container restart involved, so N batches of real model work
+            # were thrown away on an exit the stage handled cleanly.
+            # Always present (empty when nothing finished) so a reader never
+            # has to tell "no verdicts survived" from "this field predates
+            # the fix".
+            envelope["adjudications"] = list(progress["adjudications"])
+            envelope["group_assessments"] = list(progress["assessments"])
         try:
             _write_envelope(out_dir, envelope)
         except Exception as exc:  # noqa: BLE001 -- the fallback must never kill the lane
@@ -693,8 +867,36 @@ def run_adjudication(
     seen_keys: set = set()
     seen_groups: set = set()
     unsolicited = 0
+    completed_batches: set = set()
+
+    # Resume: pick up the batches an earlier run finished. Same pattern as
+    # `resume.missing_steps()` -- rescan what is on disk, run whatever is
+    # missing, no separate progress database to fall out of sync.
+    fingerprint = _plan_fingerprint(batches)
+    checkpoint = _load_checkpoint(out_dir, context["input_hash"], fingerprint)
+    if checkpoint is not None:
+        all_adjudications = list(checkpoint["adjudications"])
+        all_assessments = list(checkpoint["group_assessments"])
+        seen_keys = {_key(entry) for entry in all_adjudications}
+        seen_groups = {entry["group_id"] for entry in all_assessments}
+        unsolicited = checkpoint["unsolicited_verdicts"]
+        # A checkpoint from a LONGER plan cannot happen (the fingerprint
+        # binds the plan), but an index outside this plan would silently
+        # skip nothing, so drop it rather than trust it.
+        completed_batches = {i for i in checkpoint["completed_batches"] if i < len(batches)}
+        progress["adjudications"] = all_adjudications
+        progress["assessments"] = all_assessments
+        progress["unsolicited"] = unsolicited
+        schema.log_event(
+            "adjudication_resumed_from_checkpoint",
+            completed_batches=len(completed_batches),
+            total_batches=len(batches),
+            adjudications=len(all_adjudications),
+        )
 
     for index, batch in enumerate(batches):
+        if index in completed_batches:
+            continue
         raw_path = os.path.join(out_dir, f"{RAW_OUTPUT_PREFIX}.batch{index}.json")
         _remove(raw_path)
         prompt = build_prompt(batch, raw_path, harness)
@@ -705,6 +907,11 @@ def run_adjudication(
             # working unchanged.
             harness_result = call_harness_fn(model, prompt, raw_path)
             exit_code, rate_limited = harness_result[0], harness_result[1]
+            # Issue #4144: the third element is the sanitized output tail.
+            # It was being discarded, which is why a revoked token reached
+            # the report as a bare `harness_exit_1` with the harness's own
+            # explanation thrown away. A 2-tuple test stub still works.
+            output_tail = harness_result[2] if len(harness_result) > 2 else ""
         except Exception as exc:  # noqa: BLE001 -- a launch failure is a failed stage, never a crash
             _remove(raw_path)
             return finish(terminal_state.FAILED, f"launch_exception:{exc}", batches=len(batches), unsent_findings=unsent_findings, unassessed_groups=unassessed_groups)
@@ -714,11 +921,23 @@ def run_adjudication(
             return finish(terminal_state.PARKED, "rate_limited", batches=len(batches), unsent_findings=unsent_findings, unassessed_groups=unassessed_groups)
         if exit_code != 0:
             _remove(raw_path)
-            return finish(terminal_state.FAILED, f"harness_exit_{exit_code}", batches=len(batches), unsent_findings=unsent_findings, unassessed_groups=unassessed_groups)
+            return finish(
+                terminal_state.FAILED,
+                _stop_reason_with_tail(f"harness_exit_{exit_code}", output_tail),
+                batches=len(batches),
+                unsent_findings=unsent_findings,
+                unassessed_groups=unassessed_groups,
+            )
         data = _parse_raw_output(raw_path)
         _remove(raw_path)
         if data is None:
-            return finish(terminal_state.REFUSED, "no_valid_adjudication_file", batches=len(batches), unsent_findings=unsent_findings, unassessed_groups=unassessed_groups)
+            return finish(
+                terminal_state.REFUSED,
+                _stop_reason_with_tail("no_valid_adjudication_file", output_tail),
+                batches=len(batches),
+                unsent_findings=unsent_findings,
+                unassessed_groups=unassessed_groups,
+            )
         errors = _validate_raw_output(data)
         if errors:
             return finish(
@@ -760,6 +979,26 @@ def run_adjudication(
                 {field: entry[field] for field in schema.REQUIRED_GROUP_ASSESSMENT_FIELDS}
             )
 
+        # This batch is done. Publish it before starting the next one: a
+        # checkpoint written after the loop would protect nothing, since the
+        # loop is where the stage dies.
+        completed_batches.add(index)
+        progress["adjudications"] = all_adjudications
+        progress["assessments"] = all_assessments
+        progress["unsolicited"] = unsolicited
+        _write_checkpoint(
+            out_dir,
+            context["input_hash"],
+            fingerprint,
+            completed_batches,
+            all_adjudications,
+            all_assessments,
+            unsolicited,
+        )
+
+    # Spent: every batch is in the envelope now, so a leftover checkpoint
+    # could only ever be applied to some later, different run.
+    _remove(_checkpoint_path(out_dir))
     return finish(
         terminal_state.COMPLETE,
         adjudications=all_adjudications,
