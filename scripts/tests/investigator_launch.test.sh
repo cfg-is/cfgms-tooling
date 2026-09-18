@@ -1541,6 +1541,88 @@ check_not_contains "legacy plan-mode call never requests --output-format json" "
 rm -rf "$MODEL_TEST_DIR"
 
 echo ""
+echo "== REQUIRED TEST — the launch persists the container's log under"
+echo "   <--sweep-dir>/container-logs/<mode>.log, because a later same-name launch"
+echo "   reaps the container it lives in (Issue #4132) =="
+
+# Structural: the capture must be wired into the SUCCESS branch, before the
+# launch is announced. A capture started after the caller has already been told
+# the container is up is a capture that can miss the start of a short run.
+check_contains "launch block starts log capture" "$launch_block" \
+  'start_investigator_log_capture "$inv_sweep_dir" "$inv_mode_safe" "$container_id"'
+check_contains "capture is defined as a helper" "$dispatch_src" \
+  'start_investigator_log_capture() {'
+
+# The shared stub's catch-all returns silently for every verb but `run`, which
+# would leave an empty log indistinguishable from a working capture. This stub
+# makes `docker logs` emit, so "non-empty" actually means the capture ran AND
+# its output reached the file.
+cat > "${FAKEBIN}/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "${DOCKER_CALL_LOG:?}"
+case "$1" in
+  ps)   echo "" ;;
+  run)  echo "fake-container-id" ;;
+  wait) exit 0 ;;
+  logs) printf '%s\n' '{"event": "step_written", "state": "complete"}' ;;
+  *)    exit 0 ;;
+esac
+STUB
+chmod +x "${FAKEBIN}/docker"
+
+: > "$DOCKER_CALL_LOG"
+rm -rf "${SWEEP_DIR}/container-logs"
+capture_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --bundle-dir "$BUNDLE_DIR" --mode plan 2>&1)
+check_contains "launch with capture still reports LAUNCHED_INVESTIGATOR" "$capture_out" \
+  "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
+
+# The capture is detached deliberately — it has to outlive the dispatch shell —
+# so poll for the file rather than assume it is scheduled by the time launch
+# returns. Bounded: a real regression fails here in ~5s, not by hanging.
+captured_log="${SWEEP_DIR}/container-logs/plan.log"
+for _ in $(seq 1 50); do
+  [[ -s "$captured_log" ]] && break
+  sleep 0.1
+done
+
+if [[ -f "$captured_log" ]]; then ok "container log is created under <sweep>/container-logs"
+else bad "container log is created under <sweep>/container-logs" "missing: ${captured_log}"; fi
+if [[ -s "$captured_log" ]]; then ok "container log is non-empty"
+else bad "container log is non-empty" "empty or missing: ${captured_log}"; fi
+check_contains "capture follows the container with timestamps" \
+  "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "logs -f --timestamps fake-container-id"
+
+# A capture that cannot write must not take the launch down with it: the log is
+# a diagnostic, the sweep is the work. Block ONLY the log directory -- occupying
+# its name with a regular file makes the helper's `mkdir -p` fail while leaving
+# the rest of the sweep tree writable, so this exercises the capture's own
+# failure path rather than breaking the launch somewhere upstream.
+: > "$DOCKER_CALL_LOG"
+rm -rf "${SWEEP_DIR}/container-logs"
+: > "${SWEEP_DIR}/container-logs"
+set +e
+blocked_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --bundle-dir "$BUNDLE_DIR" --mode plan 2>&1)
+blocked_rc=$?
+set -e
+rm -f "${SWEEP_DIR}/container-logs"
+if [[ "$blocked_rc" -eq 0 ]]; then ok "an uncreatable log dir does not fail the launch"
+else bad "an uncreatable log dir does not fail the launch" "exited ${blocked_rc}: ${blocked_out}"; fi
+check_contains "launch still reports success when the log cannot be persisted" "$blocked_out" \
+  "LAUNCHED_INVESTIGATOR:plan:fake-container-id"
+check_contains "an unpersistable log is warned about, not silent" "$blocked_out" \
+  "container log will not be persisted"
+
+echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"
 if [[ $fail -gt 0 ]]; then

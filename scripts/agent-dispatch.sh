@@ -1121,6 +1121,74 @@ gate_credentials_for_launch() {
   esac
 }
 
+# Stream an investigator container's log to disk for the container's lifetime.
+#
+# Writes to <sweep_dir>/container-logs/<mode>.log, where sweep_dir is whatever
+# the CALLER passed as --sweep-dir. Five dispatch sites, and `plan` mode is
+# split across both shapes -- planner.py is one file with two behaviours:
+#
+#   security-review.sh:724  finder lane    sweep root
+#   planner.py:874          legacy planner sweep root
+#   planner.py:921          multi-planner  <sweep>/planners/<lane>
+#   verify.py:180           verifier       <sweep>/verification
+#   adjudicate.py:187       adjudicator    <sweep>/adjudication
+#
+# The sub-sweep layout is what makes the fixed <mode>.log filename
+# collision-free: every multi-planner lane writes plan.log, kept apart solely
+# by its own sub-directory.
+#
+# A container's log lives exactly as long as the container, and an investigator
+# container's lifetime is not the sweep's to decide. This `docker run -d`
+# carries NO `--rm` -- see the container-conflict gate's own comment further
+# down -- but three paths remove an exited one anyway, none of which waits for
+# anyone to have read the log:
+#
+#   1. the conflict gate reaps one (`docker rm -f`) before reusing its name,
+#      which is what makes `resume` work rather than refuse forever;
+#   2. the stale-investigator reaper in the `cleanup-stale` arm (Issue #4055)
+#      removes any exited `cfg-agent-investigator-*` past a grace window
+#      (`CFGMS_INVESTIGATOR_REAP_MINUTES`, default 30) -- the routine garbage
+#      collector, and the path that takes containers from FINISHED sweeps;
+#   3. `cleanup-container <name>`, on request.
+#
+# NOT `cleanup-issue`: it only builds `cfg-agent-<num>` / `cfg-agent-item-<id>`,
+# neither of which can match an investigator container's name.
+#
+# Step results survive independently in
+# `lanes/<lane>/step-*.findings.json`; what is lost is the event stream —
+# `step_written`, `step_repair_attempted`, `scan_gap`, `stop_reason_raw` — and
+# with it the sequencing and timing needed to analyse harness behaviour after a
+# run. A sweep's first-finishing lane was the reliable casualty: by the time
+# anyone looked, only the still-running lanes could be read.
+#
+# `docker logs -f` follows until the container exits and then ends by itself,
+# so there is nothing to clean up and no lifetime to track. `--timestamps`
+# is what makes the result useful for timing analysis rather than just a
+# transcript.
+#
+# Detached via setsid+nohup so it never blocks or is killed with the dispatch
+# shell, and every failure path returns 0: an unpersisted log is a diagnostic
+# loss, never a reason to fail a launch that is otherwise fine.
+start_investigator_log_capture() {
+  local sweep_dir="$1" mode_safe="$2" container_id="$3"
+  local log_dir="${sweep_dir}/container-logs"
+
+  if [[ -z "$sweep_dir" || -z "$mode_safe" || -z "$container_id" ]]; then
+    echo "WARNING: log capture skipped (missing sweep dir, mode or container id)" >&2
+    return 0
+  fi
+
+  if ! mkdir -p "$log_dir" 2>/dev/null; then
+    echo "WARNING: could not create ${log_dir}; container log will not be persisted" >&2
+    return 0
+  fi
+
+  setsid nohup docker logs -f --timestamps "$container_id" \
+    > "${log_dir}/${mode_safe}.log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  return 0
+}
+
 usage() {
   cat <<'EOF'
 Usage: agent-dispatch.sh <command> [args...]
@@ -3464,6 +3532,9 @@ PY
       --entrypoint /usr/local/bin/investigator-entrypoint.sh \
       cfg-agent:latest \
       "${inv_mode}" 2>&1); then
+      # Before announcing the launch: the log exists only while the container
+      # does, and a later same-name launch reaps this one to reuse its name.
+      start_investigator_log_capture "$inv_sweep_dir" "$inv_mode_safe" "$container_id"
       echo "LAUNCHED_INVESTIGATOR:${inv_mode}:${container_id}"
     else
       echo "LAUNCH_FAILED:${container_name}:${container_id}"
@@ -3693,6 +3764,10 @@ PY
     # 2026-09-11: ten exited investigators had accumulated over 40 hours,
     # holding ~179MB. Their findings are written to the host sweep directory,
     # never kept inside the container, so an exited one holds nothing of value.
+    # Since Issue #4132 that is true BECAUSE its log is streamed to a
+    # container-logs/ directory under whichever --sweep-dir that launch was
+    # given -- see start_investigator_log_capture. Without that capture this
+    # reap is the main path by which a finished sweep's lane log is lost.
     #
     # Grace window rather than immediate: a just-exited investigator may still
     # be being read by the sweep that launched it.
