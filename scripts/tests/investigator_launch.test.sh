@@ -132,6 +132,61 @@ check_not_contains "disallowed tools list never lists the unknown MultiEdit tool
 entrypoint_src="$(cat "$ENTRYPOINT")"
 check_contains "investigator-entrypoint.sh passes --disallowedTools to claude in plan mode" "$entrypoint_src" '--disallowedTools "$DISALLOWED_TOOLS"'
 
+# probe_claude_unknown_tools <claude-bin> <timeout-seconds> <rules>
+#
+# Runs the real CLI once with <rules> as --disallowedTools and classifies the
+# result as exactly one of:
+#   ok          exited 0, no "matches no known tool" warning — verified.
+#   warned      printed the warning — a rule name the CLI does not know.
+#   timeout     did not finish within <timeout-seconds>.
+#   error:<rc>  exited non-zero without the warning.
+#
+# BOUNDED (Issue #4148). This is a live, billed, network-dependent call. Run
+# unbounded, it hung `make test` for the suite runner's whole 180 s budget
+# during an API outage, failing unrelated branches. `timeout` caps it.
+#
+# The warning is emitted when the CLI parses --disallowedTools at startup, but
+# there is no documented flag that runs that validation without a model
+# round-trip, so a real call is still made — one short prompt per run.
+#
+# `timeout` and `error` are NOT passes. Before this, `|| true` discarded the
+# exit status, so a CLI that failed before or instead of validating (network
+# down, auth rejected) printed no warning and the check reported a pass it
+# never earned.
+probe_claude_unknown_tools() {
+  local bin="$1" secs="$2" rules="$3" out rc=0
+  out="$(timeout "$secs" "$bin" --disallowedTools "$rules" --print "say hi" --dangerously-skip-permissions 2>&1 >/dev/null)" || rc=$?
+  if [[ "$out" == *"matches no known tool"* ]]; then
+    printf 'warned\n%s\n' "$out"
+  elif (( rc == 124 )); then
+    printf 'timeout\n'
+  elif (( rc != 0 )); then
+    printf 'error:%s\n%s\n' "$rc" "$out"
+  else
+    printf 'ok\n'
+  fi
+}
+
+echo ""
+echo "== REQUIRED TEST (Issue #4148) — the live CLI probe is bounded and never"
+echo "   reports an unverified result as a pass (stubbed CLI, no network) =="
+PROBE_STUBS="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "${PROBE_STUBS}/claude-hang"
+printf '#!/usr/bin/env bash\necho "Permission deny rule \\"Bogus\\" matches no known tool" >&2\n' > "${PROBE_STUBS}/claude-warn"
+printf '#!/usr/bin/env bash\necho "API Error: 529 overloaded" >&2\nexit 1\n' > "${PROBE_STUBS}/claude-fail"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${PROBE_STUBS}/claude-clean"
+chmod +x "${PROBE_STUBS}"/claude-*
+probe_start=$(date +%s)
+probe_hang="$(probe_claude_unknown_tools "${PROBE_STUBS}/claude-hang" 2 "Edit")"
+probe_elapsed=$(( $(date +%s) - probe_start ))
+if (( probe_elapsed <= 10 )); then ok "a hanging CLI is cut off by the bound (${probe_elapsed}s, bound 2s)"
+else bad "a hanging CLI is cut off by the bound" "took ${probe_elapsed}s"; fi
+check_contains "a hanging CLI is classified as timeout, not a pass" "$(head -1 <<<"$probe_hang")" "timeout"
+check_contains "an unknown-rule warning is detected" "$(head -1 <<<"$(probe_claude_unknown_tools "${PROBE_STUBS}/claude-warn" 5 "Bogus")")" "warned"
+check_contains "a CLI that fails without validating is an error, not a pass" "$(head -1 <<<"$(probe_claude_unknown_tools "${PROBE_STUBS}/claude-fail" 5 "Edit")")" "error:1"
+check_contains "a clean exit with no warning is the only pass" "$(head -1 <<<"$(probe_claude_unknown_tools "${PROBE_STUBS}/claude-clean" 5 "Edit")")" "ok"
+rm -rf "$PROBE_STUBS"
+
 if command -v claude >/dev/null 2>&1; then
   echo ""
   echo "== REQUIRED TEST evidence (Issue #4013) — the rendered disallowed-tools"
@@ -140,11 +195,20 @@ if command -v claude >/dev/null 2>&1; then
   inv_disallowed_line="$(grep -m1 '^ *inv_disallowed=' "$DISPATCH")"
   inv_gh_issue_verb="issue"
   eval "$inv_disallowed_line"
-  claude_unknown_tool_out="$(claude --disallowedTools "$inv_disallowed" --print "say hi" --dangerously-skip-permissions 2>&1 >/dev/null || true)"
-  check_not_contains "pinned claude CLI accepts every rule in inv_disallowed with no 'matches no known tool' warning" "$claude_unknown_tool_out" "matches no known tool"
+  probe_result="$(probe_claude_unknown_tools claude "${CFGMS_CLAUDE_PROBE_TIMEOUT:-60}" "$inv_disallowed")"
+  case "$(head -1 <<<"$probe_result")" in
+    ok)
+      ok "pinned claude CLI accepts every rule in inv_disallowed with no 'matches no known tool' warning" ;;
+    warned)
+      bad "pinned claude CLI accepts every rule in inv_disallowed with no 'matches no known tool' warning" "$(tail -n +2 <<<"$probe_result")" ;;
+    *)
+      # Not a pass and not a failure of the rule list: the CLI could not be
+      # asked (timeout, API or auth error). Reported, never counted as ok.
+      echo "  n/a   unknown-tool check NOT verified this run: $(head -1 <<<"$probe_result") — $(tail -n +2 <<<"$probe_result" | head -c 200)" ;;
+  esac
 else
   echo ""
-  echo "== SKIPPED — claude CLI not on PATH; empirical unknown-tool check requires the pinned binary =="
+  echo "  n/a   claude CLI not on PATH; empirical unknown-tool check requires the pinned binary"
 fi
 
 echo ""
