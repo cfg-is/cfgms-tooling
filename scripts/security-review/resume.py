@@ -9,7 +9,8 @@ Implements the epic's four-terminal-state table exactly
 | complete   | skip                                    |
 | parked     | retry                                    |
 | refused    | retry once (caller's job to count)       |
-| failed     | surface to human, never auto-retried     |
+| failed     | surface to human; re-attempted ONLY for a |
+|            | transient cause (Issue #4177)             |
 
 A step is complete if and only if `<step_id>.findings.json` exists and
 validates against the step-envelope schema with `state == "complete"`. That
@@ -52,6 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_write  # noqa: E402
 import schema  # noqa: E402
 
 
@@ -229,6 +231,35 @@ def _quarantine(findings_path: str, step_id: str, mismatches: list[str]) -> None
     )
 
 
+# How many times one step may be re-attempted for a transient cause before it
+# goes back to being an ordinary `failed` step.
+#
+# A credential rotation clears on the very next attempt, so two is already
+# generous. The cap exists because the classifier reads a string containing
+# the model's own output, and this harness reviews code for auth defects --
+# so a false positive is not exotic, it is the expected shape of a finding.
+# Without a cap such a step is re-run at full cost on every resume, and a
+# sweep is resumed for days.
+MAX_TRANSIENT_RETRIES = 2
+
+
+def _record_transient_retry(status_path: str, envelope: dict, attempt: int) -> None:
+    """Persist the re-attempt count on the step's own envelope.
+
+    Written here rather than by the lane because `resume` is what decides to
+    retry, and the lane that runs next has no memory of the previous failure.
+    Best-effort: if the count cannot be written the step is still retried, and
+    the only cost is that the cap restarts -- which is the pre-cap behaviour,
+    not a worse one.
+    """
+    try:
+        updated = dict(envelope)
+        updated["transient_retries"] = attempt
+        atomic_write.write_json_atomic(status_path, updated)
+    except Exception as exc:  # noqa: BLE001 -- bookkeeping must never fail a scan
+        schema.log_event("transient_retry_count_unwritable", path=status_path, error=str(exc))
+
+
 def missing_steps(
     lane_dir: str,
     step_ids: list[str],
@@ -288,6 +319,73 @@ def missing_steps(
             envelope = _load_json(status_path)
             state = envelope.get("state") if isinstance(envelope, dict) else None
             if state == "failed":
+                # Issue #4177: a step that failed for a TRANSIENT cause is
+                # re-attempted; everything else keeps `failed`'s original
+                # meaning and is skipped.
+                #
+                # Before this, every `failed` step was written off for good.
+                # A host token rotation revokes the old credential instantly,
+                # so a container mid-call dies with a 401 -- and that step's
+                # coverage was then lost permanently, not merely delayed. A
+                # sweep spanning several rotations quietly shed steps it would
+                # never pick up again.
+                #
+                # TWO GUARDS, and neither is sufficient alone.
+                #
+                # 1. The harness-written PREFIX vetoes first, inside
+                #    `schema.is_transient_stop_reason`. A stop reason opening
+                #    `invalid_findings_schema` means the model's answer failed
+                #    validation -- deterministic by construction, whatever
+                #    that answer happened to say -- so the rest of the string
+                #    is never read.
+                # 2. MAX_TRANSIENT_RETRIES caps how often any one step may be
+                #    re-attempted, counted on its own envelope.
+                #
+                # The prefix rule cannot catch a mis-detected `harness_exit_1`,
+                # whose tail genuinely is the CLI's error output. The cap
+                # cannot make a wrongly-classified step cheap -- it still
+                # burns two full runs. Each covers the other's gap.
+                #
+                # An earlier revision had no cap, arguing that this function is
+                # invoked rather than looping. That bounds re-attempts PER
+                # INVOCATION and says nothing across them, and a sweep is
+                # resumed for days. The argument was true and did not support
+                # the conclusion.
+                #
+                # Why a cap is needed at all: `stop_reason_raw` is
+                # `"<reason>: <harness output tail>"`, and the tail is combined
+                # stdout+stderr -- which for a finder lane contains the model's
+                # own answer. This harness reviews code for security defects,
+                # so that answer routinely contains "unauthorized" and
+                # "invalid token" as FINDINGS. A false positive here is not
+                # exotic; it is the expected shape of a finding.
+                stop_reason = envelope.get("stop_reason_raw") if isinstance(envelope, dict) else None
+                attempts = envelope.get("transient_retries") if isinstance(envelope, dict) else 0
+                attempts = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
+                if schema.is_transient_stop_reason(stop_reason):
+                    if attempts >= MAX_TRANSIENT_RETRIES:
+                        # Exhausted: back to `failed`'s ordinary meaning. A
+                        # rotation clears on the next attempt, so a step still
+                        # failing this way after the cap is not being rotated
+                        # out -- it is broken, or the classifier was wrong
+                        # about it, and either deserves a human.
+                        schema.log_event(
+                            "step_transient_retries_exhausted",
+                            step_id=step_id,
+                            lane_dir=lane_dir,
+                            attempts=attempts,
+                            stop_reason_raw=str(stop_reason)[:200],
+                        )
+                        continue
+                    _record_transient_retry(status_path, envelope, attempts + 1)
+                    schema.log_event(
+                        "step_retried_after_transient_failure",
+                        step_id=step_id,
+                        lane_dir=lane_dir,
+                        attempt=attempts + 1,
+                        stop_reason_raw=str(stop_reason)[:200],
+                    )
+                    missing.append(step_id)
                 continue
             missing.append(step_id)
             continue

@@ -222,6 +222,177 @@ def _plan_hash_of(plan_dir: str, step_id: str) -> str:
 # --- Binding checks on resume (Issue #3962) ---------------------------------
 
 
+def test_a_transient_failure_is_re_attempted_and_a_deterministic_one_is_not():
+    """[REQUIRED TEST -- Issue #4177 AC3] `failed` stops meaning "lost forever"
+    for transient causes only.
+
+    A host token rotation revokes the old credential instantly, so a container
+    mid-call dies with a 401. Before this, that step was written off for good:
+    `missing_steps` skipped every `failed` envelope, so a sweep spanning
+    several rotations quietly shed steps it would never pick up again. The cost
+    of a rotation was not 19 seconds of staleness, it was that step's coverage,
+    permanently.
+
+    The pairing is the whole test. Retrying everything would let a
+    deterministically broken step loop, which is the property `failed` exists
+    to protect; retrying nothing is the bug. Both directions are asserted
+    against the same scanner in the same fixture, so a change that collapses
+    them in either direction fails here.
+    """
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        transient = [
+            "harness_exit_1: OAuth access token has been revoked",
+            "harness_exit_1: HTTP 401: Unauthorized",
+            "launch_exception: authentication failed, run `claude setup-token`",
+        ]
+        deterministic = [
+            "invalid_findings_schema: severity must be one of [...]",
+            "no_valid_findings_file",
+            "harness_exit_1: unrecognised model id 'gpt-9'",
+            "rate_limited",
+        ]
+
+        step_ids = []
+        for i, reason in enumerate(transient + deterministic):
+            step_id = f"step-{i + 1:03d}"
+            step_ids.append(step_id)
+            write_plan_step(plan_dir, step_id)
+            write(
+                os.path.join(lane_dir, f"{step_id}.status.json"),
+                status_envelope(step_id, "failed", stop_reason_raw=reason),
+            )
+
+        with redirect_stderr(io.StringIO()):
+            outstanding = resume.missing_steps(lane_dir, step_ids, plan_dir=plan_dir)
+
+        for i, reason in enumerate(transient):
+            step_id = f"step-{i + 1:03d}"
+            check(
+                step_id in outstanding,
+                f"transient retry: {reason.split(':')[-1].strip()[:44]!r} is re-attempted",
+                str(outstanding),
+            )
+        for j, reason in enumerate(deterministic):
+            step_id = f"step-{len(transient) + j + 1:03d}"
+            check(
+                step_id not in outstanding,
+                f"no retry: {reason[:44]!r} stays failed, so a broken step cannot loop",
+                str(outstanding),
+            )
+
+
+def test_model_findings_about_auth_are_not_mistaken_for_an_auth_failure():
+    """[REQUIRED TEST -- #4182 review finding, MEDIUM] The model's own text is
+    inside `stop_reason_raw` and must not be trusted.
+
+    `stop_reason_raw` is `"<reason>: <harness output tail>"`, and the tail is
+    combined stdout+stderr -- which for a finder lane contains the model's
+    answer. **This harness reviews code for security defects**, so that answer
+    routinely contains "unauthorized", "invalid token" and "session expired"
+    as FINDINGS rather than as errors.
+
+    Before the fix, a step whose findings discussed auth and which then failed
+    deterministically was classified transient and re-run at full cost on
+    every resume, forever. "Invoked, not looping" bounds that per resume, and
+    a sweep is resumed for days.
+
+    The harness-written PREFIX is what makes this decidable: a
+    schema-invalid answer is deterministic by construction, whatever the
+    answer said.
+    """
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        model_tail = (
+            "the handler allows unauthorized access when the session token is "
+            "invalid; authentication failed paths fall through to the admin branch"
+        )
+        cases = [
+            # (step, stop_reason_raw, should_retry, why)
+            ("step-001", f"invalid_findings_schema: severity must be one of [...] {model_tail}",
+             False, "schema-invalid answer whose findings discuss auth"),
+            ("step-002", f"unhandled_step_error: duplicate hypothesis id. {model_tail}",
+             False, "step-body defect whose findings discuss auth"),
+            ("step-003", "harness_exit_1: API Error: 401 OAuth access token has been revoked",
+             True, "a real credential failure reported by the harness"),
+        ]
+        step_ids = [c[0] for c in cases]
+        for step_id, reason, _want, _why in cases:
+            write_plan_step(plan_dir, step_id)
+            write(os.path.join(lane_dir, f"{step_id}.status.json"),
+                  status_envelope(step_id, "failed", stop_reason_raw=reason))
+
+        with redirect_stderr(io.StringIO()):
+            outstanding = resume.missing_steps(lane_dir, step_ids, plan_dir=plan_dir)
+
+        for step_id, _reason, want, why in cases:
+            got = step_id in outstanding
+            check(got == want,
+                  f"model-text guard: {why} -> {'retried' if want else 'NOT retried'}",
+                  f"{step_id} in outstanding = {got}")
+
+
+def test_transient_retries_are_capped_so_a_false_positive_cannot_loop():
+    """[#4182 review finding] The prefix rule cannot catch a mis-detected
+    `harness_exit_1`, so the count is the backstop.
+
+    A genuine rotation clears on the very next attempt. A step still failing
+    this way after the cap is not being rotated out -- it is broken, or the
+    classifier was wrong about it, and either deserves a human.
+    """
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        reason = "harness_exit_1: OAuth access token has been revoked"
+        write_plan_step(plan_dir, "step-001")
+        path = os.path.join(lane_dir, "step-001.status.json")
+        write(path, status_envelope("step-001", "failed", stop_reason_raw=reason))
+
+        seen = []
+        for _ in range(resume.MAX_TRANSIENT_RETRIES + 2):
+            with redirect_stderr(io.StringIO()):
+                seen.append("step-001" in resume.missing_steps(lane_dir, ["step-001"], plan_dir=plan_dir))
+
+        check(all(seen[: resume.MAX_TRANSIENT_RETRIES]),
+              f"cap: the first {resume.MAX_TRANSIENT_RETRIES} resumes re-attempt the step",
+              str(seen))
+        check(not any(seen[resume.MAX_TRANSIENT_RETRIES:]),
+              "cap: every resume after the cap leaves it failed, back to surface-to-human",
+              str(seen))
+
+        with open(path) as f:
+            final = json.load(f)
+        check(final.get("transient_retries") == resume.MAX_TRANSIENT_RETRIES,
+              "cap: the count is persisted on the envelope, so it survives across resume invocations",
+              str(final.get("transient_retries")))
+        check(final.get("state") == "failed",
+              "cap: the envelope is still a failed one -- counting must not change its state",
+              str(final.get("state")))
+
+
+def test_a_transient_retry_is_logged_not_silent():
+    """[Issue #4177 AC5] A resume that quietly redoes work is
+    indistinguishable from one that does not, and the difference matters when
+    an operator is deciding whether a sweep is progressing."""
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        write_plan_step(plan_dir, "step-001")
+        write(
+            os.path.join(lane_dir, "step-001.status.json"),
+            status_envelope("step-001", "failed",
+                            stop_reason_raw="harness_exit_1: OAuth access token has been revoked"),
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            resume.missing_steps(lane_dir, ["step-001"], plan_dir=plan_dir)
+        logged = err.getvalue()
+        check(
+            "step_retried_after_transient_failure" in logged,
+            "transient retry: the re-attempt is logged as an event",
+            logged[:200],
+        )
+        check(
+            "revoked" in logged,
+            "transient retry: the log names the reason, so the operator can tell WHY it re-ran",
+            logged[:200],
+        )
+
+
 def test_plan_hash_mismatch_quarantines_and_returns_outstanding():
     # REQUIRED TEST: a complete envelope's plan_hash was computed from one
     # version of step-001.json; the plan file's hypotheses then changes on

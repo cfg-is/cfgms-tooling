@@ -182,33 +182,13 @@ ADJUDICATION_OK_STATUSES = frozenset(
     {ADJUDICATION_NOT_CONFIGURED, ADJUDICATION_SKIPPED_NO_FINDINGS, ADJUDICATION_COMPLETE}
 )
 
-# Matches a credential failure in a harness's own error text. Modelled on
-# `harness_runner._RATE_LIMIT_RE`, and deliberately narrow: a false positive
-# here tells an operator "just re-run it" about a real defect, which is worse
-# than no classification at all.
+# The credential classifier moved to `schema.py` for Issue #4177.
 #
-# `401` is required to carry an http/status/code/error prefix so a bare
-# `401` inside an unrelated number or path cannot trigger it. `403` is NOT
-# matched on its own -- forbidden is an authorization outcome that a resume
-# will not fix -- only alongside explicit authentication wording.
-_AUTH_REVOKED_RE = re.compile(
-    r"(?:http|https|status(?:\s+code)?|code|error)\s*[:/]?\s*401\b"
-    r"|unauthorized"
-    r"|authentication\s+(?:failed|error|required)"
-    r"|invalid[\s_-]api[\s_-]key"
-    r"|(?:oauth\s+)?(?:token|credential|session)s?\s+(?:has\s+|have\s+)?(?:been\s+)?(?:expired|revoked|invalid)"
-    r"|(?:expired|revoked|invalid)\s+(?:oauth\s+)?(?:token|credential|session)"
-    r"|(?:please\s+)?(?:re-?)?(?:log\s*in|login|authenticate)\s+again"
-    r"|not\s+logged\s+in"
-    r"|setup-token",
-    re.IGNORECASE,
-)
-
-
-def looks_auth_revoked(text: str) -> bool:
-    """True when a harness's error text names a credential problem a resume
-    can fix once the credential is restored."""
-    return bool(_AUTH_REVOKED_RE.search(text or ""))
+# `resume.py` needs it too, and `consolidate` imports `resume` -- so keeping
+# it here would have forced a cycle or a second copy. `schema` is imported by
+# both and owns no policy of its own, which makes it the right home. Re-bound
+# here so every existing call site in this module reads unchanged.
+looks_auth_revoked = schema.looks_auth_revoked
 
 
 def _load_json(path: str):

@@ -722,6 +722,85 @@ def validate_group_assessment(assessment: object) -> list[str]:
     return errors
 
 
+# Matches a credential failure in a harness's own error text. Modelled on
+# `harness_runner._RATE_LIMIT_RE`, and deliberately narrow: a false positive
+# tells an operator "just re-run it" about a real defect, which is worse than
+# no classification at all. Since Issue #4177 it also decides whether `resume`
+# re-attempts a failed step, so a loose pattern would retry a deterministic
+# failure forever -- narrowness is now a safety property, not only a courtesy.
+#
+# `401` must carry an http/status/code/error prefix, so a bare `401` inside an
+# unrelated number or path cannot trigger it. `403` is NOT matched alone --
+# forbidden is an authorization outcome a resume will not fix -- only
+# alongside explicit authentication wording.
+#
+# Lives here rather than in `consolidate.py` (where it started) because
+# `resume.py` needs it and `consolidate` imports `resume`. Both import this
+# module.
+_AUTH_REVOKED_RE = re.compile(
+    r"(?:http|https|status(?:\s+code)?|code|error)\s*[:/]?\s*401\b"
+    r"|unauthorized"
+    r"|authentication\s+(?:failed|error|required)"
+    r"|invalid[\s_-]api[\s_-]key"
+    r"|(?:oauth\s+)?(?:token|credential|session)s?\s+(?:has\s+|have\s+)?(?:been\s+)?(?:expired|revoked|invalid)"
+    r"|(?:expired|revoked|invalid)\s+(?:oauth\s+)?(?:token|credential|session)"
+    r"|(?:please\s+)?(?:re-?)?(?:log\s*in|login|authenticate)\s+again"
+    r"|not\s+logged\s+in"
+    r"|setup-token",
+    re.IGNORECASE,
+)
+
+
+def looks_auth_revoked(text: str) -> bool:
+    """True when an error text names a credential problem that a retry can
+    fix once the credential is restored."""
+    return bool(_AUTH_REVOKED_RE.search(text or ""))
+
+
+# Stop-reason prefixes that are deterministic BY CONSTRUCTION. The prefix is
+# written by the harness itself, never by the model, so it is trustworthy in a
+# way the rest of the string is not.
+#
+# `invalid_findings_schema` means the model's answer failed validation --
+# true regardless of what that answer happened to say. `unhandled_step_error`
+# is a defect in the step body. Re-running either changes nothing.
+DETERMINISTIC_STOP_REASON_PREFIXES = (
+    "invalid_findings_schema",
+    "invalid_adjudication_schema",
+    "unhandled_step_error",
+    "unknown_harness",
+    "input_unreadable",
+)
+
+
+def is_transient_stop_reason(stop_reason: object) -> bool:
+    """True when a `failed` step's stop reason names a cause a retry can fix.
+
+    The single place that decides whether `resume` re-attempts a failed step.
+
+    **The model's own text is in this string and must not be trusted.**
+    `stop_reason_raw` is `"<reason>: <harness output tail>"`, and the tail is
+    combined stdout+stderr -- which for a finder lane contains the model's
+    answer. This harness reviews code for security defects, so that answer
+    routinely contains "unauthorized", "invalid token", "session expired" and
+    "authentication failed" as FINDINGS rather than as errors. A step whose
+    findings discuss auth and which then failed deterministically would
+    otherwise be re-run at full cost on every resume, forever.
+
+    So the harness-written PREFIX is checked first and can veto on its own.
+    Only then is the rest of the string consulted, and `resume` additionally
+    caps how many times any one step may be re-attempted -- the prefix rule
+    cannot catch a mis-detected `harness_exit_1`, and the cap cannot make a
+    deterministic failure cheap. Neither alone is sufficient.
+    """
+    if not isinstance(stop_reason, str) or not stop_reason:
+        return False
+    head = stop_reason.strip().lower()
+    if head.startswith(DETERMINISTIC_STOP_REASON_PREFIXES):
+        return False
+    return looks_auth_revoked(stop_reason)
+
+
 def _validate_adjudication_list(adjudications: object, required: bool) -> list[str]:
     """Validate an `adjudications` list: every entry valid, no duplicate key.
 

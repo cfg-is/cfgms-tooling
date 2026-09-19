@@ -195,7 +195,7 @@ schema. Nothing else counts. Four states, and they are not interchangeable:
 | `complete` | schema-valid findings written | skip |
 | `parked` | rate limited or quota exhausted | retry |
 | `refused` | the model declined on policy grounds | retry once, then surface |
-| `failed` | auth error, invalid output, no parseable result | surface, do not retry |
+| `failed` | auth error, invalid output, no parseable result | surface; retried only for a transient cause (#4177) |
 
 **A lane that produces no parseable findings file has NOT reviewed that step.** It is recorded as
 `refused` or `failed` — never as `complete` with zero findings. This is the single most dangerous

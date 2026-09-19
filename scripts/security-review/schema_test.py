@@ -937,6 +937,107 @@ def test_adjudication_envelope_valid_complete_and_non_complete():
     check(any("stop_reason_raw" in e for e in schema.validate_adjudication_envelope(env)), "adjudication: a non-complete envelope needs stop_reason_raw")
 
 
+def test_looks_auth_revoked_matches_harness_credential_errors():
+    """The relocated classifier, tested where it now lives.
+
+    Moved here from `consolidate.py` for Issue #4177 because `resume` needs it
+    and `consolidate` imports `resume`.
+    """
+    for text in (
+        "API Error: 401 OAuth access token has been revoked",
+        "HTTP 401: Unauthorized",
+        "authentication failed",
+        "invalid api key",
+        "your session has expired",
+        "please log in again",
+        "not logged in",
+        "run `claude setup-token` to re-authenticate",
+    ):
+        check(schema.looks_auth_revoked(text), f"auth classifier: matches {text[:46]!r}")
+
+    for text in (
+        "",
+        "harness_exit_1",
+        "invalid_findings_schema: severity must be one of [...]",
+        "rate_limited",
+        "429 Too Many Requests",
+        "connection reset by peer",
+        # 403 alone is an AUTHORIZATION outcome a retry will not fix. Only
+        # matched alongside explicit authentication wording.
+        "HTTP 403: Forbidden",
+    ):
+        check(not schema.looks_auth_revoked(text), f"auth classifier: does NOT match {text[:46]!r}")
+
+
+def test_is_transient_stop_reason_vetoes_on_the_harness_written_prefix():
+    """[REQUIRED by the #4182 review] The single decision point for whether a
+    failed step is re-run.
+
+    `stop_reason_raw` is `"<reason>: <harness output tail>"`, and that tail is
+    combined stdout+stderr -- which for a finder lane contains the model's own
+    answer. **This harness reviews code for security defects**, so the answer
+    routinely contains "unauthorized" and "invalid token" as FINDINGS.
+
+    The prefix is written by the harness and the model cannot influence it, so
+    it is the only trustworthy part of the string. A deterministic prefix
+    vetoes before the rest is read.
+    """
+    model_tail = (
+        "the handler allows unauthorized access when the session token is invalid, "
+        "and authentication failed paths fall through to the admin branch"
+    )
+
+    # Every deterministic prefix must veto, even carrying auth-shaped findings.
+    for prefix in schema.DETERMINISTIC_STOP_REASON_PREFIXES:
+        reason = f"{prefix}: {model_tail}"
+        check(
+            not schema.is_transient_stop_reason(reason),
+            f"prefix veto: {prefix!r} is deterministic whatever the model said",
+            reason[:80],
+        )
+
+    # A bare CLI credential error, with no deterministic prefix, IS transient.
+    for reason in (
+        "harness_exit_1: API Error: 401 OAuth access token has been revoked",
+        "launch_exception: authentication failed",
+    ):
+        check(
+            schema.is_transient_stop_reason(reason),
+            f"transient: {reason[:52]!r} is a real credential failure",
+        )
+
+    # Neither transient nor deterministic-prefixed: no credential wording, so
+    # it stays failed.
+    for reason in ("harness_exit_1: segmentation fault", "harness_exit_2"):
+        check(
+            not schema.is_transient_stop_reason(reason),
+            f"not transient: {reason[:52]!r} names no credential problem",
+        )
+
+    # Shape guards: a decision point that accepts anything decides nothing.
+    for value in (None, 0, [], {}, "", "   "):
+        check(
+            not schema.is_transient_stop_reason(value),
+            f"not transient: {value!r} is not a usable stop reason",
+        )
+
+
+def test_the_prefix_veto_is_case_and_whitespace_insensitive():
+    """A reason that arrives capitalised or indented must not slip past the
+    veto and become retryable."""
+    tail = "unauthorized access with an invalid token"
+    for variant in (
+        f"invalid_findings_schema: {tail}",
+        f"  invalid_findings_schema: {tail}",
+        f"INVALID_FINDINGS_SCHEMA: {tail}",
+        f"Invalid_Findings_Schema: {tail}",
+    ):
+        check(
+            not schema.is_transient_stop_reason(variant),
+            f"prefix veto: survives {variant[:38]!r}",
+        )
+
+
 def test_a_non_complete_envelope_validates_the_verdicts_it_carries():
     """Issue #4144: a non-complete envelope may carry the batches that
     finished, and those verdicts must be validated by the same rules.
