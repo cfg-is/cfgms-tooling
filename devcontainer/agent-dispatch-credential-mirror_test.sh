@@ -133,6 +133,21 @@ source "$DISPATCH"
 # off explicitly, after sourcing, where the import happens.
 set +e
 
+# Watchers that were ALREADY running before this suite started.
+#
+# A production watcher legitimately runs forever on a host that dispatches --
+# that is the whole point of #4154, and one was observed running from the main
+# checkout while this suite ran. Counting every watcher on the host therefore
+# reports somebody else's healthy process as this suite's leak, and would fail
+# on any machine where the pipeline is actually in use.
+#
+# Baseline the pids now and compare at the end, so the assertion measures what
+# THIS suite left behind and nothing else.
+_watcher_pids() {
+    ps -eo pid=,args= 2>/dev/null | awk '/[a]gent-dispatch\.sh creds-mirror-watch/ {print $1}' | sort
+}
+PREEXISTING_WATCHERS="$(_watcher_pids)"
+
 echo "=== agent-dispatch.sh: credential mirror (T6) ==="
 
 # ---------------------------------------------------------------------------
@@ -525,6 +540,91 @@ assert_contains "$uid_out" "LAUNCH_PROCEEDED" \
     "uid assert: it warns and proceeds -- refusing on a guess about the container would be a third outage class"
 teardown_fixture
 
+# [REQUIRED TEST -- Issue #4166 AC2] N concurrent launches leave ONE watcher.
+#
+# `ensure_creds_mirror_for_mount` checked "is a watcher alive?" and started one
+# if not. Two steps, nothing serialising them, so racing dispatches both saw
+# "dead" and both started a detached watcher. The pidfile recorded whichever
+# wrote last; the other was untracked, unreachable by
+# `stop_creds_mirror_watcher`, and -- since its only self-exit is "the mirror
+# directory is gone", which never happens in production -- ran until reboot.
+#
+# Eight leaked watchers were observed on one host in a single day of testing,
+# which is what makes "harmless duplicates" worth a lock: harmless and
+# unbounded is still unbounded.
+setup_fixture
+race_before="$(_watcher_pids)"
+CONCURRENT=8
+for _ in $(seq "$CONCURRENT"); do
+    bash -c "
+        export CFGMS_HOST_CREDS_FILE='$CFGMS_HOST_CREDS_FILE'
+        export CFGMS_CREDS_MIRROR_DIR='$CREDS_MIRROR_DIR'
+        export CFGMS_CREDS_MIRROR_POLL_SECONDS=1
+        source '$DISPATCH'
+        ensure_creds_mirror_for_mount
+    " >/dev/null 2>&1 &
+done
+wait
+
+race_started=$(comm -13 <(printf '%s\n' "$race_before") <(_watcher_pids) | grep -c . || true)
+assert_eq "$race_started" "1" \
+    "concurrency: ${CONCURRENT} simultaneous launches start exactly ONE watcher, not ${CONCURRENT}"
+
+# And the one that survived is the one the pidfile names -- a lock that
+# prevented duplicates but left the pidfile pointing at a dead process would
+# pass the count above while breaking `stop_creds_mirror_watcher`.
+if creds_mirror_watcher_alive; then
+    _pass "concurrency: the pidfile names the watcher that is actually running"
+else
+    _fail "concurrency: exactly one watcher runs, but the pidfile does not name it"
+fi
+teardown_fixture
+
+# A lock that cannot be taken must NOT refuse the launch (#4166 AC3).
+#
+# Three refuse-forever paths were created and removed in #4154. A lock is a new
+# way to invent a fourth, so failing to take one degrades to the pre-#4166
+# behaviour -- a possible duplicate, harmless to correctness -- rather than to
+# a dispatch that does not happen.
+setup_fixture
+mkdir -p "$CREDS_MIRROR_DIR"
+# Hold the lock with a fresh mtime, so the stale-reclaim path cannot rescue it
+# and the launch really does face an untakeable lock.
+mkdir -p "${CREDS_MIRROR_DIR}/.watcher.lock.d"
+blocked_before="$(_watcher_pids)"
+blocked_out=$(bash -c "
+    export CFGMS_HOST_CREDS_FILE='$CFGMS_HOST_CREDS_FILE'
+    export CFGMS_CREDS_MIRROR_DIR='$CREDS_MIRROR_DIR'
+    export CFGMS_CREDS_MIRROR_POLL_SECONDS=1
+    source '$DISPATCH'
+    ensure_creds_mirror_for_mount
+    echo LAUNCH_PROCEEDED
+" 2>&1)
+assert_contains "$blocked_out" "LAUNCH_PROCEEDED" \
+    "lock failure: a held lock degrades to a possible duplicate, never to a refused launch"
+blocked_started=$(comm -13 <(printf '%s\n' "$blocked_before") <(_watcher_pids) | grep -c . || true)
+assert_eq "$blocked_started" "1" \
+    "lock failure: the watcher still starts, which is the behaviour being degraded to"
+rmdir "${CREDS_MIRROR_DIR}/.watcher.lock.d" 2>/dev/null || true
+teardown_fixture
+
+# A STALE lock is reclaimed, not obeyed forever.
+setup_fixture
+mkdir -p "$CREDS_MIRROR_DIR" "${CREDS_MIRROR_DIR}/.watcher.lock.d"
+touch -d "@$(( $(date +%s) - 600 ))" "${CREDS_MIRROR_DIR}/.watcher.lock.d"
+stale_before="$(_watcher_pids)"
+bash -c "
+    export CFGMS_HOST_CREDS_FILE='$CFGMS_HOST_CREDS_FILE'
+    export CFGMS_CREDS_MIRROR_DIR='$CREDS_MIRROR_DIR'
+    export CFGMS_CREDS_MIRROR_POLL_SECONDS=1
+    source '$DISPATCH'
+    start_creds_mirror_watcher
+" >/dev/null 2>&1
+stale_started=$(comm -13 <(printf '%s\n' "$stale_before") <(_watcher_pids) | grep -c . || true)
+assert_eq "$stale_started" "1" \
+    "stale lock: a lock left by a start that died inside it is reclaimed, not obeyed until someone deletes it"
+teardown_fixture
+
 # An ORPHANED watcher must exit on its own.
 #
 # A watcher outlives its dispatch by design, so nothing reaps it if the
@@ -571,14 +671,17 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     # the very process doing the measuring and reported a leak that was not
     # one. The bracketed class cannot match the grep itself, and the full
     # invocation cannot match a shell that merely mentions the subcommand.
-    leaked=$(ps -eo args 2>/dev/null | grep -c "[a]gent-dispatch.sh creds-mirror-watch" || true)
+    #
+    # Only watchers this suite STARTED count: a production watcher running
+    # from the main checkout is healthy, not a leak.
+    leaked=$(comm -13 <(printf '%s\n' "$PREEXISTING_WATCHERS") <(_watcher_pids) | grep -c . || true)
     [[ "$leaked" -eq 0 ]] && break
     sleep 0.5
 done
 assert_eq "$leaked" "0" "cleanup: the suite leaks no watcher processes"
 if [[ "$leaked" -ne 0 ]]; then
     echo "      still running:" >&2
-    ps -eo pid,args | grep "[a]gent-dispatch.sh creds-mirror-watch" >&2 || true
+    comm -13 <(printf '%s\n' "$PREEXISTING_WATCHERS") <(_watcher_pids) >&2 || true
 fi
 
 teardown_fixture

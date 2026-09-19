@@ -1402,6 +1402,10 @@ ensure_creds_mirror_for_mount() {
 }
 
 CREDS_MIRROR_WATCHER_PIDFILE="${CREDS_MIRROR_DIR}/.watcher.pid"
+# Serialises check-start-record against a racing dispatch (Issue #4166). Beside
+# the pidfile it protects, so a per-mirror-directory lock falls out naturally:
+# two different mirror dirs are two different watchers and must not contend.
+CREDS_MIRROR_LOCKDIR="${CREDS_MIRROR_DIR}/.watcher.lock.d"
 
 # Is a watcher actually running RIGHT NOW?
 #
@@ -1453,9 +1457,66 @@ creds_mirror_watcher_alive() {
 # Concurrent orchestrators are fine. The pidfile check means a second one
 # finds the first alive and returns; and even if two did run, both copy the
 # same host file to the same path, so a duplicate write is a redundant write.
+# Take the watcher lock, or report failure. NEVER blocks a launch (see AC3 in
+# the caller). Stale-lock reclaim included: the critical section below is
+# milliseconds, so a lock older than a minute belongs to a start that died
+# inside it, and reclaiming it is better than locking the host out of
+# dispatching until someone removes a directory by hand.
+_take_creds_mirror_lock() {
+  local waited=0
+  until mkdir "$CREDS_MIRROR_LOCKDIR" 2>/dev/null; do
+    waited=$((waited + 1))
+    if (( waited > 25 )); then
+      if [[ -n "$(find "$CREDS_MIRROR_LOCKDIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+        rmdir "$CREDS_MIRROR_LOCKDIR" 2>/dev/null || true
+        waited=0
+        continue
+      fi
+      return 1
+    fi
+    sleep 0.2
+  done
+  return 0
+}
+
+_release_creds_mirror_lock() {
+  rmdir "$CREDS_MIRROR_LOCKDIR" 2>/dev/null || true
+}
+
 start_creds_mirror_watcher() {
   creds_mirror_watcher_alive && return 0
   refresh_creds_mirror || return 1
+
+  # Issue #4166: check-start-record is ONE step, or two racing dispatches both
+  # see "dead" and both start a detached watcher. The pidfile then records
+  # whichever wrote last, so the other is untracked --
+  # `stop_creds_mirror_watcher` cannot reach it, and its only self-exit ("the
+  # mirror directory is gone") never fires in production, where that directory
+  # is permanent. Eight such watchers accumulated on one host in a day.
+  #
+  # `mkdir` lock, the pattern pipeline-watch.sh took for the same shape in
+  # #4137: atomic on every filesystem bash runs on, and `flock` is absent from
+  # Git Bash.
+  local locked=0
+  if _take_creds_mirror_lock; then
+    locked=1
+    # The AUTHORITATIVE check, inside the lock. The caller's check above is a
+    # cheap early-out and nothing more: without this one, a loser of the race
+    # takes the lock the winner just released and starts a second watcher
+    # anyway. The lock would then serialise the writes without preventing the
+    # duplicate -- which is the entire failure it exists to stop.
+    if creds_mirror_watcher_alive; then
+      _release_creds_mirror_lock
+      return 0
+    fi
+  fi
+  # NOT locked and proceeding anyway is deliberate (#4166 AC3). A lock that
+  # cannot be taken degrades to the pre-#4166 behaviour -- a possible duplicate
+  # watcher, harmless to correctness since both write identical bytes to the
+  # same inode. A launch that does not happen is not harmless. This block has a
+  # no-refusal rule for a reason: #4154 created and removed three
+  # refuse-forever paths here.
+
   # Beat once up front, so a launch immediately after starting the watcher is
   # not refused for a staleness that has had no time to occur.
   creds_mirror_heartbeat
@@ -1463,6 +1524,7 @@ start_creds_mirror_watcher() {
   local pid=$!
   disown 2>/dev/null || true
   ( umask 077; printf '%s\n' "$pid" > "$CREDS_MIRROR_WATCHER_PIDFILE" ) 2>/dev/null || true
+  (( locked )) && _release_creds_mirror_lock
   return 0
 }
 
