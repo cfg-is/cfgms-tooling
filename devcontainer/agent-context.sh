@@ -296,6 +296,100 @@ ac_detect_no_op() {
     return 0
 }
 
+# ----------------------------------------------------------------------------
+# Headless background-wait stall (Issue #4178)
+# ----------------------------------------------------------------------------
+#
+# In `claude -p` (print) mode, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS covers
+# background SUBAGENTS and WORKFLOWS only. A background BASH task gets a few
+# seconds' grace after the agent ends its turn, and is then killed, and the
+# agent is never re-invoked. An agent that starts `make test` in the background
+# and ends its turn "to wait for the notification" therefore loses everything it
+# had not committed. Observed 5 times on 2026-09-18/19 across dev and fix
+# containers.
+
+# The rule appended to every headless agent prompt.
+AC_HEADLESS_NO_BG_WAIT_RULE='## Headless execution rule (mandatory)
+
+You are running headless (`claude -p`). Your session ENDS the moment you end
+your turn, and you are never woken up again. Any background Bash command
+(`run_in_background`, a background Monitor, `&`) is killed a few seconds after
+your turn ends, and its output is lost.
+
+- Run every command you need the result of (make test, test suites, builds,
+  `gh run watch`) in the FOREGROUND.
+- If a command may exceed the ~10 minute tool limit, split it into smaller
+  foreground commands, or run only the suites your change touches.
+- Commit (and push, if your mode pushes) BEFORE any long command, so progress
+  survives.
+- NEVER end your turn with "waiting for the background task / notification /
+  validation to finish". Nothing will resume you.'
+
+# ac_last_assistant_text <session.jsonl>
+# Prints the text of the last assistant message in a Claude session transcript
+# (empty when the file is missing or has none).
+ac_last_assistant_text() {
+    local jsonl="$1"
+    [[ -f "$jsonl" ]] || return 0
+    python3 - "$jsonl" <<'PY' 2>/dev/null || true
+import json, sys
+last = ""
+with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        msg = rec.get("message") or {}
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        texts = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts = [c.get("text", "") for c in content
+                     if isinstance(c, dict) and c.get("type") == "text"]
+        joined = "\n".join(t for t in texts if t)
+        if joined:
+            last = joined
+print(last)
+PY
+}
+
+# ac_detect_ended_turn_waiting <session.jsonl>
+# Returns 0 when the agent's LAST message says it is waiting on background work.
+# Callers combine this with "no PR and HEAD not advanced". On its own, it only
+# says what the agent intended, not that work was lost.
+ac_detect_ended_turn_waiting() {
+    local text
+    text="$(ac_last_assistant_text "$1")"
+    [[ -n "$text" ]] || return 1
+    grep -qiE "(wait|waiting|pause)[^.]{0,80}(notification|background|monitor|validation|to (complete|finish))" <<<"$text"
+}
+
+# ac_classify_outcome <mode> <pr_url> <head_advanced> <session.jsonl>
+# Prints "ended_turn_waiting" or "normal" for agent-result.json.
+#
+# "Nothing landed" differs by mode. fix-pr and resolve-conflict run on a branch
+# that ALREADY has a PR, so PR_URL is always set there and says nothing about
+# this run -- only HEAD advancing does. For the other modes, a new PR also
+# counts as landing work. Gating fix-pr on an empty PR_URL made the check
+# unreachable for the mode behind 3 of the 4 observed stalls.
+ac_classify_outcome() {
+    local mode="$1" pr_url="$2" head_advanced="$3" jsonl="$4" landed="false"
+    if [[ "$head_advanced" == "true" ]]; then
+        landed="true"
+    elif [[ "$mode" != "fix-pr" && "$mode" != "resolve-conflict" && -n "$pr_url" ]]; then
+        landed="true"
+    fi
+    if [[ "$landed" == "false" ]] && ac_detect_ended_turn_waiting "$jsonl"; then
+        echo "ended_turn_waiting"
+    else
+        echo "normal"
+    fi
+}
+
 # ac_no_op_comment_body <container_name>
 # Returns the canonical no-op comment body (used both for posting and for idempotency lookup).
 ac_no_op_comment_body() {

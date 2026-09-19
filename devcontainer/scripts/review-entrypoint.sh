@@ -95,6 +95,8 @@ echo "Starting Acceptance Reviewer (pr=${PR_NUM} story=${STORY_NUM} item=${ITEM_
 
 EXIT_CODE=0
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
+# Background Bash is killed when a headless turn ends (Issue #4178).
+PROMPT_CONTENT+=$'\n\n'"${AC_HEADLESS_NO_BG_WAIT_RULE}"
 claude --dangerously-skip-permissions --model "$AGENT_MODEL" -p "$PROMPT_CONTENT" || EXIT_CODE=$?
 
 # --- Phase 2: Failsafe project status reset ---

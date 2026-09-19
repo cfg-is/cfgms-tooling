@@ -725,6 +725,139 @@ test_20_exit_zero_branch_checks_pr_url() {
 }
 
 # ============================================================================
+# TEST 21 — ended-turn-waiting detection (Issue #4178)
+# Fixture transcripts shaped like real Claude session JSONL. The stalled ones
+# use wording observed verbatim in 2026-09-18/19 containers.
+# ============================================================================
+_t21_transcript() {
+    # $1 = path, $2 = last assistant text
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+path, last = sys.argv[1], sys.argv[2]
+recs = [
+    {"type": "user", "message": {"role": "user", "content": "implement the story"}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "Starting validation now."},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "make test"}}]}},
+    {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "content": "Command running in background"}]}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": last}]}},
+]
+with open(path, "w") as fh:
+    for r in recs:
+        fh.write(json.dumps(r) + "\n")
+PY
+}
+
+test_21_ended_turn_waiting_detection() {
+    local dir; dir=$(mktemp -d)
+    local stalled=(
+        "I'll wait for the background task notification before continuing with validation and the PR update."
+        "I'll pause here and wait for the background task notification when the dispatched workflow run finishes."
+        "Waiting for the background test run (\`byeez3ry9\`) to finish before continuing."
+        "The hooks all look clean. Now I'll wait for the validation to complete."
+    )
+    local i=0 t
+    for t in "${stalled[@]}"; do
+        i=$((i + 1))
+        _t21_transcript "$dir/s$i.jsonl" "$t"
+        if ac_detect_ended_turn_waiting "$dir/s$i.jsonl"; then
+            echo "    ✓ stalled transcript $i detected"
+        else
+            _fail "stalled transcript $i not detected: $t"
+        fi
+    done
+
+    local normal=(
+        "PR #4175 is up and CI is running. Work is committed and pushed."
+        "Validation failed: TestFoo is red. I could not fix it within scope; see the PR comment."
+        "Done. The fix is committed and the PR description is updated."
+    )
+    i=0
+    for t in "${normal[@]}"; do
+        i=$((i + 1))
+        _t21_transcript "$dir/n$i.jsonl" "$t"
+        if ac_detect_ended_turn_waiting "$dir/n$i.jsonl"; then
+            _fail "normal transcript $i misclassified as waiting: $t"
+        else
+            echo "    ✓ normal transcript $i not flagged"
+        fi
+    done
+
+    # Only the LAST assistant message counts: an earlier "waiting" line that
+    # the agent then moved past is not a stall.
+    python3 - "$dir/moved-on.jsonl" <<'PY'
+import json, sys
+recs = [
+    {"message": {"role": "assistant", "content": [{"type": "text", "text": "Waiting for the background build to finish."}]}},
+    {"message": {"role": "assistant", "content": [{"type": "text", "text": "Build passed; PR opened."}]}},
+]
+with open(sys.argv[1], "w") as fh:
+    for r in recs:
+        fh.write(json.dumps(r) + "\n")
+PY
+    if ac_detect_ended_turn_waiting "$dir/moved-on.jsonl"; then
+        _fail "an earlier waiting line the agent moved past was flagged"
+    else
+        echo "    ✓ only the last assistant message is considered"
+    fi
+
+    if ac_detect_ended_turn_waiting "$dir/does-not-exist.jsonl"; then
+        _fail "missing transcript must not be flagged"
+    else
+        echo "    ✓ missing transcript is not flagged"
+    fi
+    rm -rf "$dir"
+}
+
+# ============================================================================
+# TEST 22 — the no-bg-wait rule reaches every headless prompt (Issue #4178)
+# ============================================================================
+test_22_no_bg_wait_rule_in_prompts() {
+    assert_contains "$AC_HEADLESS_NO_BG_WAIT_RULE" "FOREGROUND" "rule tells the agent to run in the foreground"
+    assert_contains "$AC_HEADLESS_NO_BG_WAIT_RULE" "NEVER end your turn" "rule forbids ending the turn to wait"
+
+    local entry review
+    entry=$(cat "$SCRIPT_DIR/entrypoint.sh")
+    review=$(cat "$SCRIPT_DIR/scripts/review-entrypoint.sh")
+    assert_contains "$entry" 'PROMPT_CONTENT+=$'"'"'\n\n'"'"'"${AC_HEADLESS_NO_BG_WAIT_RULE}"' \
+        "dev/fix entrypoint appends the rule at the single launch point"
+    assert_contains "$review" 'PROMPT_CONTENT+=$'"'"'\n\n'"'"'"${AC_HEADLESS_NO_BG_WAIT_RULE}"' \
+        "review entrypoint appends the rule"
+    assert_contains "$entry" '"outcome": "${AGENT_OUTCOME}"' \
+        "agent-result.json records the outcome"
+    assert_contains "$entry" 'AGENT_OUTCOME=$(ac_classify_outcome "$MODE" "$PR_URL" "$HEAD_ADVANCED"' \
+        "entrypoint classifies the outcome through ac_classify_outcome"
+}
+
+# ============================================================================
+# TEST 23 — outcome classification per mode (Issue #4178 review finding)
+# fix-pr / resolve-conflict always have a PR_URL (the PR pre-exists), so only
+# HEAD advancing counts as landed work there. 3 of the 4 observed stalls were
+# fix-pr containers; gating on an empty PR_URL made them unclassifiable.
+# ============================================================================
+test_23_outcome_classification_by_mode() {
+    local dir; dir=$(mktemp -d)
+    _t21_transcript "$dir/stall.jsonl" "I'll wait for the background task notification before continuing."
+    _t21_transcript "$dir/done.jsonl" "Done. Fix committed and pushed."
+    local pr="https://github.com/cfg-is/cfgms/pull/1"
+
+    _t23() { # desc want mode pr_url head_advanced jsonl
+        local got; got=$(ac_classify_outcome "$3" "$4" "$5" "$6")
+        if [[ "$got" == "$2" ]]; then echo "    ✓ $1"; else _fail "$1: want $2 got $got"; fi
+    }
+    _t23 "fix-pr, existing PR, no commit, waiting → ended_turn_waiting" ended_turn_waiting fix-pr "$pr" false "$dir/stall.jsonl"
+    _t23 "resolve-conflict, existing PR, no commit, waiting → ended_turn_waiting" ended_turn_waiting resolve-conflict "$pr" false "$dir/stall.jsonl"
+    _t23 "fix-pr, commit landed, waiting text → normal" normal fix-pr "$pr" true "$dir/stall.jsonl"
+    _t23 "fix-pr, no commit, normal ending → normal" normal fix-pr "$pr" false "$dir/done.jsonl"
+    _t23 "issue mode, no PR, no commit, waiting → ended_turn_waiting" ended_turn_waiting issue "" false "$dir/stall.jsonl"
+    _t23 "issue mode, PR opened, waiting text → normal" normal issue "$pr" false "$dir/stall.jsonl"
+    _t23 "issue mode, missing transcript → normal" normal issue "" false "$dir/none.jsonl"
+    rm -rf "$dir"
+}
+
+# ============================================================================
 # runner
 # ============================================================================
 
@@ -748,6 +881,9 @@ run_test "T17 — dry-run: review gate invokes story-review workflow" test_17_re
 run_test "T18 — salvage: exit-0 with work becomes a draft PR" test_18_salvage_captures_uncommitted_work
 run_test "T19 — salvage: exit-0 with no work routes for re-dispatch" test_19_salvage_routes_zero_work_for_redispatch
 run_test "T20 — regression guard: exit-0 branch checks PR_URL" test_20_exit_zero_branch_checks_pr_url
+run_test "T21 — ended-turn-waiting detection (Issue #4178)" test_21_ended_turn_waiting_detection
+run_test "T22 — headless no-bg-wait rule reaches every prompt (Issue #4178)" test_22_no_bg_wait_rule_in_prompts
+run_test "T23 — outcome classification per mode (Issue #4178)" test_23_outcome_classification_by_mode
 
 echo ""
 echo "============================================================"
