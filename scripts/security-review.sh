@@ -1001,6 +1001,15 @@ cmd_launch() {
     exit 1
   fi
   sweep_dir="$(printf '%s' "$result" | cut -f1)"
+  # manifest.py builds this path with os.path.join, which uses the native
+  # separator (backslash on Windows). Everything downstream that also
+  # resolves a path to the same directory (agent-dispatch.sh's own
+  # launch-investigator normalizes --sweep-dir via realpath) ends up
+  # forward-slash, so leaving this one as-is made it the only backslash
+  # value in the whole chain -- every caller comparing this script's own
+  # printed sweep_dir against a realpath'd path elsewhere would mismatch on
+  # Windows (Issue #4158).
+  sweep_dir="$(realpath "$sweep_dir")"
   commit_sha="$(printf '%s' "$result" | cut -f2)"
 
   # Verify before dispatching anything (Issue #3952, epic #3950's D1): a
@@ -1060,6 +1069,16 @@ cmd_resume() {
     echo "ERROR: no sweep found at ${sweep_dir} (manifest.json missing)" >&2
     exit 1
   fi
+  # resolve_base_dir (basedir.py) builds its path with os.path.join, so
+  # base_dir carries the native separator (backslash on Windows) while
+  # sweep_id and everything bash-concatenates onto it here use forward
+  # slashes -- a mixed path. A plain [[ -f ]] test above tolerates that fine
+  # (passed straight to stat()), but a glob pattern built from this value
+  # does not: bash's glob syntax treats a backslash as an escape character
+  # (Issue #4158, found via cmd_resume's plan_already_populated() silently
+  # failing to match real files). Matches cmd_launch's own realpath
+  # normalization of sweep_dir.
+  sweep_dir="$(realpath "$sweep_dir")"
 
   local commit_sha
   commit_sha="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['commit_sha'])" "${sweep_dir}/manifest.json")"
@@ -1123,6 +1142,16 @@ cmd_status() {
     echo "ERROR: no sweep found at ${sweep_dir} (manifest.json missing)" >&2
     exit 1
   fi
+  # resolve_base_dir (basedir.py) builds its path with os.path.join, so
+  # base_dir carries the native separator (backslash on Windows) while
+  # sweep_id and everything bash-concatenates onto it here use forward
+  # slashes -- a mixed path. A plain [[ -f ]] test above tolerates that fine
+  # (passed straight to stat()), but a glob pattern built from this value
+  # does not: bash's glob syntax treats a backslash as an escape character
+  # (Issue #4158, found via cmd_resume's plan_already_populated() silently
+  # failing to match real files). Matches cmd_launch's own realpath
+  # normalization of sweep_dir.
+  sweep_dir="$(realpath "$sweep_dir")"
 
   # Reuses consolidate.py's own load_sweep()/build_coverage_table() rather
   # than re-deriving the coverage computation -- this command never writes

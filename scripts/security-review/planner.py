@@ -126,6 +126,7 @@ import partition  # noqa: E402
 import scenarios  # noqa: E402
 import roster  # noqa: E402
 import schema  # noqa: E402
+import shell_command  # noqa: E402
 
 PROMPT_FILENAME = ".investigator-plan-prompt.md"
 CONTEXT_FILENAME = ".plan-context.json"
@@ -868,8 +869,8 @@ def launch(
     if not planners:
         try:
             result = subprocess.run(
-                [
-                    script,
+                shell_command.sh_argv(script)
+                + [
                     "launch-investigator",
                     "--sweep-dir",
                     sweep_dir,
@@ -882,7 +883,7 @@ def launch(
                 text=True,
                 timeout=30,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, shell_command.ShellCommandError) as exc:
             raise PlannerError(f"launch-investigator failed to run: {exc}") from exc
 
         if result.returncode != 0:
@@ -915,8 +916,8 @@ def launch(
 
         try:
             result = subprocess.run(
-                [
-                    script,
+                shell_command.sh_argv(script)
+                + [
                     "launch-investigator",
                     "--sweep-dir",
                     lane_sweep_dir,
@@ -933,7 +934,7 @@ def launch(
                 text=True,
                 timeout=30,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, shell_command.ShellCommandError) as exc:
             failures.append(f"{lane.lane_dir_name}: launch-investigator failed to run: {exc}")
             continue
 
@@ -1128,7 +1129,13 @@ def _scope_boundary(path: str, root_files: "frozenset[str] | None" = None) -> st
     worst outcome is that a step grouping several genuine root files is
     rejected as spanning, never that an unbounded one is accepted.
     """
-    if not path or os.path.isabs(path):
+    # Scope strings are always POSIX-style repo-relative paths (as written by
+    # the planning model and read from git blob listings), so a leading "/"
+    # must be rejected as absolute regardless of what platform this runs on.
+    # os.path.isabs() alone is not enough on Windows: ntpath.isabs("/etc/passwd")
+    # is False there (no drive letter), so a POSIX-absolute path silently
+    # passed this check on a Windows host (Issue #4158).
+    if not path or path.startswith("/") or os.path.isabs(path):
         return None
     normalized = os.path.normpath(path)
     if normalized == os.curdir or normalized == os.pardir or normalized.startswith(os.pardir + os.sep):

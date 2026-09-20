@@ -189,7 +189,14 @@ def test_verify_snapshot_detects_deleted_file():
         snapshot.create_snapshot(sha, repo, dest)
 
         os.chmod(dest, os.stat(dest).st_mode | stat.S_IWUSR)
-        os.remove(os.path.join(dest, "b.txt"))
+        # Deleting a file depends on the CONTAINING DIRECTORY's write
+        # permission on POSIX (the chmod above), but on Windows os.remove
+        # checks the FILE's own read-only attribute -- which create_snapshot
+        # deliberately sets on every extracted file -- so the file itself
+        # also needs to be made writable first there.
+        target = os.path.join(dest, "b.txt")
+        os.chmod(target, os.stat(target).st_mode | stat.S_IWUSR)
+        os.remove(target)
 
         mismatches = snapshot.verify_snapshot(dest, sha, repo)
         check(len(mismatches) > 0, "verify_snapshot: non-empty when a snapshot file is deleted", str(mismatches))

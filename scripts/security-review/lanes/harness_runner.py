@@ -86,6 +86,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -136,6 +137,24 @@ SYSTEM_PROMPT = (
     "file named in your instructions, in exactly the shape described below, and "
     "nothing else -- no prose before or after it."
 )
+
+def resolve_harness_binary(name: str) -> str:
+    """Resolve `name` (e.g. "claude", "codex", "opencode") to an absolute
+    path via `shutil.which`, falling back to the bare name unchanged if it
+    cannot be found -- the subsequent `subprocess.run` then fails exactly as
+    it always has for a genuinely missing binary.
+
+    Passing an unresolved bare name straight to `subprocess.run` is unreliable
+    on Windows: `CreateProcess`'s own bare-name search does not reliably
+    prefer a directory prepended to this process's PATH over one found via
+    a different PATHEXT extension elsewhere on PATH (observed: a real
+    `claude.exe` installed elsewhere on PATH was launched instead of a test's
+    `claude.cmd` stub placed first in PATH, Issue #4158) -- `shutil.which`
+    performs the same PATH search Python itself trusts elsewhere and returns
+    a single unambiguous answer, which is then passed to `subprocess.run`
+    directly rather than left to platform-specific implicit resolution."""
+    return shutil.which(name) or name
+
 
 # The single output-schema description every harness's lane runner sends,
 # describing the exact shape `schema.py::validate_finding` requires --
@@ -1784,10 +1803,68 @@ def scan_tool_env(scratch_dir: str, base_env: dict | None = None) -> dict:
     }
     if goroot:
         env["GOROOT"] = goroot
+    if os.name == "nt":
+        # Windows process/DLL initialization depends on SystemRoot being
+        # present even though it carries no credential or identity
+        # information.
+        system_root = base.get("SystemRoot") or base.get("SYSTEMROOT")
+        if system_root:
+            env["SystemRoot"] = system_root
+        # The actual cause of "failed to initialize build cache at :" is
+        # TMP/TEMP, not GOCACHE (which was already set correctly above and
+        # is a red herring in that message): Go's runtime resolves its own
+        # scratch/work directory (separate from GOCACHE, used for e.g. a
+        # build's temporary object files) via os.TempDir(), which on Windows
+        # falls back to the Windows *system* directory itself
+        # (GetWindowsDirectory(), i.e. C:\Windows) when NONE of TMP, TEMP or
+        # USERPROFILE are set. A non-admin user has no write access there,
+        # so any `go`-based tool -- confirmed directly with `go env` in this
+        # exact environment, which failed with "creating work dir: mkdir
+        # C:\WINDOWS\go-build...: Access is denied" -- breaks on Windows
+        # without an explicit scratch TMP/TEMP (Issue #4158).
+        tmp_dir = os.path.join(scratch_dir, "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        env["TMP"] = tmp_dir
+        env["TEMP"] = tmp_dir
+        # staticcheck's own in-process caching (golang.org/x/tools'
+        # gocommand layer, not Go's own build cache -- distinct from the
+        # TMP/TEMP fix above) calls os.UserCacheDir(), which on Windows
+        # reads LocalAppData and returns an error if it's unset. Without it,
+        # staticcheck swallows a clean "go.mod requires go >= X" error and
+        # reports an opaque "failed to initialize build cache at :" instead
+        # -- confirmed directly: identical invocation, only LocalAppData
+        # added, and the real version-mismatch message comes through
+        # (Issue #4158). It carries no credential or identity information.
+        local_appdata = base.get("LocalAppData") or base.get("LOCALAPPDATA")
+        if local_appdata:
+            env["LocalAppData"] = local_appdata
     return env
 
 
 def _killpg(proc: subprocess.Popen) -> None:
+    """Kill proc and its whole process tree, matching what os.killpg does for
+    the POSIX session run_bounded starts each child in.
+
+    os.killpg does not exist on Windows at all (an AttributeError, not one of
+    the exceptions this used to catch), so this silently never killed
+    anything there: a scan tool that hung past its timeout, or produced more
+    output than the byte cap, kept running -- indistinguishable from a
+    Windows-native tempdir cleanup PermissionError with no other explanation,
+    since a subprocess with a locked file/cwd under the temp directory was
+    still alive (Issue #4158). start_new_session=True (run_bounded's Popen
+    call) has no effect on Windows -- there is no POSIX session concept to
+    join -- so taskkill's own tree-kill (/T), which walks the OS's recorded
+    parent-child PID relationships rather than a process group, is the
+    Windows equivalent."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -2030,7 +2107,12 @@ def resolve_scopes(repo_root: str, files: list) -> tuple[list[dict], list[dict]]
         if language is None:
             unsupported.append(value)
             continue
-        rel = os.path.relpath(real, root)
+        # Forward slashes always, even on Windows: this becomes the "scope"
+        # grouping key (a cache/reporting identifier compared against
+        # POSIX-style literals elsewhere) and, via scope_dir below, an argv
+        # element passed to external tools -- os.path.relpath's native
+        # separator would otherwise leak backslashes into both (Issue #4158).
+        rel = os.path.relpath(real, root).replace(os.sep, "/")
         if scan_profiles.SCOPE_KIND_BY_LANGUAGE.get(language) == "package":
             go_by_dir.setdefault(os.path.dirname(rel), []).append(rel)
         else:
@@ -2051,7 +2133,7 @@ def resolve_scopes(repo_root: str, files: list) -> tuple[list[dict], list[dict]]
         if problem is not None:
             gaps.append({"kind": "go_module_unscannable", "scope": rel_dir or ".", "reason": problem})
             continue
-        pkg_rel = os.path.relpath(dir_real, module_root)
+        pkg_rel = os.path.relpath(dir_real, module_root).replace(os.sep, "/")
         scopes.append({
             "language": "go",
             "kind": "package",
@@ -2059,7 +2141,7 @@ def resolve_scopes(repo_root: str, files: list) -> tuple[list[dict], list[dict]]
             "files": sorted(go_by_dir[rel_dir]),
             "cwd": module_root,
             "scope_dir": "." if pkg_rel == "." else "./" + pkg_rel,
-            "cwd_files": sorted(os.path.relpath(os.path.join(root, f), module_root) for f in go_by_dir[rel_dir]),
+            "cwd_files": sorted(os.path.relpath(os.path.join(root, f), module_root).replace(os.sep, "/") for f in go_by_dir[rel_dir]),
         })
     for language in sorted(by_language_files):
         scopes.append({

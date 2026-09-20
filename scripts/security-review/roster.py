@@ -106,6 +106,18 @@ def parse_roster(value: str) -> list[Lane]:
 
 
 def main(argv: list[str]) -> int:
+    # This CLI's whole reason to exist is to be captured multi-line by a
+    # shell ($(python3 roster.py ...)) and split back into per-lane lines
+    # (security-review.sh's `while read -r` loop over roster_output). Bash's
+    # $(...) only strips *trailing* newlines from the whole capture, so an
+    # embedded CRLF before any line but the last survives as a literal \r
+    # stuck to that lane's fields -- and Python's stdout on Windows
+    # translates \n to \r\n by default. That \r then rides along into a lane
+    # directory name, which NTFS then refuses outright (WinError 123)
+    # (Issue #4158). sys.stdout doesn't have reconfigure() before Python 3.7,
+    # but this repo's supported floor is well past that.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(newline="\n")
     if len(argv) != 1:
         print("Usage: roster.py <CFGMS_SECURITY_REVIEW_LANES value>", file=sys.stderr)
         return 1

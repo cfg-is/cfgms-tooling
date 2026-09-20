@@ -61,6 +61,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import consolidate  # noqa: E402
+import shell_command  # noqa: E402
 
 
 class AdjudicationError(Exception):
@@ -181,8 +182,8 @@ def launch(
 
     try:
         result = subprocess.run(
-            [
-                script,
+            shell_command.sh_argv(script)
+            + [
                 "launch-investigator",
                 "--sweep-dir",
                 sub_dir,
@@ -201,7 +202,7 @@ def launch(
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, shell_command.ShellCommandError) as exc:
         raise AdjudicationError(f"launch-investigator failed to run: {exc}") from exc
 
     if result.returncode != 0:

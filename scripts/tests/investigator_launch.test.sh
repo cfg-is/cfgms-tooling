@@ -40,6 +40,26 @@ check_not_contains() {
   if [[ "$hay" != *"$needle"* ]]; then ok "$desc"
   else bad "$desc" "must NOT contain: ${needle}"; fi
 }
+# try_ln_s <target> <link> — like ln -s, but reports [N/A] and returns 1
+# instead of a false pass/fail when the platform cannot create a real
+# symlink. Git Bash's own `ln -s` does not require SeCreateSymbolicLinkPrivilege
+# the way a native Win32 CreateSymbolicLink call does, but a non-admin,
+# non-Developer-Mode Windows host still cannot honor it: `ln -s` here returns
+# 0 and silently creates a plain COPY of the target's content instead of a
+# real symlink (confirmed directly: `test -L` on the result is false). A
+# symlink-escape test run against that copy would find no escape to detect
+# and wrongly "pass" the refusal it never exercised, or "fail" it outright --
+# the caller must skip its assertions instead (Issue #4158).
+try_ln_s() {
+  local target="$1" link="$2"
+  ln -s "$target" "$link" 2>/dev/null || true
+  if [[ -L "$link" ]]; then
+    return 0
+  fi
+  rm -f "$link"
+  printf '  [N/A] %s\n' "cannot create a real symlink on this host (ln -s silently falls back to copying); the symlink-escape property under test does not apply here"
+  return 1
+}
 # check_cred_mount_count <desc> <rendered-run-argv> <want> — counts how many
 # `-v` flags in one rendered `docker run` target the container-side
 # credential path. Docker rejects two mounts with the same destination, so
@@ -1013,12 +1033,12 @@ PLAN_ESCAPE_TARGET="${SANDBOX}/plan-escape-target"
 mkdir -p "$PLAN_ESCAPE_TARGET"
 SWEEP_PLANLINK="${SANDBOX}/sweep-planlink/2026-09-05T0000Z-planlink"
 mkdir -p "${SWEEP_PLANLINK}/lanes"
-ln -s "$PLAN_ESCAPE_TARGET" "${SWEEP_PLANLINK}/plan"
 SWEEP_PLANLINK_SNAPSHOT="${SWEEP_PLANLINK}/snapshot"
 mkdir -p "$SWEEP_PLANLINK_SNAPSHOT"
 SWEEP_PLANLINK_BUNDLE="${SWEEP_PLANLINK}/bundle"
 mkdir -p "$SWEEP_PLANLINK_BUNDLE"
 
+if try_ln_s "$PLAN_ESCAPE_TARGET" "${SWEEP_PLANLINK}/plan"; then
 for escape_mode in plan escapelane; do
   : > "$DOCKER_CALL_LOG"
   set +e
@@ -1050,6 +1070,7 @@ if find "$PLAN_ESCAPE_TARGET" -mindepth 1 2>/dev/null | grep -q .; then
 else
   ok "symlink target directory is untouched"
 fi
+fi
 
 echo ""
 echo "== REQUIRED TEST evidence — a symlinked --snapshot-dir cannot redirect the"
@@ -1073,8 +1094,8 @@ SNAPSHOT_ESCAPE_TARGET="${SANDBOX}/snapshot-escape-target"
 mkdir -p "$SNAPSHOT_ESCAPE_TARGET"
 SWEEP_SNAPLINK="${SANDBOX}/sweep-snaplink/2026-09-05T0000Z-snaplink"
 mkdir -p "${SWEEP_SNAPLINK}/lanes" "${SWEEP_SNAPLINK}/plan"
-ln -s "$SNAPSHOT_ESCAPE_TARGET" "${SWEEP_SNAPLINK}/snapshot"
 
+if try_ln_s "$SNAPSHOT_ESCAPE_TARGET" "${SWEEP_SNAPLINK}/snapshot"; then
 for escape_mode in escapelane; do
   : > "$DOCKER_CALL_LOG"
   set +e
@@ -1106,6 +1127,7 @@ if find "$SNAPSHOT_ESCAPE_TARGET" -mindepth 1 2>/dev/null | grep -q .; then
 else
   ok "snapshot symlink target directory is untouched"
 fi
+fi
 
 echo ""
 echo "== REQUIRED TEST evidence — a symlinked --bundle-dir cannot redirect the"
@@ -1123,8 +1145,8 @@ BUNDLE_ESCAPE_TARGET="${SANDBOX}/bundle-escape-target"
 mkdir -p "$BUNDLE_ESCAPE_TARGET"
 SWEEP_BUNDLELINK="${SANDBOX}/sweep-bundlelink/2026-09-05T0000Z-bundlelink"
 mkdir -p "${SWEEP_BUNDLELINK}/lanes" "${SWEEP_BUNDLELINK}/plan"
-ln -s "$BUNDLE_ESCAPE_TARGET" "${SWEEP_BUNDLELINK}/bundle"
 
+if try_ln_s "$BUNDLE_ESCAPE_TARGET" "${SWEEP_BUNDLELINK}/bundle"; then
 : > "$DOCKER_CALL_LOG"
 set +e
 bundle_escape_out=$(PATH="${FAKEBIN}:${PATH}" \
@@ -1153,6 +1175,7 @@ if find "$BUNDLE_ESCAPE_TARGET" -mindepth 1 2>/dev/null | grep -q .; then
   bad "bundle symlink target directory is untouched" "something was created under it"
 else
   ok "bundle symlink target directory is untouched"
+fi
 fi
 
 echo ""
@@ -1367,7 +1390,15 @@ run_hid_launch() {
     HOME="${SANDBOX}/HOME" \
     bash "$DISPATCH" launch-investigator --sweep-dir "$HID_SWEEP_DIR" --snapshot-dir "$HID_SNAPSHOT_DIR" --bundle-dir "$HID_BUNDLE_DIR" \
       --mode "$mode" "${extra[@]}" >/dev/null 2>&1
-  python3 -c "import json; print(json.load(open('${HID_SWEEP_DIR}/harness_identity.json'))['hash'])"
+  # The path is passed as its own argv element, not embedded inside the -c
+  # string: Git Bash's MSYS layer auto-converts a POSIX path that appears as
+  # a whole argument to a native Windows one before a non-MSYS python.exe
+  # ever sees it, but does NOT convert one buried inside a larger string --
+  # embedding it directly here silently read a wrong (nonexistent) path on
+  # Windows despite the file having just been written correctly by the
+  # production code, which already passes its own path as a bare argv
+  # element (Issue #4158).
+  python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['hash'])" "${HID_SWEEP_DIR}/harness_identity.json"
 }
 
 echo ""

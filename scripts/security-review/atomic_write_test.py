@@ -14,6 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
+import platform_test_support  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -125,7 +126,8 @@ def test_write_json_atomic_does_not_touch_a_planted_fixed_tmp_symlink():
         victim = os.path.join(outside, "victim.txt")
         with open(victim, "w") as f:
             f.write("original host content\n")
-        os.symlink(victim, f"{path}.tmp")
+        if not platform_test_support.try_symlink(victim, f"{path}.tmp"):
+            return
 
         atomic_write.write_json_atomic(path, {"a": 1})
 
@@ -190,7 +192,8 @@ def test_write_text_atomic_does_not_touch_a_planted_fixed_tmp_symlink():
         victim = os.path.join(outside, "victim.txt")
         with open(victim, "w") as f:
             f.write("original host content\n")
-        os.symlink(victim, f"{path}.tmp")
+        if not platform_test_support.try_symlink(victim, f"{path}.tmp"):
+            return
 
         atomic_write.write_text_atomic(path, "prompt text\n")
 
@@ -239,7 +242,8 @@ def test_write_bytes_atomic_does_not_touch_a_planted_fixed_tmp_symlink():
         victim = os.path.join(outside, "victim.txt")
         with open(victim, "w") as f:
             f.write("original host content\n")
-        os.symlink(victim, f"{path}.tmp")
+        if not platform_test_support.try_symlink(victim, f"{path}.tmp"):
+            return
 
         atomic_write.write_bytes_atomic(path, b"real content")
 

@@ -150,7 +150,7 @@ def test_launch_dispatches_through_the_launcher_with_the_lane_mode_contract():
             "--lane-entrypoint", adjudicate.default_lane_entrypoint(),
         ]
         check(argv == expected, "launch: exact launch-investigator argv (sub-sweep dir, its EMPTY snapshot, lane mode `adjudicator`, harness/model, the adjudicator lane entrypoint)", str(argv))
-        check(argv[expected.index("--lane-entrypoint") + 1].endswith("lanes/adjudicator.py") and os.path.isfile(argv[-1]), "launch: the lane entrypoint is the real adjudicator.py")
+        check(argv[expected.index("--lane-entrypoint") + 1].endswith(os.path.join("lanes", "adjudicator.py")) and os.path.isfile(argv[-1]), "launch: the lane entrypoint is the real adjudicator.py")
         check(os.listdir(os.path.join(sub, "snapshot")) == [], "launch: the snapshot mounted at /workspace is still empty at dispatch time")
 
 

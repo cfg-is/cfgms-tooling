@@ -92,6 +92,25 @@ check_not_contains() {
   if [[ "$hay" != *"$needle"* ]]; then ok "$desc"
   else bad "$desc" "must NOT contain: ${needle}"; fi
 }
+# write_win_shim <bin_dir> <name...> — for each <name>, if a POSIX stub
+# script by that name exists in bin_dir (this file's usual
+# `cat > "${bin_dir}/<name>" <<'STUB'` + `chmod +x` pattern), also write a
+# Windows .cmd shim of the same name that relays through bash. Harmless
+# no-op on POSIX. Without it, harness_runner.resolve_harness_binary's
+# shutil.which() -- which every real lane's harness-invocation call site
+# uses -- correctly treats a bare-named shebang script as not executable on
+# Windows and silently continues its PATH search, landing on whatever REAL
+# claude/codex binary happens to be installed elsewhere on PATH instead of
+# the intended stub, which then does not recognize the test's placeholder
+# model id (Issue #4158).
+write_win_shim() {
+  local bin_dir="$1"; shift
+  local name
+  for name in "$@"; do
+    [[ -f "${bin_dir}/${name}" ]] || continue
+    printf '@echo off\r\nbash "%s" %%*\r\n' "${bin_dir}/${name}" > "${bin_dir}/${name}.cmd"
+  done
+}
 check_eq() {
   local desc="$1" actual="$2" expected="$3"
   if [[ "$actual" == "$expected" ]]; then ok "$desc"
@@ -282,6 +301,7 @@ set -euo pipefail
 printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "${CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE:?}"
 AC3_CLAUDE_STUB
 chmod +x "${AC3_CLAUDE_BIN}/claude"
+write_win_shim "$AC3_CLAUDE_BIN" claude
 cat > "${AC3_PLAN_DIR}/step-001.json" <<JSON
 {"step_id":"step-001","sweep_id":"ac3-sweep","commit_sha":"0000000000000000000000000000000000000000","scope":["pkg/example"],"hypotheses":[{"id":"h1","objective":"sole-file import check","required_evidence":"the lane runs without ModuleNotFoundError","planner":"ac3-check"}],"files":[],"planners":["ac3-check"]}
 JSON
@@ -497,6 +517,7 @@ case "$outcome" in
 esac
 CLAUDE_STUB
 chmod +x "${STUB_CLAUDE_BIN_DIR}/claude"
+write_win_shim "$STUB_CLAUDE_BIN_DIR" claude
 
 # Stub docker: renders `docker run -d ...` exactly as agent-dispatch.sh built
 # it, logs the full argv, then performs the simulated container's job
@@ -736,7 +757,7 @@ echo "   the snapshot (Issue #3979) =="
 [[ -f "${SWEEP_DIR_1}/bundle/01-tree.tsv" ]] \
   && ok "the bundle includes 01-tree.tsv" \
   || bad "the bundle includes 01-tree.tsv" "not found"
-scope_provided_1="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_1}/bundle/MANIFEST.json'))['scope_provided'])")"
+scope_provided_1="$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['scope_provided'])" "${SWEEP_DIR_1}/bundle/MANIFEST.json")"
 check_eq "no --scope-file was passed, so MANIFEST.json records scope_provided=False" "$scope_provided_1" "False"
 plan_mount_call="$(grep ' plan$' "${SUB1}/docker_calls.log" | tail -1)"
 check_contains "the plan-mode docker run mounts the bundle at /workspace:ro" "$plan_mount_call" "${SWEEP_DIR_1}/bundle:/workspace:ro"
@@ -759,7 +780,7 @@ SWEEP_DIR_SCOPE="$(dirname "$(dirname "$scope_launch_out")")"
   || bad "the bundle's 00-scope.md was written" "not found"
 scope_content="$(cat "${SWEEP_DIR_SCOPE}/bundle/00-scope.md" 2>/dev/null || true)"
 check_eq "00-scope.md is a byte-identical copy of --scope-file" "$scope_content" "Reviewing pkg/example for tenant-scoping regressions."
-scope_provided_2="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_SCOPE}/bundle/MANIFEST.json'))['scope_provided'])")"
+scope_provided_2="$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['scope_provided'])" "${SWEEP_DIR_SCOPE}/bundle/MANIFEST.json")"
 check_eq "MANIFEST.json records scope_provided=True when --scope-file was passed" "$scope_provided_2" "True"
 
 echo ""
@@ -776,10 +797,10 @@ SWEEP_DIR_PATH="$(dirname "$(dirname "$path_launch_out")")"
 tree_paths_path="$(cut -f1 "${SWEEP_DIR_PATH}/bundle/01-tree.tsv" | tail -n +2 | sort -u)"
 check_eq "launch --path bounds the bundle's 01-tree.tsv to pkg/example only" "$tree_paths_path" "pkg/example/file.go"
 
-manifest_scope_path="$(python3 -c "import json; print(json.dumps(json.load(open('${SWEEP_DIR_PATH}/manifest.json'))['scope_paths']))")"
+manifest_scope_path="$(python3 -c "import json, sys; print(json.dumps(json.load(open(sys.argv[1]))['scope_paths']))" "${SWEEP_DIR_PATH}/manifest.json")"
 check_eq "the sweep manifest.json records scope_paths" "$manifest_scope_path" '["pkg/example"]'
 
-bundle_manifest_scope="$(python3 -c "import json; print(json.dumps(json.load(open('${SWEEP_DIR_PATH}/bundle/MANIFEST.json'))['scope_paths']))")"
+bundle_manifest_scope="$(python3 -c "import json, sys; print(json.dumps(json.load(open(sys.argv[1]))['scope_paths']))" "${SWEEP_DIR_PATH}/bundle/MANIFEST.json")"
 check_eq "the bundle MANIFEST.json records scope_paths" "$bundle_manifest_scope" '["pkg/example"]'
 
 prompt_content_path="$(cat "${SWEEP_DIR_PATH}/plan/.investigator-plan-prompt.md")"
@@ -808,7 +829,7 @@ resume_tree_paths="$(cut -f1 "${SWEEP_DIR_PATH}/bundle/01-tree.tsv" | tail -n +2
 check_eq "resume's re-written bundle is still bounded to pkg/example only, with no --path re-passed" \
   "$resume_tree_paths" "pkg/example/file.go"
 
-resume_bundle_manifest_scope="$(python3 -c "import json; print(json.dumps(json.load(open('${SWEEP_DIR_PATH}/bundle/MANIFEST.json'))['scope_paths']))")"
+resume_bundle_manifest_scope="$(python3 -c "import json, sys; print(json.dumps(json.load(open(sys.argv[1]))['scope_paths']))" "${SWEEP_DIR_PATH}/bundle/MANIFEST.json")"
 check_eq "resume's bundle MANIFEST.json still records the original --path scope" "$resume_bundle_manifest_scope" '["pkg/example"]'
 
 echo ""
@@ -1060,7 +1081,7 @@ done
 [[ -f "${SWEEP_DIR_3}/lanes/claude-model-b/step-001.status.json" && -f "${SWEEP_DIR_3}/lanes/claude-model-b/step-002.status.json" ]] \
   && ok "parked lane wrote status.json (not findings.json) for both steps" \
   || bad "parked lane wrote status.json for both steps" "missing status files"
-parked_state="$(python3 -c "import json; print(json.load(open('${SWEEP_DIR_3}/lanes/claude-model-b/step-001.status.json'))['state'])")"
+parked_state="$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['state'])" "${SWEEP_DIR_3}/lanes/claude-model-b/step-001.status.json")"
 check_eq "parked lane's step state is literally 'parked'" "$parked_state" "parked"
 
 [[ -f "${SWEEP_DIR_3}/report/consolidated.md" ]] \
@@ -1224,6 +1245,7 @@ case "$outcome" in
 esac
 CODEX_STUB
 chmod +x "${TWOHARNESS_BIN_DIR}/claude" "${TWOHARNESS_BIN_DIR}/codex"
+write_win_shim "$TWOHARNESS_BIN_DIR" claude codex
 
 twoharness_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x,codex:model-y" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
@@ -1388,6 +1410,7 @@ case "$outcome" in
 esac
 OPENCODE_STUB
 chmod +x "${TWOMODEL_BIN_DIR}/opencode"
+write_win_shim "$TWOMODEL_BIN_DIR" opencode
 
 twomodel_out=$(CFGMS_SECURITY_REVIEW_LANES="opencode:model-qwen,opencode:model-glm" \
   CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOMODEL_ENTRYPOINT_DIR" \
@@ -1460,6 +1483,7 @@ OLLAMA_BIN_DIR="${SANDBOX}/ollama-harness-bins"
 mkdir -p "$OLLAMA_BIN_DIR"
 cp "${STUB_CLAUDE_BIN_DIR}/claude" "${OLLAMA_BIN_DIR}/claude"
 chmod +x "${OLLAMA_BIN_DIR}/claude"
+write_win_shim "$OLLAMA_BIN_DIR" claude
 
 cat > "${SANDBOX}/ollama_stub_server.py" <<'PYSTUB'
 """Minimal stand-in for the local ollama daemon's /api/generate."""
@@ -1985,6 +2009,7 @@ printf '\n' >> "$prompt_log"
 printf '{"findings":[],"dispositions":[{"hypothesis_id":"h1","disposition":"investigated","summary":"stub: reviewed h1, nothing found"}]}' > "$output_path"
 CONTENT_STUB
 chmod +x "${CONTENT_TEST_CLAUDE_BIN}/claude"
+write_win_shim "$CONTENT_TEST_CLAUDE_BIN" claude
 
 SUB_CONTENT="${SANDBOX}/case-content-provenance"
 mkdir -p "${SUB_CONTENT}/HOME/.claude"

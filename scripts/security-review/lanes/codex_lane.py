@@ -281,7 +281,7 @@ def call_codex_harness(model: str, prompt: str, output_path: str, timeout: float
     try:
         result = subprocess.run(
             [
-                "codex",
+                harness_runner.resolve_harness_binary("codex"),
                 "exec",
                 "--model",
                 model,

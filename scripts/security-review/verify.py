@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import consolidate  # noqa: E402
+import shell_command  # noqa: E402
 
 VERIFIER_LANE_ID = "verifier"
 INPUT_FILENAME = "verification-input.json"
@@ -175,8 +176,8 @@ def launch(
     sub_dir = verification_dir(sweep_dir)
     try:
         result = subprocess.run(
-            [
-                script, "launch-investigator",
+            shell_command.sh_argv(script) + [
+                "launch-investigator",
                 "--sweep-dir", sub_dir,
                 "--snapshot-dir", snapshot_dir,
                 "--mode", VERIFIER_LANE_ID,
@@ -188,7 +189,7 @@ def launch(
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, shell_command.ShellCommandError) as exc:
         raise VerificationError(f"launch-investigator failed to run: {exc}") from exc
 
     if result.returncode != 0:

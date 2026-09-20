@@ -1256,7 +1256,16 @@ refresh_creds_mirror() {
   # window in which a credential file is readable by more than its owner.
   # Short windows on a credential are still windows.
   if [[ ! -d "$CREDS_MIRROR_DIR" ]]; then
-    mkdir -m 0700 -p "$CREDS_MIRROR_DIR" || return 1
+    # mkdir -m can report failure (and exit non-zero) purely from being
+    # unable to fully apply the requested mode bits, while still having
+    # created the directory itself -- observed on Windows/NTFS via Git
+    # Bash's coreutils mkdir, which prints "cannot change permissions of
+    # ..." in exactly this shape (Issue #4158). Only a genuinely missing
+    # directory afterward is a real failure; the chmod immediately below is
+    # this function's existing, already-tolerant attempt to tighten
+    # whatever the platform allows -- the same one that already runs
+    # unconditionally for the "directory already existed" branch.
+    mkdir -m 0700 -p "$CREDS_MIRROR_DIR" 2>/dev/null || [[ -d "$CREDS_MIRROR_DIR" ]] || return 1
   fi
   chmod 0700 "$CREDS_MIRROR_DIR" 2>/dev/null || true
 
@@ -1622,8 +1631,20 @@ start_investigator_log_capture() {
     return 0
   fi
 
-  setsid nohup docker logs -f --timestamps "$container_id" \
-    > "${log_dir}/${mode_safe}.log" 2>&1 < /dev/null &
+  # setsid does not exist on Windows/Git Bash at all: the whole command
+  # failed to resolve ("setsid: command not found") before nohup or docker
+  # ever ran, and since the command's own stderr redirect swallowed that
+  # message into the log file, it looked like a real (if useless) capture
+  # rather than a silent no-op (Issue #4158). nohup alone still gives the
+  # property this actually needs -- outliving the dispatch shell's exit --
+  # even without setsid's full session detachment.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup docker logs -f --timestamps "$container_id" \
+      > "${log_dir}/${mode_safe}.log" 2>&1 < /dev/null &
+  else
+    nohup docker logs -f --timestamps "$container_id" \
+      > "${log_dir}/${mode_safe}.log" 2>&1 < /dev/null &
+  fi
   disown 2>/dev/null || true
   return 0
 }
@@ -3950,7 +3971,11 @@ if lane_entrypoint_path:
 for path in paths:
     if not path:
         continue
-    rel = os.path.relpath(path, repo_root)
+    # Forward slashes always, even on Windows: this path is both hashed
+    # (native-separator paths would make the identity gratuitously
+    # platform-dependent) and recorded verbatim in "files" for callers to
+    # match against (Issue #4158).
+    rel = os.path.relpath(path, repo_root).replace(os.sep, "/")
     with open(path, "rb") as f:
         content = f.read()
     digest.update(rel.encode("utf-8"))

@@ -30,9 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness_runner  # noqa: E402
 import opencode_lane  # noqa: E402
+import stub_binary  # noqa: E402
 import terminal_state  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import platform_test_support  # noqa: E402
 import schema  # noqa: E402
 
 FAILURES: list[str] = []
@@ -496,7 +498,8 @@ def test_files_intended_vs_files_read_on_partial_read() -> None:
         with open(outside_target, "w") as f:
             f.write("package secret\n")
         escaping_symlink = os.path.join(repo_root, "escape.go")
-        os.symlink(outside_target, escaping_symlink)
+        if not platform_test_support.try_symlink(outside_target, escaping_symlink):
+            return
 
         write_plan_step(plan_dir, "step-001", files=["pkg/example/thing.go", "escape.go"])
         written = opencode_lane.run_lane(
@@ -522,19 +525,18 @@ def test_files_intended_vs_files_read_on_partial_read() -> None:
         )
 
 
-def _write_argv_recording_stub(stub_path: str, argv_path: str) -> None:
-    with open(stub_path, "w") as f:
-        f.write(
-            "#!/usr/bin/env python3\n"
-            "import json, os, sys\n"
-            f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
-            "output_path = os.environ.get('CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE')\n"
-            "if output_path:\n"
-            "    with open(output_path, 'w') as out:\n"
-            "        out.write('{\"findings\": []}')\n"
-            "sys.exit(0)\n"
-        )
-    os.chmod(stub_path, 0o755)
+def _write_argv_recording_stub(bin_dir: str, name: str, argv_path: str) -> str:
+    return stub_binary.install_stub(
+        bin_dir,
+        name,
+        "import json, os, sys\n"
+        f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
+        "output_path = os.environ.get('CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE')\n"
+        "if output_path:\n"
+        "    with open(output_path, 'w') as out:\n"
+        "        out.write('{\"findings\": []}')\n"
+        "sys.exit(0)\n",
+    )
 
 
 def test_dispositions_missing_hypothesis_synthesizes_not_attempted() -> None:
@@ -650,15 +652,14 @@ def test_call_opencode_harness_reaches_the_real_subprocess() -> None:
     surface this lane's whole design exists to close."""
     with tempfile.TemporaryDirectory() as bin_dir, tempfile.TemporaryDirectory() as work_dir:
         argv_path = os.path.join(work_dir, "argv.json")
-        stub_path = os.path.join(bin_dir, "opencode")
-        _write_argv_recording_stub(stub_path, argv_path)
+        _write_argv_recording_stub(bin_dir, "opencode", argv_path)
 
         out_dir = os.path.join(work_dir, "out")
         os.makedirs(out_dir, exist_ok=True)
         raw_path = os.path.join(out_dir, "step-001.opencode-raw.json")
 
         original_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{bin_dir}:{original_path}"
+        os.environ["PATH"] = stub_binary.prepend_bin_dir(bin_dir)
         try:
             exit_code, rate_limited, _output_tail = opencode_lane.call_opencode_harness(MODEL, "prompt body", raw_path)
         finally:
@@ -700,17 +701,14 @@ def _make_argv_and_stdin_capturing_stub(bin_dir: str, name: str, argv_path: str,
     and the stdin prompt transport (Issue #4031) actually reach the real
     subprocess, not just an injected `call_harness_fn` stand-in. Identical to
     `codex_lane_test.py`'s own `_make_argv_and_stdin_capturing_stub`."""
-    stub_path = os.path.join(bin_dir, name)
-    with open(stub_path, "w") as f:
-        f.write(
-            "#!/usr/bin/env python3\n"
-            "import json, sys\n"
-            f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
-            f"open({stdin_path!r}, 'w').write(sys.stdin.read())\n"
-            "sys.exit(0)\n"
-        )
-    os.chmod(stub_path, 0o755)
-    return stub_path
+    return stub_binary.install_stub(
+        bin_dir,
+        name,
+        "import json, sys\n"
+        f"json.dump(sys.argv[1:], open({argv_path!r}, 'w'))\n"
+        f"open({stdin_path!r}, 'w').write(sys.stdin.read())\n"
+        "sys.exit(0)\n",
+    )
 
 
 def test_large_prompt_reaches_harness_via_stdin() -> None:
@@ -731,7 +729,7 @@ def test_large_prompt_reaches_harness_via_stdin() -> None:
 
         large_prompt = "B" * 200_000
         original_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{bin_dir}:{original_path}"
+        os.environ["PATH"] = stub_binary.prepend_bin_dir(bin_dir)
         try:
             exit_code, rate_limited, _output_tail = opencode_lane.call_opencode_harness(
                 MODEL, large_prompt, os.path.join(work_dir, "raw.json")
@@ -829,27 +827,25 @@ def test_two_models_same_script_dispatch_independently() -> None:
         # Now prove the same property against a REAL subprocess for both
         # calls, using one shared stub `opencode` binary on PATH -- the
         # module under test needs no branch to tell the two calls apart.
-        stub_path = os.path.join(bin_dir, "opencode")
-        with open(stub_path, "w") as f:
-            f.write(
-                "#!/usr/bin/env python3\n"
-                "import json, os, sys\n"
-                "argv = sys.argv[1:]\n"
-                "model = argv[argv.index('--model') + 1]\n"
-                "log_path = os.environ['ARGV_LOG_PATH']\n"
-                "existing = json.load(open(log_path)) if os.path.exists(log_path) else []\n"
-                "existing.append(model)\n"
-                "json.dump(existing, open(log_path, 'w'))\n"
-                "output_path = os.environ.get('CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE')\n"
-                "if output_path:\n"
-                "    open(output_path, 'w').write('{\"findings\": []}')\n"
-                "sys.exit(0)\n"
-            )
-        os.chmod(stub_path, 0o755)
+        stub_binary.install_stub(
+            bin_dir,
+            "opencode",
+            "import json, os, sys\n"
+            "argv = sys.argv[1:]\n"
+            "model = argv[argv.index('--model') + 1]\n"
+            "log_path = os.environ['ARGV_LOG_PATH']\n"
+            "existing = json.load(open(log_path)) if os.path.exists(log_path) else []\n"
+            "existing.append(model)\n"
+            "json.dump(existing, open(log_path, 'w'))\n"
+            "output_path = os.environ.get('CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE')\n"
+            "if output_path:\n"
+            "    open(output_path, 'w').write('{\"findings\": []}')\n"
+            "sys.exit(0)\n",
+        )
 
         real_log_path = os.path.join(work_dir, "real-argv-log.json")
         original_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{bin_dir}:{original_path}"
+        os.environ["PATH"] = stub_binary.prepend_bin_dir(bin_dir)
         os.environ["ARGV_LOG_PATH"] = real_log_path
         try:
             for model in ("qwen-real", "glm-real"):

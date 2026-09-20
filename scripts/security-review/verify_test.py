@@ -198,17 +198,19 @@ def test_launch_names_a_missing_entrypoint():
 # --- paths -------------------------------------------------------------------
 
 def test_stage_paths_are_under_their_own_subdirectory():
-    sweep = "/tmp/sweep"
-    check(verify.verification_dir(sweep).endswith("/verification"),
+    sweep = os.path.join(os.sep, "tmp", "sweep")
+    check(verify.verification_dir(sweep).endswith(os.sep + "verification"),
           "paths: the stage owns its own sub-directory")
-    check(verify.input_path(sweep).endswith("/verification/plan/verification-input.json"),
+    check(verify.input_path(sweep).endswith(
+              os.path.join("verification", "plan", "verification-input.json")),
           "paths: input", verify.input_path(sweep))
-    check(verify.output_path(sweep).endswith("/verification/lanes/verifier/verification.json"),
+    check(verify.output_path(sweep).endswith(
+              os.path.join("verification", "lanes", "verifier", "verification.json")),
           "paths: output", verify.output_path(sweep))
 
 
 def test_default_entrypoint_is_the_verifier_lane():
-    check(verify.default_lane_entrypoint().endswith("lanes/verifier.py"),
+    check(verify.default_lane_entrypoint().endswith(os.path.join("lanes", "verifier.py")),
           "paths: the default entrypoint is the verifier lane",
           verify.default_lane_entrypoint())
     check(os.path.isfile(verify.default_lane_entrypoint()),

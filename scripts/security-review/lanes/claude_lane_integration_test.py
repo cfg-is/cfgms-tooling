@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +41,8 @@ LANES_DIR = Path(__file__).resolve().parent
 SECURITY_REVIEW_DIR = LANES_DIR.parent
 CLAUDE_LANE_SCRIPT = LANES_DIR / "claude_lane.py"
 CONSOLIDATE_SCRIPT = SECURITY_REVIEW_DIR / "consolidate.py"
+
+import stub_binary  # noqa: E402
 
 sys.path.insert(0, str(SECURITY_REVIEW_DIR))
 import schema  # noqa: E402
@@ -79,8 +80,7 @@ def _make_repo(repo: str) -> str:
     return result.stdout.strip()
 
 
-STUB_CLAUDE_SCRIPT = """#!/usr/bin/env python3
-import json
+STUB_CLAUDE_SCRIPT = """import json
 import os
 import sys
 
@@ -115,11 +115,7 @@ sys.exit(0)
 
 
 def _install_stub_claude(bin_dir: str) -> None:
-    stub_path = os.path.join(bin_dir, "claude")
-    with open(stub_path, "w") as f:
-        f.write(STUB_CLAUDE_SCRIPT)
-    st = os.stat(stub_path)
-    os.chmod(stub_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    stub_binary.install_stub(bin_dir, "claude", STUB_CLAUDE_SCRIPT)
 
 
 def test_end_to_end_switchover_proof() -> None:
@@ -157,7 +153,7 @@ def test_end_to_end_switchover_proof() -> None:
             json.dump(step, f)
 
         env = dict(os.environ)
-        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
         env["CFGMS_SECURITY_REVIEW_PLAN_DIR"] = plan_dir
         env["CFGMS_SECURITY_REVIEW_OUT_DIR"] = lane_dir
         env["CFGMS_SECURITY_REVIEW_REPO_ROOT"] = repo_root

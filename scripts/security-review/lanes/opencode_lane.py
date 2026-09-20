@@ -355,7 +355,7 @@ def call_opencode_harness(
     try:
         result = subprocess.run(
             [
-                "opencode",
+                harness_runner.resolve_harness_binary("opencode"),
                 "run",
                 "--model",
                 f"{OPENCODE_PROVIDER}/{model}",

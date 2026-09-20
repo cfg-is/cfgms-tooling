@@ -347,7 +347,7 @@ def call_claude_harness(model: str, prompt: str, output_path: str, timeout: floa
     try:
         result = subprocess.run(
             [
-                "claude",
+                harness_runner.resolve_harness_binary("claude"),
                 "--dangerously-skip-permissions",
                 "--disallowedTools",
                 disallowed_tools,

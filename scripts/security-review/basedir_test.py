@@ -15,6 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import basedir  # noqa: E402
+import platform_test_support  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -163,7 +164,7 @@ def test_fails_closed_when_unwritable():
         target = os.path.join(base, "unwritable-parent", "sweep-base")
         parent = os.path.dirname(target)
         os.makedirs(parent)
-        os.chmod(parent, 0o500)  # read+execute, no write
+        platform_test_support.deny_write(parent)
         try:
             env = {"CFGMS_SECURITY_REVIEW_BASE": target}
             raised = False
@@ -176,7 +177,7 @@ def test_fails_closed_when_unwritable():
                     raised = True
             check(raised, "resolve_base_dir: raises when the resolved path cannot be created/written")
         finally:
-            os.chmod(parent, 0o700)  # restore so TemporaryDirectory cleanup can remove it
+            platform_test_support.restore_write(parent)  # so TemporaryDirectory cleanup can remove it
 
 
 def test_cli_exits_nonzero_and_prints_nothing_but_error_on_failure():
