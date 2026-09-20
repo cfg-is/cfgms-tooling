@@ -57,8 +57,18 @@ AGENT_SESSIONS_MOUNT="/agent-sessions"
 # The image bakes a copy at the same path (.devcontainer/Dockerfile), so this
 # bind mount is not what makes the control exist -- it is what keeps every
 # dispatch path on the *harness checkout's* reporter without waiting for an
-# image rebuild, the same no-rebuild pattern already used for setup-env.sh and
-# review-entrypoint.sh. Mounting is conditional on the source existing: Docker
+# image rebuild, the same no-rebuild pattern already used for setup-env.sh,
+# review-entrypoint.sh and agent-context.sh.
+#
+# A mounted entrypoint MUST be mounted together with the helper library it
+# sources (Issue #4194). review-entrypoint.sh is mounted from the harness
+# checkout but sources agent-context.sh, which resolves to a *sibling* under
+# /usr/local/bin/ -- so leaving the helper baked pairs a new script with an
+# old library. When ae5474eb (#4191) added AC_HEADLESS_NO_BG_WAIT_RULE to the
+# helper, every review container died on `unbound variable` under `set -u`
+# two seconds in, and no PR could be reviewed or merged until the image was
+# rebuilt. The pairing is asserted by .devcontainer/agent-context-mount_test.sh.
+# Mounting is conditional on the source existing: Docker
 # would otherwise create an empty host directory and shadow the baked copy with
 # nothing, turning a working control into reporter_missing.
 AGENT_METRICS_MOUNT="/usr/local/share/cfgms-metrics"
@@ -3307,6 +3317,7 @@ PROMPT_EOF
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
+      -v "${REPO_ROOT}/.devcontainer/agent-context.sh:/usr/local/bin/agent-context.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
       "${review_session_mount[@]}" \
