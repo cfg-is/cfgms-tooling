@@ -51,6 +51,40 @@ _fail() {
     FAILURES+=("$msg")
 }
 
+# Settle a live DNS query before asserting on it.
+#
+# The dnsmasq instances started below answer an allowlisted domain by
+# FORWARDING it upstream, so a NOERROR there depends on a packet leaving the
+# machine and coming back. A single lost or slow forwarded packet makes `dig
+# +time=3 +tries=1` return nothing (the callers' `|| echo QUERY_FAILED`
+# fallback) or makes dnsmasq synthesise SERVFAIL — a transient network
+# condition, not the regression these assertions exist to catch. Observed as a
+# one-off `anthropic.com -> QUERY_FAILED` failure on an otherwise-passing run.
+#
+# Only those two non-answers are retried. Every status dnsmasq produces from
+# its own configuration — REFUSED (the exact shape a dropped or mis-scoped
+# allowlist entry gives) and NOERROR alike — is definitive, needs no upstream
+# packet, and is returned from the first query without a retry. So this cannot
+# turn a real allowlist regression into a pass; it only stops a dropped packet
+# from being reported as one.
+#
+# $1 is the name of the per-instance status function to call, $2 the domain.
+dns_status_settled() {
+    local status_fn="$1" domain="$2"
+    local attempt status=""
+    for attempt in 1 2 3 4 5; do
+        status="$("$status_fn" "$domain")"
+        case "$status" in
+            QUERY_FAILED|SERVFAIL) ;;
+            *) echo "$status"; return 0 ;;
+        esac
+        if [[ "$attempt" -lt 5 ]]; then
+            sleep 1
+        fi
+    done
+    echo "$status"
+}
+
 assert_contains() {
     local haystack="$1" needle="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -302,7 +336,7 @@ dns_status() {
 assert_resolves() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status "$domain")
+    status=$(dns_status_settled dns_status "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "NOERROR" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -314,7 +348,7 @@ assert_resolves() {
 assert_blocked_dns() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status "$domain")
+    status=$(dns_status_settled dns_status "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "REFUSED" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -379,7 +413,7 @@ dns_status2() {
 assert_resolves2() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status2 "$domain")
+    status=$(dns_status_settled dns_status2 "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "NOERROR" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -391,7 +425,7 @@ assert_resolves2() {
 assert_blocked_dns2() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status2 "$domain")
+    status=$(dns_status_settled dns_status2 "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "REFUSED" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -458,7 +492,7 @@ dns_status3() {
 assert_resolves3() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status3 "$domain")
+    status=$(dns_status_settled dns_status3 "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "NOERROR" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -470,7 +504,7 @@ assert_resolves3() {
 assert_blocked_dns3() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status3 "$domain")
+    status=$(dns_status_settled dns_status3 "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "REFUSED" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -541,7 +575,7 @@ dns_status4() {
 assert_resolves4() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status4 "$domain")
+    status=$(dns_status_settled dns_status4 "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "NOERROR" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
@@ -553,7 +587,7 @@ assert_resolves4() {
 assert_blocked_dns4() {
     local domain="$1" msg="$2"
     local status
-    status=$(dns_status4 "$domain")
+    status=$(dns_status_settled dns_status4 "$domain")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "$status" == "REFUSED" ]]; then
         echo "    ✓ $msg ($domain -> $status)"
