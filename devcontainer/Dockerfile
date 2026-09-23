@@ -8,7 +8,7 @@
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
 # and .git history are never baked into the final image's layers.
 # CLI_BINARY=cfg  Entry point: ./cmd/cfg
-FROM golang:1.27.1-trixie@sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728 AS cfg-builder
+FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183 AS cfg-builder
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
@@ -26,7 +26,7 @@ RUN set -eu; \
        ./cmd/cfg
 
 # Stage 1 (runtime): main agent container with full tooling
-FROM golang:1.27.1-trixie@sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728
+FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183
 
 # Declare TARGETARCH so BuildKit auto-populates it from the build platform.
 # Must be declared inside the consuming stage; an undeclared ${TARGETARCH}
