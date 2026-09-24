@@ -250,9 +250,15 @@ its shape check at runtime; that is a code defect to fix, not a finding to triag
 `parked` / `refused` / `failed` — before any findings, so a sweep where a lane refused a third of
 its steps is visibly incomplete on the first screen. Findings are de-duplicated on
 `file` + `symbol` + normalised `cwe` (never on line number, which rots as `develop` advances) and
-sorted by multi-lane agreement first, then severity, then confidence. A single-lane finding is not
-noise by default — the whole reason for running multiple labs is that the unique findings are
-often the valuable ones.
+sorted by verification verdict first, then multi-lane agreement, then severity, then confidence.
+A single-lane finding is not noise by default — the whole reason for running multiple labs is that
+the unique findings are often the valuable ones.
+
+**Verdict leads the sort because reachability is the question the report is read to answer:** a
+reachable medium is work you do before an unreachable critical. An *unverified* finding ranks with
+`undetermined`, ABOVE `guarded` and `not_reachable` — no verdict is an absence of evidence, not
+evidence of safety, and ranking it below findings shown to be unreachable would bury exactly the
+rows nobody has looked at yet.
 
 **An empty findings array means "no candidates reported in the tasks that completed," never
 "clean."** Those two only read the same when the sweep is actually complete — every lane finished

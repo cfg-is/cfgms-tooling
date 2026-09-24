@@ -140,7 +140,8 @@ STEP_STATES = ("complete", "parked", "refused", "failed")
 NOT_STARTED = "not_started"
 
 # Rank tables for the findings sort order documented at SKILL.md's "sorted by
-# multi-lane agreement first, then severity, then confidence" sentence --
+# verification verdict first, then multi-lane agreement, then severity, then
+# confidence" sentence (the verdict table is `_VERIFICATION_RANK`, below) --
 # higher value sorts first (descending). Keys match schema.py's
 # SEVERITY_VALUES/CONFIDENCE_VALUES exactly.
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -584,7 +585,7 @@ def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> di
         # validation at a trust boundary"), ollama wrote identifiers
         # ("CWE-20"), 122 distinct values against 203 with only 14 in common.
         # Keyed on that, the two lanes agreed on 12 findings out of a 974
-        # union -- 1.2%. The report sorts by multi-lane agreement first, so
+        # union -- 1.2%. Multi-lane agreement is the sort's second key, so
         # that sort carried almost no information and the same defect found
         # twice rendered twice, unlinked.
         #
@@ -708,12 +709,44 @@ def _eligible_lanes(step_ids: list[str], lane_step_state: dict[str, dict[str, st
     return eligible
 
 
-def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
+# How a verification verdict ranks a finding, highest first. The stage exists
+# to answer "can an attacker reach this", so that answer sorts AHEAD of
+# agreement and severity: a reachable medium is work you do before an
+# unreachable critical.
+#
+# An UNVERIFIED finding ranks above `guarded` and `not_reachable`, not below
+# them. It is not evidence of safety -- it is an absence of evidence, and
+# burying it under findings actively shown to be unreachable would hide exactly
+# the rows nobody has looked at yet. `undetermined` sits with it for the same
+# reason: the verifier said it could not tell.
+_VERIFICATION_RANK = {
+    "reachable_from_untrusted": 5,
+    "reachable_internal_only": 4,
+    "undetermined": 3,
+    # (no verdict at all is also 3 -- see _verification_rank)
+    "guarded": 2,
+    "not_reachable": 1,
+}
+_UNVERIFIED_RANK = 3
+
+
+def _verification_rank(finding: dict) -> int:
+    verification = finding.get("verification")
+    if not isinstance(verification, dict):
+        return _UNVERIFIED_RANK
+    return _VERIFICATION_RANK.get(verification.get("verdict"), _UNVERIFIED_RANK)
+
+
+def _group_rank_key(finding: dict) -> tuple:
     """Sort key for one consolidated finding, matching `SKILL.md`'s documented
-    order exactly: multi-lane agreement first, then severity, then
-    confidence -- each descending -- with the `file`/`symbol`/`cwe`
-    key retained only as the final tiebreaker for two findings tied on all
-    three ranked fields, so output stays deterministic.
+    order exactly: verification verdict first, then multi-lane agreement, then
+    severity, then confidence -- each descending -- with the
+    `file`/`symbol`/`cwe` key retained only as the final tiebreaker for two
+    findings tied on all four ranked fields, so output stays deterministic.
+
+    The verdict leads because reachability is the question the report is read
+    to answer; see `_VERIFICATION_RANK` for why an unverified finding ranks
+    above one shown to be unreachable rather than below it.
 
     Severity/confidence are taken from the group's highest-ranked occurrence
     via `max()` over `finding["occurrences"]`, not the first occurrence in
@@ -731,6 +764,7 @@ def _group_rank_key(finding: dict) -> tuple[int, int, int, str, str, str]:
         severity_rank = _SEVERITY_RANK[adjudication["severity"]]
     confidence_rank = max(_CONFIDENCE_RANK[occ["confidence"]] for occ in finding["occurrences"])
     return (
+        -_verification_rank(finding),
         -finding["agreement"]["reported"],
         -severity_rank,
         -confidence_rank,
@@ -1184,11 +1218,18 @@ def _attach_verification(sweep_dir: str, findings: list) -> dict:
 
     ANNOTATES, NEVER DELETES (Issue #4071). A finding with no verdict, or one
     the verifier could not decide, stays in the report with `verification` left
-    as recorded -- it is never dropped and never re-ranked here. A verifier
-    that could remove findings would be one model holding a veto over the whole
-    review, and the measured false positive cuts both ways: a careful verifier
-    rejects a bad claim correctly, a careless one rejects a real defect just as
-    easily.
+    as recorded -- it is never dropped. A verifier that could remove findings
+    would be one model holding a veto over the whole review, and the measured
+    false positive cuts both ways: a careful verifier rejects a bad claim
+    correctly, a careless one rejects a real defect just as easily.
+
+    The verdict DOES rank: `consolidate()` re-sorts after this call, because
+    `_group_rank_key` reads it (see `_VERIFICATION_RANK`). Ranking and deleting
+    are different powers -- a `not_reachable` finding sorts last but is still
+    in the report, still carrying its finder severity, still readable by a
+    human who disagrees. An unverified finding deliberately outranks one shown
+    to be unreachable, so "nobody looked at this yet" never sorts below
+    "somebody looked and it was fine".
 
     Absent stage, unreadable file, or malformed envelope all read as "did not
     run", never as an error that fails the sweep -- verification must not be
@@ -1233,6 +1274,19 @@ def _attach_verification(sweep_dir: str, findings: list) -> dict:
             "guard": entry.get("guard") or "",
             "citation": entry.get("citation") or [],
             "rationale": entry.get("rationale") or "",
+            # The three fields that make a verdict CHECKABLE rather than
+            # merely stated. A later fix pass is run by the same kind of model
+            # that wrote the code, so it shares the blind spot -- "reachable"
+            # plus two sentences of prose is something it can talk itself past.
+            # What the attacker controls, the concrete trigger, and what would
+            # OVERTURN the verdict are the parts a fixer can test against the
+            # code and be wrong about visibly.
+            #
+            # Dropping them here would be silent: the verifier computes them,
+            # they never reach the reader, and nothing reports a gap.
+            "attacker_input": entry.get("attacker_input") or "",
+            "trigger": entry.get("trigger") or "",
+            "falsifier": entry.get("falsifier") or "",
             "harness": envelope.get("harness"),
             "model_id": envelope.get("model_id"),
         }
@@ -1760,6 +1814,12 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     # the adjudicator's severity should be informed by an established
     # reachability rather than a guessed one; the render order does not.
     verification = _attach_verification(sweep_dir, consolidated_findings)
+    # The sort key reads the verification verdict, so re-sort after merging --
+    # exactly as `_attach_adjudication` does for the adjudicated severity.
+    # `_finalize_findings` sorted this list before either annotation existed,
+    # so without this the verdict is recorded on each finding and changes
+    # nothing about the order a human reads them in.
+    consolidated_findings.sort(key=_group_rank_key)
 
     return {
         "sweep_id": sweep_id,
@@ -2509,11 +2569,25 @@ def _verification_line(finding: dict, verification_record: dict) -> str:
         citation = verification.get("citation") or []
         if citation:
             parts.append("cited at " + ", ".join(f"`{_md_escape_inline(str(c))}`" for c in citation))
+        # What an attacker controls and how it is triggered: the difference
+        # between a reader believing the verdict and being able to check it.
+        attacker_input = verification.get("attacker_input")
+        if attacker_input:
+            parts.append(f"attacker controls {_md_escape_inline(attacker_input)}")
+        trigger = verification.get("trigger")
+        if trigger:
+            parts.append(f"triggered by {_md_escape_inline(trigger)}")
         tail = (
             f" — by `{_md_escape_inline(verification.get('harness'))}` / "
             f"`{_md_escape_inline(verification.get('model_id'))}`. "
             f"{_md_escape_inline(verification.get('rationale') or '')}"
         )
+        # The falsifier goes LAST and is called out, because it is the line a
+        # reviewer uses to disagree with the verdict. A verdict a reader cannot
+        # argue with is one they either take on faith or ignore.
+        falsifier = verification.get("falsifier")
+        if falsifier:
+            tail += f" Overturned by: {_md_escape_inline(falsifier)}"
         return "; ".join(parts) + tail
 
     status = verification_record.get("status", "missing")

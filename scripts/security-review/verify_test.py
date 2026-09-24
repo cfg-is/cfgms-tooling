@@ -209,12 +209,37 @@ def test_stage_paths_are_under_their_own_subdirectory():
           "paths: output", verify.output_path(sweep))
 
 
-def test_default_entrypoint_is_the_verifier_lane():
-    check(verify.default_lane_entrypoint().endswith(os.path.join("lanes", "verifier.py")),
-          "paths: the default entrypoint is the verifier lane",
-          verify.default_lane_entrypoint())
-    check(os.path.isfile(verify.default_lane_entrypoint()),
-          "paths: and that file exists")
+def test_default_entrypoint_is_the_agentic_verifier():
+    """The default is the AGENTIC entrypoint: the legacy lane put 81 lines of
+    the finding's own file into a prompt with nineteen unrelated findings and
+    no way to look anything up, and reachability is a cross-file property."""
+    default = verify.default_lane_entrypoint()
+    check(default.endswith(os.path.join("lanes", "agentic_verifier_entrypoint.py")),
+          "paths: the default entrypoint is the agentic verifier", default)
+    check(os.path.isfile(default), "paths: and that file exists")
+
+
+def test_the_legacy_lane_is_opt_in_and_never_a_silent_fallback():
+    """The old lane stays reachable for a side-by-side comparison, behind an
+    explicit env var. It must never be reached by accident: if the agentic
+    entrypoint cannot run, that is a failure to report, not a reason to
+    quietly emit weaker verdicts under the same stage name."""
+    saved = os.environ.get(verify.LEGACY_LANE_ENV)
+    try:
+        os.environ[verify.LEGACY_LANE_ENV] = "1"
+        check(verify.default_lane_entrypoint().endswith(os.path.join("lanes", "verifier.py")),
+              "paths: the env var selects the legacy lane",
+              verify.default_lane_entrypoint())
+        for value in ("", "0", "no", "off"):
+            os.environ[verify.LEGACY_LANE_ENV] = value
+            check(verify.default_lane_entrypoint().endswith("agentic_verifier_entrypoint.py"),
+                  f"paths: {value!r} does not select the legacy lane",
+                  verify.default_lane_entrypoint())
+    finally:
+        if saved is None:
+            os.environ.pop(verify.LEGACY_LANE_ENV, None)
+        else:
+            os.environ[verify.LEGACY_LANE_ENV] = saved
 
 
 def main() -> int:

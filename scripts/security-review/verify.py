@@ -65,8 +65,22 @@ def output_path(sweep_dir: str) -> str:
     return os.path.join(verification_dir(sweep_dir), "lanes", VERIFIER_LANE_ID, OUTPUT_FILENAME)
 
 
+# The agentic lane investigates the snapshot with tools, one file-batch at a
+# time; the legacy lane puts 81 lines of the finding's own file into a prompt
+# with nineteen unrelated findings and no way to look anything up. Reachability
+# is a cross-file property, so the legacy shape could not establish it -- see
+# `lanes/agentic_verifier.py`. The old lane stays reachable by env var for a
+# side-by-side comparison, not as a fallback: if the agentic lane cannot run,
+# that is a failure to report, never a reason to silently produce weaker
+# verdicts under the same name.
+LEGACY_LANE_ENV = "CFGMS_SECURITY_REVIEW_LEGACY_VERIFIER"
+
+
 def default_lane_entrypoint() -> str:
-    return str(Path(__file__).resolve().parent / "lanes" / "verifier.py")
+    lanes = Path(__file__).resolve().parent / "lanes"
+    if os.environ.get(LEGACY_LANE_ENV, "").lower() in ("1", "true", "yes"):
+        return str(lanes / "verifier.py")
+    return str(lanes / "agentic_verifier_entrypoint.py")
 
 
 def default_dispatch_script(repo_root: "str | None" = None) -> str:

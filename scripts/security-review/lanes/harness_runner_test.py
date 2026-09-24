@@ -1378,6 +1378,19 @@ def test_prompt_constants_are_defined_in_exactly_one_module():
 
 
 def test_every_lane_builds_its_prompt_from_shared_preamble():
+    """This guard is about FINDER lanes, and the `*_lane.py` glob is how it
+    says so.
+
+    The point is comparability: the four harnesses must ask the plan's steps
+    the IDENTICAL question, or a difference between lanes reads as a difference
+    between models when it is really a difference between prompts.
+
+    A verifier asks a different question entirely -- "is this reachable", about
+    one finding, with no plan step in scope -- so it has its own prompt by
+    design. `verifier.py` and `agentic_verifier_entrypoint.py` are both
+    deliberately outside this rule, and both are named so they fall outside the
+    glob. That exemption is asserted below rather than left to the filename,
+    because a convention nobody checks is a convention that drifts."""
     lane_files = sorted((SECURITY_REVIEW_DIR / "lanes").glob("*_lane.py"))
     check(len(lane_files) >= 4, "at least the four landed lane runners are present", str([p.name for p in lane_files]))
     for lane_file in lane_files:
@@ -1387,6 +1400,22 @@ def test_every_lane_builds_its_prompt_from_shared_preamble():
             and "harness_runner.SYSTEM_PROMPT}" not in source
             and "harness_runner.OUTPUT_SCHEMA_DESCRIPTION}" not in source,
             f"{lane_file.name} builds its prompt from shared_preamble, never by interpolating the constants itself",
+        )
+
+    # The exemption, stated. A verifier entrypoint that acquired a `*_lane.py`
+    # name would silently join the rule above and fail for the wrong reason;
+    # one that started carrying a finder prompt would be a real defect.
+    verifier_entrypoints = ["agentic_verifier_entrypoint.py", "verifier.py"]
+    for name in verifier_entrypoints:
+        path = SECURITY_REVIEW_DIR / "lanes" / name
+        check(path.is_file(), f"{name} exists where the exemption expects it", str(path))
+        check(
+            not name.endswith("_lane.py"),
+            f"{name} stays outside the finder-lane glob -- it asks a different question",
+        )
+        check(
+            "shared_preamble(step)" not in path.read_text(encoding="utf-8"),
+            f"{name} does not carry a finder lane's step prompt",
         )
 
 

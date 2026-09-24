@@ -1433,7 +1433,8 @@ def test_skill_md_ranking_sentence_matches_shipped_sort_order():
         Path(__file__).resolve().parent.parent.parent / "skills" / "security-review" / "SKILL.md"
     )
     skill_text = skill_path.read_text()
-    ranking_sentence = "sorted by multi-lane agreement first, then severity, then confidence"
+    ranking_sentence = ("sorted by verification verdict first, then multi-lane agreement, "
+                        "then severity, then confidence")
     check(
         ranking_sentence in skill_text,
         "SKILL.md: the F6 ranking-order sentence is present in the live file "
@@ -3642,6 +3643,139 @@ def test_verification_absent_reads_as_not_verified_never_as_clean():
     check("no verifier configured" in line, "verification: and says why", line)
     check("not reachable" not in line,
           "verification: absent is never rendered as not reachable", line)
+
+
+def test_the_verdict_ranks_findings_not_just_annotates_them():
+    """[REQUIRED TEST] Before this, the verdict was recorded on every finding
+    and changed nothing about the order a human reads them in: `_group_rank_key`
+    never looked at it, and `_finalize_findings` had already sorted the list
+    before `_attach_verification` ran. The stage was paid for and its answer
+    discarded at the point it was supposed to be used.
+
+    Reachability leads the sort because it is the question the report is read
+    to answer: a reachable medium is work you do before an unreachable
+    critical."""
+    def f(verdict, severity, agreement=1):
+        return {"verification": ({"verdict": verdict} if verdict else None),
+                "agreement": {"reported": agreement},
+                "occurrences": [{"severity": severity, "confidence": "high"}],
+                "file": "a.go", "symbol": verdict or "none", "cwe": "CWE-863",
+                "vuln_class": "x"}
+
+    # A reachable MEDIUM must outrank an unreachable CRITICAL.
+    ordered = sorted([f("not_reachable", "critical"),
+                      f("reachable_from_untrusted", "medium")],
+                     key=consolidate._group_rank_key)
+    check([x["symbol"] for x in ordered] == ["reachable_from_untrusted", "not_reachable"],
+          "rank: a reachable medium outranks an unreachable critical",
+          str([x["symbol"] for x in ordered]))
+
+    # Full verdict ordering, most actionable first.
+    verdicts = ["not_reachable", "guarded", "undetermined",
+                "reachable_internal_only", "reachable_from_untrusted"]
+    ordered = sorted([f(v, "high") for v in verdicts], key=consolidate._group_rank_key)
+    check([x["symbol"] for x in ordered] == list(reversed(verdicts)),
+          "rank: verdicts order from reachable down to not_reachable",
+          str([x["symbol"] for x in ordered]))
+
+
+def test_an_unverified_finding_outranks_one_shown_unreachable():
+    """[REQUIRED TEST] No verdict is an ABSENCE of evidence, not evidence of
+    safety. Ranking it below findings actively shown to be unreachable would
+    bury exactly the rows nobody has looked at yet -- the same class of mistake
+    as reading an empty findings array as 'clean'."""
+    def f(verdict, symbol):
+        return {"verification": ({"verdict": verdict} if verdict else None),
+                "agreement": {"reported": 1},
+                "occurrences": [{"severity": "high", "confidence": "high"}],
+                "file": "a.go", "symbol": symbol, "cwe": "CWE-863", "vuln_class": "x"}
+
+    ordered = sorted([f("guarded", "guarded"), f(None, "unverified"),
+                      f("not_reachable", "unreachable")],
+                     key=consolidate._group_rank_key)
+    check([x["symbol"] for x in ordered] == ["unverified", "guarded", "unreachable"],
+          "rank: unverified sits above guarded and not_reachable",
+          str([x["symbol"] for x in ordered]))
+
+
+def test_the_checkable_fields_survive_the_envelope_and_reach_the_reader():
+    """[REQUIRED TEST] `attacker_input`, `trigger` and `falsifier` are the
+    fields that make a verdict checkable instead of merely stated.
+
+    A fix pass is run by the same kind of model that wrote the code, so it
+    shares the blind spot: "reachable" plus two sentences of prose is something
+    it can talk itself past. What the attacker controls, the concrete trigger,
+    and what would OVERTURN the verdict are the parts a fixer can test and be
+    visibly wrong about.
+
+    Dropping them was silent -- the verifier computed them, `_attach_verification`
+    did not copy them, `_verification_line` did not render them, and nothing
+    anywhere reported a gap. Pinned at both hops."""
+    with tempfile.TemporaryDirectory() as tmp:
+        entry = {
+            "file": "pkg/a/b.go", "symbol": "Thing.Do", "vuln_class": "CWE-863",
+            "verdict": "reachable_from_untrusted", "entry_point": "handleThing",
+            "call_path": ["handleThing"], "guard": "", "citation": ["pkg/a/b.go:12"],
+            "rationale": "reached from the handler",
+            "attacker_input": "the :id path variable",
+            "trigger": "DELETE /api/v1/items/1 with no session",
+            "falsifier": "an auth middleware on that route group",
+        }
+        path = os.path.join(tmp, consolidate.VERIFICATION_SUBDIR, "lanes",
+                            consolidate.VERIFIER_LANE_ID)
+        os.makedirs(path)
+        with open(os.path.join(path, consolidate.VERIFICATION_OUTPUT_FILENAME), "w") as fh:
+            json.dump({"state": "complete", "harness": "opencode",
+                       "model_id": "glm-5.3-flash:cloud",
+                       "verifications": [entry], "leaked": [], "errors": []}, fh)
+
+        findings = [{"file": "pkg/a/b.go", "symbol": "Thing.Do", "cwe": "CWE-863",
+                     "vuln_class": "CWE-863"}]
+        consolidate._attach_verification(tmp, findings)
+        carried = findings[0]["verification"]
+
+        # Hop 1: the envelope onto the finding.
+        for field in ("attacker_input", "trigger", "falsifier"):
+            check(carried.get(field) == entry[field],
+                  f"verification: {field} is carried onto the finding",
+                  repr(carried.get(field)))
+
+        # Hop 2: the finding into the rendered line.
+        line = consolidate._verification_line(findings[0], {"status": "complete"})
+        check("the :id path variable" in line,
+              "verification: what the attacker controls is rendered", line)
+        check("DELETE /api/v1/items/1" in line,
+              "verification: the concrete trigger is rendered", line)
+        check("an auth middleware on that route group" in line,
+              "verification: the falsifier is rendered", line)
+        check("Overturned by:" in line,
+              "verification: the falsifier is labelled so a reviewer can use it", line)
+
+
+def test_the_envelope_attribution_reaches_the_verdict_line():
+    """[REQUIRED TEST] `harness` and `model_id` are read off the ENVELOPE, not
+    the entry. An entrypoint that omits them does not fail anything -- every
+    verdict just renders "by None / None", which looks fine and attributes the
+    review to nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, consolidate.VERIFICATION_SUBDIR, "lanes",
+                            consolidate.VERIFIER_LANE_ID)
+        os.makedirs(path)
+        with open(os.path.join(path, consolidate.VERIFICATION_OUTPUT_FILENAME), "w") as fh:
+            json.dump({"state": "complete", "harness": "opencode",
+                       "model_id": "glm-5.3-flash:cloud",
+                       "verifications": [{"file": "a.go", "symbol": "S",
+                                          "vuln_class": "CWE-863",
+                                          "verdict": "guarded"}],
+                       "leaked": [], "errors": []}, fh)
+        findings = [{"file": "a.go", "symbol": "S", "cwe": "CWE-863",
+                     "vuln_class": "CWE-863"}]
+        record = consolidate._attach_verification(tmp, findings)
+        check(record["harness"] == "opencode", "verification: the harness is recorded",
+              str(record["harness"]))
+        line = consolidate._verification_line(findings[0], record)
+        check("None" not in line, "verification: the line attributes a real model", line)
+        check("glm-5.3-flash:cloud" in line, "verification: naming the model id", line)
 
 
 def test_a_verdict_renders_beside_the_severity_with_its_citation():
