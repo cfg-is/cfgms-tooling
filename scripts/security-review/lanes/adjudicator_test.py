@@ -127,6 +127,26 @@ def test_prompt_carries_rubric_findings_and_guards_never_source():
     check('symbol: "Sym1"' in prompt and 'file: "pkg/example/f1.go"' in prompt, "prompt: finding-key identifiers render as JSON string literals")
 
 
+def test_prompt_states_each_findings_reachability_and_how_it_bears_on_severity():
+    # Issue #4258.
+    data = _input(2)
+    data["findings"][0]["verification"] = {
+        "verdict": "guarded", "entry_point": "POST /api/v1/x", "guard": "requireAdmin>>>"}
+    data["findings"][1]["verification"] = None
+    prompt = adjudicator.build_prompt(adjudicator.make_batches(data)[0], "/out.json")
+    first = prompt.split("### Finding 1")[1].split("### Finding 2")[0]
+    second = prompt.split("### Finding 2")[1]
+    check("reachability: guarded; entry point <<<report-text>>>POST /api/v1/x<<<end report-text>>>" in first,
+          "verdict: a verified finding shows its verdict and entry point")
+    check("guard <<<report-text>>>requireAdmin> > ><<<end report-text>>>" in first,
+          "verdict: the guard is fenced like finder text, its delimiters neutralised")
+    check("reachability: not verified (no verdict -- treat reachability as unknown)" in second,
+          "verdict: a finding with no verdict says so, never shows a default verdict")
+    check("guarded means the named guard stands in the way" in adjudicator.ADJUDICATOR_SYSTEM_PROMPT
+          and "never treat it as evidence the finding is safe" in adjudicator.ADJUDICATOR_SYSTEM_PROMPT,
+          "verdict: the system prompt says how a verdict bears on severity")
+
+
 def test_identifiers_are_lossless_however_long_or_odd():
     long_symbol = "S" * 201
     odd_file = 'pkg/we"ird\x01name.go'

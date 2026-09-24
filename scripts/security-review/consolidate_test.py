@@ -3923,6 +3923,57 @@ def test_evidence_quoting_source_is_redacted_not_dropped():
               "redaction: the finding keeps its severity")
 
 
+def _verified(verdict="reachable_from_untrusted", **fields) -> dict:
+    f = _leaky_finding("nothing quoted here")
+    f["verification"] = {"verdict": verdict, "entry_point": "", "guard": "", **fields}
+    return f
+
+
+def test_the_adjudication_input_carries_only_verdict_entry_point_and_guard():
+    # Issue #4258: metadata crosses; the prose fields and citations stay behind.
+    f = _verified(entry_point="POST /api/v1/x", guard="requireAdmin",
+                  rationale="r", attacker_input="a", trigger="t", falsifier="z",
+                  citation=["pkg/a/b.go:3"], harness="h", model_id="m")
+    out = consolidate.build_adjudication_input("s", "c" * 40, [f], [])
+    check(out["findings"][0]["verification"] ==
+          {"verdict": "reachable_from_untrusted", "entry_point": "POST /api/v1/x", "guard": "requireAdmin"},
+          "adjudication verdict: exactly verdict, entry point and guard cross",
+          str(out["findings"][0]["verification"]))
+
+
+def test_no_verdict_is_passed_as_none_never_as_a_default():
+    # An absence of evidence must not read as evidence of safety.
+    f = _leaky_finding("nothing quoted here")
+    f["verification"] = None
+    unknown = _verified(verdict="probably_fine")
+    out = consolidate.build_adjudication_input("s", "c" * 40, [f, unknown], [])
+    got = [x["verification"] for x in out["findings"]]
+    check(got == [None, None],
+          "adjudication verdict: absent or out-of-vocabulary verdicts are passed as none", str(got))
+
+
+def test_no_source_reaches_the_adjudicator_through_the_verdict_fields():
+    # Every verification field set to a verbatim source line: none of it may
+    # appear in the serialised adjudication input.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_source(tmp, "package a\n" + LONG_LINE + "\n")
+        f = _verified(entry_point=LONG_LINE, guard=LONG_LINE, rationale=LONG_LINE,
+                      attacker_input=LONG_LINE, trigger=LONG_LINE, falsifier=LONG_LINE,
+                      citation=[LONG_LINE])
+        out = consolidate.build_adjudication_input("s", "c" * 40, [f], [], source_root=tmp)
+        blob = consolidate.canonical_adjudication_input(out)
+        check(LONG_LINE not in blob and "GetConfiguration" not in blob,
+              "adjudication verdict: no source text reaches the payload through the verdict fields")
+        v = out["findings"][0]["verification"]
+        check(v["entry_point"] == consolidate.EVIDENCE_REDACTED and v["guard"] == consolidate.EVIDENCE_REDACTED,
+              "adjudication verdict: a leaking entry point or guard is redacted, not dropped", str(v))
+        check(v["verdict"] == "reachable_from_untrusted",
+              "adjudication verdict: the verdict itself survives the redaction")
+        check(out["evidence_redacted"] == 2,
+              "adjudication verdict: the redactions are counted", str(out["evidence_redacted"]))
+
+
 def test_a_suggested_fix_quoting_source_is_redacted_too():
     # A suggested fix that pastes the corrected line leaks as much as evidence
     # that pastes the broken one.

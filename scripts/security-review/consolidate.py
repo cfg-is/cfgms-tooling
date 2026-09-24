@@ -1114,6 +1114,62 @@ def _redact_source_from_reports(reports: list, file_value: str, source_root: "st
     return redacted
 
 
+def _verification_for_adjudication(finding: dict, source_root: "str | None") -> "tuple[dict | None, int]":
+    """The reachability facts the adjudicator may see for `finding`, and how
+    many of their strings were redacted (Issue #4258).
+
+    `(None, 0)` when the finding has no verdict, or one outside the verifier's
+    vocabulary. It is NEVER a default verdict: an absence of evidence must not
+    read as evidence of safety, so the adjudicator is told there is none.
+
+    Only `verdict`, `entry_point` and `guard` cross. They are a vocabulary
+    word and two symbol names -- metadata, not code. The prose fields
+    (`rationale`, `attacker_input`, `trigger`, `falsifier`) and `citation` stay
+    behind: they are the fields most able to carry a pasted line. The verifier
+    already withheld any answer quoting a file it cited
+    (`agentic_verifier.scrub_answer`). The two names are ALSO checked against
+    the finding's own file here, the same check the reports get, and replaced
+    with `EVIDENCE_REDACTED` on a match, because the adjudicator must never
+    be handed source."""
+    verification = finding.get("verification")
+    if not isinstance(verification, dict):
+        return None, 0
+    verdict = verification.get("verdict")
+    if verdict not in _VERIFICATION_RANK:
+        return None, 0
+    facts = {
+        "verdict": verdict,
+        "entry_point": str(verification.get("entry_point") or ""),
+        "guard": str(verification.get("guard") or ""),
+    }
+    source = _read_finding_source(source_root, finding.get("file"))
+    redacted = 0
+    if source:
+        for field in ("entry_point", "guard"):
+            value = facts[field]
+            if not value:
+                continue
+            try:
+                if source_leak.find_leak(value, source) is not None:
+                    facts[field] = EVIDENCE_REDACTED
+                    redacted += 1
+            except Exception:  # noqa: BLE001 -- a check must never fail a sweep
+                facts[field] = EVIDENCE_REDACTED
+                redacted += 1
+    return facts, redacted
+
+
+def _read_finding_source(source_root: "str | None", file_value: "str | None") -> str:
+    """The finding's own file from the snapshot, or "" when it cannot be read."""
+    if not source_root or not file_value:
+        return ""
+    try:
+        with open(os.path.join(source_root, file_value), "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def build_adjudication_input(
     sweep_id: str, commit_sha: str, findings: list[dict], groups: list[dict],
     source_root: "str | None" = None,
@@ -1157,6 +1213,8 @@ def build_adjudication_input(
             for occ in finding["occurrences"]
         ]
         redacted_count += _redact_source_from_reports(reports, finding["file"], source_root)
+        verification, verification_redacted = _verification_for_adjudication(finding, source_root)
+        redacted_count += verification_redacted
         built_findings.append({
             "file": finding["file"],
             "symbol": finding["symbol"],
@@ -1164,6 +1222,7 @@ def build_adjudication_input(
             "step_ids": list(finding["step_ids"]),
             "severity_range": finding["severity_range"],
             "reports": reports,
+            "verification": verification,
         })
     if redacted_count:
         schema.log_event("adjudication_evidence_redacted", count=redacted_count)
@@ -1789,6 +1848,15 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     # adjudication envelope merged ONTO them if -- and only if -- it is
     # complete, for this sweep, and over this input.
     cross_step_groups = build_cross_step_groups(consolidated_findings)
+    # Issue #4258: verification is attached BEFORE the adjudication input is
+    # built, because that input carries each finding's verdict -- the pipeline
+    # runs the verifier first precisely so the adjudicator's severity rests on
+    # an established reachability rather than a guessed one. `adjudicate.py`
+    # builds its input from this function's findings, so both sides see the
+    # same verdicts and the `input_hash` agrees. A verifier re-run after
+    # adjudication changes that input, and the adjudication then reads as stale
+    # -- correctly, since it was judged without the current verdicts.
+    verification = _attach_verification(sweep_dir, consolidated_findings)
     adjudication_input = build_adjudication_input(
         sweep_id, _sweep_commit_sha(sweep_dir), consolidated_findings, cross_step_groups,
         source_root=os.path.join(sweep_dir, "snapshot"),
@@ -1808,12 +1876,6 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     if envelope is not None:
         _apply_adjudication(consolidated_findings, cross_step_groups, envelope, adjudication)
 
-    # Issue #4071: verification runs BEFORE adjudication in the pipeline, but is
-    # folded on AFTER it here -- these are independent annotations of the same
-    # finding and neither reads the other. The pipeline order matters because
-    # the adjudicator's severity should be informed by an established
-    # reachability rather than a guessed one; the render order does not.
-    verification = _attach_verification(sweep_dir, consolidated_findings)
     # The sort key reads the verification verdict, so re-sort after merging --
     # exactly as `_attach_adjudication` does for the adjudicated severity.
     # `_finalize_findings` sorted this list before either annotation existed,

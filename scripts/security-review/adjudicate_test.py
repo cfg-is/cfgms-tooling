@@ -88,12 +88,48 @@ def test_prepare_lays_out_source_free_subsweep_with_findings_only():
         check(data["sweep_id"] == os.path.basename(sweep) and data["commit_sha"] == sha, "prepare: input is bound to this sweep and commit", str({k: data[k] for k in ("sweep_id", "commit_sha")}))
         check(len(data["findings"]) == 2 and len(data["cross_step_groups"]) == 1, "prepare: findings and cross-step groups are carried", str((len(data["findings"]), len(data["cross_step_groups"]))))
         for finding in data["findings"]:
-            check(set(finding) == {"file", "symbol", "vuln_class", "step_ids", "severity_range", "reports"}, "prepare: each finding carries exactly the findings-only fields", str(sorted(finding)))
+            check(set(finding) == {"file", "symbol", "vuln_class", "step_ids", "severity_range", "reports", "verification"}, "prepare: each finding carries exactly the findings-only fields", str(sorted(finding)))
         check(
             hashlib.sha256(raw).hexdigest() == consolidate.adjudication_input_hash(adjudication_input),
             "prepare: the bytes on disk hash to the same value consolidate.py will expect on the envelope",
         )
         check(consolidate.adjudication_input_hash(adjudication_input) == hashlib.sha256(consolidate.canonical_adjudication_input(json.loads(raw)).encode()).hexdigest(), "prepare: round-tripping the file through JSON yields the same canonical hash")
+
+
+def test_prepare_carries_the_verdict_into_the_adjudication_input():
+    # Issue #4258: verification runs before adjudication so severity can rest on
+    # an established reachability. The input must carry the verdict for the
+    # finding it names, None for a finding with no verdict, and no prose.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        _sweep_with_findings(repo, sweep)
+        fixtures.write(consolidate.verification_output_path(sweep), {
+            "state": "complete", "harness": "opencode", "model_id": "m",
+            "verifications": [{
+                "file": "pkg/example/thing.go", "symbol": "Thing.DoSomething",
+                "vuln_class": "CWE-863", "verdict": "guarded",
+                "entry_point": "POST /api/v1/things", "guard": "requireTenantAdmin",
+                "rationale": "SECRET-MARKER-NEVER-IN-PROMPT prose",
+                "attacker_input": "SECRET-MARKER-NEVER-IN-PROMPT body",
+                "trigger": "SECRET-MARKER-NEVER-IN-PROMPT", "falsifier": "x",
+                "citation": ["pkg/example/thing.go:2"],
+            }],
+        })
+        path, _ = adjudicate.prepare(sweep, repo)
+        with open(path, "rb") as f:
+            raw = f.read()
+        data = json.loads(raw)
+        by_file = {f["file"]: f for f in data["findings"]}
+        check(by_file["pkg/example/thing.go"]["verification"] ==
+              {"verdict": "guarded", "entry_point": "POST /api/v1/things", "guard": "requireTenantAdmin"},
+              "prepare: the verified finding carries verdict, entry point and guard only",
+              str(by_file["pkg/example/thing.go"]["verification"]))
+        check(by_file["pkg/other/audit.go"]["verification"] is None,
+              "prepare: a finding with no verdict carries none, never a default verdict",
+              str(by_file["pkg/other/audit.go"]["verification"]))
+        check(b"SECRET-MARKER-NEVER-IN-PROMPT" not in raw,
+              "prepare: the verifier's prose fields do not reach the adjudication input")
+        check(os.listdir(os.path.join(sweep, "adjudication", "snapshot")) == [],
+              "prepare: the adjudication snapshot is still empty")
 
 
 def test_prepare_with_no_findings_writes_no_input_and_reports_nothing_to_do():

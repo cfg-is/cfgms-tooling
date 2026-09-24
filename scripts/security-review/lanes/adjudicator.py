@@ -206,7 +206,17 @@ ADJUDICATOR_SYSTEM_PROMPT = (
     "correct the shared rating -- agreement is not evidence of correctness. Judge "
     "severity from the impact and preconditions the reports describe, against the "
     "threat model in the rubric, never from how confident or numerous the finders "
-    "were. You are also given groups of findings that share a defect class across "
+    "were. Each finding also carries a reachability line from a separate "
+    "verification stage that read the code. Use it as a precondition fact: "
+    "reachable_from_untrusted with an entry point means the attacker-access "
+    "precondition is established, so rate the impact as reachable. "
+    "reachable_internal_only means an attacker must first hold internal or "
+    "privileged access, so weigh that precondition. guarded means the named guard "
+    "stands in the way; rate the severity of the guard failing, not of the "
+    "unguarded defect. not_reachable means no path was found, which lowers the "
+    "likelihood but not the impact if the verdict is wrong. undetermined or not "
+    "verified means reachability is unknown: judge from the reports alone, and "
+    "never treat it as evidence the finding is safe. You are also given groups of findings that share a defect class across "
     "different review steps; for each group, decide whether the members describe "
     "one defect whose evidence was split between steps (same_defect), separate "
     "defects (distinct), or whether the reports do not let you tell (unsure). "
@@ -310,6 +320,25 @@ def _ident(value: object) -> str:
     return json.dumps(str(value) if value is not None else "")
 
 
+def _render_verification(verification: object) -> str:
+    """The reachability line for one finding (Issue #4258).
+
+    A finding with no verdict says so in words. It is never rendered as a
+    default verdict, because "nobody checked" must not read as "checked and
+    safe". The entry point and guard are verifier-written, so they are
+    clipped and fenced exactly like finder report text."""
+    if not isinstance(verification, dict) or not verification.get("verdict"):
+        return "reachability: not verified (no verdict -- treat reachability as unknown)"
+    line = f"reachability: {_clip(verification.get('verdict'), 40)}"
+    entry_point = verification.get("entry_point")
+    if entry_point:
+        line += f"; entry point <<<report-text>>>{_clip(entry_point, 200)}<<<end report-text>>>"
+    guard = verification.get("guard")
+    if guard:
+        line += f"; guard <<<report-text>>>{_clip(guard, 200)}<<<end report-text>>>"
+    return line
+
+
 def _render_finding(index: int, finding: dict) -> str:
     severity_range = finding.get("severity_range") or {}
     lines = [
@@ -320,6 +349,7 @@ def _render_finding(index: int, finding: dict) -> str:
         f"review steps: {', '.join(str(s) for s in finding.get('step_ids') or [])}",
         f"finder severities: lowest={severity_range.get('lowest')} highest={severity_range.get('highest')}"
         f" disagreement={'yes' if severity_range.get('disagreement') else 'no'}",
+        _render_verification(finding.get("verification")),
     ]
     # `_text_cap` / `reports_omitted` are set only by `_shrink_to_budget` on a
     # finding too large to send whole; every other finding renders at the
