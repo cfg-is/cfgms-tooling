@@ -1447,8 +1447,12 @@ ensure_creds_mirror_for_mount() {
     if [[ "$was" != "never" ]]; then
       echo "NOTE: credential mirror watcher was not working (heartbeat ${was}s old); restarting it" >&2
     fi
-    stop_creds_mirror_watcher
-    start_creds_mirror_watcher || {
+    # The stop happens INSIDE start's lock (Issue #4277), never here. A stop
+    # out here raced a concurrent launch: this caller saw "no watcher", another
+    # launch then started one, and this stop killed it or deleted its pidfile.
+    # The next launch into the lock read "dead" and started a second. Under
+    # load, 8 concurrent launches left 2-4 watchers.
+    start_creds_mirror_watcher --restart-stale || {
       echo "ERROR: could not start the credential mirror watcher; refusing to launch" >&2
       exit 10
     }
@@ -1537,8 +1541,17 @@ _release_creds_mirror_lock() {
   rmdir "$CREDS_MIRROR_LOCKDIR" 2>/dev/null || true
 }
 
+# With --restart-stale, a watcher that is alive but no longer beating counts as
+# unhealthy: it is stopped and replaced, all inside the lock (Issue #4277).
 start_creds_mirror_watcher() {
-  creds_mirror_watcher_alive && return 0
+  local restart_stale=0
+  [[ "${1:-}" == "--restart-stale" ]] && restart_stale=1
+  _creds_mirror_watcher_healthy() {
+    creds_mirror_watcher_alive || return 1
+    (( restart_stale )) || return 0
+    creds_mirror_is_fresh
+  }
+  _creds_mirror_watcher_healthy && return 0
   refresh_creds_mirror || return 1
 
   # Issue #4166: check-start-record is ONE step, or two racing dispatches both
@@ -1559,11 +1572,14 @@ start_creds_mirror_watcher() {
     # takes the lock the winner just released and starts a second watcher
     # anyway. The lock would then serialise the writes without preventing the
     # duplicate -- which is the entire failure it exists to stop.
-    if creds_mirror_watcher_alive; then
+    if _creds_mirror_watcher_healthy; then
       _release_creds_mirror_lock
       return 0
     fi
   fi
+  # Replace an unhealthy watcher here, where no other launch can start one
+  # between the stop and the start. Only a confirmed watcher is ever killed.
+  (( restart_stale )) && stop_creds_mirror_watcher
   # NOT locked and proceeding anyway is deliberate (#4166 AC3). A lock that
   # cannot be taken degrades to the pre-#4166 behaviour -- a possible duplicate
   # watcher, harmless to correctness since both write identical bytes to the

@@ -570,6 +570,25 @@ race_started=$(comm -13 <(printf '%s\n' "$race_before") <(_watcher_pids) | grep 
 assert_eq "$race_started" "1" \
     "concurrency: ${CONCURRENT} simultaneous launches start exactly ONE watcher, not ${CONCURRENT}"
 
+# Issue #4277: the restart path must stop a watcher only INSIDE the lock. The
+# stop used to run in ensure_creds_mirror_for_mount, before start took the
+# lock, so a launch that saw "no watcher" could kill (or un-record) a watcher a
+# concurrent launch had just started -- and the next launch into the lock then
+# started a second. That flaked the count above in CI under load (2-4 watchers
+# from 8 launches). The count cannot catch it reliably on an idle machine, so
+# the structure is pinned too.
+ensure_body=$(sed -n '/^ensure_creds_mirror_for_mount() {/,/^}/p' "$DISPATCH")
+assert_not_contains "$ensure_body" $'\n    stop_creds_mirror_watcher' \
+    "concurrency: ensure_creds_mirror_for_mount never stops a watcher outside the lock"
+start_body=$(sed -n '/^start_creds_mirror_watcher() {/,/^}/p' "$DISPATCH")
+lock_line=$(grep -n '_take_creds_mirror_lock' <<< "$start_body" | head -1 | cut -d: -f1)
+stop_line=$(grep -n 'stop_creds_mirror_watcher' <<< "$start_body" | grep -v '#' | head -1 | cut -d: -f1)
+if [[ -n "$lock_line" && -n "$stop_line" && "$stop_line" -gt "$lock_line" ]]; then
+    _pass "concurrency: the restart's stop runs after start takes the lock"
+else
+    _fail "concurrency: the restart's stop is not after the lock (lock line ${lock_line:-none}, stop line ${stop_line:-none})"
+fi
+
 # And the one that survived is the one the pidfile names -- a lock that
 # prevented duplicates but left the pidfile pointing at a dead process would
 # pass the count above while breaking `stop_creds_mirror_watcher`.
