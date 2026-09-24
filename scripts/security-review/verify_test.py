@@ -79,14 +79,32 @@ def test_build_input_keeps_coordinates_and_the_finders_claim():
           "input: the finder's claim is carried -- it is what gets checked")
 
 
-def test_build_input_withholds_severity():
-    # The verifier decides reachability. Showing it a severity invites it to
-    # reason about importance instead, which is the adjudicator's job.
-    payload = verify.build_verification_input("s1", "c" * 40, [finding()])
+def test_build_input_carries_severity_range_for_scoping_only():
+    # Issue #4284: the entrypoint SELECTS critical/high findings by
+    # severity_range, in code, before any model runs. Withholding it here meant
+    # a single-lane critical was never verified. The per-occurrence severities
+    # stay out, and the prompts never render severity (see the batch tests).
+    rng = {"lowest": "critical", "highest": "critical", "disagreement": False}
+    payload = verify.build_verification_input("s1", "c" * 40, [finding(severity_range=rng)])
     got = payload["findings"][0]
-    check("severity_range" not in got, "input: severity_range is withheld", str(sorted(got)))
+    check(got.get("severity_range") == rng, "input: severity_range is carried for scoping", str(sorted(got)))
     check("severity" not in got.get("occurrences", [{}])[0],
-          "input: per-occurrence severity is withheld", str(got.get("occurrences")))
+          "input: per-occurrence severity is still withheld", str(got.get("occurrences")))
+
+
+def test_a_single_lane_critical_is_selected_for_verification():
+    # The defect #4284 names, end to end through the real selection code: a
+    # critical finding reported by ONE lane must be in the verifier's scope.
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lanes"))
+    import agentic_verifier_batch as ab  # noqa: E402
+    rng = {"lowest": "critical", "highest": "critical", "disagreement": False}
+    payload = verify.build_verification_input("s1", "c" * 40, [finding(severity_range=rng)])
+    check(len(ab.select_scope(payload["findings"])) == 1,
+          "scope: a single-lane critical finding is selected for verification")
+    low = {"lowest": "low", "highest": "low", "disagreement": False}
+    payload = verify.build_verification_input("s1", "c" * 40, [finding(severity_range=low)])
+    check(ab.select_scope(payload["findings"]) == [],
+          "scope: a single-lane low finding is still out of scope")
 
 
 def test_build_input_skips_occurrences_without_evidence():

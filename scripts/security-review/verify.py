@@ -142,9 +142,15 @@ def build_verification_input(sweep_id: str, commit_sha: str, findings: list) -> 
     """The findings the verifier is asked about, carrying only what it needs.
 
     Each entry keeps its coordinates, its class, and the finder's own evidence
-    -- the claim being checked. Severity is deliberately omitted: the verifier
-    decides reachability, and showing it a severity invites it to reason about
-    importance instead."""
+    -- the claim being checked.
+
+    `severity_range` rides along for SCOPING ONLY (Issue #4284): the lane
+    entrypoint selects critical/high findings by it, in code, before any model
+    runs. Without it that selection saw no severity and verified only
+    multi-lane findings, never a single-lane critical. The MODEL still never
+    sees severity -- the prompts render coordinates, class and claim only --
+    because showing it a severity invites it to reason about importance
+    instead of reachability."""
     trimmed = []
     for f in findings or []:
         if not isinstance(f, dict):
@@ -158,6 +164,7 @@ def build_verification_input(sweep_id: str, commit_sha: str, findings: list) -> 
             "symbol": f.get("symbol"),
             "vuln_class": f.get("vuln_class"),
             "line": f.get("line"),
+            "severity_range": f.get("severity_range"),
             "occurrences": occurrences,
         })
     return {"sweep_id": sweep_id, "commit_sha": commit_sha, "findings": trimmed}

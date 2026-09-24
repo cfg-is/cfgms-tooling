@@ -127,6 +127,18 @@ def test_prompt_numbers_every_finding() -> None:
     check("2 finding(s)" in prompt, "prompt: states how many")
 
 
+def test_prompts_never_show_severity() -> None:
+    # Issue #4284: severity now rides in the input for SCOPING. It must never
+    # reach the model, which judges reachability, not importance.
+    marked = {"lowest": "SEVMARKLOW", "highest": "SEVMARKHIGH", "disagreement": True}
+    findings = [finding(1, "x", severity_range=marked), finding(2, "y", severity_range=marked)]
+    prompts = [ab.build_investigate_prompt("pkg/a.go", findings), ab.build_forced_prompt([1, 2])]
+    # Values, not the word: the prompt legitimately says "You are not judging
+    # severity". What must not appear is any finding's severity itself.
+    check(not any("SEVMARK" in p for p in prompts),
+          "prompt: severity_range values never appear in the investigate or forced prompt")
+
+
 # --- banking partial answers -------------------------------------------------
 
 def test_a_valid_subset_is_banked_and_the_rest_asked_again() -> None:
