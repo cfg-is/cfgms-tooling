@@ -140,6 +140,129 @@ def score_findings(entry: dict, files: "list[str]", findings: "list[dict]") -> d
     return {"id": entry["id"], "outcome": "near", "matched": on_file}
 
 
+# --- verifier accuracy (Issue #4259) -----------------------------------------
+#
+# The sweep score above asks "did a finder find it". These ask a different
+# question of a different stage: given a finding, did the VERIFIER call its
+# reachability right. A corpus entry is a known-real defect, so `not_reachable`
+# or `guarded` on one is a measured false negative. The negative set is
+# known-clean code, so `reachable_*` on one is a measured false positive.
+# Without the negative set the score measures one direction only, and a
+# verifier that answered `reachable_from_untrusted` to everything would look
+# perfect.
+
+_NEG_ROW_RE = re.compile(
+    r"^\|\s*(?P<id>NC-\d{2,})\s*\|\s*`(?P<commit>[0-9a-f]{7,40})`\s*\|"
+    r"\s*`(?P<file>[^`|]+)`\s*\|\s*`?(?P<symbol>[^`|]+?)`?\s*\|"
+    r"\s*(?P<vuln_class>[A-Za-z0-9-]+)\s*\|\s*(?P<reason>[^|]*?)\s*\|\s*$",
+    re.MULTILINE,
+)
+
+REACHABLE_VERDICTS = ("reachable_from_untrusted", "reachable_internal_only")
+UNREACHABLE_VERDICTS = ("guarded", "not_reachable")
+VERDICT_TERMS = REACHABLE_VERDICTS + UNREACHABLE_VERDICTS + ("undetermined",)
+
+
+def parse_negative_index(text: str) -> "list[dict]":
+    """Parse the negative-set table: known-clean `(commit, file, symbol)`
+    triples, each with the vuln_class a finder might wrongly claim there and the
+    reason it is safe. Ids share the corpus rule: permanent, never reused."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for m in _NEG_ROW_RE.finditer(text):
+        row = m.groupdict()
+        if row["id"] in seen:
+            raise CorpusError(f"duplicate negative-set id {row['id']!r}; ids are permanent and unique")
+        seen.add(row["id"])
+        rows.append(row)
+    return rows
+
+
+def load_negative_index(path: str | None = None) -> "list[dict]":
+    resolved = path or index_path()
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        raise CorpusError(f"cannot read corpus index at {resolved}: {exc}") from exc
+    return parse_negative_index(text)
+
+
+def score_verdicts(records: "list[dict]") -> dict:
+    """Count verifier verdicts against both sets.
+
+    `records`: `{"set": "positive"|"negative", "id", "verdict"}` -- one per
+    verified corpus or negative-set item. A `verdict` of None, or outside the
+    verifier's vocabulary, counts as `no_verdict` and is excluded from both
+    error counts: a stage that failed to answer made no claim to be wrong about,
+    and folding it into either error would misstate the verifier's accuracy.
+
+    `undetermined` is counted on its own. It is an honest non-answer, not an
+    error in either direction, and a rate that hid it would reward guessing.
+    """
+    by_set = {
+        s: {v: 0 for v in VERDICT_TERMS + ("no_verdict",)} for s in ("positive", "negative")
+    }
+    for r in records:
+        s = r.get("set")
+        if s not in by_set:
+            raise CorpusError(f"record {r.get('id')!r} has set {s!r}; want 'positive' or 'negative'")
+        v = r.get("verdict")
+        by_set[s][v if v in VERDICT_TERMS else "no_verdict"] += 1
+
+    pos, neg = by_set["positive"], by_set["negative"]
+    false_neg = sum(pos[v] for v in UNREACHABLE_VERDICTS)
+    true_pos = sum(pos[v] for v in REACHABLE_VERDICTS)
+    false_pos = sum(neg[v] for v in REACHABLE_VERDICTS)
+    true_neg = sum(neg[v] for v in UNREACHABLE_VERDICTS)
+    decided_pos = true_pos + false_neg
+    decided_neg = true_neg + false_pos
+    return {
+        "positive": pos,
+        "negative": neg,
+        "true_positive": true_pos,
+        "false_negative": false_neg,
+        "true_negative": true_neg,
+        "false_positive": false_pos,
+        # Rates over DECIDED verdicts only, with the denominators beside them:
+        # a rate quoted without its sample size is not a measurement.
+        "false_negative_rate": (false_neg / decided_pos) if decided_pos else None,
+        "false_positive_rate": (false_pos / decided_neg) if decided_neg else None,
+        "decided_positive": decided_pos,
+        "decided_negative": decided_neg,
+    }
+
+
+def verdict_stability(runs: "list[list[dict]]") -> dict:
+    """How often repeated verification of the SAME item returns the same verdict.
+
+    Stability and correctness are different numbers and are never folded
+    together: a verifier can be reliably wrong or erratically right. `runs` is
+    a list of runs, each a list of `{"id", "verdict"}`. An item's agreement is
+    the share of its runs that returned its most common verdict; a missing
+    verdict counts as its own outcome, because an answer that sometimes fails
+    to appear is unstable.
+    """
+    per_item: dict = {}
+    for run in runs:
+        for r in run:
+            per_item.setdefault(r["id"], []).append(r.get("verdict") or "no_verdict")
+    items = {}
+    for item_id, verdicts in sorted(per_item.items()):
+        counts: dict = {}
+        for v in verdicts:
+            counts[v] = counts.get(v, 0) + 1
+        modal = max(counts.values())
+        items[item_id] = {"runs": len(verdicts), "agreement": modal / len(verdicts), "verdicts": counts}
+    agreements = [i["agreement"] for i in items.values()]
+    return {
+        "items": items,
+        "item_count": len(items),
+        "fully_stable": sum(1 for a in agreements if a == 1.0),
+        "mean_agreement": (sum(agreements) / len(agreements)) if agreements else None,
+    }
+
+
 def score_report(entries: "list[dict]", results: "list[dict]") -> dict:
     """Aggregate per-entry results into one comparable score.
 
