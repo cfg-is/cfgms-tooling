@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -49,9 +50,18 @@ def make_stub_dispatch(path: str, argv_out: str, exit_code: int = 0) -> None:
     os.chmod(path, 0o755)
 
 
+SNAPSHOT_MARKER = "pkg/marker.go"
+
+
 def sweep_with_snapshot(tmp: str) -> str:
     sweep = os.path.join(tmp, "sweep")
-    os.makedirs(os.path.join(sweep, "snapshot"), exist_ok=True)
+    marker = os.path.join(sweep, "snapshot", SNAPSHOT_MARKER)
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    # Real content, not an empty directory: the mount assertion below proves
+    # the verifier is handed THIS tree by comparing inodes, which an empty
+    # snapshot could not distinguish from an empty stand-in.
+    with open(marker, "w") as f:
+        f.write("package marker\n")
     os.makedirs(os.path.join(sweep, "verification", "plan"), exist_ok=True)
     with open(verify.input_path(sweep), "w") as f:
         json.dump({"findings": [finding()]}, f)
@@ -113,9 +123,27 @@ def test_launch_mounts_the_sweeps_real_snapshot():
         check("LAUNCHED_INVESTIGATOR" in out, "launch: returns the launcher's stdout", out.strip())
         check("--snapshot-dir" in argv, "launch: a snapshot is mounted", str(argv))
         snap = argv[argv.index("--snapshot-dir") + 1]
-        check(snap == os.path.join(sweep, "snapshot"),
-              "launch: it is the SWEEP's real snapshot, not an empty stand-in", snap)
+        passed_sweep_dir = argv[argv.index("--sweep-dir") + 1]
+
+        # The escape check in `agent-dispatch.sh launch-investigator` resolves
+        # --snapshot-dir against the --sweep-dir passed on the SAME call, and
+        # refuses anything else with INVESTIGATOR_REFUSED:snapshot_dir_escape.
+        # Passing the sweep ROOT's snapshot beside the verification sub-sweep
+        # failed that check on every real dispatch, so the stage never ran.
+        check(snap == os.path.join(passed_sweep_dir, "snapshot"),
+              "launch: the snapshot satisfies the launcher's escape check", snap)
         check(os.path.isdir(snap), "launch: and that directory exists")
+
+        # ...and it is still the SWEEP's real snapshot, not an empty
+        # stand-in: same content, same inode, no second byte-copy.
+        mounted = os.path.join(snap, SNAPSHOT_MARKER)
+        real = os.path.join(sweep, "snapshot", SNAPSHOT_MARKER)
+        check(os.path.isfile(mounted),
+              "launch: it carries the sweep's real snapshot content", mounted)
+        check(os.path.isfile(mounted) and os.stat(mounted).st_ino == os.stat(real).st_ino,
+              "launch: hardlinked to the one real snapshot, not copied")
+        check(not os.path.islink(snap),
+              "launch: never a symlink -- that would fail the same escape check")
         check(argv[argv.index("--mode") + 1] == "verifier", "launch: mode is the verifier lane")
         check(argv[argv.index("--model") + 1] == "glm-5.3-flash:cloud",
               "launch: the configured model is passed through")
@@ -124,7 +152,9 @@ def test_launch_mounts_the_sweeps_real_snapshot():
 def test_launch_without_a_snapshot_fails_closed():
     with tempfile.TemporaryDirectory() as tmp:
         sweep = sweep_with_snapshot(tmp)
-        os.rmdir(os.path.join(sweep, "snapshot"))
+        # rmtree, not rmdir: the fixture's snapshot carries a marker file so
+        # the mount assertion above can prove inode identity.
+        shutil.rmtree(os.path.join(sweep, "snapshot"))
         script = os.path.join(tmp, "dispatch.sh")
         make_stub_dispatch(script, os.path.join(tmp, "argv.json"))
         entry = os.path.join(tmp, "verifier.py"); open(entry, "w").close()

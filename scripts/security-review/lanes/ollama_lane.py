@@ -453,6 +453,29 @@ def _strip_terminal_control(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+# The top-level keys that mark a decoded object as the model's ANSWER rather
+# than an aside, an echoed example, or an error body.
+#
+# TWO answer shapes reach this extractor, because this module's
+# `call_ollama_harness` backs both kinds of ollama lane:
+#
+#   finder   (harness_runner)      {"findings": [...], "dispositions": [...]}
+#   verifier (lanes/verifier.py)   {"verifications": [...]}
+#
+# `verifications` was missing, so `_extract_json_object` returned None for
+# EVERY verifier batch and nothing was ever written to the batch's output
+# path. `lanes/verifier.py` then recorded "no parseable output" against
+# answers that were in fact well-formed, complete JSON -- a whole verification
+# stage reporting zero verified findings while the model was answering
+# correctly the entire time. Measured on sweep 2026-09-20T0056Z-ae5474eb: 95
+# consecutive batches, `exit_code: 0`, `extracted_json_object: false`, each
+# stdout parsing cleanly with `json.loads` on its own.
+#
+# Keep this list in step with every answer shape a caller asks this lane to
+# produce: a shape missing here fails silently and looks like a model problem.
+ANSWER_KEYS = ("findings", "dispositions", "verifications")
+
+
 def _extract_json_object(text: str) -> "dict | None":
     """Best-effort extraction of the answer's top-level JSON object embedded
     in `text`, tolerating prose before, between, and after it.
@@ -484,8 +507,8 @@ def _extract_json_object(text: str) -> "dict | None":
     non-zero guard (which only fires when extraction finds nothing at all)
     never catches it.
 
-    Among the collected candidates, the **last** one that carries a
-    `findings` or `dispositions` key is returned -- the model's actual answer
+    Among the collected candidates, the **last** one that carries any
+    `ANSWER_KEYS` key is returned -- the model's actual answer
     is conventionally the last thing it says, and requiring one of those two
     keys rejects objects that are JSON-shaped but not an answer at all (e.g.
     `{"error": "unauthorized: you need to be signed in"}`, which must be
@@ -513,7 +536,7 @@ def _extract_json_object(text: str) -> "dict | None":
             search_from = brace_index + 1
 
     for obj in reversed(candidates):
-        if "findings" in obj or "dispositions" in obj:
+        if any(key in obj for key in ANSWER_KEYS):
             return obj
     return None
 

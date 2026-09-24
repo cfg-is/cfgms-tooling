@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -81,6 +82,55 @@ def default_lane_entrypoint() -> str:
     if os.environ.get(LEGACY_LANE_ENV, "").lower() in ("1", "true", "yes"):
         return str(lanes / "verifier.py")
     return str(lanes / "agentic_verifier_entrypoint.py")
+
+
+def _materialize_verification_snapshot(top_snapshot_dir: str, sub_dir: str) -> str:
+    """Give the verifier's sub-sweep-dir (`<sweep_dir>/verification/`) a
+    `snapshot/` of its own, hardlinked from the sweep's one real snapshot at
+    `top_snapshot_dir` (`<sweep_dir>/snapshot`).
+
+    `agent-dispatch.sh launch-investigator`'s `--snapshot-dir` escape check
+    (Issue #3952) requires the passed directory to resolve to EXACTLY `<the
+    --sweep-dir passed on that same call>/snapshot` -- and verifier dispatch
+    passes the `verification/` sub-directory as `--sweep-dir`, not the sweep
+    root, so the root's own snapshot cannot be passed there directly without
+    weakening that check. Passing it anyway is what produced
+    `INVESTIGATOR_REFUSED:snapshot_dir_escape` on every verifier dispatch: the
+    stage had never run.
+
+    This is `planner.py::_materialize_lane_bundle()`'s fix for the identical
+    mismatch on `--bundle-dir`, applied to the other sub-sweep that needs a
+    real artifact from its parent. Hardlinking (never symlinking -- a symlink
+    would itself fail the same escape check, by design) gives the sub-sweep a
+    real directory entry satisfying the check while sharing the same inodes
+    and disk blocks as the one snapshot `snapshot.create_snapshot()` already
+    verified -- no second byte-copy of the tree. Idempotent: a second call
+    against an already-materialized snapshot is a no-op, which is what makes
+    `resume` re-dispatch the verifier without rebuilding it.
+    """
+    sub_snapshot_dir = os.path.join(sub_dir, "snapshot")
+    if os.path.islink(sub_snapshot_dir):
+        raise VerificationError(
+            f"refusing to use a symlinked verifier snapshot directory: {sub_snapshot_dir}"
+        )
+    if not os.path.isdir(sub_snapshot_dir):
+        os.makedirs(sub_dir, exist_ok=True)
+        # Build under a temporary name and rename into place, so a run that
+        # dies partway leaves nothing at `sub_snapshot_dir`. A half-built tree
+        # left there would satisfy the `isdir` check above on the next resume
+        # and be mounted as if complete -- a silently short snapshot, which is
+        # the one failure mode worse than the refusal this fixes.
+        staging = os.path.join(sub_dir, f".snapshot.incomplete.{os.getpid()}")
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            shutil.copytree(top_snapshot_dir, staging, copy_function=os.link)
+            os.rename(staging, sub_snapshot_dir)
+        except OSError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise VerificationError(
+                f"could not hardlink the sweep snapshot into {sub_snapshot_dir}: {exc}"
+            ) from exc
+    return sub_snapshot_dir
 
 
 def default_dispatch_script(repo_root: "str | None" = None) -> str:
@@ -188,12 +238,16 @@ def launch(
         )
 
     sub_dir = verification_dir(sweep_dir)
+    # The escape check resolves `--snapshot-dir` against the `--sweep-dir`
+    # passed on this same call, which is the sub-sweep -- so hand it the
+    # sub-sweep's own hardlinked view of that same snapshot, not the root's.
+    sub_snapshot_dir = _materialize_verification_snapshot(snapshot_dir, sub_dir)
     try:
         result = subprocess.run(
             shell_command.sh_argv(script) + [
                 "launch-investigator",
                 "--sweep-dir", sub_dir,
-                "--snapshot-dir", snapshot_dir,
+                "--snapshot-dir", sub_snapshot_dir,
                 "--mode", VERIFIER_LANE_ID,
                 "--harness", harness,
                 "--model", model,

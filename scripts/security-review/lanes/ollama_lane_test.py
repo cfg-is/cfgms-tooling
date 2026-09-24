@@ -640,6 +640,58 @@ def test_extract_json_object_rejects_a_json_object_with_neither_findings_nor_dis
     )
 
 
+def test_extract_json_object_accepts_the_verifier_answer_shape() -> None:
+    """[REQUIRED TEST] The verifier answer shape is an answer too.
+
+    This module's `call_ollama_harness` backs BOTH kinds of ollama lane: the
+    finder lanes, which answer `{"findings": [...], "dispositions": [...]}`,
+    and `lanes/verifier.py`, which answers `{"verifications": [...]}`. The
+    key check only knew the finder's two keys, so every verifier batch
+    extracted as None, nothing was written to the batch output path, and
+    `verifier.py` recorded "no parseable output" against answers that were
+    well-formed, complete JSON.
+
+    Measured on sweep 2026-09-20T0056Z-ae5474eb before the fix: 96 consecutive
+    batches, every one `exit_code: 0` and `extracted_json_object: false`, every
+    one parsing cleanly under a bare `json.loads`. 1,903 verifications were
+    discarded over nine hours while the model answered correctly throughout.
+    Nothing in this suite failed, which is why the fix carries this test.
+
+    Asserts the payload comes back intact, not merely that extraction returned
+    something: a key check that accepted the object but handed back the wrong
+    one would pass a bare `is not None`."""
+    text = 'Here is my verification.\n{"verifications": [{"verdict": "guarded"}]}\n'
+    extracted = ollama_lane._extract_json_object(text)
+    check(
+        extracted == {"verifications": [{"verdict": "guarded"}]},
+        "_extract_json_object: a verifier answer is an answer",
+        repr(extracted),
+    )
+
+
+def test_extract_json_object_still_rejects_an_object_with_no_answer_key() -> None:
+    """[REQUIRED TEST] The guard the test above must not have widened away.
+
+    Adding `verifications` to the accepted keys is only safe while the key
+    check still REJECTS objects that are JSON-shaped but are not an answer.
+    `{"error": ...}` is the case that matters (see
+    `test_extract_json_object_rejects_a_json_object_with_neither_findings_nor_dispositions`):
+    an ollama auth failure prints one and exits 0, and treating it as an answer
+    records an unreviewed step as complete. Pinned here as well so a future
+    widening of `ANSWER_KEYS` cannot quietly turn the check into "any object"."""
+    for payload in (
+        '{"error": "unauthorized: you need to be signed in"}',
+        '{"verification": "not the plural key"}',
+        '{"result": {"verifications": []}}',
+    ):
+        extracted = ollama_lane._extract_json_object(payload)
+        check(
+            extracted is None,
+            f"_extract_json_object: not an answer -- {payload[:40]}",
+            repr(extracted),
+        )
+
+
 def test_no_findings_file_is_refused() -> None:
     with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
         write_plan_step(plan_dir, "step-001")
