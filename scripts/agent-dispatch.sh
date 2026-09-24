@@ -979,6 +979,41 @@ resolve_pr_story_or_item() {
   return 0
 }
 
+# Delete a leftover remote story branch before a fresh dispatch -- but only when
+# it carries no work. A dev agent that commits and then dies before opening a PR
+# (e.g. a revoked OAuth token mid-run) leaves its only copy of that work on this
+# branch; deleting it on re-dispatch destroys the work (Issue #4272). So:
+#   - commits not on origin/develop -> print STALE_BRANCH_HAS_WORK:<branch>:<n>
+#     and return 4 without deleting. Salvage it into a PR instead.
+#   - the count cannot be established -> treat as work (return 4). A wrongly
+#     kept branch costs a manual look; a wrongly deleted one loses the work.
+#   - no commits ahead -> delete with --no-verify. A deletion pushes no code,
+#     so the host's pre-push hook (a full `make test`) has nothing to check,
+#     and letting it run stalled dispatch for minutes and failed it outright
+#     whenever that test run failed.
+# Returns 0 when the branch is absent or was deleted, 1 when the delete failed.
+delete_stale_remote_branch() {
+  local branch="$1" ahead
+  git -C "$REPO_ROOT" ls-remote --heads origin "$branch" 2>/dev/null | grep -q . || return 0
+  if ! git -C "$REPO_ROOT" fetch -q origin develop \
+        "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null \
+     || ! ahead=$(git -C "$REPO_ROOT" rev-list --count \
+        "origin/develop..origin/${branch}" 2>/dev/null); then
+    echo "ERROR: could not count commits on '${branch}' ahead of develop; keeping it."
+    echo "STALE_BRANCH_HAS_WORK:${branch}:unknown"
+    return 4
+  fi
+  if [[ "$ahead" != "0" ]]; then
+    echo "ERROR: '${branch}' has ${ahead} commit(s) not on develop. Refusing to delete it."
+    echo "       Open a PR from it and dispatch a fix agent, or delete it by hand if it is junk."
+    # Marker last: callers read this through `| tail -1`.
+    echo "STALE_BRANCH_HAS_WORK:${branch}:${ahead}"
+    return 4
+  fi
+  echo "Cleaning stale remote branch: ${branch}"
+  git -C "$REPO_ROOT" push --no-verify origin --delete "$branch" 2>&1 || return 1
+}
+
 # Emit OPEN_PR_EXISTS:<ISSUE>:<PR>:<TITLE> for each open PR that references
 # this issue. Uses two signals:
 #   1. GitHub's authoritative "closing PR" linkage (body Fixes/Closes/Resolves
@@ -1966,8 +2001,11 @@ case "$cmd" in
       if $keep_remote; then
         echo "INFO: Stale remote branch exists: ${branch_name} (keeping due to --keep-remote)"
       else
-        echo "Cleaning stale remote branch: ${branch_name}"
-        if ! git -C "$REPO_ROOT" push origin --delete "$branch_name" 2>&1; then
+        rc=0
+        delete_stale_remote_branch "$branch_name" || rc=$?
+        if [[ $rc -eq 4 ]]; then
+          exit 4
+        elif [[ $rc -ne 0 ]]; then
           echo "ERROR: Failed to delete stale remote branch '${branch_name}'. Refusing to dispatch to prevent history corruption."
           exit 1
         fi
@@ -2002,12 +2040,13 @@ case "$cmd" in
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
     # Check for stale remote branch before cloning — same logic as create-clone.
-    if git -C "$REPO_ROOT" ls-remote --heads origin "$branch_name" 2>/dev/null | grep -q .; then
-      echo "Cleaning stale remote branch: ${branch_name}"
-      if ! git -C "$REPO_ROOT" push origin --delete "$branch_name" 2>&1; then
-        echo "ERROR: Failed to delete stale remote branch '${branch_name}'. Refusing to dispatch to prevent history corruption."
-        exit 1
-      fi
+    rc=0
+    delete_stale_remote_branch "$branch_name" || rc=$?
+    if [[ $rc -eq 4 ]]; then
+      exit 4
+    elif [[ $rc -ne 0 ]]; then
+      echo "ERROR: Failed to delete stale remote branch '${branch_name}'. Refusing to dispatch to prevent history corruption."
+      exit 1
     fi
 
     trap "rm -rf '$dest'" ERR

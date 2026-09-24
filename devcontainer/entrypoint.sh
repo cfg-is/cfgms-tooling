@@ -102,16 +102,28 @@ _zero_work_retry() {
 _salvage_no_pr() {
     local reason="$1"
 
-    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    # Work is uncommitted changes OR commits the agent already made on this
+    # branch. Checking only the tree read an agent that committed (and even
+    # pushed) its fix, then died before `gh pr create`, as zero work: the item
+    # went back to Ready and the re-dispatch deleted the branch (Issue #4272).
+    # If the count vs origin/develop cannot be established, assume work -- a
+    # needless draft PR is recoverable, a discarded branch is not.
+    local dirty="" ahead
+    [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty=1
+    ahead=$(git rev-list --count origin/develop..HEAD 2>/dev/null) || ahead="unknown"
+
+    if [[ -n "$dirty" || "$ahead" != "0" ]]; then
         # The agent produced work but opened no PR — capture it as a draft PR so
         # the cron's resume_failed_session path can pick it up.
-        git add --update
-        local local_issue_ref=""
-        if [[ -n "${ISSUE_NUM:-}" ]]; then
-            local_issue_ref=" for issue #${ISSUE_NUM}"
+        if [[ -n "$dirty" ]]; then
+            git add --update
+            local local_issue_ref=""
+            if [[ -n "${ISSUE_NUM:-}" ]]; then
+                local_issue_ref=" for issue #${ISSUE_NUM}"
+            fi
+            git commit -m "WIP: agent attempt${local_issue_ref} (${reason})" \
+                2>/dev/null || true
         fi
-        git commit -m "WIP: agent attempt${local_issue_ref} (${reason})" \
-            2>/dev/null || true
         git push -u origin "$CURRENT_BRANCH" 2>/dev/null || true
         gh pr create --base develop --draft \
             --title "WIP: ${CURRENT_BRANCH} (agent produced no PR)" \

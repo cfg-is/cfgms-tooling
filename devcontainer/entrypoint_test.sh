@@ -625,6 +625,8 @@ STUB
     echo "seed" > "$SALVAGE_REPO/seed.txt"
     git -C "$SALVAGE_REPO" add seed.txt
     git -C "$SALVAGE_REPO" commit -q -m "seed"
+    # An agent clone is branched from develop; salvage measures work against it.
+    git -C "$SALVAGE_REPO" update-ref refs/remotes/origin/develop HEAD
 
     cat > "$SALVAGE_DIR/git" <<STUB
 #!/usr/bin/env bash
@@ -680,6 +682,46 @@ test_18_salvage_captures_uncommitted_work() {
     subject=$(git -C "$SALVAGE_REPO" log --format=%s -1)
     assert_equals "$subject" "WIP: agent attempt for issue #9999 (exited 0 without opening a pull request)" \
         "WIP commit records the issue and the reason"
+
+    teardown_salvage_env
+}
+
+# T18b — clean tree, but the agent already committed its work (Issue #4272).
+# That is work, not a zero-work run: push it and open the draft PR, and never
+# route the item for re-dispatch, which would delete the branch.
+test_18b_salvage_captures_committed_work() {
+    setup_salvage_env
+
+    echo "agent fix" > "$SALVAGE_REPO/fix.txt"
+    git -C "$SALVAGE_REPO" add fix.txt
+    git -C "$SALVAGE_REPO" commit -q -m "ci: the agent's own commit (Issue #9999)"
+
+    (
+        cd "$SALVAGE_REPO" || exit 1
+        CURRENT_BRANCH="feature/story-9999-agent"
+        ISSUE_NUM="9999"
+        EXIT_CODE=1
+        PROJECT_QUEUE="$SALVAGE_DIR/project-queue.sh"
+        CFGMS_PROJECT_ITEM_ID="pv2-test-item"
+        _salvage_no_pr "failed validation" > /dev/null 2>&1
+    )
+
+    local log
+    log=$(cat "$SALVAGE_LOG")
+
+    assert_contains "$log" "git push -u origin feature/story-9999-agent" \
+        "committed work is pushed"
+    assert_contains "$log" "pr create --base develop --draft" \
+        "committed work becomes a draft PR"
+    assert_not_contains "$log" "ZeroWorkRetries" \
+        "committed work is not counted as a zero-work retry"
+    assert_not_contains "$log" "status Ready" \
+        "committed work is not reset to Ready for re-dispatch"
+
+    local subject
+    subject=$(git -C "$SALVAGE_REPO" log --format=%s -1)
+    assert_equals "$subject" "ci: the agent's own commit (Issue #9999)" \
+        "no empty WIP commit is stacked on the agent's own commit"
 
     teardown_salvage_env
 }
@@ -879,6 +921,7 @@ run_test "T15 — dry-run branch mode: no injection, project body present" test_
 run_test "T16 — hard refusal when CFGMS_PROJECT_ITEM_ID unset" test_16_hard_refusal_missing_project_item_id
 run_test "T17 — dry-run: review gate invokes story-review workflow" test_17_review_gate_uses_story_review_workflow
 run_test "T18 — salvage: exit-0 with work becomes a draft PR" test_18_salvage_captures_uncommitted_work
+run_test "T18b — salvage: committed-only work becomes a draft PR, never a zero-work retry" test_18b_salvage_captures_committed_work
 run_test "T19 — salvage: exit-0 with no work routes for re-dispatch" test_19_salvage_routes_zero_work_for_redispatch
 run_test "T20 — regression guard: exit-0 branch checks PR_URL" test_20_exit_zero_branch_checks_pr_url
 run_test "T21 — ended-turn-waiting detection (Issue #4178)" test_21_ended_turn_waiting_detection
