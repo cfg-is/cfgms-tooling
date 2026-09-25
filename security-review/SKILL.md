@@ -101,7 +101,7 @@ malformed — there is no hardcoded lane set to fall back to. An `ollama` model 
 mandatory tag (`<name>:cloud`); the roster parser allows at most one extra `:` in the model half
 for exactly this shape.
 
-Four harnesses are landed, each authenticating as that harness's own subscription session (a
+Five harnesses are landed, each authenticating as that harness's own subscription session (a
 read-only credential mount, never an OS-keychain API key):
 
 | Harness | Model examples | Landed by |
@@ -110,6 +110,15 @@ read-only credential mount, never an OS-keychain API key):
 | `codex` | `gpt-5.6-terra` (list the account's ids with `codex debug models`; `gpt-5-codex` is rejected for a ChatGPT-account session) | Codex lane runner (#3935) |
 | `opencode` | `qwen3-coder`, `glm-4.6` (OpenCode Zen catalog) | OpenCode lane runner (#3936) |
 | `ollama` | `glm-5.3-flash:cloud` (Ollama Cloud only — never a local/GPU model) | Ollama Cloud lane runner (#3976) |
+| `opencode_agent` | `glm-5.3-flash:cloud` (same Ollama Cloud models as `ollama`) | OpenCode agentic finder lane (#4293) |
+
+**`opencode_agent` is the one lane that explores instead of reading a bundle.** Every other lane
+embeds the step's file bodies in its prompt; `opencode_agent` hands OpenCode the scope, hypotheses and
+file list and lets it investigate the snapshot with read-only tools (`read`/`grep`/`glob`/`list`;
+`bash`, `edit` and web denied; the snapshot's own OpenCode config ignored). It drives the same
+in-container ollama daemon and needs the same `ollama signin` session as `ollama`. Listing both on one
+model (`ollama:glm-5.3-flash:cloud,opencode_agent:glm-5.3-flash:cloud`) compares the two loops on
+identical steps.
 
 **`ollama` needs an `ollama signin` session** before it can be used — the same "subscription
 session, never an API key" contract every other harness follows. Without it, `--harness ollama`

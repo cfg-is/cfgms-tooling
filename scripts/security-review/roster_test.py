@@ -36,6 +36,17 @@ def test_single_entry() -> None:
     )
 
 
+def test_opencode_agent_lane_beside_the_in_house_lane() -> None:
+    # Issue #4293: the comparison roster lists both loops on one model. The
+    # harness id must map to an importable lane file (opencode_agent_lane.py,
+    # via security-review.sh's `${harness}_lane.py`) and to distinct lane dirs.
+    lanes = roster.parse_roster("ollama:glm-5.3-flash:cloud,opencode_agent:glm-5.3-flash:cloud")
+    check([l.lane_dir_name for l in lanes] == ["ollama-glm-5.3-flash-cloud", "opencode_agent-glm-5.3-flash-cloud"],
+          "opencode_agent: distinct lane dirs beside the in-house lane", repr(lanes))
+    lane_file = Path(__file__).resolve().parent / "lanes" / f"{lanes[1].harness}_lane.py"
+    check(lane_file.is_file(), "opencode_agent: the harness id names an existing lane file", str(lane_file))
+
+
 def test_multiple_entries_fan_out() -> None:
     lanes = roster.parse_roster("claude:sonnet-5,codex:gpt-terra,opencode:qwen")
     check(len(lanes) == 3, "multiple entries: all three parsed", repr(lanes))

@@ -325,7 +325,8 @@ case "$MODE" in
     # zero-work-silent-pass failure class this harness exists to prevent,
     # just moved one layer earlier than `ollama_lane.py`'s own exit-0
     # detection handles for an authentication failure.
-    if [ "${CFGMS_SECURITY_REVIEW_HARNESS:-}" = "ollama" ]; then
+    # opencode_agent (Issue #4293) drives OpenCode against this same daemon.
+    if [ "${CFGMS_SECURITY_REVIEW_HARNESS:-}" = "ollama" ] || [ "${CFGMS_SECURITY_REVIEW_HARNESS:-}" = "opencode_agent" ]; then
         echo "Starting ollama daemon..."
         ollama serve >/tmp/ollama-serve.log 2>&1 &
         OLLAMA_SERVE_PID=$!

@@ -205,6 +205,30 @@ rm -f "$LANE_RUN_LOG" "$OLLAMA_CALL_LOG"
 
 # ----------------------------------------------------------------------------
 echo ""
+echo "--- REQUIRED TEST: opencode_agent harness also starts the ollama daemon"
+echo "    before the lane runs (Issue #4293: OpenCode talks to it on localhost) ---"
+BIN_DIR="$(mktemp -d)"
+WORK_HOME="$(mktemp -d)"
+LANE_RUN_LOG="$(mktemp)"
+OLLAMA_CALL_LOG="$(mktemp)"
+make_stub_ollama "$BIN_DIR"
+make_stub_lane_script "$WORK_HOME"
+
+set +e
+out=$(STUB_HARNESS=opencode_agent STUB_OLLAMA_READY=1 STUB_MAX_ATTEMPTS=5 STUB_SLEEP_SECONDS=0 \
+  run_entrypoint opencode_agent-glm-cloud 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "opencode_agent case: entrypoint exits 0"
+assert_contains "$out" "ollama daemon ready" "opencode_agent case: the ollama daemon is started and reported ready"
+lane_log="$(cat "$LANE_RUN_LOG" 2>/dev/null || true)"
+assert_contains "$lane_log" "lane_ran:opencode_agent-glm-cloud" "opencode_agent case: the lane script ran after the daemon"
+pkill -f "${BIN_DIR}/ollama" 2>/dev/null || true
+rm -rf "$BIN_DIR" "$WORK_HOME"
+rm -f "$LANE_RUN_LOG" "$OLLAMA_CALL_LOG"
+
+# ----------------------------------------------------------------------------
+echo ""
 echo "--- REQUIRED TEST: ollama harness, daemon NEVER becomes ready -> exit"
 echo "    non-zero and the lane script is NEVER invoked (Issue #3976) ---"
 BIN_DIR="$(mktemp -d)"

@@ -813,6 +813,24 @@ check_not_contains "--harness ollama never mounts the OpenCode credential file" 
 check_not_contains "--harness ollama launch has no GH_TOKEN" "$ollama_run_call" "GH_TOKEN"
 
 echo ""
+echo "== --harness opencode_agent (Issue #4293) gets the ollama keypair, because"
+echo "   OpenCode drives the in-container ollama daemon; it never gets an OpenCode"
+echo "   Zen credential =="
+: > "$DOCKER_CALL_LOG"
+agent_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode opencode_agent-glm-5.3-flash-cloud \
+    --harness opencode_agent --model glm-5.3-flash:cloud --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "--harness opencode_agent launch reports LAUNCHED_INVESTIGATOR" "$agent_out" "LAUNCHED_INVESTIGATOR:opencode_agent-glm-5.3-flash-cloud:fake-container-id"
+agent_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "--harness opencode_agent mounts id_ed25519 read-only" "$agent_run_call" "${SANDBOX}/HOME/.ollama/id_ed25519:/home/agent/.ollama/id_ed25519:ro"
+check_contains "--harness opencode_agent sets CFGMS_SECURITY_REVIEW_HARNESS=opencode_agent" "$agent_run_call" "CFGMS_SECURITY_REVIEW_HARNESS=opencode_agent"
+check_not_contains "--harness opencode_agent never mounts the OpenCode Zen credential" "$agent_run_call" "opencode/auth.json"
+check_not_contains "--harness opencode_agent never mounts the Claude credential" "$agent_run_call" ":/home/agent/.claude/.credentials.json"
+
+echo ""
 echo "== REQUIRED TEST — an ollama lane with no ~/.ollama/id_ed25519 on the host"
 echo "   fails closed as a recorded, skippable credential_unavailable, and never"
 echo "   mounts a broken/nonexistent path (Issue #3976) =="

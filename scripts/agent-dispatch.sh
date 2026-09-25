@@ -3781,7 +3781,10 @@ PROMPT_EOF
           fi
           inv_harness_creds_mount=(-v "${HOME}/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro")
           ;;
-        ollama)
+        ollama|opencode_agent)
+          # opencode_agent (Issue #4293) drives OpenCode against the in-container
+          # ollama daemon, so it needs exactly this lane's sign-in keypair.
+          #
           # Ollama's own session credential (Issue #3976): the `ollama
           # signin` keypair, `id_ed25519{,.pub}` -- confirmed against the
           # installed CLI (`ollama signin`, host verification while writing

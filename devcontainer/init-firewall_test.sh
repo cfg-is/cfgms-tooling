@@ -258,6 +258,23 @@ frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_li
 assert_eq "$frag_count" "1" "--harness ollama launch loads at most one fragment"
 
 echo ""
+echo "--- --harness opencode_agent (Issue #4293): loads base + opencode_agent.conf, never opencode.ai ---"
+: > "$CALL_LOG"
+set +e
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=opencode_agent CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "--harness opencode_agent launch exits 0"
+call_line="$(cat "$CALL_LOG")"
+assert_contains "$call_line" "--conf-file=${FRAGMENT_DIR}/opencode_agent.conf" "--harness opencode_agent launch loads its own fragment"
+assert_not_contains "$call_line" "/opencode.conf" "--harness opencode_agent launch does not load the opencode (Zen) fragment"
+frag_count=$(grep -o -- "--conf-file=${FRAGMENT_DIR}/[^[:space:]]*" <<<"$call_line" | wc -l)
+assert_eq "$frag_count" "1" "--harness opencode_agent launch loads at most one fragment"
+agent_src="$(grep -v '^#' "${FRAGMENT_DIR}/opencode_agent.conf")"
+assert_contains "$agent_src" "server=/ollama.com/" "opencode_agent fragment allows ollama.com (the in-container daemon's Cloud backend)"
+assert_not_contains "$agent_src" "opencode.ai" "opencode_agent fragment never allows opencode.ai (it uses no OpenCode-hosted provider)"
+
+echo ""
 echo "--- REQUIRED TEST: an unrecognized harness value fails to start ---"
 # Reverting the fail-closed branch (so an unrecognized value falls back to
 # loading every fragment, or is ignored) makes this block fail: dnsmasq
