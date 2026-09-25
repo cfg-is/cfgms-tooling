@@ -155,6 +155,45 @@ def test_plan_refuses_to_reuse_a_snapshot():
             check(False, "plan: a second plan into the same run dir is refused")
 
 
+def test_launch_runs_commits_one_at_a_time_and_survives_a_failure():
+    # Every verifier container shares one name, so launches must not overlap:
+    # each one's container is waited on before the next launch starts.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, first, second = two_commit_repo(tmp)
+        run_dir = os.path.join(tmp, "run")
+        corpus_run.plan(run_dir, repo, items(first, second))
+        events: list = []
+
+        def launcher(sweep, harness, model, repo_root=None):
+            commit = os.path.basename(sweep)
+            events.append(("launch", commit))
+            if commit == first:
+                raise verify.VerificationError("launch-investigator exited 2: refused")
+            return f"LAUNCHED_INVESTIGATOR:verifier:cid-{commit}\n"
+
+        def waiter(cid):
+            events.append(("wait", cid))
+            return 0
+
+        log = corpus_run.launch(run_dir, "ollama", "m", launcher=launcher, waiter=waiter,
+                                clock=iter(range(0, 100, 5)).__next__)
+        # Commits run in sorted order; `first` is the one whose launch fails.
+        expected = []
+        for c in sorted([first, second]):
+            expected.append(("launch", c))
+            if c == second:
+                expected.append(("wait", f"cid-{second}"))
+        check(events == expected,
+              "launch: a commit's container is waited on before the next launch", str(events))
+        by_commit = {e["commit"]: e for e in log}
+        check("refused" in by_commit[first].get("error", "") and by_commit[second]["exit_code"] == 0,
+              "launch: one failed commit is recorded and the rest still run", str(log))
+        check(by_commit[second]["seconds"] == 5,
+              "launch: per-commit wall time is recorded", str(by_commit[second]))
+        check(os.path.isfile(os.path.join(run_dir, corpus_run.LAUNCH_LOG_FILENAME)),
+              "launch: the per-commit log is written into the run dir")
+
+
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

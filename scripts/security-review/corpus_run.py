@@ -28,7 +28,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -138,11 +140,56 @@ def score(run_dirs: "list[str]") -> dict:
     return result
 
 
-def launch(run_dir: str, harness: str, model: str, repo_root: "str | None" = None) -> "list[str]":
-    """Dispatch the verifier once per planned commit. Returns launcher output."""
+LAUNCH_LOG_FILENAME = "corpus-launch.json"
+
+
+def _docker_wait(container_id: str) -> "int | None":
+    proc = subprocess.run(["docker", "wait", container_id], capture_output=True, text=True)
+    out = proc.stdout.strip()
+    return int(out) if proc.returncode == 0 and out.isdigit() else None
+
+
+def launch(run_dir: str, harness: str, model: str, repo_root: "str | None" = None,
+           launcher=verify.launch, waiter=_docker_wait, clock=time.time) -> "list[dict]":
+    """Dispatch the verifier once per planned commit, ONE AT A TIME.
+
+    Every verification sub-sweep is named `verification/`, so every verifier
+    container gets the same name, and the launcher refuses to start one while
+    another of that name is running. A loop that fired all commits at once
+    would start the first and have the rest refused. So each launch waits for
+    its container to exit (`docker wait`, as security-review.sh does) before
+    the next begins.
+
+    A commit whose launch fails or prints no container id is recorded with its
+    error and the loop continues: one bad commit must not lose the others.
+    Per-commit wall time is recorded; it is the cost measurement #4260 needs.
+    """
     with open(os.path.join(run_dir, ITEMS_FILENAME), encoding="utf-8") as f:
         commits = sorted({i["commit"] for i in json.load(f)})
-    return [verify.launch(_sweep_dir(run_dir, c), harness, model, repo_root=repo_root) for c in commits]
+    log: list[dict] = []
+    for commit in commits:
+        started = clock()
+        entry: dict = {"commit": commit}
+        try:
+            out = launcher(_sweep_dir(run_dir, commit), harness, model, repo_root=repo_root)
+        except verify.VerificationError as exc:
+            entry.update(error=str(exc)[:500], seconds=round(clock() - started, 1))
+            log.append(entry)
+            continue
+        ids = [line.split("LAUNCHED_INVESTIGATOR:verifier:", 1)[1].strip()
+               for line in (out or "").splitlines() if "LAUNCHED_INVESTIGATOR:verifier:" in line]
+        if not ids:
+            entry.update(error=f"launcher printed no container id: {(out or '')[-300:]}",
+                         seconds=round(clock() - started, 1))
+            log.append(entry)
+            continue
+        entry.update(container=ids[-1], exit_code=waiter(ids[-1]), seconds=round(clock() - started, 1))
+        log.append(entry)
+        atomic_write.write_text_atomic(os.path.join(run_dir, LAUNCH_LOG_FILENAME),
+                                       json.dumps(log, indent=1, sort_keys=True))
+    atomic_write.write_text_atomic(os.path.join(run_dir, LAUNCH_LOG_FILENAME),
+                                   json.dumps(log, indent=1, sort_keys=True))
+    return log
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -175,8 +222,8 @@ def main(argv: "list[str] | None" = None) -> int:
             if not args.spend:
                 print("refusing: `launch` runs live model sessions; pass --spend to confirm", file=sys.stderr)
                 return 2
-            for out in launch(args.run_dir, args.harness, args.model):
-                print(out.strip())
+            for entry in launch(args.run_dir, args.harness, args.model):
+                print(json.dumps(entry, sort_keys=True))
         else:
             result = score(args.run_dirs)
             atomic_write.write_text_atomic(os.path.join(args.run_dirs[0], SCORE_FILENAME),
