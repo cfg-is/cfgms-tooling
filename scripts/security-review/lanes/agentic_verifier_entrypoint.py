@@ -37,8 +37,33 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+def _bootstrap_harness_imports() -> None:
+    """Put the lanes directory and the harness directory on `sys.path` (Issue #4290).
+
+    Two layouts. In a checkout, both sit beside and one level above this file.
+    In the investigator container, launch-investigator mounts this file ALONE
+    at `/usr/local/bin/investigator-lane-entrypoint.py` and the trusted
+    harness tree read-only at `CFGMS_SECURITY_REVIEW_HARNESS_DIR` (default
+    `/opt/cfgms-harness/security-review`). The first candidate that holds the
+    marker file wins.
+
+    Deliberately NO `/workspace` fallback, unlike the older lanes' bootstrap.
+    For the verifier `/workspace` is the snapshot under review, often at an old
+    commit, so importing harness code from it would run the audited tree's
+    code (or an older harness that lacks these modules) as the reviewer."""
+    here = Path(__file__).resolve().parent
+    trusted = Path(os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_DIR")
+                   or "/opt/cfgms-harness/security-review")
+    for candidates, marker in (([here, trusted / "lanes"], "agentic_verifier.py"),
+                               ([here.parent, trusted], "schema.py")):
+        for candidate in candidates:
+            if (candidate / marker).is_file():
+                if str(candidate) not in sys.path:
+                    sys.path.insert(0, str(candidate))
+                break
+
+
+_bootstrap_harness_imports()
 
 import agentic_verifier as av             # noqa: E402
 import agentic_verifier_batch as ab       # noqa: E402

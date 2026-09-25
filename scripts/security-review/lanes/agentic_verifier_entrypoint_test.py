@@ -304,6 +304,48 @@ def test_verify_all_turns_the_scope_off() -> None:
               "lane: VERIFY_ALL verifies low single-lane findings too")
 
 
+def _import_alone(harness_dir: "str | None") -> "tuple[int, str]":
+    """Copy the entrypoint ALONE into an empty directory -- the container
+    layout launch-investigator creates -- and import it in a fresh
+    interpreter with no inherited PYTHONPATH."""
+    import shutil
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "investigator-lane-entrypoint.py")
+        shutil.copy(Path(__file__).resolve().parent / "agentic_verifier_entrypoint.py", target)
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env.pop("CFGMS_SECURITY_REVIEW_HARNESS_DIR", None)
+        if harness_dir is not None:
+            env["CFGMS_SECURITY_REVIEW_HARNESS_DIR"] = harness_dir
+        code = ("import importlib.util as u, sys; "
+                f"s = u.spec_from_file_location('ep', {target!r}); m = u.module_from_spec(s); "
+                "s.loader.exec_module(m); print('IMPORTED')")
+        proc = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env,
+                              capture_output=True, text=True, timeout=60)
+        return proc.returncode, proc.stdout + proc.stderr
+
+
+def test_it_imports_alone_from_the_trusted_harness_mount() -> None:
+    # Issue #4290: in the container this file is mounted alone at
+    # /usr/local/bin, and the harness sits on a separate trusted mount. Its old
+    # bootstrap looked only beside itself, so every real verifier container
+    # died on `No module named 'agentic_verifier'` before reaching the model.
+    harness = str(Path(__file__).resolve().parent.parent)
+    rc, out = _import_alone(harness)
+    check(rc == 0 and "IMPORTED" in out,
+          "container layout: imports from CFGMS_SECURITY_REVIEW_HARNESS_DIR", out[-400:])
+
+
+def test_it_does_not_import_without_a_trusted_harness() -> None:
+    # With no trusted mount and nothing beside it, the import must fail -- it
+    # must not reach for another copy of the harness somewhere (the snapshot
+    # under review in particular).
+    with tempfile.TemporaryDirectory() as empty:
+        rc, out = _import_alone(empty)
+    check(rc != 0 and "No module named" in out,
+          "container layout: no trusted harness means no import, not a fallback", out[-300:])
+
+
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
