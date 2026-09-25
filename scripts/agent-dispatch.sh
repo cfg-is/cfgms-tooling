@@ -3932,6 +3932,23 @@ PROMPT_EOF
         -e "CFGMS_SECURITY_REVIEW_LANE_TIMEOUT_SECONDS=${CFGMS_SECURITY_REVIEW_LANE_TIMEOUT_SECONDS:-3600}"
         -e "CFGMS_SECURITY_REVIEW_PLANNER_REASONING=${CFGMS_SECURITY_REVIEW_PLANNER_REASONING:-}"
       )
+
+      # The agentic verifier's operator knobs: worker count, and turning the
+      # critical/high-or-multi-lane scope off. They are documented as
+      # operator-settable but were never passed into the container, so a real
+      # sweep always ran the defaults. Forwarded only when set: an empty
+      # value would reach the lane as "" and fail int() at import. The worker
+      # count is validated here, before any container starts.
+      if [[ -n "${CFGMS_AGENTIC_VERIFIER_WORKERS:-}" ]]; then
+        if ! [[ "$CFGMS_AGENTIC_VERIFIER_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "ERROR: CFGMS_AGENTIC_VERIFIER_WORKERS='${CFGMS_AGENTIC_VERIFIER_WORKERS}' is not a positive integer" >&2
+          exit 3
+        fi
+        inv_harness_env+=(-e "CFGMS_AGENTIC_VERIFIER_WORKERS=${CFGMS_AGENTIC_VERIFIER_WORKERS}")
+      fi
+      if [[ -n "${CFGMS_AGENTIC_VERIFIER_ALL:-}" ]]; then
+        inv_harness_env+=(-e "CFGMS_AGENTIC_VERIFIER_ALL=${CFGMS_AGENTIC_VERIFIER_ALL}")
+      fi
     fi
 
     inv_lane_entrypoint_mount=()

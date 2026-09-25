@@ -562,6 +562,38 @@ check_contains "an unwired --harness still sets CFGMS_SECURITY_REVIEW_HARNESS" "
 # ~/.claude, a needle of ".claude/.credentials.json" would match nothing
 # whatever the launcher did, and pass unconditionally.
 check_not_contains "an unwired --harness gets no claude credential mount" "$unwired_run_call" ":/home/agent/.claude/.credentials.json"
+check_not_contains "verifier knobs are not forwarded when unset" "$unwired_run_call" "CFGMS_AGENTIC_VERIFIER_"
+
+echo ""
+echo "== the agentic verifier's knobs reach the container when set, and a bad"
+echo "   worker count is refused before any container starts =="
+: > "$DOCKER_CALL_LOG"
+knob_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  CFGMS_AGENTIC_VERIFIER_WORKERS=2 CFGMS_AGENTIC_VERIFIER_ALL=1 \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode stub-lane \
+    --harness stub --model stubmodel --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+check_contains "a lane launch with verifier knobs set still dispatches" "$knob_out" "LAUNCHED_INVESTIGATOR:stub-lane:fake-container-id"
+knob_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
+check_contains "CFGMS_AGENTIC_VERIFIER_WORKERS is forwarded" "$knob_run_call" "CFGMS_AGENTIC_VERIFIER_WORKERS=2"
+check_contains "CFGMS_AGENTIC_VERIFIER_ALL is forwarded" "$knob_run_call" "CFGMS_AGENTIC_VERIFIER_ALL=1"
+
+: > "$DOCKER_CALL_LOG"
+set +e
+bad_workers_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  CFGMS_AGENTIC_VERIFIER_WORKERS=eight \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode stub-lane \
+    --harness stub --model stubmodel --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+bad_workers_rc=$?
+set -e
+check_contains "a non-integer worker count is reported" "$bad_workers_out" "is not a positive integer"
+if [[ "$bad_workers_rc" -ne 0 ]]; then ok "a non-integer worker count exits non-zero"; else bad "a non-integer worker count exits non-zero" "exited 0"; fi
+check_not_contains "a non-integer worker count never reaches docker run" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
 
 echo ""
 echo '== REQUIRED TEST evidence — "--mode plan --harness <id>" is harness-gated'
