@@ -243,6 +243,25 @@ def _quarantine(findings_path: str, step_id: str, mismatches: list[str]) -> None
 MAX_TRANSIENT_RETRIES = 2
 
 
+# Issue #4261: the stop-reason prefix a finder lane writes when the PROVIDER
+# failed the call -- an HTTP 5xx, a dropped connection -- and the harness's own
+# in-place retries ran out. Harness-written, so reading it is safe in a way
+# the output tail is not (see `schema.is_transient_stop_reason`): the lane
+# sets it from its own transport record, never from the model's answer.
+#
+# Re-attempted under the same MAX_TRANSIENT_RETRIES cap as a revoked
+# credential. An outage long enough to exhaust the in-place retries is usually
+# over by the next resume; one that is not is still bounded.
+TRANSIENT_PROVIDER_STOP_REASON = "transient_provider_error"
+
+
+def is_transient_failure(stop_reason: object) -> bool:
+    """True when a `failed` step's stop reason is one a later attempt can clear."""
+    if isinstance(stop_reason, str) and stop_reason.startswith(TRANSIENT_PROVIDER_STOP_REASON):
+        return True
+    return schema.is_transient_stop_reason(stop_reason)
+
+
 def _record_transient_retry(status_path: str, envelope: dict, attempt: int) -> None:
     """Persist the re-attempt count on the step's own envelope.
 
@@ -362,7 +381,7 @@ def missing_steps(
                 stop_reason = envelope.get("stop_reason_raw") if isinstance(envelope, dict) else None
                 attempts = envelope.get("transient_retries") if isinstance(envelope, dict) else 0
                 attempts = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
-                if schema.is_transient_stop_reason(stop_reason):
+                if is_transient_failure(stop_reason):
                     if attempts >= MAX_TRANSIENT_RETRIES:
                         # Exhausted: back to `failed`'s ordinary meaning. A
                         # rotation clears on the next attempt, so a step still

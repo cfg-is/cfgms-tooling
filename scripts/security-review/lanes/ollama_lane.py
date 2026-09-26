@@ -541,6 +541,55 @@ def _extract_json_object(text: str) -> "dict | None":
     return None
 
 
+# Issue #4261: provider failures a second attempt can clear. Sweep
+# 2026-09-20 recorded eight HTTP 500/502 failures from ollama.com on this lane
+# (`server_shutting_down`, `Internal Server Error`), none retried. 501 is left
+# out on purpose -- "not implemented" does not get better by asking again.
+TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+
+# The waits between in-place attempts for a transient failure: three retries,
+# 130 s of sleep at most. Long enough to ride out a Cloud node restarting
+# (`server_shutting_down`), short enough that a real outage becomes a recorded
+# failure -- which `resume` re-attempts on the next run -- rather than a worker
+# parked for an hour.
+TRANSIENT_RETRY_DELAYS_SECONDS = (10.0, 30.0, 90.0)
+
+# The harness-written last line of a failed call's output tail, and the only
+# text `_transient_stop_reason` reads. Appended by this module on the paths
+# where no model text is present (a non-200 status, a transport exception);
+# on a 200 the same prefix is defanged inside the model's text first, so an
+# answer cannot claim a provider failure it did not have.
+_TRANSPORT_MARKER = "[ollama transport: "
+_TRANSPORT_MARKER_RE = re.compile(
+    r"\[ollama transport: (?:http_status=(50[0234])|transient_error=([A-Za-z]+))\]\s*$"
+)
+
+
+def _is_transient_exception(exc: BaseException) -> bool:
+    """A dropped or refused connection, or a truncated response -- never a
+    timeout. A timeout already spent the whole per-call budget, and retrying
+    it three times turns one slow step into four."""
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        exc = exc.reason if isinstance(exc.reason, BaseException) else exc
+    if isinstance(exc, TimeoutError):
+        return False
+    return isinstance(exc, (ConnectionError, http.client.IncompleteRead))
+
+
+def _defang_transport_marker(text: str) -> str:
+    return text.replace(_TRANSPORT_MARKER, "[ollama-transport (model text): ")
+
+
+def _transient_stop_reason(output_tail: str) -> "str | None":
+    """`resume.TRANSIENT_PROVIDER_STOP_REASON` plus the cause, when the tail
+    ends with this module's own transport marker for a retryable failure."""
+    match = _TRANSPORT_MARKER_RE.search(output_tail or "")
+    if match is None:
+        return None
+    cause = f"http_{match.group(1)}" if match.group(1) else match.group(2)
+    return f"{resume.TRANSIENT_PROVIDER_STOP_REASON}:{cause}"
+
+
 def call_ollama_harness(
     model: str, prompt: str, output_path: str, timeout: float = OLLAMA_TIMEOUT_SECONDS
 ) -> tuple:
@@ -652,8 +701,34 @@ def call_ollama_harness(
                 body = ""
             return exc.code, header, body, exc.reason
 
+    # Issue #4261: every attempt that failed transiently, in order, for the
+    # meta. A step that recovered on its second try is otherwise
+    # indistinguishable from one that never failed, and a provider getting
+    # steadily worse would stay invisible until it stopped recovering.
+    transient_retries: list = []
+
+    def _post_retrying() -> tuple:
+        """`_post`, retried in place on a transient provider failure.
+
+        The last attempt's result is returned whatever it was; the last
+        attempt's exception is raised. Either way the caller records it
+        exactly as it would have without the retry."""
+        for delay in (*TRANSIENT_RETRY_DELAYS_SECONDS, None):
+            try:
+                result = _post()
+            except (OSError, http.client.HTTPException) as exc:
+                if delay is None or not _is_transient_exception(exc):
+                    raise
+                transient_retries.append({"cause": type(exc).__name__, "slept_seconds": delay})
+            else:
+                if delay is None or result[0] not in TRANSIENT_HTTP_STATUSES:
+                    return result
+                transient_retries.append({"cause": f"http_{result[0]}", "slept_seconds": delay})
+            time.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
     try:
-        http_status, retry_after, body, reason = _post()
+        http_status, retry_after, body, reason = _post_retrying()
 
         # Honour the server's own Retry-After on a 429, once.
         #
@@ -711,7 +786,7 @@ def call_ollama_harness(
                 # the one a caller could actually act on. Throwing it away left
                 # the shared backoff sleeping its own 30s guess while a live
                 # instruction sat unread.
-                http_status, retry_after_after, body, reason = _post()
+                http_status, retry_after_after, body, reason = _post_retrying()
                 retry_after_retry = retry_after_after
                 # NOT computed here. `rate_limited_recovered` is a claim about
                 # the OUTCOME -- see where it is set below, once `rate_limited`
@@ -726,9 +801,13 @@ def call_ollama_harness(
 
         if reason is None:
             stdout, stderr, metrics = _parse_generate_response(body)
+            stdout = _defang_transport_marker(stdout)
+            stderr = _defang_transport_marker(stderr)
         else:
             stdout = ""
-            stderr = "HTTP {}: {}\n{}".format(http_status, reason, body)
+            stderr = "HTTP {}: {}\n{}\n{}http_status={}]".format(
+                http_status, reason, _defang_transport_marker(body), _TRANSPORT_MARKER, http_status
+            )
         # A transport that reports failure by STATUS CODE has no exit code of
         # its own. Synthesize one so every downstream consumer --
         # `terminal_state.classify()` most of all -- keeps the exact contract it
@@ -744,6 +823,10 @@ def call_ollama_harness(
     # could not raise these at all.
     except (OSError, subprocess.SubprocessError, http.client.HTTPException) as exc:
         error_text = str(exc)
+        if _is_transient_exception(exc):
+            error_text = "{}\n{}transient_error={}]".format(
+                _defang_transport_marker(error_text), _TRANSPORT_MARKER, type(exc).__name__
+            )
         # A timeout carries the partial output the model had produced when the
         # clock ran out, and that is the single most useful artifact for sizing
         # the timeout correctly -- `subprocess.TimeoutExpired.stdout` is bytes.
@@ -788,6 +871,7 @@ def call_ollama_harness(
                     "retry_after_deferred_seconds": retry_after_deferred,
                     "retry_after_on_retry": retry_after_retry,
                     "rate_limited_recovered": False,
+                    "transient_retries": transient_retries,
                 },
                 indent=2,
             ),
@@ -873,6 +957,9 @@ def call_ollama_harness(
                 # limit prose leaves this False and `rate_limited` True. Those
                 # are not recoveries and counting them as such over-reports.
                 "rate_limited_recovered": rate_limited_recovered,
+                # Issue #4261: each transient failure retried in place before
+                # this call's final outcome -- cause and the wait served.
+                "transient_retries": transient_retries,
                 **metrics,
             },
             indent=2,
@@ -906,6 +993,15 @@ LANE_SPEC = harness_runner.LaneSpec(
     call_harness=call_ollama_harness,
     build_prompt=build_prompt,
     fatal_stop_reason=_fatal_stop_reason,
+    transient_stop_reason=_transient_stop_reason,
+    # Issue #4261: eight steps at once. Measured, not chosen: eight concurrent
+    # workers against Ollama Cloud drew no rate limit at 1/2/4/8 on the
+    # verifier (#4249), and this lane's own before/after run is recorded on
+    # #4261. Safe to run concurrently because each call is one self-contained
+    # /api/generate request -- no `context` is sent, so no conversation state
+    # exists to share; see `call_ollama_harness`'s payload.
+    # `CFGMS_SECURITY_REVIEW_LANE_WORKERS` overrides it.
+    workers=8,
 )
 
 

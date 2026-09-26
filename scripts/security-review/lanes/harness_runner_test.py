@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -2784,6 +2785,144 @@ def test_repair_no_progress_when_a_parsing_answer_stops_parsing():
         ),
         "repair_made_progress: still unparseable is not progress",
     )
+
+
+# --- Issue #4261: concurrent steps -------------------------------------------
+
+
+def _with_workers_env(value, fn):
+    original = os.environ.get("CFGMS_SECURITY_REVIEW_LANE_WORKERS")
+    try:
+        if value is None:
+            os.environ.pop("CFGMS_SECURITY_REVIEW_LANE_WORKERS", None)
+        else:
+            os.environ["CFGMS_SECURITY_REVIEW_LANE_WORKERS"] = value
+        return fn()
+    finally:
+        if original is None:
+            os.environ.pop("CFGMS_SECURITY_REVIEW_LANE_WORKERS", None)
+        else:
+            os.environ["CFGMS_SECURITY_REVIEW_LANE_WORKERS"] = original
+
+
+def test_lane_workers_serial_lane_ignores_the_override():
+    """A lane declaring one worker has calls that share state; no knob may
+    make two of them share it."""
+    serial = harness_runner.LaneSpec("x", None, None)
+    check(_with_workers_env("16", lambda: harness_runner.lane_workers(serial)) == 1,
+          "lane_workers: a serial lane stays serial whatever the override says")
+
+
+def test_lane_workers_override_is_clamped_and_validated():
+    spec = harness_runner.LaneSpec("x", None, None, workers=8)
+    cases = {None: 8, "": 8, "3": 3, "0": 1, "-4": 1, "999": harness_runner.LANE_WORKERS_MAX, "abc": 8}
+    got = {k: _with_workers_env(k, lambda: harness_runner.lane_workers(spec)) for k in cases}
+    check(got == cases, "lane_workers: default, override, clamp and bad-value fallback", repr(got))
+
+
+def test_drive_steps_runs_workers_at_once_and_keeps_step_order():
+    """AC1: the steps really are concurrent -- four of them meet at a barrier
+    no serial loop could pass -- and the result reads in plan order."""
+    workers = 4
+    barrier = threading.Barrier(workers, timeout=30)
+    ids = [f"step-{i:03d}" for i in range(8)]
+
+    def _run(step_id):
+        if int(step_id[-3:]) < workers:
+            barrier.wait()
+        time.sleep(0.01 * (8 - int(step_id[-3:])))  # finish out of order
+        return {"step_id": step_id}, False
+
+    written = harness_runner._drive_steps(ids, _run, workers)
+    check([e["step_id"] for e in written] == ids,
+          "drive_steps: every step ran, reported in plan order", repr(written))
+
+
+def test_drive_steps_lane_fatal_stops_new_steps():
+    """A lane-fatal step stops further steps from starting; at most the
+    workers already busy finish theirs."""
+    for workers in (1, 3):
+        started: list = []
+        lock = threading.Lock()
+
+        def _run(step_id):
+            with lock:
+                started.append(step_id)
+            if step_id == "step-000":
+                return {"step_id": step_id}, True
+            time.sleep(0.05)
+            return {"step_id": step_id}, False
+
+        ids = [f"step-{i:03d}" for i in range(20)]
+        written = harness_runner._drive_steps(ids, _run, workers)
+        check(len(started) <= workers,
+              f"drive_steps({workers}): no step starts after a lane-fatal result", repr(started))
+        check(written and written[0]["step_id"] == "step-000",
+              f"drive_steps({workers}): the fatal step's envelope is kept", repr(written))
+
+
+def test_drive_steps_a_raising_step_costs_one_step():
+    def _run(step_id):
+        if step_id == "step-001":
+            raise RuntimeError("loop bug")
+        return {"step_id": step_id}, False
+
+    ids = [f"step-{i:03d}" for i in range(6)]
+    written = harness_runner._drive_steps(ids, _run, 3)
+    check([e["step_id"] for e in written] == [i for i in ids if i != "step-001"],
+          "drive_steps: one raising step does not stop the others", repr(written))
+
+
+def test_run_lane_concurrent_workers_never_share_a_step_workspace():
+    """AC2 at the loop level: every in-flight call has its own answer path,
+    and every step's envelope holds its own step's answer -- none answered by
+    another worker's call."""
+    workers = 4
+    in_flight: set = set()
+    overlaps: list = []
+    peak = [0]
+    lock = threading.Lock()
+
+    def _call(model, prompt, raw_path):
+        with lock:
+            if raw_path in in_flight:
+                overlaps.append(raw_path)
+            in_flight.add(raw_path)
+            peak[0] = max(peak[0], len(in_flight))
+        time.sleep(0.05)
+        step_id = os.path.basename(raw_path).split(".")[1]
+        finding = {
+            "hypothesis_id": "h1", "file": "pkg/example/thing.go", "symbol": "Thing.Do",
+            "line": 1, "vuln_class": "injection", "cwe": "CWE-89", "severity": "low",
+            "confidence": "low", "title": f"answer-for-{step_id}", "evidence": "e",
+            "suggested_fix": "f",
+        }
+        with open(raw_path, "w") as f:
+            json.dump({"findings": [finding], "dispositions": []}, f)
+        with lock:
+            in_flight.discard(raw_path)
+        return 0, False, ""
+
+    spec = harness_runner.LaneSpec("fake", _call, lambda step, files, path: "p", workers=workers)
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        ids = [f"step-{i:03d}" for i in range(12)]
+        for step_id in ids:
+            with open(os.path.join(plan_dir, f"{step_id}.json"), "w") as f:
+                json.dump({
+                    "step_id": step_id, "sweep_id": "2026-09-25T0000Z-abc1234",
+                    "commit_sha": "abc1234def5678", "scope": "pkg/example", "description": "d",
+                    "hypotheses": [{"id": "h1", "objective": "o", "required_evidence": "e", "planner": "p1"}],
+                    "files": [], "planners": ["p1"],
+                }, f)
+        written = _with_workers_env(None, lambda: harness_runner.run_lane(
+            spec, plan_dir, out_dir, "/workspace", "fake-model", "m"))
+    check(len(written) == len(ids) and all(e["state"] == terminal_state.COMPLETE for e in written),
+          "run_lane(workers): every step completes", repr([e.get("state") for e in written]))
+    check(peak[0] > 1, "run_lane(workers): steps actually overlapped", repr(peak[0]))
+    check(overlaps == [], "run_lane(workers): no answer path was ever in use by two calls", repr(overlaps))
+    titles = {e["step_id"]: [f["title"] for f in e.get("findings") or []] for e in written}
+    check(titles == {i: [f"answer-for-{i}"] for i in ids},
+          "run_lane(workers): each step's envelope holds its own answer", repr(titles))
 
 
 def main() -> int:

@@ -330,6 +330,31 @@ def test_model_findings_about_auth_are_not_mistaken_for_an_auth_failure():
                   f"{step_id} in outstanding = {got}")
 
 
+def test_a_transient_provider_failure_is_re_attempted():
+    """Issue #4261: a lane that exhausted its in-place retries on a 5xx or a
+    dropped connection writes `transient_provider_error:<cause>`. Before this,
+    such a step was a bare `harness_exit_1` and was dropped for good -- eight
+    of one sweep's ollama failures were 500/502s. The prefix is harness-written,
+    so the same text inside the MODEL's output earns nothing."""
+    with tempfile.TemporaryDirectory() as lane_dir, tempfile.TemporaryDirectory() as plan_dir:
+        cases = [
+            ("step-001", f"{resume.TRANSIENT_PROVIDER_STOP_REASON}:http_502", True),
+            ("step-002", f"{resume.TRANSIENT_PROVIDER_STOP_REASON}:ConnectionResetError", True),
+            ("step-003", f"harness_exit_1: model said {resume.TRANSIENT_PROVIDER_STOP_REASON}:http_502", False),
+            ("step-004", f"invalid_findings_schema: {resume.TRANSIENT_PROVIDER_STOP_REASON}", False),
+        ]
+        for step_id, reason, _want in cases:
+            write_plan_step(plan_dir, step_id)
+            write(os.path.join(lane_dir, f"{step_id}.status.json"),
+                  status_envelope(step_id, "failed", stop_reason_raw=reason))
+        with redirect_stderr(io.StringIO()):
+            outstanding = resume.missing_steps(lane_dir, [c[0] for c in cases], plan_dir=plan_dir)
+        for step_id, reason, want in cases:
+            check((step_id in outstanding) == want,
+                  f"provider failure: {reason[:60]!r} -> {'retried' if want else 'NOT retried'}",
+                  str(outstanding))
+
+
 def test_transient_retries_are_capped_so_a_false_positive_cannot_loop():
     """[#4182 review finding] The prefix rule cannot catch a mis-detected
     `harness_exit_1`, so the count is the backstop.

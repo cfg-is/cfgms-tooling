@@ -3952,6 +3952,16 @@ PROMPT_EOF
       if [[ -n "${CFGMS_AGENTIC_VERIFIER_ALL:-}" ]]; then
         inv_harness_env+=(-e "CFGMS_AGENTIC_VERIFIER_ALL=${CFGMS_AGENTIC_VERIFIER_ALL}")
       fi
+      # The finder lane's concurrent-step count (Issue #4261). Same rules:
+      # forwarded only when set, validated before any container starts. A
+      # lane that declares itself serial ignores it inside the container.
+      if [[ -n "${CFGMS_SECURITY_REVIEW_LANE_WORKERS:-}" ]]; then
+        if ! [[ "$CFGMS_SECURITY_REVIEW_LANE_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "ERROR: CFGMS_SECURITY_REVIEW_LANE_WORKERS='${CFGMS_SECURITY_REVIEW_LANE_WORKERS}' is not a positive integer" >&2
+          exit 3
+        fi
+        inv_harness_env+=(-e "CFGMS_SECURITY_REVIEW_LANE_WORKERS=${CFGMS_SECURITY_REVIEW_LANE_WORKERS}")
+      fi
     fi
 
     inv_lane_entrypoint_mount=()

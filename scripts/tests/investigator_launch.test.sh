@@ -572,13 +572,14 @@ knob_out=$(PATH="${FAKEBIN}:${PATH}" \
   CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
   CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
   HOME="${SANDBOX}/HOME" \
-  CFGMS_AGENTIC_VERIFIER_WORKERS=2 CFGMS_AGENTIC_VERIFIER_ALL=1 \
+  CFGMS_AGENTIC_VERIFIER_WORKERS=2 CFGMS_AGENTIC_VERIFIER_ALL=1 CFGMS_SECURITY_REVIEW_LANE_WORKERS=5 \
   bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode stub-lane \
     --harness stub --model stubmodel --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
 check_contains "a lane launch with verifier knobs set still dispatches" "$knob_out" "LAUNCHED_INVESTIGATOR:stub-lane:fake-container-id"
 knob_run_call="$(grep '^run -d' "$DOCKER_CALL_LOG" | tail -1)"
 check_contains "CFGMS_AGENTIC_VERIFIER_WORKERS is forwarded" "$knob_run_call" "CFGMS_AGENTIC_VERIFIER_WORKERS=2"
 check_contains "CFGMS_AGENTIC_VERIFIER_ALL is forwarded" "$knob_run_call" "CFGMS_AGENTIC_VERIFIER_ALL=1"
+check_contains "CFGMS_SECURITY_REVIEW_LANE_WORKERS is forwarded" "$knob_run_call" "CFGMS_SECURITY_REVIEW_LANE_WORKERS=5"
 
 : > "$DOCKER_CALL_LOG"
 set +e
@@ -594,6 +595,21 @@ set -e
 check_contains "a non-integer worker count is reported" "$bad_workers_out" "is not a positive integer"
 if [[ "$bad_workers_rc" -ne 0 ]]; then ok "a non-integer worker count exits non-zero"; else bad "a non-integer worker count exits non-zero" "exited 0"; fi
 check_not_contains "a non-integer worker count never reaches docker run" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
+
+: > "$DOCKER_CALL_LOG"
+set +e
+bad_lane_workers_out=$(PATH="${FAKEBIN}:${PATH}" \
+  CFGMS_TEST_REPO_ROOT="$REPO_ROOT" \
+  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
+  HOME="${SANDBOX}/HOME" \
+  CFGMS_SECURITY_REVIEW_LANE_WORKERS=0 \
+  bash "$DISPATCH" launch-investigator --sweep-dir "$SWEEP_DIR" --snapshot-dir "$SNAPSHOT_DIR" --bundle-dir "$BUNDLE_DIR" --mode stub-lane \
+    --harness stub --model stubmodel --lane-entrypoint "$LANE_ENTRYPOINT_STAND_IN" 2>&1)
+bad_lane_workers_rc=$?
+set -e
+check_contains "a non-positive lane worker count is reported" "$bad_lane_workers_out" "CFGMS_SECURITY_REVIEW_LANE_WORKERS='0' is not a positive integer"
+if [[ "$bad_lane_workers_rc" -ne 0 ]]; then ok "a non-positive lane worker count exits non-zero"; else bad "a non-positive lane worker count exits non-zero" "exited 0"; fi
+check_not_contains "a non-positive lane worker count never reaches docker run" "$(cat "$DOCKER_CALL_LOG" 2>/dev/null || true)" "run -d"
 
 echo ""
 echo '== REQUIRED TEST evidence — "--mode plan --harness <id>" is harness-gated'

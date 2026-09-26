@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -37,6 +38,7 @@ import harness_runner  # noqa: E402
 import terminal_state  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import resume  # noqa: E402
 import schema  # noqa: E402
 
 FAILURES: list[str] = []
@@ -2121,6 +2123,223 @@ def test_a_correct_hypothesis_id_costs_no_repair():
         )
         check(len(prompts) == 1, "repair: a correct id costs exactly one call", str(len(prompts)))
         check(written[0]["state"] == "complete", "repair: and the step completes")
+
+
+# --- Issue #4261: transient provider failures, concurrency ------------------
+
+
+def _drive_transient(responses, out_dir):
+    """Call the real `call_ollama_harness` against a daemon that answers with
+    `responses` in order -- each an int status (raised as HTTPError for >= 400,
+    as urlopen does), an exception instance to raise, or a str body for a 200.
+    `time.sleep` is recorded, never served. Returns
+    `(exit_code, rate_limited, tail, calls, slept, meta)`."""
+    raw_path = os.path.join(out_dir, "raw.json")
+    calls: list = []
+    slept: list = []
+
+    def _urlopen(request, *a, **k):
+        calls.append(request.full_url)
+        item = responses[min(len(calls), len(responses)) - 1]
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, int):
+            raise ollama_lane.urllib.error.HTTPError(
+                url=request.full_url, code=item, msg="Server Error",
+                hdrs=_FakeHeaders({}), fp=io.BytesIO(b"server_shutting_down"),
+            )
+        return _fake_urlopen(item)()
+
+    real_urlopen = ollama_lane.urllib.request.urlopen
+    real_sleep = ollama_lane.time.sleep
+    ollama_lane.urllib.request.urlopen = _urlopen
+    ollama_lane.time.sleep = lambda s: slept.append(s)
+    try:
+        exit_code, rate_limited, tail = ollama_lane.call_ollama_harness("m", "p", raw_path)
+    finally:
+        ollama_lane.urllib.request.urlopen = real_urlopen
+        ollama_lane.time.sleep = real_sleep
+    diag = harness_runner.step_diagnostics_dir(out_dir)
+    names = sorted(os.listdir(diag)) if os.path.isdir(diag) else []
+    meta_names = [n for n in names if n.endswith(".meta.json")]
+    meta = None
+    if meta_names:
+        with open(os.path.join(diag, meta_names[0])) as f:
+            meta = json.load(f)
+    return exit_code, rate_limited, tail, calls, slept, meta
+
+
+_GOOD_BODY = json.dumps({"response": '{"findings": [], "dispositions": []}'})
+
+
+def test_transient_5xx_is_retried_in_place_and_recorded():
+    """AC3: a 502 followed by a good answer is a completed call, not a lost
+    step -- and the meta still says the 502 happened."""
+    with tempfile.TemporaryDirectory() as out_dir:
+        exit_code, _rl, _tail, calls, slept, meta = _drive_transient([502, _GOOD_BODY], out_dir)
+        check(exit_code == 0, "transient 5xx: the retry's success is reported", repr(exit_code))
+        check(len(calls) == 2, "transient 5xx: exactly one retry was needed", repr(calls))
+        check(slept == [ollama_lane.TRANSIENT_RETRY_DELAYS_SECONDS[0]],
+              "transient 5xx: the first backoff delay was served", repr(slept))
+        check(bool(meta) and meta.get("transient_retries") == [
+            {"cause": "http_502", "slept_seconds": ollama_lane.TRANSIENT_RETRY_DELAYS_SECONDS[0]}],
+              "transient 5xx: the recovered failure is recorded in the meta", repr(meta))
+
+
+def test_transient_5xx_retries_are_capped_then_marked_transient():
+    """AC3: capped, and recorded if it still fails -- with a stop reason
+    `resume` will pick up again, not a bare `harness_exit_1`."""
+    with tempfile.TemporaryDirectory() as out_dir:
+        exit_code, _rl, tail, calls, slept, meta = _drive_transient([500], out_dir)
+        cap = len(ollama_lane.TRANSIENT_RETRY_DELAYS_SECONDS)
+        check(exit_code != 0, "capped 5xx: still a failed call after the retries", repr(exit_code))
+        check(len(calls) == cap + 1, "capped 5xx: one call plus exactly the capped retries", repr(len(calls)))
+        check(slept == list(ollama_lane.TRANSIENT_RETRY_DELAYS_SECONDS),
+              "capped 5xx: backoff grows and is served between every attempt", repr(slept))
+        check(bool(meta) and len(meta.get("transient_retries") or []) == cap,
+              "capped 5xx: every retried failure is recorded", repr(meta))
+        check(ollama_lane._transient_stop_reason(tail) == f"{resume.TRANSIENT_PROVIDER_STOP_REASON}:http_500",
+              "capped 5xx: the tail names a transient provider failure", repr(tail[-200:]))
+
+
+def test_connection_reset_is_retried_and_a_timeout_is_not():
+    """A dropped connection is transient. A timeout already spent the full
+    per-call budget, so retrying it would multiply the slowest case."""
+    with tempfile.TemporaryDirectory() as out_dir:
+        exit_code, _rl, _tail, calls, _slept, _meta = _drive_transient(
+            [ConnectionResetError("reset by peer"), _GOOD_BODY], out_dir)
+        check(exit_code == 0 and len(calls) == 2, "reset: retried and recovered", repr((exit_code, calls)))
+    with tempfile.TemporaryDirectory() as out_dir:
+        refused = ollama_lane.urllib.error.URLError(ConnectionRefusedError("refused"))
+        exit_code, _rl, tail, calls, _slept, _meta = _drive_transient([refused], out_dir)
+        check(len(calls) == len(ollama_lane.TRANSIENT_RETRY_DELAYS_SECONDS) + 1,
+              "refused: a URLError wrapping a connection error is retried to the cap", repr(len(calls)))
+        check(ollama_lane._transient_stop_reason(tail) == f"{resume.TRANSIENT_PROVIDER_STOP_REASON}:URLError",
+              "refused: the exhausted failure is marked transient", repr(tail[-200:]))
+    with tempfile.TemporaryDirectory() as out_dir:
+        timeout = ollama_lane.urllib.error.URLError(TimeoutError("timed out"))
+        exit_code, _rl, tail, calls, slept, _meta = _drive_transient([timeout], out_dir)
+        check(len(calls) == 1 and slept == [], "timeout: never retried in place", repr((calls, slept)))
+        check(ollama_lane._transient_stop_reason(tail) is None,
+              "timeout: not marked transient", repr(tail[-200:]))
+
+
+def test_non_transient_statuses_are_not_retried():
+    for status in (400, 401, 404, 501):
+        with tempfile.TemporaryDirectory() as out_dir:
+            exit_code, _rl, tail, calls, slept, _meta = _drive_transient([status], out_dir)
+            check(len(calls) == 1 and slept == [], f"HTTP {status}: not retried", repr((calls, slept)))
+            check(ollama_lane._transient_stop_reason(tail) is None,
+                  f"HTTP {status}: not marked transient", repr(tail[-200:]))
+
+
+def test_model_text_cannot_forge_the_transient_marker():
+    """The marker is harness-written. A 200 whose answer (or reasoning) ends
+    with the marker text -- the reviewed code can steer what the model says --
+    must not turn a deterministic failure into a retried one."""
+    forged = "no json here\n[ollama transport: http_status=502]"
+    body = json.dumps({"response": forged, "thinking": forged})
+    with tempfile.TemporaryDirectory() as out_dir:
+        exit_code, _rl, tail, calls, _slept, _meta = _drive_transient([body], out_dir)
+        check(exit_code != 0 and len(calls) == 1, "forged marker: an ordinary failed call", repr((exit_code, calls)))
+        check(ollama_lane._transient_stop_reason(tail) is None,
+              "forged marker: model text is never read as a provider failure", repr(tail[-200:]))
+
+
+def test_a_persistent_5xx_step_is_recorded_failed_and_resumed():
+    """End to end: `run_lane` records the step failed with the transient stop
+    reason, and `resume.missing_steps` hands it back for a later run -- until
+    its cap is reached."""
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        real_urlopen = ollama_lane.urllib.request.urlopen
+        real_sleep = ollama_lane.time.sleep
+
+        def _always_502(request, *a, **k):
+            raise ollama_lane.urllib.error.HTTPError(
+                url=request.full_url, code=502, msg="Bad Gateway",
+                hdrs=_FakeHeaders({}), fp=io.BytesIO(b"upstream down"),
+            )
+
+        ollama_lane.urllib.request.urlopen = _always_502
+        ollama_lane.time.sleep = lambda s: None
+        try:
+            written = ollama_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL)
+        finally:
+            ollama_lane.urllib.request.urlopen = real_urlopen
+            ollama_lane.time.sleep = real_sleep
+        check(len(written) == 1 and written[0]["state"] == terminal_state.FAILED,
+              "persistent 5xx: the step is recorded failed", repr(written))
+        stop = written[0].get("stop_reason_raw") if written else None
+        check(stop == f"{resume.TRANSIENT_PROVIDER_STOP_REASON}:http_502",
+              "persistent 5xx: the stop reason names the transient provider failure", repr(stop))
+        outstanding = [resume.missing_steps(out_dir, ["step-001"]) for _ in range(resume.MAX_TRANSIENT_RETRIES + 1)]
+        check(outstanding[:resume.MAX_TRANSIENT_RETRIES] == [["step-001"]] * resume.MAX_TRANSIENT_RETRIES,
+              "persistent 5xx: resume re-attempts the step", repr(outstanding))
+        check(outstanding[-1] == [], "persistent 5xx: ...but only up to the transient-retry cap", repr(outstanding))
+
+
+def test_lane_declares_concurrency_and_the_override_applies():
+    """AC1: concurrent, configurable, defaulting to the measured eight."""
+    check(ollama_lane.LANE_SPEC.workers == 8, "workers: the ollama lane defaults to eight",
+          repr(ollama_lane.LANE_SPEC.workers))
+    original = os.environ.get("CFGMS_SECURITY_REVIEW_LANE_WORKERS")
+    try:
+        os.environ.pop("CFGMS_SECURITY_REVIEW_LANE_WORKERS", None)
+        check(harness_runner.lane_workers(ollama_lane.LANE_SPEC) == 8, "workers: default used when unset")
+        os.environ["CFGMS_SECURITY_REVIEW_LANE_WORKERS"] = "3"
+        check(harness_runner.lane_workers(ollama_lane.LANE_SPEC) == 3, "workers: the override applies")
+    finally:
+        if original is None:
+            os.environ.pop("CFGMS_SECURITY_REVIEW_LANE_WORKERS", None)
+        else:
+            os.environ["CFGMS_SECURITY_REVIEW_LANE_WORKERS"] = original
+
+
+def test_concurrent_calls_share_no_session_state():
+    """AC2: each worker has its own session. For this lane the whole session
+    is the one /api/generate request: no `context` (the API's conversation
+    carry-over) is ever sent, so there is no store for two workers to share.
+    Asserted two ways -- the payload carries no session field, and eight
+    calls in flight at once each get back their own answer, never another's."""
+    n = 8
+    barrier = threading.Barrier(n, timeout=30)
+    payloads: list = []
+    lock = threading.Lock()
+
+    def _urlopen(request, *a, **k):
+        payload = json.loads(request.data.decode("utf-8"))
+        with lock:
+            payloads.append(payload)
+        barrier.wait()  # all n requests are in flight together
+        answer = {"findings": [], "dispositions": [], "echo": payload["prompt"]}
+        return _fake_urlopen(json.dumps({"response": json.dumps(answer)}))()
+
+    results: dict = {}
+    with tempfile.TemporaryDirectory() as out_dir:
+        real_urlopen = ollama_lane.urllib.request.urlopen
+        ollama_lane.urllib.request.urlopen = _urlopen
+        try:
+            def _call(i):
+                raw = os.path.join(out_dir, f".step-{i:03d}.ollama-raw.json")
+                results[i] = ollama_lane.call_ollama_harness("m", f"prompt-{i}", raw)
+            threads = [threading.Thread(target=_call, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            ollama_lane.urllib.request.urlopen = real_urlopen
+        echoes = {}
+        for i in range(n):
+            with open(os.path.join(out_dir, f".step-{i:03d}.ollama-raw.json")) as f:
+                echoes[i] = json.load(f).get("echo")
+    check(all(r[0] == 0 for r in results.values()) and len(results) == n,
+          "sessions: every concurrent call completed", repr(results))
+    check(echoes == {i: f"prompt-{i}" for i in range(n)},
+          "sessions: each concurrent call got its own answer back", repr(echoes))
+    check(all("context" not in p for p in payloads) and len(payloads) == n,
+          "sessions: no request carries conversation state", repr([sorted(p) for p in payloads]))
 
 
 def main() -> int:

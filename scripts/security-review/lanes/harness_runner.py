@@ -2763,13 +2763,29 @@ class LaneSpec:
     current step's envelope is written, so no further step spends a harness
     call to record the same rejection over and over. A lane with no such
     condition passes `None` and never stops early.
+
+    `transient_stop_reason(output_tail)` (Issue #4261) names a failure the
+    provider caused and a later attempt can clear -- a 5xx, a dropped
+    connection -- or returns `None`. It is consulted only for a failed call
+    that is not lane-fatal, and only AFTER the harness's own in-place retries
+    have run out; its string becomes the step's `stop_reason_raw`, which
+    `resume` then re-attempts under its transient-retry cap. It must match
+    harness-written text only, never the model's answer.
+
+    `workers` (Issue #4261) is how many steps this lane may run at once. `1`
+    means the lane is not safe to run concurrently -- a CLI whose session store
+    is shared across invocations, say -- and no override raises it. A lane that
+    declares more is one whose calls share no state; see `lane_workers`.
     """
 
-    def __init__(self, harness: str, call_harness, build_prompt, fatal_stop_reason=None):
+    def __init__(self, harness: str, call_harness, build_prompt, fatal_stop_reason=None,
+                 transient_stop_reason=None, workers: int = 1):
         self.harness = harness
         self.call_harness = call_harness
         self.build_prompt = build_prompt
         self._fatal_stop_reason = fatal_stop_reason
+        self._transient_stop_reason = transient_stop_reason
+        self.workers = workers
 
     def raw_output_path(self, out_dir: str, step_id: str) -> str:
         return os.path.join(out_dir, f".{step_id}.{self.harness}-raw.json")
@@ -2781,6 +2797,108 @@ class LaneSpec:
         if self._fatal_stop_reason is None:
             return None
         return self._fatal_stop_reason(output_tail, model)
+
+    def transient_stop_reason(self, output_tail: str) -> "str | None":
+        if self._transient_stop_reason is None:
+            return None
+        return self._transient_stop_reason(output_tail)
+
+
+# Issue #4261: the ceiling on `CFGMS_SECURITY_REVIEW_LANE_WORKERS`. Not a
+# measured limit -- eight was measured clean against Ollama Cloud and nothing
+# above it was -- but a typo of 800 must not open 800 connections.
+LANE_WORKERS_MAX = 32
+
+
+def lane_workers(spec: LaneSpec) -> int:
+    """How many steps `run_lane` runs at once for this lane.
+
+    A lane that declares `workers == 1` is serial, full stop: the override
+    below never raises it, because a lane declares one worker when concurrent
+    calls would share state (a CLI session store `--continue` resumes, for
+    instance) and two workers sharing one answer each other's questions.
+
+    For a lane declaring more, `CFGMS_SECURITY_REVIEW_LANE_WORKERS` overrides
+    the declared default, clamped to `[1, LANE_WORKERS_MAX]`. A value that is
+    not an integer is ignored with a logged event rather than failing the
+    lane: the default is a working configuration, and a sweep that dies on a
+    typo in a tuning knob loses more than it saves.
+    """
+    declared = spec.workers if isinstance(spec.workers, int) and spec.workers > 0 else 1
+    if declared == 1:
+        return 1
+    raw = (os.environ.get("CFGMS_SECURITY_REVIEW_LANE_WORKERS") or "").strip()
+    if not raw:
+        return min(declared, LANE_WORKERS_MAX)
+    try:
+        value = int(raw)
+    except ValueError:
+        schema.log_event("lane_workers_invalid", value=raw[:40], using=declared)
+        return min(declared, LANE_WORKERS_MAX)
+    return max(1, min(value, LANE_WORKERS_MAX))
+
+
+def _drive_steps(step_ids: list, run_step, workers: int) -> list:
+    """Run `run_step(step_id) -> (envelope | None, lane_fatal)` over every step,
+    `workers` at a time, and return the envelopes in `step_ids` order.
+
+    With one worker this is the plain loop it replaced, step for step.
+
+    With more, each worker pulls the next step from a shared cursor, so a slow
+    step holds up one worker rather than a batch. A lane-fatal result stops
+    new steps from STARTING; steps already running finish and write their
+    envelopes, because abandoning a paid call half way loses its answer and
+    saves nothing. That can cost up to `workers - 1` extra calls against a
+    rejected model id, against the serial loop's zero -- bounded, and the price
+    of not serialising the common case.
+
+    `run_step` guards its own body and never raises for a step's problem. An
+    exception escaping it anyway is a bug in the loop itself; it is logged and
+    the worker moves on, so one bug costs one step, as in the serial loop.
+    """
+    if workers <= 1 or len(step_ids) <= 1:
+        written: list = []
+        for step_id in step_ids:
+            envelope, lane_fatal = run_step(step_id)
+            if envelope is not None:
+                written.append(envelope)
+            if lane_fatal:
+                break
+        return written
+
+    lock = threading.Lock()
+    cursor = iter(enumerate(step_ids))
+    stop = threading.Event()
+    results: dict = {}
+
+    def _worker() -> None:
+        while not stop.is_set():
+            with lock:
+                item = next(cursor, None)
+            if item is None:
+                return
+            index, step_id = item
+            try:
+                envelope, lane_fatal = run_step(step_id)
+            except Exception as exc:  # noqa: BLE001 -- one bug costs one step
+                schema.log_event("step_worker_error", step_id=step_id, error=str(exc))
+                continue
+            if envelope is not None:
+                with lock:
+                    results[index] = envelope
+            if lane_fatal:
+                stop.set()
+
+    threads = [
+        threading.Thread(target=_worker, name=f"lane-worker-{n}", daemon=True)
+        for n in range(min(workers, len(step_ids)))
+    ]
+    schema.log_event("lane_workers_started", workers=len(threads), steps=len(step_ids))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return [results[i] for i in sorted(results)]
 
 
 def _build_candidate(
@@ -3055,11 +3173,11 @@ def run_lane(
     prompt_version = compute_prompt_version()
     outstanding = resume.missing_steps(out_dir, step_ids, plan_dir=plan_dir)
 
-    written: list = []
-    for step_id in outstanding:
+    def _run_step(step_id: str) -> tuple:
+        """One step, start to finish: `(envelope | None, lane_fatal)`."""
         step = _load_plan_step(plan_dir, step_id)
         if step is None:
-            continue
+            return None, False
 
         sweep_id = step["sweep_id"]
         commit_sha = step["commit_sha"]
@@ -3387,7 +3505,15 @@ def run_lane(
                             stop_reason_raw = fatal
                             lane_fatal = True
                         else:
-                            stop_reason_raw = stop_reason_raw or f"harness_exit_{exit_code}"
+                            # Issue #4261: a provider-side failure the harness
+                            # already retried in place gets a stop reason
+                            # `resume` recognises, so a later run picks the
+                            # step up again instead of writing it off.
+                            stop_reason_raw = (
+                                stop_reason_raw
+                                or spec.transient_stop_reason(output_tail)
+                                or f"harness_exit_{exit_code}"
+                            )
                     else:
                         stop_reason_raw = stop_reason_raw or "invalid_findings_schema"
 
@@ -3415,8 +3541,7 @@ def run_lane(
                 with timings.stage(STAGE_VALIDATE_WRITE):
                     write_envelope(out_dir, step_id, envelope, plan_step=step)
                 _write_step_meta(envelope["state"])
-                written.append(envelope)
-                continue
+                return envelope, False
 
             if task_states and all(s == terminal_state.COMPLETE for s in task_states):
                 state = terminal_state.COMPLETE
@@ -3449,14 +3574,13 @@ def run_lane(
                 state=envelope["state"],
                 stop_reason_raw=envelope.get("stop_reason_raw"),
             )
-            written.append(envelope)
             if lane_fatal:
                 # Issue #4006: every remaining step would fail on this same
                 # rejected model id -- stop the lane here instead of spending
                 # one harness call per remaining step to record it again.
                 schema.log_event("lane_stopped_fatal_condition", step_id=step_id, model=model,
                                  reason=stop_reason_raw)
-                break
+            return envelope, lane_fatal
         except Exception as exc:  # noqa: BLE001 -- one bad step is a failed step, never a crashed lane
             schema.log_event("step_unhandled_error", step_id=step_id, error=str(exc))
             remove_step_temp_artifacts(out_dir, step_id)
@@ -3468,8 +3592,6 @@ def run_lane(
             # the time go" has no other answer at all -- and `StepTimings`
             # records a stage that raised because it closes in a `finally`.
             _write_step_meta(terminal_state.FAILED)
-            if envelope is not None:
-                written.append(envelope)
-            continue
+            return envelope, False
 
-    return written
+    return _drive_steps(outstanding, _run_step, lane_workers(spec))
