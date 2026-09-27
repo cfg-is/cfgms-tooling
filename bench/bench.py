@@ -43,7 +43,160 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
+# Stdlib-only YAML subset parser: PyYAML is not installed in any environment
+# this harness runs in (dev container, CI, or a bare `python3`) -- the rest of
+# the tooling under scripts/ already avoids it for the same reason (see
+# project-queue.sh's and tier1-smoke-test.sh's stdlib YAML fallbacks). This
+# covers exactly the shapes case.yaml/expect.yaml use: scalar mappings, lists
+# of mappings, inline flow lists, and folded/literal block scalars -- not
+# general YAML.
+_SCALAR_KEY_RE = re.compile(r"^([A-Za-z0-9_]+):\s?(.*)$")
+
+
+def _yaml_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _yaml_parse_scalar(val: str) -> Any:
+    val = val.strip()
+    if val == "":
+        return None
+    if len(val) >= 2 and val[0] == val[-1] == "'":
+        return val[1:-1].replace("''", "'")
+    if len(val) >= 2 and val[0] == val[-1] == '"':
+        return val[1:-1].replace('\\"', '"')
+    if " #" in val:
+        val = val.split(" #", 1)[0].rstrip()
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        return [] if inner == "" else [_yaml_parse_scalar(x) for x in inner.split(",")]
+    if val == "true":
+        return True
+    if val == "false":
+        return False
+    if val in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", val):
+        return int(val)
+    if re.fullmatch(r"-?\d+\.\d+", val):
+        return float(val)
+    return val
+
+
+class _YamlParser:
+    def __init__(self, text: str):
+        self.lines = text.split("\n")
+        self.pos = 0
+
+    def _peek(self) -> str | None:
+        while self.pos < len(self.lines):
+            line = self.lines[self.pos]
+            stripped = line.strip()
+            if stripped == "" or stripped.startswith("#"):
+                self.pos += 1
+                continue
+            return line
+        return None
+
+    def _parse_block_scalar(self, indicator: str, key_indent: int) -> str:
+        content_lines: list[str] = []
+        block_indent: int | None = None
+        pending_blanks = 0
+        while self.pos < len(self.lines):
+            raw = self.lines[self.pos]
+            if raw.strip() == "":
+                pending_blanks += 1
+                self.pos += 1
+                continue
+            indent = _yaml_indent(raw)
+            if indent <= key_indent:
+                break
+            if block_indent is None:
+                block_indent = indent
+            content_lines.extend([""] * pending_blanks)
+            pending_blanks = 0
+            content_lines.append(raw[block_indent:] if indent >= block_indent else raw.lstrip(" "))
+            self.pos += 1
+
+        if indicator.startswith("|"):
+            return "\n".join(content_lines) + "\n"
+
+        paragraphs = []
+        current: list[str] = []
+        for line in content_lines:
+            if line == "":
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+            else:
+                current.append(line)
+        if current:
+            paragraphs.append(" ".join(current))
+        return "\n".join(paragraphs) + "\n"
+
+    def _parse_value(self, key_indent: int, val: str) -> Any:
+        if val in (">", "|", ">-", "|-"):
+            return self._parse_block_scalar(val, key_indent)
+        if val != "":
+            return _yaml_parse_scalar(val)
+
+        nxt = self._peek()
+        if nxt is not None and _yaml_indent(nxt) > key_indent:
+            nested_indent = _yaml_indent(nxt)
+            if nxt.lstrip(" ").startswith("-"):
+                return self.parse_sequence(nested_indent)
+            return self.parse_mapping(nested_indent)
+        return None
+
+    def parse_mapping(self, indent: int) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        while True:
+            line = self._peek()
+            if line is None or _yaml_indent(line) != indent:
+                break
+            content = line.lstrip(" ")
+            if content.startswith("-"):
+                break
+            self.pos += 1
+            m = _SCALAR_KEY_RE.match(content)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2)
+            result[key] = self._parse_value(indent, val)
+        return result
+
+    def parse_sequence(self, indent: int) -> list[Any]:
+        result: list[Any] = []
+        while True:
+            line = self._peek()
+            if line is None or _yaml_indent(line) != indent:
+                break
+            content = line.lstrip(" ")
+            if not content.startswith("-"):
+                break
+            self.pos += 1
+            after_dash = content[1:]
+            stripped_after = after_dash.lstrip(" ")
+            n_spaces = len(after_dash) - len(stripped_after)
+            child_indent = indent + 1 + max(n_spaces, 1)
+
+            if stripped_after == "":
+                item: Any = self.parse_mapping(child_indent)
+            else:
+                m = _SCALAR_KEY_RE.match(stripped_after)
+                if m:
+                    key, val = m.group(1), m.group(2)
+                    item = {key: self._parse_value(child_indent, val)}
+                    item.update(self.parse_mapping(child_indent))
+                else:
+                    item = _yaml_parse_scalar(stripped_after)
+            result.append(item)
+        return result
+
+
+def _load_yaml(text: str) -> dict[str, Any]:
+    return _YamlParser(text).parse_mapping(0)
+
 
 BENCH_DIR = Path(__file__).resolve().parent
 CASES_DIR = BENCH_DIR / "cases"
@@ -144,12 +297,12 @@ class Case:
 
     @classmethod
     def load(cls, case_dir: Path) -> "Case":
-        spec = yaml.safe_load((case_dir / "case.yaml").read_text(encoding="utf-8"))
+        spec = _load_yaml((case_dir / "case.yaml").read_text(encoding="utf-8"))
         prompt_path = case_dir / spec.get("prompt_file", "input/prompt.md")
         prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else spec.get("prompt", "")
 
         expect_path = case_dir / "expect.yaml"
-        expect = yaml.safe_load(expect_path.read_text(encoding="utf-8")) if expect_path.exists() else {}
+        expect = _load_yaml(expect_path.read_text(encoding="utf-8")) if expect_path.exists() else {}
 
         return cls(
             case_id=f"{case_dir.parent.name}/{case_dir.name}",
