@@ -1,0 +1,2803 @@
+#!/usr/bin/env python3
+"""Findings consolidator for the security review harness (Issue #3904).
+
+Reads the frozen plan under `<sweep_dir>/plan/` (Issue #3953) -- the
+`step-*.json` files `planner.py`'s `finalize()`/`finalize_multi_planner()`
+write once and `resume` never regenerates -- for the set of step ids a sweep
+was supposed to cover, then reads whatever `lanes/<lane>/step-*.findings.json`
+and `step-*.status.json` files currently exist against that fixed
+denominator -- a sweep in any state of completeness, mid-run, fully complete,
+or partially parked -- and produces two files under `<sweep_dir>/report/`:
+
+- `consolidated.json` -- machine-readable findings, de-duplicated on
+  `file` + `symbol` + normalised `cwe` (never a line number, per
+  .claude/skills/security-review/docs/harness-architecture.md; never the free-text
+  `vuln_class`, per Issue #4134 -- two lanes describing one defect in
+  different registers are the same defect, and keying on prose made them two),
+  each annotated with exactly the lanes that independently reported it and the
+  number of lanes that actually completed the step it came from.
+- `consolidated.md` -- a per-lane x per-step coverage table followed by the
+  de-duplicated findings, rendered as literal Markdown text (no raw HTML, no
+  unescaped table/heading syntax from model-generated content).
+
+This module never calls a provider API and never dispatches a container --
+it is a pure read-existing-files-and-render step, safe to run against fixture
+data before any lane (S6/S7/S8) exists. That stays true after Issue #3984:
+the model-backed **adjudication stage** lives in `adjudicate.py` (host side,
+prepare/launch) and `lanes/adjudicator.py` (in-container), and this
+module only *reads* the envelope that stage leaves at
+`adjudication/lanes/adjudicator/adjudication.json` -- exactly as it reads a
+finder lane's envelopes. `consolidate_test.py` enforces the claim: every
+subprocess this module spawns is `git`, and it imports no network module.
+
+**Severity disagreement and adjudication (Issue #3984):** every consolidated
+finding carries a deterministic `severity_range` -- the lowest and highest
+severity any lane reported for it, per-lane values, and a `disagreement`
+flag -- so two lanes calling the same defect `low` and `critical` is
+rendered as an explicit disagreement, never silently collapsed. When the
+adjudication stage ran, its per-finding verdict is merged ONTO the
+deterministic set by de-duplication key as a second layer (`adjudication`
+on each finding, with the adjudicating harness/model and its rationale);
+`occurrences` and `severity_range` are never rewritten, so what the lanes
+actually said is always recoverable. The adjudication layer can annotate
+and can never delete: a finding the adjudicator omitted is still rendered,
+marked as not adjudicated, and counted in `## Incomplete`; an adjudication
+naming a key that matches no finding is dropped and counted (`unmatched`)
+-- a model cannot add findings either. An adjudication envelope that is
+missing after a recorded dispatch, schema-invalid, non-`complete`, from a
+different sweep, or computed over a different deterministic input than the
+current one (`input_hash` mismatch, e.g. lanes re-ran on resume) is treated
+like a failed lane: raw severities render, and the failure is named in
+`## Incomplete`, so a report never *looks* adjudicated when it is not.
+
+**Cross-step re-aggregation (Issue #3984):** the planner partitions blind, so
+one defect's evidence can land in two steps. `build_cross_step_groups()`
+mechanically groups consolidated findings that share a defect class (`cwe`
+when a finding carries one -- #3983 -- else `vuln_class`) across two or more
+distinct plan steps, renders them in a `## Cross-step groups` section, and
+hands them to the adjudicator for a `same_defect`/`distinct`/`unsure`
+assessment. Grouping is over-inclusive by design: a false group costs a
+reader a glance, a missed cross-step defect is the failure this exists to
+catch.
+
+Every file this module reads is validated through #3901's actual
+`schema.validate_step_envelope` (which recursively validates nested findings
+via `schema.validate_finding`) -- never a hand-typed "does this look valid"
+check. A file that fails validation is excluded from both output files, never
+crashes the consolidator, and is counted as `failed` in the coverage table --
+exactly as visible to a human reader as a normal `failed` step.
+
+**Per-hypothesis dispositions (Issue #3959):** a schema-valid `complete`
+envelope whose `dispositions` array contains any `not_attempted` entry is
+treated exactly like a schema-invalid envelope -- excluded from findings,
+logged via `schema.log_event`, and counted `failed` in the coverage table,
+never `complete`. A bundle that completed silently short of the hypotheses
+it was handed must never read as full coverage. A duplicate `hypothesis_id`
+within `dispositions` is caught earlier, by `schema.validate_step_envelope`
+itself (structural, no plan step needed), so it already falls into the
+ordinary schema-invalid path above.
+
+**Path-traversal validation (SEC3900 A1):** a finding's `file` field is
+model-generated text. Before it is rendered anywhere, it is checked for
+membership in the real repository tree at the finding's own `commit_sha`
+(`git ls-tree -r --name-only <commit_sha>`, resolved once per distinct
+`commit_sha` and cached). A `file` value that is absolute, `../`-shaped, or
+simply absent from that tree is excluded from the output -- and, critically,
+`file` is never joined onto a filesystem path or opened: the only operation
+performed against it is a set-membership check, so a malicious value cannot
+cause a path operation outside the sweep tree even if the tree lookup itself
+were somehow bypassed.
+
+**Log injection (SEC3900 A2):** every diagnostic this module logs about a
+malformed file goes through `schema.log_event`/`safe_log_event`, never a raw
+f-string interpolation of tainted content -- matching `resume.py`.
+
+**Coverage gates (Issue #3980):** `load_coverage_gates()` reads
+`<sweep_dir>/plan/coverage.json`, the G-2 ("every code-tier file reviewed at
+least once") / G-3 ("every entrypoint/security file reviewed by at least two
+steps that genuinely differ in what they investigate") result
+`planner.py`'s `finalize()`/`finalize_multi_planner()` compute over the
+finalized plan. A gate that failed, or that could not be evaluated at all
+(a missing or unparseable bundle tree listing), folds into `_sweep_complete()`
+exactly like any other gap and is named -- by path, never only by count -- in
+`## Incomplete`. Absence of `coverage.json` itself (a sweep from before this
+story, or one whose `finalize()` returned before the write) carries no
+signal and is judged on every other check alone, same as any other optional
+artifact this module reads.
+
+**Honest incompleteness (Issue #3961):** an empty `findings` array means "no
+candidates reported in the tasks that completed," never "clean" -- the two
+read identically only when every lane finished every planned step. Whenever
+`_sweep_complete()` is `False` (any `not_started`, `files_short`, `failed`,
+`parked`, or `refused` count on any lane's coverage row -- a parked or refused
+step read no more code than a failed one; any `dispatch_report.json`/
+`rejected_proposals.json` entry; or the plan itself failed), `render_markdown()`
+says so in its opening sentence, in a dedicated `## Incomplete` section naming
+every gap, and in the `## Findings` section's empty-case text -- it never
+falls back to the unconditional "no findings" framing that reads as a clean
+sweep regardless of how much of the sweep actually ran.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_write  # noqa: E402
+import basedir  # noqa: E402
+import planner  # noqa: E402
+import resume  # noqa: E402
+import schema  # noqa: E402
+import source_leak  # noqa: E402
+
+STEP_STATES = ("complete", "parked", "refused", "failed")
+NOT_STARTED = "not_started"
+
+# Rank tables for the findings sort order documented at SKILL.md's "sorted by
+# verification verdict first, then multi-lane agreement, then severity, then
+# confidence" sentence (the verdict table is `_VERIFICATION_RANK`, below) --
+# higher value sorts first (descending). Keys match schema.py's
+# SEVERITY_VALUES/CONFIDENCE_VALUES exactly.
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+_SEVERITY_BY_RANK = {rank: name for name, rank in _SEVERITY_RANK.items()}
+
+# Adjudication stage layout (Issue #3984). The stage runs as a lane-mode
+# investigator container against its own sub-sweep directory,
+# `<sweep_dir>/adjudication/`, whose `snapshot/` is deliberately EMPTY (the
+# adjudicator sees findings, never source), whose `plan/` carries the
+# deterministic input this module builds, and whose
+# `lanes/adjudicator/` is the container's only writable mount.
+ADJUDICATION_SUBDIR = "adjudication"
+ADJUDICATOR_LANE_ID = "adjudicator"
+VERIFICATION_SUBDIR = "verification"
+VERIFIER_LANE_ID = "verifier"
+VERIFICATION_OUTPUT_FILENAME = "verification.json"
+ADJUDICATION_INPUT_FILENAME = "adjudication-input.json"
+ADJUDICATION_OUTPUT_FILENAME = "adjudication.json"
+
+# Adjudication statuses a report can carry. The first two are the only ones
+# `_sweep_complete()` accepts; every other status names a gap in
+# `## Incomplete`.
+ADJUDICATION_NOT_CONFIGURED = "not_configured"
+ADJUDICATION_SKIPPED_NO_FINDINGS = "skipped_no_findings"
+ADJUDICATION_COMPLETE = "complete"
+ADJUDICATION_MISSING = "missing"
+ADJUDICATION_INVALID = "invalid"
+ADJUDICATION_STALE = "stale"
+# Issue #4144: a revoked or expired credential, told apart from a real
+# defect. Deliberately NOT in ADJUDICATION_OK_STATUSES -- the stage did not
+# produce verdicts, so every severity below is still a raw lane value and the
+# sweep is still incomplete. What this status buys is that a reader can tell
+# "credential blip, just resume" from "investigate this" without opening
+# container stderr by hand. Calling it OK would make the report claim an
+# adjudication that never happened.
+ADJUDICATION_AUTH_REVOKED = "auth_revoked"
+ADJUDICATION_OK_STATUSES = frozenset(
+    {ADJUDICATION_NOT_CONFIGURED, ADJUDICATION_SKIPPED_NO_FINDINGS, ADJUDICATION_COMPLETE}
+)
+
+# The credential classifier moved to `schema.py` for Issue #4177.
+#
+# `resume.py` needs it too, and `consolidate` imports `resume` -- so keeping
+# it here would have forced a cycle or a second copy. `schema` is imported by
+# both and owns no policy of its own, which makes it the right home. Re-bound
+# here so every existing call site in this module reads unchanged.
+looks_auth_revoked = schema.looks_auth_revoked
+
+
+def _load_json(path: str):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+STEP_DIAGNOSTICS_DIRNAME = "diagnostics"
+STEP_META_SUFFIX = ".meta.json"
+
+
+def build_timing_rollup(sweep_dir: str, lanes: list) -> list:
+    """Aggregate every lane's per-step `meta.json` into one row per lane
+    (Issue #4135 AC7).
+
+    This has to live in the sweep tree rather than a log. Container logs are
+    destroyed when the container exits (Issue #4132 captures them, but into
+    the sweep tree for the same reason), and the question this answers --
+    "why did that lane take six times longer than the other one on the same
+    plan" -- is asked days later, from the report.
+
+    Reads only `<step_id>.meta.json`, never the ollama lane's per-CALL
+    `<step_id>.taskN.meta.json`: the step file is written by the shared
+    runner for all four lanes, so the rows are comparable. A lane whose
+    envelopes predate this story contributes a row of zeros with
+    `steps_measured: 0` rather than being omitted, so a missing lane is
+    visibly missing.
+    """
+    rows = []
+    for lane in lanes:
+        diag_dir = os.path.join(sweep_dir, "lanes", lane, STEP_DIAGNOSTICS_DIRNAME)
+        row = {
+            "lane": lane,
+            "steps_measured": 0,
+            "wall_seconds": 0.0,
+            "model_seconds": 0.0,
+            "backoff_sleep_seconds": 0.0,
+            "unattributed_seconds": 0.0,
+            "harness_calls": 0,
+            "rate_limited_steps": 0,
+            "rate_limited_only_on_an_earlier_attempt": 0,
+            "over_budget_parks": 0,
+            "repair_attempts": 0,
+            "steps_with_repairs": 0,
+            "hypotheses_answered": 0,
+            "hypotheses_synthesized_not_attempted": 0,
+        }
+        if os.path.isdir(diag_dir):
+            for name in sorted(os.listdir(diag_dir)):
+                if not name.endswith(STEP_META_SUFFIX):
+                    continue
+                # A per-call meta carries a `.taskN.` segment; the step meta
+                # does not. Filtering by shape rather than by lane id keeps
+                # this correct when another lane gains per-call metas too.
+                if ".task" in name[: -len(STEP_META_SUFFIX)]:
+                    continue
+                meta = _load_json(os.path.join(diag_dir, name))
+                if not isinstance(meta, dict) or "wall_seconds" not in meta:
+                    continue
+                row["steps_measured"] += 1
+                for field, key in (
+                    ("wall_seconds", "wall_seconds"),
+                    ("model_seconds", "model_seconds"),
+                    ("backoff_sleep_seconds", "rate_limit_backoff_sleep_seconds"),
+                    ("unattributed_seconds", "unattributed_seconds"),
+                ):
+                    value = meta.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        row[field] += float(value)
+                for field, key in (
+                    ("harness_calls", "harness_calls"),
+                    ("repair_attempts", "repair_attempts"),
+                    ("hypotheses_answered", "hypotheses_answered"),
+                    ("hypotheses_synthesized_not_attempted", "hypotheses_synthesized_not_attempted"),
+                ):
+                    value = meta.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        row[field] += value
+                if meta.get("rate_limited"):
+                    row["rate_limited_steps"] += 1
+                    # The case this story was written about: a step that slept
+                    # through a limit and then SUCCEEDED. It used to be
+                    # recorded `complete` with `rate_limited: false`, so the
+                    # artifacts said the lane was not rate limited.
+                    if not meta.get("rate_limited_final_attempt"):
+                        row["rate_limited_only_on_an_earlier_attempt"] += 1
+                if meta.get("rate_limit_backoff_gave_up_over_budget"):
+                    row["over_budget_parks"] += 1
+                if (meta.get("repair_attempts") or 0) > 0:
+                    row["steps_with_repairs"] += 1
+
+        for field in ("wall_seconds", "model_seconds", "backoff_sleep_seconds", "unattributed_seconds"):
+            row[field] = round(row[field], 3)
+        row["mean_wall_seconds_per_step"] = (
+            round(row["wall_seconds"] / row["steps_measured"], 3) if row["steps_measured"] else 0.0
+        )
+        rows.append(row)
+    return rows
+
+
+def _timing_lines(rows: list) -> list:
+    """Render the timing roll-up. Returns [] when no lane recorded anything,
+    so a sweep whose lanes predate this story gains no empty section."""
+    measured = [r for r in rows if r["steps_measured"]]
+    if not measured:
+        return []
+    lines = [
+        "## Timing",
+        "",
+        "Where each lane's wall clock went, from the per-step `meta.json` the lane runner "
+        "writes for every step (Issue #4135). Read `backoff sleep` first when two lanes on "
+        "the same plan disagree wildly: on one measured sweep a lane averaged 7.29 min/step "
+        "against another's 1.26, and the whole difference was rate-limit backoff that no "
+        "artifact recorded.",
+        "",
+        "| Lane | Steps | Wall (s) | Mean/step (s) | Model (s) | Backoff sleep (s) | Unattributed (s) | Calls | Rate-limited steps | ... of those, recovered | Parked over budget | Repairs |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {lane} | {steps} | {wall} | {mean} | {model} | {sleep} | {unattributed} | {calls} "
+            "| {rl} | {recovered} | {parked} | {repairs} |".format(
+                lane=_md_escape_inline(row["lane"]),
+                steps=row["steps_measured"],
+                wall=row["wall_seconds"],
+                mean=row["mean_wall_seconds_per_step"],
+                model=row["model_seconds"],
+                sleep=row["backoff_sleep_seconds"],
+                unattributed=row["unattributed_seconds"],
+                calls=row["harness_calls"],
+                rl=row["rate_limited_steps"],
+                recovered=row["rate_limited_only_on_an_earlier_attempt"],
+                parked=row["over_budget_parks"],
+                repairs=row["repair_attempts"],
+            )
+        )
+    lines.append("")
+    lines.append(
+        "**`... of those, recovered`** counts steps that hit a rate limit, waited, and then "
+        "succeeded. Those are the ones that used to be invisible: the envelope's "
+        "`rate_limited` reflected only the FINAL attempt, so such a step was recorded "
+        "`complete` with `rate_limited: false` and its waiting left no trace at all."
+    )
+    lines.append("")
+    lines.append(
+        "**`Unattributed`** is wall time no stage accounted for. It should be small; a large "
+        "value means real time is being spent somewhere nothing instruments, which is the "
+        "condition this table exists to end rather than to hide."
+    )
+    lines.append("")
+    return lines
+
+
+def _discover_lanes(sweep_dir: str) -> list[str]:
+    lanes_dir = os.path.join(sweep_dir, "lanes")
+    if not os.path.isdir(lanes_dir):
+        return []
+    return sorted(
+        name
+        for name in os.listdir(lanes_dir)
+        if os.path.isdir(os.path.join(lanes_dir, name))
+    )
+
+
+def _step_id_from_filename(filename: str, suffix: str) -> str:
+    return filename[: -len(suffix)]
+
+
+def _discover_plan_step_ids(sweep_dir: str) -> list[str]:
+    """Read the frozen plan's step ids from `<sweep_dir>/plan/step-*.json`
+    file names -- the denominator `planner.py`'s `finalize()`/
+    `finalize_multi_planner()` write once and `resume` never regenerates.
+
+    Reuses `planner.py`'s own `STEP_FILENAME_RE` rather than redefining an
+    equivalent pattern, so the two stay in lock-step by construction (Issue
+    #3953). Never reads `lanes/*/step-*.{findings,status}.json` -- a step a
+    lane never touched must still count against the denominator, which an
+    artifact-derived set can never do because it only sees files that exist.
+    """
+    plan_dir = os.path.join(sweep_dir, "plan")
+    if not os.path.isdir(plan_dir):
+        return []
+    return sorted(
+        filename[: -len(".json")]
+        for filename in os.listdir(plan_dir)
+        if planner.STEP_FILENAME_RE.match(filename)
+    )
+
+
+def _plan_failed(sweep_dir: str, step_ids: list[str]) -> bool:
+    """True when the frozen plan cannot serve as a coverage denominator:
+    `finalize()`'s `plan/PLANNING_FAILED` marker is present, or zero
+    `step-*.json` files survived under `plan/` (the condition `finalize()`
+    guarantees always accompanies that marker, checked independently here in
+    case the marker itself is somehow absent)."""
+    marker_path = os.path.join(sweep_dir, "plan", planner.FAILURE_MARKER_FILENAME)
+    return os.path.isfile(marker_path) or not step_ids
+
+
+def load_sweep(sweep_dir: str):
+    """Read the frozen plan and every lane's step files under `sweep_dir`.
+
+    Returns `(lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail)`:
+    - `lanes`: sorted lane directory names discovered under `lanes/`.
+    - `step_ids`: sorted step ids read from `plan/step-*.json` -- the frozen
+      plan, never a union of lane-produced artifact files. Empty when the
+      plan failed.
+    - `lane_step_state`: `{lane: {step_id: state}}`, `state` one of
+      `STEP_STATES`. A `(lane, step_id)` pair with no file at all is simply
+      absent here -- `build_coverage_table()` turns that absence into an
+      explicit `not_started` count rather than dropping it from every bucket
+      (SEC3900 B7's "neither reported nor did-not-find" signal still holds
+      for agreement math; it is `not_started` for coverage math).
+    - `lane_step_files`: `{lane: {step_id: {"files_intended": [...], "files_read": [...]}}}`
+      (Issue #3957) -- populated only for a `state == "complete"` step whose
+      envelope actually carries both fields (an envelope written before this
+      story, or by a lane that has not yet been upgraded, simply has no entry
+      here rather than a synthesized one).
+    - `findings`: `[(lane, step_id, finding_dict), ...]` for every finding in
+      a schema-valid `state == "complete"` envelope.
+    - `plan_failed`: True when `plan/PLANNING_FAILED` is present or `plan/`
+      contains zero step files -- coverage cannot be computed for this sweep.
+    - `lane_step_tail`: `{lane: {step_id: harness_output_tail}}` (Issue #4008)
+      -- populated only for a non-`complete` step whose envelope carries a
+      non-empty `harness_output_tail`. An envelope written before this story,
+      by a lane that has not yet been upgraded, or that genuinely has nothing
+      to show simply has no entry here rather than an empty string.
+    """
+    lanes = _discover_lanes(sweep_dir)
+    step_ids = _discover_plan_step_ids(sweep_dir)
+    plan_failed = _plan_failed(sweep_dir, step_ids)
+    lane_step_state: dict[str, dict[str, str]] = {lane: {} for lane in lanes}
+    lane_step_files: dict[str, dict[str, dict]] = {lane: {} for lane in lanes}
+    lane_step_tail: dict[str, dict[str, str]] = {lane: {} for lane in lanes}
+    findings: list[tuple[str, str, dict]] = []
+
+    for lane in lanes:
+        lane_dir = os.path.join(sweep_dir, "lanes", lane)
+        for step_id in step_ids:
+            findings_path = os.path.join(lane_dir, f"{step_id}.findings.json")
+            status_path = os.path.join(lane_dir, f"{step_id}.status.json")
+
+            if os.path.isfile(findings_path):
+                envelope = _load_json(findings_path)
+                errors = (
+                    schema.validate_step_envelope(envelope)
+                    if isinstance(envelope, dict)
+                    else ["findings file did not contain a JSON object"]
+                )
+                if errors:
+                    schema.log_event(
+                        "invalid_step_file",
+                        lane=lane,
+                        step_id=step_id,
+                        path=findings_path,
+                        errors=errors,
+                    )
+                    lane_step_state[lane][step_id] = "failed"
+                    continue
+
+                state = envelope["state"]
+                if state == "complete":
+                    dispositions = envelope.get("dispositions") or []
+                    has_not_attempted = any(
+                        isinstance(d, dict) and d.get("disposition") == "not_attempted"
+                        for d in dispositions
+                    )
+                    if has_not_attempted:
+                        schema.log_event(
+                            "step_incomplete_not_attempted",
+                            lane=lane,
+                            step_id=step_id,
+                            path=findings_path,
+                        )
+                        lane_step_state[lane][step_id] = "failed"
+                        continue
+
+                    lane_step_state[lane][step_id] = state
+                    for finding in envelope["findings"]:
+                        findings.append((lane, step_id, finding))
+                    files_intended = envelope.get("files_intended")
+                    files_read = envelope.get("files_read")
+                    if isinstance(files_intended, list) and isinstance(files_read, list):
+                        lane_step_files[lane][step_id] = {
+                            "files_intended": files_intended,
+                            "files_read": files_read,
+                        }
+                else:
+                    lane_step_state[lane][step_id] = state
+                    tail = envelope.get("harness_output_tail")
+                    if isinstance(tail, str) and tail:
+                        lane_step_tail[lane][step_id] = tail
+                continue
+
+            if os.path.isfile(status_path):
+                envelope = _load_json(status_path)
+                errors = (
+                    schema.validate_step_envelope(envelope)
+                    if isinstance(envelope, dict)
+                    else ["status file did not contain a JSON object"]
+                )
+                if errors:
+                    schema.log_event(
+                        "invalid_step_file",
+                        lane=lane,
+                        step_id=step_id,
+                        path=status_path,
+                        errors=errors,
+                    )
+                    lane_step_state[lane][step_id] = "failed"
+                    continue
+
+                lane_step_state[lane][step_id] = envelope["state"]
+                tail = envelope.get("harness_output_tail")
+                if isinstance(tail, str) and tail:
+                    lane_step_tail[lane][step_id] = tail
+                continue
+
+            # Neither file exists: this lane never ran this step. Left absent
+            # from lane_step_state -- build_coverage_table() counts it as
+            # not_started rather than dropping it from every bucket.
+
+    return lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail
+
+
+def _tree_files(repo_root: str, commit_sha: str, cache: dict[str, frozenset]) -> frozenset:
+    if commit_sha in cache:
+        return cache[commit_sha]
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_root, "ls-tree", "-r", "--name-only", commit_sha],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        files = frozenset(line for line in result.stdout.splitlines() if line)
+    except (OSError, subprocess.SubprocessError):
+        files = frozenset()
+    cache[commit_sha] = files
+    return files
+
+
+def _is_valid_repo_file(
+    file_value: object, repo_root: str, commit_sha: str, tree_cache: dict[str, frozenset]
+) -> bool:
+    """True iff `file_value` names a real path in the tree at `commit_sha`.
+
+    Deliberately never joins `file_value` onto a filesystem path or opens
+    it -- the only operation performed is a set-membership check against the
+    tree listing, so a `../`-shaped or absolute value cannot cause a path
+    operation outside the sweep tree even before the explicit checks below
+    reject it.
+    """
+    if not isinstance(file_value, str) or file_value == "":
+        return False
+    if os.path.isabs(file_value):
+        return False
+    normalized = os.path.normpath(file_value)
+    if normalized == os.pardir or normalized.startswith(os.pardir + os.sep):
+        return False
+    return file_value in _tree_files(repo_root, commit_sha, tree_cache)
+
+
+def _group_findings(findings: list[tuple[str, str, dict]], repo_root: str) -> dict:
+    tree_cache: dict[str, frozenset] = {}
+    groups: dict[tuple[str, str, str], dict] = {}
+
+    for lane, step_id, finding in findings:
+        file_value = finding["file"]
+        commit_sha = finding["commit_sha"]
+
+        if not _is_valid_repo_file(file_value, repo_root, commit_sha, tree_cache):
+            schema.log_event(
+                "finding_excluded_invalid_file",
+                lane=lane,
+                step_id=step_id,
+                file=file_value,
+                commit_sha=commit_sha,
+            )
+            continue
+
+        # The class component of the key is the NORMALISED `cwe`, not the
+        # free-text `vuln_class` (Issue #4134).
+        #
+        # `vuln_class` is described to the model as a "short vulnerability-class
+        # label" -- free prose, and models write it in incompatible registers.
+        # Measured across the 142 steps two lanes both completed in sweep
+        # 2026-09-16T1843Z-a17e6fcc: codex wrote phrases ("Improper input
+        # validation at a trust boundary"), ollama wrote identifiers
+        # ("CWE-20"), 122 distinct values against 203 with only 14 in common.
+        # Keyed on that, the two lanes agreed on 12 findings out of a 974
+        # union -- 1.2%. Multi-lane agreement is the sort's second key, so
+        # that sort carried almost no information and the same defect found
+        # twice rendered twice, unlinked.
+        #
+        # `cwe` is the field that was already comparable: required on every
+        # finding, drawn from a closed list, and put through
+        # `schema.normalize_cwe()` so case and formatting variants collapse.
+        # Re-keying on it lifts agreement to 42 of a 927 union (4.5%) on the
+        # same data. The sharper number is the population where it can help at
+        # all: of the 68 file+symbol pairs BOTH lanes flagged, 39 (57%) share a
+        # cwe. That agreement existed all along and was being discarded.
+        #
+        # `_defect_class` below already prefers `cwe` for cross-step grouping,
+        # so this makes one rule out of two that disagreed.
+        #
+        # Falling back to `vuln_class` when `cwe` will not normalise keeps a
+        # pre-#3983 envelope groupable. Not reachable from a current sweep --
+        # `validate_finding` requires a well-formed `cwe`, and 0 of 1,019
+        # findings in the measured sweep failed to normalise -- but a fallback
+        # costs nothing and a KeyError on old data costs a re-run.
+        normalized_cwe = schema.normalize_cwe(finding.get("cwe"))
+        defect_class = normalized_cwe or finding["vuln_class"]
+
+        # De-duplication reconciles DIFFERENT lanes. It must never collapse two
+        # findings from the SAME lane (Issue #4134).
+        #
+        # A lane reporting two findings is that lane asserting they are two
+        # things. Merging them overrules the only judgement in the system that
+        # actually read the code, and it loses a defect: the second one
+        # survives as an occurrence bullet while the consolidated record --
+        # title, line, the count itself -- describes only the first.
+        #
+        # Measured on sweep 2026-09-16T1843Z-a17e6fcc: 107 same-lane keys held
+        # two or more findings, swallowing 116 of the 2,079 occurrences that
+        # reach grouping -- 5.6%.
+        #
+        # An earlier revision divided by 2,133, which is the PRE-validation
+        # count across all 631 envelopes. 54 findings are dropped by path and
+        # schema validation before `_group_findings` ever sees them, so 2,133
+        # is not the population 116 was measured over. Wrong denominator, in a
+        # comment arguing for measurement discipline. Example, codex on pkg/secrets/providers/sops/lock.go
+        # ::acquireCASLock, both CWE-362: one race window at line 83 and
+        # another at line 103. Two defects, twenty lines apart, one record.
+        #
+        # THIS IS A KNOWN GAP, LEFT OPEN DELIBERATELY. The fix tried first was
+        # a per-lane ordinal in the key -- the Nth finding a lane reports at a
+        # key pairs with the Nth from every other lane. It does stop the
+        # over-merge. It was REVERTED, because it breaks finding IDENTITY,
+        # which two downstream stages depend on:
+        #
+        #   - `_finding_key` re-derives this key from an already-consolidated
+        #     finding to attach the adjudicator's verdict and the verifier's.
+        #     An ordinal is not recoverable from the consolidated record, so
+        #     keys collided and a verdict attached to the WRONG finding. A
+        #     `guarded` verdict landing on a different defect reads as CLEAN.
+        #   - the adjudication response schema rejects duplicate keys, so a
+        #     correct adjudicator reply was rejected and the whole envelope
+        #     invalidated.
+        #
+        # Losing a second same-lane finding is bad. Silently marking an
+        # unrelated real finding as guarded is worse, so the merge stays until
+        # findings carry an explicit `finding_id` end to end.
+        #
+        # What IS fixed: `_severity_range` no longer fabricates a disagreement
+        # out of this. It reads the per-lane values, so two same-lane findings
+        # at `low` and `critical` can no longer render "DISAGREEMENT low ->
+        # critical ... until a human resolves it" from ONE lane. Both
+        # severities stay visible on `occurrences`.
+        key = (file_value, finding["symbol"], defect_class)
+        group = groups.setdefault(key, {"lanes": set(), "step_ids": set(), "occurrences": []})
+        group["lanes"].add(lane)
+        group["step_ids"].add(step_id)
+        occurrence = {
+            "lane": lane,
+            "step_id": step_id,
+            "severity": finding["severity"],
+            "confidence": finding["confidence"],
+            "title": finding["title"],
+            "evidence": finding["evidence"],
+            "suggested_fix": finding["suggested_fix"],
+            # Carried per-occurrence now that it no longer keys the group: each
+            # lane's own wording is worth showing a reader, and losing it would
+            # trade one kind of information for another rather than gaining.
+            "vuln_class": finding["vuln_class"],
+        }
+        # Issue #3983's normalised defect classification and location. Every
+        # finding this loop sees already passed `schema.validate_finding`
+        # (nested inside the `complete` envelope's own validation in
+        # `load_sweep()`), so `cwe` and `line` are always present and
+        # well-formed here -- the `isinstance`/range checks below are
+        # defence in depth, not load-bearing, and never invented findings
+        # from before Issue #3983 pass through since those envelopes never
+        # validated in the first place. `cwe` is run through
+        # `schema.normalize_cwe()` rather than stored raw, so two lanes
+        # naming the same identifier with different case or formatting
+        # (`cwe-295` vs `CWE-295: ...`) group together downstream instead of
+        # reading as two distinct classes. Since #4134 that same normalised
+        # value is computed above and used as the key's class component, so it
+        # is reused here rather than recomputed -- one value, one definition.
+        if normalized_cwe:
+            occurrence["cwe"] = normalized_cwe
+        line = finding.get("line")
+        if isinstance(line, int) and not isinstance(line, bool) and line >= 1:
+            occurrence["line"] = line
+            end_line = finding.get("end_line")
+            if isinstance(end_line, int) and not isinstance(end_line, bool) and end_line >= line:
+                occurrence["end_line"] = end_line
+        group["occurrences"].append(occurrence)
+
+    return groups
+
+
+def _eligible_lanes(step_ids: list[str], lane_step_state: dict[str, dict[str, str]]) -> set[str]:
+    """Lanes that completed at least one of `step_ids` -- the `M` in
+    "N of M lanes agree" (SEC3900 B7): a lane that never completed the step a
+    finding came from contributes neither a "found it" nor a "missed it"
+    signal, so it must not inflate the denominator."""
+    eligible: set[str] = set()
+    for lane, steps in lane_step_state.items():
+        if any(steps.get(step_id) == "complete" for step_id in step_ids):
+            eligible.add(lane)
+    return eligible
+
+
+# How a verification verdict ranks a finding, highest first. The stage exists
+# to answer "can an attacker reach this", so that answer sorts AHEAD of
+# agreement and severity: a reachable medium is work you do before an
+# unreachable critical.
+#
+# An UNVERIFIED finding ranks above `guarded` and `not_reachable`, not below
+# them. It is not evidence of safety -- it is an absence of evidence, and
+# burying it under findings actively shown to be unreachable would hide exactly
+# the rows nobody has looked at yet. `undetermined` sits with it for the same
+# reason: the verifier said it could not tell.
+_VERIFICATION_RANK = {
+    "reachable_from_untrusted": 5,
+    "reachable_internal_only": 4,
+    "undetermined": 3,
+    # (no verdict at all is also 3 -- see _verification_rank)
+    "guarded": 2,
+    "not_reachable": 1,
+}
+_UNVERIFIED_RANK = 3
+
+
+def _verification_rank(finding: dict) -> int:
+    verification = finding.get("verification")
+    if not isinstance(verification, dict):
+        return _UNVERIFIED_RANK
+    return _VERIFICATION_RANK.get(verification.get("verdict"), _UNVERIFIED_RANK)
+
+
+def _group_rank_key(finding: dict) -> tuple:
+    """Sort key for one consolidated finding, matching `SKILL.md`'s documented
+    order exactly: verification verdict first, then multi-lane agreement, then
+    severity, then confidence -- each descending -- with the
+    `file`/`symbol`/`cwe` key retained only as the final tiebreaker for two
+    findings tied on all four ranked fields, so output stays deterministic.
+
+    The verdict leads because reachability is the question the report is read
+    to answer; see `_VERIFICATION_RANK` for why an unverified finding ranks
+    above one shown to be unreachable rather than below it.
+
+    Severity/confidence are taken from the group's highest-ranked occurrence
+    via `max()` over `finding["occurrences"]`, not the first occurrence in
+    insertion order -- a group's occurrences can span multiple lanes that
+    reported different severities for the same underlying issue, and a group
+    where only the second-listed lane called it `critical` must still sort
+    as critical.
+    """
+    severity_rank = max(_SEVERITY_RANK[occ["severity"]] for occ in finding["occurrences"])
+    adjudication = finding.get("adjudication")
+    if isinstance(adjudication, dict) and adjudication.get("severity") in _SEVERITY_RANK:
+        # Issue #3984: once a finding carries an adjudicated severity, that
+        # is the severity a reader is meant to act on, so it is what the
+        # report sorts by. The raw range still renders beside it.
+        severity_rank = _SEVERITY_RANK[adjudication["severity"]]
+    confidence_rank = max(_CONFIDENCE_RANK[occ["confidence"]] for occ in finding["occurrences"])
+    return (
+        -_verification_rank(finding),
+        -finding["agreement"]["reported"],
+        -severity_rank,
+        -confidence_rank,
+        # Tie-break on the de-duplication key itself, not on the picked
+        # `vuln_class`: the key is what makes two findings distinct, so
+        # ordering by anything else can put two distinct findings in an order
+        # that does not follow from what separates them (Issue #4134).
+        *_finding_key(finding),
+    )
+
+
+def _first_occurrence_field(occurrences: list[dict], field: str) -> object:
+    """The value of `field` on the first occurrence (in the given, already
+    deterministic order) that carries it, or `None` if none do. Used to pick
+    one `cwe`/`line`/`end_line` to show at the consolidated-finding
+    level beside `file` -- a deterministic pick, never a merge, since these are
+    model-generated hints for a human reader, not part of what makes two
+    findings the same finding (that is the `file`+`symbol`+`cwe` key since
+    Issue #4134, computed independently of this)."""
+    for occurrence in occurrences:
+        value = occurrence.get(field)
+        if value is not None:
+            return value
+    return None
+
+
+def _finalize_findings(groups: dict, lane_step_state: dict[str, dict[str, str]]) -> list[dict]:
+    consolidated = []
+    for (file_value, symbol, defect_class), group in sorted(groups.items()):
+        step_ids = sorted(group["step_ids"])
+        reported_lanes = sorted(group["lanes"])
+        eligible_lanes = _eligible_lanes(step_ids, lane_step_state)
+        occurrences = sorted(group["occurrences"], key=lambda o: (o["lane"], o["step_id"]))
+        consolidated.append(
+            {
+                "file": file_value,
+                "symbol": symbol,
+                # The consolidated `vuln_class` IS the key's class component --
+                # the normalised `cwe` -- not a pick from one lane's prose
+                # (Issue #4134).
+                #
+                # Setting it here rather than re-keying every downstream
+                # consumer is what keeps a finding's identity single. The
+                # verifier and the adjudicator both identify a finding by
+                # `file`/`symbol`/`vuln_class` and echo it back, and both
+                # merges look it up that way; had this stayed one lane's
+                # wording while the key became the cwe, two findings sharing a
+                # file and symbol but differing in cwe could present the same
+                # vuln_class and make those merges ambiguous.
+                #
+                # Each lane's own wording is not lost -- it is on every
+                # occurrence below, which is where a per-lane value belongs.
+                "vuln_class": defect_class,
+                "cwe": _first_occurrence_field(occurrences, "cwe"),
+                "line": _first_occurrence_field(occurrences, "line"),
+                "end_line": _first_occurrence_field(occurrences, "end_line"),
+                "lanes": reported_lanes,
+                "step_ids": step_ids,
+                "agreement": {
+                    "reported": len(reported_lanes),
+                    "eligible": len(eligible_lanes),
+                },
+                "occurrences": occurrences,
+                "severity_range": _severity_range(group["occurrences"]),
+                # Issue #4071 AC6: the evidence supporting the finding, not
+                # only its coordinates. It was previously reachable ONLY inside
+                # `occurrences`, so the artifact a reader opens first presented
+                # the claim without the proof. Taken from the first occurrence
+                # that recorded any -- the others stay in `occurrences` for a
+                # reader comparing lanes.
+                "evidence": _first_occurrence_field(occurrences, "evidence"),
+                "adjudication": None,
+                "verification": None,
+            }
+        )
+    consolidated.sort(key=_group_rank_key)
+    return consolidated
+
+
+def _severity_range(occurrences: list[dict]) -> dict:
+    """The deterministic severity record for one consolidated finding (Issue
+    #3984): the lowest and highest severity any occurrence carries, the
+    highest severity each lane reported (a lane can report the same key from
+    two steps), and whether the LANES disagree. Computed from the occurrences
+    alone, never from an adjudication, so it always says what the lanes
+    actually reported.
+
+    Every value it names is attributable to a lane (Issue #4134). `by_lane`
+    keeps the highest severity per lane, so a lane that reported the same key
+    twice at `low` and `critical` contributes only `critical` -- but `lowest`
+    used to be computed from the raw occurrence list, so it reported a `low`
+    that `by_lane` had already dropped. The result rendered "DISAGREEMENT low
+    -> critical ... until a human resolves it" with `by_lane: {codex:
+    critical}`: a dispute with one participant, and an unattributable number
+    beside it. A reader was told to escalate something that did not exist.
+
+    `lowest`/`highest`/`disagreement` are therefore taken from the per-lane
+    values, which is what "the lanes disagree" means. A single lane can never
+    disagree with itself, and the span shown is always a span between lanes.
+    The full set of raw occurrence severities is unchanged and still carried on
+    `occurrences`, so nothing is lost -- it just stops being presented as a
+    conflict.
+    """
+    by_lane: dict[str, int] = {}
+    for occ in occurrences:
+        rank = _SEVERITY_RANK[occ["severity"]]
+        if rank > by_lane.get(occ["lane"], -1):
+            by_lane[occ["lane"]] = rank
+    lane_ranks = list(by_lane.values())
+    lowest, highest = min(lane_ranks), max(lane_ranks)
+    return {
+        "lowest": _SEVERITY_BY_RANK[lowest],
+        "highest": _SEVERITY_BY_RANK[highest],
+        "disagreement": lowest != highest,
+        "by_lane": {lane: _SEVERITY_BY_RANK[rank] for lane, rank in sorted(by_lane.items())},
+    }
+
+
+# Identifier SHAPE, not vocabulary membership -- see `_prose_label`.
+# `CWE-863: Incorrect authorization`, `cwe_863 - incorrect authorization`,
+# `CWE 863` all match; `prose` is whatever readable tail follows, empty when
+# the label is nothing but the identifier.
+_IDENTIFIER_PREFIX_RE = re.compile(
+    r"^\s*cwe[\s_-]*\d+\s*[:.,;)\]\s-]*(?P<prose>.*)$", re.IGNORECASE
+)
+# A bare number with no `CWE` at all, which is still not a heading.
+_BARE_IDENTIFIER_RE = re.compile(r"^\s*\d+\s*$")
+# `other: <short label>` is the vocabulary's escape hatch, which
+# `.claude/skills/security-review/docs/methodology.md` calls "allowed and expected" -- so a
+# lane using it is behaving correctly, and it must not produce
+# "### other: foo (other: foo)", the exact duplication this helper exists to
+# prevent. The label is the tail; `other:` is the marker, not prose.
+_OTHER_ESCAPE_RE = re.compile(r"^\s*other\s*:\s*(?P<prose>.*)$", re.IGNORECASE)
+
+
+def _prose_label(finding: dict) -> str:
+    """A human-readable class label for a heading, never the bare identifier.
+
+    Since Issue #4134 the consolidated `vuln_class` IS the normalised cwe, so
+    rendering it beside `cwe` gives "CWE-863 (CWE-863)" -- correct, and useless
+    to read. Each lane's own prose is on its occurrence, so one is picked from
+    there.
+
+    Explicitly SKIPS an occurrence whose label is itself an identifier. Taking
+    the first occurrence in lane order looked right only because `codex` sorts
+    before `ollama` and codex writes prose: rename the lanes, or take a
+    single-lane ollama finding (ollama writes CWE ids into `vuln_class`), and
+    the identifier wins again. That is luck, not design, and this is the line
+    that removes the luck.
+
+    "Is this an identifier" is a question about SHAPE, and asking
+    `schema.normalize_cwe(label) is None` asked about VOCABULARY instead. The
+    two disagree in both directions, and each way is a real defect:
+
+    - `"CWE-863: Incorrect authorization"` normalises, so it was skipped --
+      throwing away "Incorrect authorization", the one piece of prose the
+      finding had. Measured on sweep 2026-09-16T1843Z-a17e6fcc, this is the
+      commonest label shape codex writes.
+    - `"CWE-99999"` and `"CWE_863 Incorrect authorization"` do NOT normalise
+      (out of the vocabulary; underscore-and-space punctuation), so they were
+      taken as prose and rendered verbatim -- producing exactly the
+      "CWE-99999 (CWE-863)" heading this helper exists to prevent. So did the
+      bare `"295"`.
+
+    So the label is stripped of an identifier prefix and the prose tail kept
+    when there is one, and skipped when what remains is only an identifier.
+
+    Falls back to the key when no occurrence carries prose -- a finding with no
+    human label anywhere still needs a non-empty heading.
+    """
+    for occurrence in finding.get("occurrences") or []:
+        label = occurrence.get("vuln_class")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        escaped = _OTHER_ESCAPE_RE.match(label)
+        if escaped:
+            tail = escaped.group("prose").strip()
+            # "other: tenant path confusion" -> "tenant path confusion".
+            # A bare "other:" with no label has no prose to offer and skips.
+            if tail:
+                return tail
+            continue
+        prefixed = _IDENTIFIER_PREFIX_RE.match(label)
+        if prefixed:
+            tail = prefixed.group("prose").strip()
+            # "CWE-863: Incorrect authorization" -> "Incorrect authorization".
+            # A bare "CWE-863" matches with an empty tail and is skipped.
+            if tail:
+                return tail
+            continue
+        if _BARE_IDENTIFIER_RE.match(label):
+            continue
+        return label
+    return finding["vuln_class"]
+
+
+def _finding_key(finding: dict) -> tuple[str, str, str]:
+    """The de-duplication key of an already-consolidated finding.
+
+    Still reads `vuln_class`, and still matches the key `_group_findings`
+    built, because since Issue #4134 a CONSOLIDATED finding's `vuln_class` is
+    the normalised class that keyed it -- not the prose one lane happened to
+    write. That is the whole point of setting it in `_finalize_findings`: one
+    identity, readable the same way by this function, by the verifier merge,
+    and by the adjudicator merge.
+    """
+    return (finding["file"], finding["symbol"], finding["vuln_class"])
+
+
+def _defect_class(finding: dict) -> str:
+    """The class a finding is grouped on for cross-step re-aggregation:
+    `finding["cwe"]` (Issue #3983's normalised identifier -- required on
+    every finding since that story landed, so always present here) when set,
+    else the de-duplication key's own `vuln_class` (a finding from a sweep
+    written before Issue #3983, whose envelope predates the required field
+    and so carries no `cwe` at all)."""
+    cwe = finding.get("cwe")
+    return cwe if isinstance(cwe, str) and cwe else finding["vuln_class"]
+
+
+def build_cross_step_groups(findings: list[dict]) -> list[dict]:
+    """Mechanically group consolidated findings whose evidence spans plan
+    steps (Issue #3984): two or more findings sharing a defect class
+    (`_defect_class`) whose combined `step_ids` cover two or more distinct
+    steps. A pair of findings in the same step is not a cross-step group --
+    the planner already put them together -- and a class reported once is
+    not a group at all.
+
+    Deterministic: groups are ordered by defect class, members by
+    de-duplication key, and ids are `group-NNN` in that order, so the id an
+    adjudicator's `group_assessments` refers back to is stable across runs
+    over the same input.
+    """
+    by_class: dict[str, list[dict]] = {}
+    for finding in findings:
+        by_class.setdefault(_defect_class(finding), []).append(finding)
+
+    groups: list[dict] = []
+    for defect_class in sorted(by_class):
+        members = sorted(by_class[defect_class], key=_finding_key)
+        if len(members) < 2:
+            continue
+        step_ids = sorted({step_id for member in members for step_id in member["step_ids"]})
+        if len(step_ids) < 2:
+            continue
+        groups.append(
+            {
+                "group_id": f"group-{len(groups) + 1:03d}",
+                "defect_class": defect_class,
+                "step_ids": step_ids,
+                "members": [
+                    {
+                        "file": member["file"],
+                        "symbol": member["symbol"],
+                        "vuln_class": member["vuln_class"],
+                        # LABELS ONLY, never the whole occurrence. `_prose_label`
+                        # reads `occurrences[].vuln_class`, and without this the
+                        # helper was wired in at the render site but INERT here:
+                        # it iterated an absent list and fell through to the
+                        # normalised cwe, rendering the "CWE-863 (CWE-863)" it
+                        # exists to prevent (Issue #4134).
+                        #
+                        # These members travel to the adjudicator (see
+                        # `adjudication_input`), and Issue #4080 keeps verbatim
+                        # SOURCE out of that payload -- not evidence as such.
+                        # The #4080 note below this function is explicit that
+                        # finder evidence DOES travel to the adjudicator; what
+                        # is redacted is a run copied verbatim out of the file
+                        # a finding names. An earlier version of this comment
+                        # said "finder evidence", contradicting that note
+                        # eighteen lines away.
+                        #
+                        # The guard is real and this projection is load-bearing
+                        # for it: `_redact_source_from_reports` runs only over
+                        # `built_findings[].reports` and never over
+                        # `group["members"]`, which `build_adjudication_input`
+                        # passes through verbatim. So copying `occurrences`
+                        # wholesale would carry `evidence` past the redaction
+                        # entirely, not merely duplicate it. Only the class
+                        # label is projected.
+                        "occurrences": [
+                            {"vuln_class": occurrence["vuln_class"]}
+                            for occurrence in member.get("occurrences") or []
+                        ],
+                        "step_ids": member["step_ids"],
+                    }
+                    for member in members
+                ],
+                "assessment": None,
+            }
+        )
+    return groups
+
+
+# Issue #4080. The adjudicator's contract is "findings, never source", and
+# `adjudicate._ensure_empty_snapshot` holds that on the MOUNT side. Nothing held
+# it on the CONTENT side: finder evidence travels to the adjudicator inside the
+# findings, and measured on sweep bench-finders-02, 10 of 224 evidence strings
+# (4.5%) carry a verbatim 60+ character run from the file they name.
+#
+# That matters because the adjudicator is a DIFFERENT PROVIDER from the finders.
+# A lane shipping file bodies to its own provider is the documented design; the
+# same source reaching a third provider through an unchecked evidence field is
+# the empty snapshot being routed around.
+EVIDENCE_REDACTED = (
+    "[evidence withheld: contained a verbatim excerpt of the source file it names, "
+    "which may not be passed to the adjudicator]"
+)
+
+
+def _redact_source_from_reports(reports: list, file_value: str, source_root: "str | None") -> int:
+    """Replace any report text quoting `file_value` with `EVIDENCE_REDACTED`.
+
+    Returns how many strings were replaced. Both `evidence` and
+    `suggested_fix` are checked -- a suggested fix that pastes the corrected
+    line leaks exactly as much as evidence that pastes the broken one.
+
+    REDACTS, NEVER DROPS. The finding keeps its place, its coordinates and its
+    severity; only the offending string is replaced, and with a marker rather
+    than an empty value, so the adjudicator is told it is rating a claim it
+    cannot read instead of quietly receiving one less field.
+
+    Never raises: an unreadable file leaves the reports untouched. A boundary
+    check that takes down a sweep would be worse than the leak it prevents.
+    """
+    if not source_root or not file_value:
+        return 0
+    try:
+        with open(os.path.join(source_root, file_value), "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except OSError:
+        return 0
+    if not source:
+        return 0
+    redacted = 0
+    for report in reports:
+        for field in ("evidence", "suggested_fix"):
+            value = report.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                if source_leak.find_leak(value, source) is not None:
+                    report[field] = EVIDENCE_REDACTED
+                    redacted += 1
+            except Exception:  # noqa: BLE001 -- a check must never fail a sweep
+                continue
+    return redacted
+
+
+def _verification_for_adjudication(finding: dict, source_root: "str | None") -> "tuple[dict | None, int]":
+    """The reachability facts the adjudicator may see for `finding`, and how
+    many of their strings were redacted (Issue #4258).
+
+    `(None, 0)` when the finding has no verdict, or one outside the verifier's
+    vocabulary. It is NEVER a default verdict: an absence of evidence must not
+    read as evidence of safety, so the adjudicator is told there is none.
+
+    Only `verdict`, `entry_point` and `guard` cross. They are a vocabulary
+    word and two symbol names -- metadata, not code. The prose fields
+    (`rationale`, `attacker_input`, `trigger`, `falsifier`) and `citation` stay
+    behind: they are the fields most able to carry a pasted line. The verifier
+    already withheld any answer quoting a file it cited
+    (`agentic_verifier.scrub_answer`). The two names are ALSO checked against
+    the finding's own file here, the same check the reports get, and replaced
+    with `EVIDENCE_REDACTED` on a match, because the adjudicator must never
+    be handed source."""
+    verification = finding.get("verification")
+    if not isinstance(verification, dict):
+        return None, 0
+    verdict = verification.get("verdict")
+    if verdict not in _VERIFICATION_RANK:
+        return None, 0
+    facts = {
+        "verdict": verdict,
+        "entry_point": str(verification.get("entry_point") or ""),
+        "guard": str(verification.get("guard") or ""),
+    }
+    source = _read_finding_source(source_root, finding.get("file"))
+    redacted = 0
+    if source:
+        for field in ("entry_point", "guard"):
+            value = facts[field]
+            if not value:
+                continue
+            try:
+                if source_leak.find_leak(value, source) is not None:
+                    facts[field] = EVIDENCE_REDACTED
+                    redacted += 1
+            except Exception:  # noqa: BLE001 -- a check must never fail a sweep
+                facts[field] = EVIDENCE_REDACTED
+                redacted += 1
+    return facts, redacted
+
+
+def _read_finding_source(source_root: "str | None", file_value: "str | None") -> str:
+    """The finding's own file from the snapshot, or "" when it cannot be read."""
+    if not source_root or not file_value:
+        return ""
+    try:
+        with open(os.path.join(source_root, file_value), "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def build_adjudication_input(
+    sweep_id: str, commit_sha: str, findings: list[dict], groups: list[dict],
+    source_root: "str | None" = None,
+) -> dict:
+    """The exact object the adjudication stage is handed (Issue #3984):
+    findings only -- each finding's key, the lanes' own severities/
+    confidences/titles/evidence/suggested fixes, and its deterministic
+    severity range -- plus the cross-step groups. No file body, no path
+    beyond the finding's own repo-relative `file`, nothing read from the
+    tree. Built here, in the pure module, so `adjudicate.py` (which writes
+    it for the container) and `consolidate()` (which recomputes it to check
+    an envelope's `input_hash` is over the CURRENT deterministic set) can
+    never disagree about its shape.
+
+    Findings are emitted in de-duplication-key order, not report order: the
+    report re-sorts once an adjudication is merged, and the hash over this
+    object must be identical before and after that merge or every
+    adjudication would read as stale against its own input."""
+    # `source_root` is the sweep's own SNAPSHOT, not the live checkout: the
+    # evidence describes the code that was reviewed, at the commit that was
+    # pinned, and the working tree may have moved since. It MUST be passed
+    # identically by every caller. `adjudicate.py`
+    # writes these bytes for the container and `consolidate()` recomputes them
+    # to check an envelope's `input_hash` is over the current set; if one
+    # redacted and the other did not, every adjudication would read as stale
+    # against its own input. Optional only so a test can build an input without
+    # a tree; both production call sites pass it.
+    redacted_count = 0
+    built_findings = []
+    for finding in sorted(findings, key=_finding_key):
+        reports = [
+            {
+                "lane": occ["lane"],
+                "step_id": occ["step_id"],
+                "severity": occ["severity"],
+                "confidence": occ["confidence"],
+                "title": occ["title"],
+                "evidence": occ["evidence"],
+                "suggested_fix": occ["suggested_fix"],
+            }
+            for occ in finding["occurrences"]
+        ]
+        redacted_count += _redact_source_from_reports(reports, finding["file"], source_root)
+        verification, verification_redacted = _verification_for_adjudication(finding, source_root)
+        redacted_count += verification_redacted
+        built_findings.append({
+            "file": finding["file"],
+            "symbol": finding["symbol"],
+            "vuln_class": finding["vuln_class"],
+            "step_ids": list(finding["step_ids"]),
+            "severity_range": finding["severity_range"],
+            "reports": reports,
+            "verification": verification,
+        })
+    if redacted_count:
+        schema.log_event("adjudication_evidence_redacted", count=redacted_count)
+
+    return {
+        "sweep_id": sweep_id,
+        "commit_sha": commit_sha,
+        "evidence_redacted": redacted_count,
+        "findings": [
+            *built_findings,
+        ],
+        "cross_step_groups": [
+            {
+                "group_id": group["group_id"],
+                "defect_class": group["defect_class"],
+                "step_ids": group["step_ids"],
+                "members": group["members"],
+            }
+            for group in groups
+        ],
+    }
+
+
+def canonical_adjudication_input(adjudication_input: dict) -> str:
+    """The one serialisation of an adjudication input: sorted keys, no
+    whitespace, no trailing newline. `adjudicate.py` writes exactly these
+    bytes for the container, the adjudicator lane hashes exactly the bytes it
+    read, and `adjudication_input_hash()` hashes this same string -- so the
+    three agree by construction."""
+    return json.dumps(adjudication_input, sort_keys=True, separators=(",", ":"))
+
+
+def adjudication_input_hash(adjudication_input: dict) -> str:
+    """SHA-256 over `canonical_adjudication_input()`. The adjudicator lane
+    records the same digest (over the file bytes it read) on its envelope;
+    `consolidate()` recomputes this over the current deterministic set and
+    treats a mismatch as a stale adjudication (the lanes re-ran, or a finding
+    was added or excluded, after the adjudicator saw its input)."""
+    canonical = canonical_adjudication_input(adjudication_input)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verification_output_path(sweep_dir: str) -> str:
+    return os.path.join(
+        sweep_dir, VERIFICATION_SUBDIR, "lanes", VERIFIER_LANE_ID, VERIFICATION_OUTPUT_FILENAME
+    )
+
+
+def _attach_verification(sweep_dir: str, findings: list) -> dict:
+    """Fold the verification stage's verdicts onto the findings they name, and
+    return the record the report prints about that stage.
+
+    ANNOTATES, NEVER DELETES (Issue #4071). A finding with no verdict, or one
+    the verifier could not decide, stays in the report with `verification` left
+    as recorded -- it is never dropped. A verifier that could remove findings
+    would be one model holding a veto over the whole review, and the measured
+    false positive cuts both ways: a careful verifier rejects a bad claim
+    correctly, a careless one rejects a real defect just as easily.
+
+    The verdict DOES rank: `consolidate()` re-sorts after this call, because
+    `_group_rank_key` reads it (see `_VERIFICATION_RANK`). Ranking and deleting
+    are different powers -- a `not_reachable` finding sorts last but is still
+    in the report, still carrying its finder severity, still readable by a
+    human who disagrees. An unverified finding deliberately outranks one shown
+    to be unreachable, so "nobody looked at this yet" never sorts below
+    "somebody looked and it was fine".
+
+    Absent stage, unreadable file, or malformed envelope all read as "did not
+    run", never as an error that fails the sweep -- verification must not be
+    able to fail a sweep whose finder lanes completed.
+    """
+    record = {
+        "status": "missing", "verified": 0, "unverified": len(findings),
+        "leaked": 0, "unmatched": 0, "harness": None, "model_id": None, "errors": [],
+    }
+    path = verification_output_path(sweep_dir)
+    if not os.path.isfile(path):
+        return record
+    envelope = _load_json(path)
+    if not isinstance(envelope, dict):
+        record["status"] = "malformed"
+        return record
+
+    record["harness"] = envelope.get("harness")
+    record["model_id"] = envelope.get("model_id")
+    record["status"] = envelope.get("state") or "complete"
+    record["errors"] = [str(e) for e in (envelope.get("errors") or [])][:10]
+    record["leaked"] = len(envelope.get("leaked") or [])
+
+    by_key = {}
+    for entry in envelope.get("verifications") or []:
+        if not isinstance(entry, dict):
+            continue
+        by_key[(entry.get("file"), entry.get("symbol"), entry.get("vuln_class"))] = entry
+
+    matched: set = set()
+    for finding in findings:
+        key = _finding_key(finding)
+        entry = by_key.get(key)
+        if entry is None:
+            continue
+        matched.add(key)
+        record["verified"] += 1
+        finding["verification"] = {
+            "verdict": entry.get("verdict"),
+            "entry_point": entry.get("entry_point") or "",
+            "call_path": entry.get("call_path") or [],
+            "guard": entry.get("guard") or "",
+            "citation": entry.get("citation") or [],
+            "rationale": entry.get("rationale") or "",
+            # The three fields that make a verdict CHECKABLE rather than
+            # merely stated. A later fix pass is run by the same kind of model
+            # that wrote the code, so it shares the blind spot -- "reachable"
+            # plus two sentences of prose is something it can talk itself past.
+            # What the attacker controls, the concrete trigger, and what would
+            # OVERTURN the verdict are the parts a fixer can test against the
+            # code and be wrong about visibly.
+            #
+            # Dropping them here would be silent: the verifier computes them,
+            # they never reach the reader, and nothing reports a gap.
+            "attacker_input": entry.get("attacker_input") or "",
+            "trigger": entry.get("trigger") or "",
+            "falsifier": entry.get("falsifier") or "",
+            "harness": envelope.get("harness"),
+            "model_id": envelope.get("model_id"),
+        }
+    record["unverified"] = len(findings) - record["verified"]
+    record["unmatched"] = sum(1 for k in by_key if k not in matched)
+    for key in by_key:
+        if key not in matched:
+            schema.log_event(
+                "verification_unmatched_key", file=key[0], symbol=key[1], vuln_class=key[2]
+            )
+    return record
+
+
+def adjudication_output_path(sweep_dir: str) -> str:
+    return os.path.join(
+        sweep_dir, ADJUDICATION_SUBDIR, "lanes", ADJUDICATOR_LANE_ID, ADJUDICATION_OUTPUT_FILENAME
+    )
+
+
+def load_adjudication(
+    sweep_dir: str,
+    dispatch: dict,
+    expected_sweep_id: str,
+    expected_input_hash: str,
+    has_findings: bool,
+) -> tuple[dict, dict | None]:
+    """Read the adjudication stage's envelope and classify it.
+
+    Returns `(status_record, envelope_or_None)`. `status_record` is the
+    `adjudication` block of the report: `status`, the requested harness/model
+    from `dispatch_report.json`'s `adjudicator` entry (when one exists), and
+    `errors` naming exactly why an envelope was not usable. The envelope is
+    returned only when `status == "complete"`, and only then does
+    `_apply_adjudication()` merge anything.
+
+    Classification, in order:
+    - no `adjudicator` dispatch entry and no envelope file: `not_configured`
+      -- the operator did not set `CFGMS_SECURITY_REVIEW_ADJUDICATOR`; raw
+      severities render, plainly labelled as raw.
+    - dispatch outcome `skipped_no_findings`: nothing to adjudicate; fine.
+    - dispatch outcome other than `dispatched`: that outcome verbatim
+      (`credential_unavailable`, `launch_failed`) -- a gap.
+    - dispatched but no envelope file: `missing` -- the container left no
+      parseable output, so it did not run (the lane rule, applied here).
+    - envelope not a JSON object / fails `validate_adjudication_envelope` /
+      names a different `sweep_id`: `invalid`.
+    - envelope `state` is `parked`/`refused`/`failed`: that state.
+    - envelope `input_hash` differs from the hash over the current
+      deterministic input: `stale`.
+    - otherwise `complete`.
+    """
+    entry = dispatch.get("adjudicator") if isinstance(dispatch, dict) else None
+    record: dict = {
+        "status": ADJUDICATION_NOT_CONFIGURED,
+        "harness": entry.get("requested_harness") if isinstance(entry, dict) else None,
+        "model_id": entry.get("requested_model") if isinstance(entry, dict) else None,
+        "dispatch_outcome": entry.get("outcome") if isinstance(entry, dict) else None,
+        "adjudicated": 0,
+        "omitted": 0,
+        "unmatched": 0,
+        "groups_assessed": 0,
+        "groups_omitted": 0,
+        "unsent": 0,
+        "groups_unsent": 0,
+        "unsolicited": 0,
+        "errors": [],
+    }
+    path = adjudication_output_path(sweep_dir)
+    envelope_exists = os.path.isfile(path)
+
+    if not isinstance(entry, dict) and not envelope_exists:
+        return record, None
+    if isinstance(entry, dict):
+        outcome = entry.get("outcome")
+        if outcome == ADJUDICATION_SKIPPED_NO_FINDINGS:
+            if not has_findings:
+                record["status"] = ADJUDICATION_SKIPPED_NO_FINDINGS
+                return record, None
+            # The skip was recorded over an empty set, but findings exist
+            # now (lanes re-ran, or an envelope landed after the skip). A
+            # skip must never be inherited by findings it never saw.
+            record["status"] = ADJUDICATION_STALE
+            record["errors"].append(
+                "adjudicator was skipped for an empty finding set, but findings now exist; "
+                "re-run the adjudication stage"
+            )
+            return record, None
+        if outcome != "dispatched":
+            record["status"] = str(outcome or "unknown")
+            record["errors"].append(f"adjudicator dispatch outcome: {outcome!r}")
+            return record, None
+
+    if not envelope_exists:
+        record["status"] = ADJUDICATION_MISSING
+        record["errors"].append("no adjudication envelope was written")
+        return record, None
+
+    envelope = _load_json(path)
+    errors = (
+        schema.validate_adjudication_envelope(envelope)
+        if isinstance(envelope, dict)
+        else ["adjudication file did not contain a JSON object"]
+    )
+    if not errors and envelope.get("sweep_id") != expected_sweep_id:
+        errors.append(
+            f"envelope sweep_id {envelope.get('sweep_id')!r} does not match this sweep {expected_sweep_id!r}"
+        )
+    if errors:
+        schema.log_event("invalid_adjudication_file", path=path, errors=errors)
+        record["status"] = ADJUDICATION_INVALID
+        record["errors"].extend(errors)
+        return record, None
+
+    record["harness"] = envelope["harness"]
+    record["model_id"] = envelope["model_id"]
+    if envelope["state"] != "complete":
+        stop_reason = str(envelope.get("stop_reason_raw", ""))
+        # Issue #4144: the harness's own error text now reaches
+        # `stop_reason_raw` (the adjudicator was discarding it), so a revoked
+        # credential can be told apart from a real defect here rather than by
+        # a human reading container stderr.
+        record["status"] = (
+            ADJUDICATION_AUTH_REVOKED
+            if looks_auth_revoked(stop_reason)
+            else envelope["state"]
+        )
+        record["errors"].append(f"adjudicator ended {envelope['state']}: {stop_reason}")
+        # How much survived the early exit. The stage attaches the batches it
+        # finished even on a non-complete envelope, so this is the difference
+        # between "28 minutes of model work, all discarded" and a number an
+        # operator can weigh against re-running.
+        partial = envelope.get("adjudications")
+        record["partial_adjudications"] = len(partial) if isinstance(partial, list) else 0
+        partial_groups = envelope.get("group_assessments")
+        record["partial_group_assessments"] = (
+            len(partial_groups) if isinstance(partial_groups, list) else 0
+        )
+        return record, None
+    if envelope["input_hash"] != expected_input_hash:
+        record["status"] = ADJUDICATION_STALE
+        record["errors"].append(
+            "adjudication was computed over a different deterministic finding set "
+            "than the current one (input_hash mismatch); re-run the adjudication stage"
+        )
+        return record, None
+
+    record["status"] = ADJUDICATION_COMPLETE
+    return record, envelope
+
+
+def _apply_adjudication(findings: list[dict], groups: list[dict], envelope: dict, record: dict) -> None:
+    """Merge a `complete` adjudication envelope ONTO the deterministic
+    findings and groups, in place, and fill the counts on `record`.
+
+    Iterates the deterministic set and looks each finding up in the
+    envelope -- never the other way round -- which is what makes deletion
+    structurally impossible: a finding the adjudicator omitted keeps
+    `adjudication: None` and is counted `omitted`; an adjudication whose key
+    matches nothing is dropped, logged and counted `unmatched`. `occurrences`
+    and `severity_range` are not touched.
+    """
+    # What the lane itself declined to send (over its prompt-size budget),
+    # so the report can say why a finding or group has no verdict.
+    unsent = envelope.get("unsent_findings")
+    unassessed = envelope.get("unassessed_groups")
+    record["unsent"] = len(unsent) if isinstance(unsent, list) else 0
+    record["groups_unsent"] = len(unassessed) if isinstance(unassessed, list) else 0
+
+    # Defence in depth on the lane's own rule: a verdict for a finding the
+    # lane says it never sent, or a group it says it never assessed, is a
+    # verdict the model was never asked for. It is dropped here too, even if
+    # a lane bug let it onto the envelope, and counted as `unsolicited`.
+    unsent_keys = {tuple(k) for k in unsent if isinstance(k, list) and len(k) == 3} if isinstance(unsent, list) else set()
+    unassessed_ids = set(unassessed) if isinstance(unassessed, list) else set()
+    record["unsolicited"] = 0
+
+    by_key = {}
+    for adjudication in envelope.get("adjudications") or []:
+        key = (adjudication["file"], adjudication["symbol"], adjudication["vuln_class"])
+        if key in unsent_keys:
+            record["unsolicited"] += 1
+            schema.log_event("adjudication_verdict_for_unsent_finding", file=key[0], symbol=key[1], vuln_class=key[2])
+            continue
+        by_key[key] = adjudication
+    matched_keys: set = set()
+    for finding in findings:
+        key = _finding_key(finding)
+        adjudication = by_key.get(key)
+        if adjudication is None:
+            record["omitted"] += 1
+            continue
+        matched_keys.add(key)
+        record["adjudicated"] += 1
+        finding["adjudication"] = {
+            "severity": adjudication["severity"],
+            "rationale": adjudication["rationale"],
+            "harness": envelope["harness"],
+            "model_id": envelope["model_id"],
+            "changed": adjudication["severity"] != finding["severity_range"]["highest"]
+            or finding["severity_range"]["disagreement"],
+        }
+    for key in by_key:
+        if key not in matched_keys:
+            record["unmatched"] += 1
+            schema.log_event(
+                "adjudication_unmatched_key",
+                file=key[0],
+                symbol=key[1],
+                vuln_class=key[2],
+            )
+
+    assessments = {}
+    for assessment in envelope.get("group_assessments") or []:
+        if assessment["group_id"] in unassessed_ids:
+            record["unsolicited"] += 1
+            schema.log_event("adjudication_verdict_for_unassessed_group", group_id=assessment["group_id"])
+            continue
+        assessments[assessment["group_id"]] = assessment
+    for group in groups:
+        assessment = assessments.get(group["group_id"])
+        if assessment is None:
+            # A group the adjudicator was handed and did not assess is a gap
+            # exactly like an omitted finding (Issue #3984 review).
+            record["groups_omitted"] += 1
+            continue
+        record["groups_assessed"] += 1
+        group["assessment"] = {
+            "assessment": assessment["assessment"],
+            "rationale": assessment["rationale"],
+            "harness": envelope["harness"],
+            "model_id": envelope["model_id"],
+        }
+    # The sort key reads the adjudicated severity, so re-sort after merging.
+    findings.sort(key=_group_rank_key)
+
+
+def build_coverage_table(
+    lanes: list[str],
+    step_ids: list[str],
+    lane_step_state: dict[str, dict[str, str]],
+    lane_step_files: dict[str, dict[str, dict]] | None = None,
+) -> list[dict]:
+    """One row per lane. The four `STEP_STATES` buckets plus `not_started`
+    always sum to `total_steps` exactly: a `(lane, step_id)` pair with
+    neither a `.findings.json` nor a `.status.json` file is counted as
+    `not_started` rather than contributing to no bucket at all (Issue
+    #3953) -- a step nobody touched must remain visible as an explicit gap,
+    never simply absent from the sum.
+
+    `files_short` (Issue #3957) counts, per lane, the `complete` steps whose
+    `files_read` is a strict/proper subset of `files_intended` -- a step that
+    skipped at least one declared file, distinct from a step that genuinely
+    reviewed everything it declared and found nothing. An empty
+    `files_intended` (a step whose `scope` names a directory rather than
+    concrete files) is never a gap: an empty set is not a proper subset of
+    itself, so `set(files_read) < set(files_intended)` is `False` for that
+    case exactly as it should be. A step with no entry in `lane_step_files`
+    at all (an envelope written before this story, or that never validated)
+    contributes nothing to `files_short` -- there is no data to judge a gap
+    from, so it is never assumed to be one."""
+    lane_step_files = lane_step_files or {}
+    total = len(step_ids)
+    rows = []
+    for lane in lanes:
+        counts = {state: 0 for state in STEP_STATES}
+        not_started = 0
+        files_short = 0
+        for step_id in step_ids:
+            state = lane_step_state.get(lane, {}).get(step_id)
+            if state in counts:
+                counts[state] += 1
+            else:
+                not_started += 1
+
+            if state == "complete":
+                info = lane_step_files.get(lane, {}).get(step_id)
+                if info is not None:
+                    intended = set(info["files_intended"])
+                    read = set(info["files_read"])
+                    if read < intended:
+                        files_short += 1
+
+        row = {"lane": lane, "total_steps": total}
+        row.update(counts)
+        row[NOT_STARTED] = not_started
+        row["files_short"] = files_short
+        rows.append(row)
+    return rows
+
+
+SCAN_STATUSES = ("ok", "partial", "empty", "failed", "timeout", "rejected", "unavailable", "skipped")
+
+
+def load_scan_summaries(sweep_dir: str, lanes: list[str], step_ids: list[str]) -> dict[str, dict[str, list]]:
+    """`{lane: {step_id: scans}}` from every lane envelope that carries a
+    `scans` list (Issue #3982) -- findings and status envelopes alike, since
+    scanner coverage is recorded regardless of the step's terminal state. A
+    lane written before scans existed simply has no entry."""
+    out: dict[str, dict[str, list]] = {}
+    for lane in lanes:
+        lane_dir = os.path.join(sweep_dir, "lanes", lane)
+        for step_id in step_ids:
+            for suffix in ("findings", "status"):
+                path = os.path.join(lane_dir, f"{step_id}.{suffix}.json")
+                if not os.path.isfile(path):
+                    continue
+                envelope = _load_json(path)
+                scans = envelope.get("scans") if isinstance(envelope, dict) else None
+                if isinstance(scans, list):
+                    out.setdefault(lane, {})[step_id] = scans
+                break
+    return out
+
+
+def build_scanner_coverage(lanes: list[str], step_ids: list[str], lane_step_scans: dict[str, dict[str, list]]) -> list[dict]:
+    """One row per lane: how many scanner checks ran per status, how many
+    were truncated or served from cache, how many steps recorded no scans at
+    all, and the concrete gaps (every non-`ok` check and every non-check gap)
+    named by step. This is report data, never adjudication: a scanner gap
+    does not change `_sweep_complete()` -- the model still reviewed the
+    source -- it changes what a reader knows the tools did not cover."""
+    rows = []
+    for lane in lanes:
+        counts = {status: 0 for status in SCAN_STATUSES}
+        truncated = cached = 0
+        steps_without = 0
+        gaps: list[dict] = []
+        for step_id in step_ids:
+            scans = lane_step_scans.get(lane, {}).get(step_id)
+            if scans is None:
+                steps_without += 1
+                continue
+            for entry in scans:
+                if not isinstance(entry, dict):
+                    continue
+                if "gap" in entry:
+                    gaps.append({"step_id": step_id, "kind": str(entry.get("gap")), "detail": {k: v for k, v in entry.items() if k != "gap"}})
+                    continue
+                status = str(entry.get("status", "failed"))
+                counts[status if status in counts else "failed"] += 1
+                if entry.get("truncated"):
+                    truncated += 1
+                if entry.get("cached"):
+                    cached += 1
+                if status != "ok" or entry.get("truncated"):
+                    gaps.append({
+                        "step_id": step_id,
+                        "kind": f"scan_{status}" + ("_truncated" if entry.get("truncated") else ""),
+                        "detail": {"tool": entry.get("tool"), "scope": entry.get("scope"), "reason": entry.get("reason", "")},
+                    })
+        row = {"lane": lane, "checks": sum(counts.values()), "truncated": truncated, "cached": cached, "steps_without_scans": steps_without, "gaps": gaps}
+        row.update(counts)
+        rows.append(row)
+    return rows
+
+
+def _failed_step_tails(
+    lanes: list[str],
+    step_ids: list[str],
+    lane_step_state: dict[str, dict[str, str]],
+    lane_step_tail: dict[str, dict[str, str]],
+) -> list[dict]:
+    """One entry per (lane, step_id) with a recorded `harness_output_tail`
+    (Issue #4008), in deterministic lane/step order -- never a dict keyed on
+    lane, since a report reader wants a flat, orderable list of concrete
+    gaps, exactly like every other `## Incomplete` bullet. A step with no
+    tail recorded (an envelope written before this story, or a state that
+    genuinely had nothing to show) is simply absent, never an empty string."""
+    entries = []
+    for lane in lanes:
+        for step_id in step_ids:
+            tail = lane_step_tail.get(lane, {}).get(step_id)
+            if not tail:
+                continue
+            entries.append(
+                {
+                    "lane": lane,
+                    "step_id": step_id,
+                    "state": lane_step_state.get(lane, {}).get(step_id, "failed"),
+                    "harness_output_tail": tail,
+                }
+            )
+    return entries
+
+
+def build_provenance(sweep_dir: str, lanes: list, step_ids: list) -> list:
+    """Per-lane instrument provenance for the report (Issue #4136).
+
+    One row per lane: `{lane, harness_identity: {value: [step_id,...]},
+    prompt_version: {...}, mixed: bool}`. `mixed` is true when ANY tracked
+    field has more than one distinct value in that lane.
+
+    This is the other half of not gating on drift, and it is the half that
+    makes the first half safe. A sweep is now ALLOWED to run two harness
+    versions or two prompt versions, which is a real gain -- and would be a
+    silent hazard if the report did not say so. A reader comparing two lanes
+    has to be able to see that one of them changed instrument partway.
+
+    Reads `resume.provenance_by_step`, never its own walk of the envelopes, so
+    the resume-time answer and the report-time answer cannot drift apart.
+    """
+    rows = []
+    for lane in lanes:
+        by_field = resume.provenance_by_step(os.path.join(sweep_dir, "lanes", lane), step_ids)
+        rows.append(
+            {
+                "lane": lane,
+                **by_field,
+                "mixed": any(len(values) > 1 for values in by_field.values()),
+            }
+        )
+    return rows
+
+
+def _provenance_lines(report: dict) -> list:
+    """`## Provenance` -- which instrument produced which steps.
+
+    Says something in every case rather than only on drift: "one version
+    throughout" is the answer to the same question, and a section that appears
+    only when there is bad news teaches a reader to skim for its absence.
+    """
+    rows = report.get("provenance") or []
+    lines = []
+    if not rows:
+        return ["_(no lane output found for this sweep)_"]
+
+    mixed_rows = [row for row in rows if row["mixed"]]
+    if mixed_rows:
+        lines.append(
+            "**{names} changed instrument partway through this sweep.** That is allowed "
+            "(Issue #4136): the target tree is the specimen and stays pinned, while the "
+            "harness is the instrument, and improving an instrument mid-sweep does not "
+            "invalidate readings already taken. It is recorded here because a reader "
+            "comparing steps must be able to see it. A finding is a finding whichever "
+            "version found it -- but a rate is not a rate across two.".format(
+                names=", ".join(f"`{_md_escape_inline(row['lane'])}`" for row in mixed_rows)
+            )
+        )
+    else:
+        lines.append(
+            "Each lane ran ONE harness version and ONE prompt version from start to "
+            "finish. Recorded rather than assumed."
+        )
+    lines.append("")
+    # Measured, not styled. On sweep 2026-09-16T1843Z-a17e6fcc the codex and
+    # ollama lanes carry DIFFERENT `harness_identity` values while neither lane
+    # drifted -- the identity is per-harness, so two lanes never share one. An
+    # earlier draft of the clean-sweep sentence said "every lane ran the same
+    # harness", which that real report falsified on its first render. Drift is
+    # a WITHIN-lane property, and saying so stops a reader reading the two
+    # values below as a problem.
+    lines.append(
+        "Drift is measured **within** a lane. Two lanes on different harnesses always "
+        "carry different `harness_identity` values -- that is normal and expected, not "
+        "drift, because the identity covers the harness that ran. Stated here rather "
+        "than left as an absence of a warning: this section is read by someone deciding "
+        "whether to trust a sweep, and a false alarm does not cost them a minute -- it "
+        "teaches them the section cries wolf, and a real drift then lands somewhere "
+        "nobody looks."
+    )
+    lines.append("")
+    lines.append("| Lane | Field | Value | Steps |")
+    lines.append("|---|---|---|---|")
+    for row in rows:
+        for field in resume.PROVENANCE_FIELDS:
+            values = row.get(field) or {}
+            if not values:
+                lines.append(
+                    "| {lane} | `{field}` | _(no completed steps)_ | 0 |".format(
+                        lane=_md_escape_inline(row["lane"]), field=field
+                    )
+                )
+                continue
+            for value, steps in values.items():
+                lines.append(
+                    "| {lane} | `{field}` | `{value}` | {n} |".format(
+                        lane=_md_escape_inline(row["lane"]),
+                        field=field,
+                        value=_md_escape_inline(value),
+                        n=len(steps),
+                    )
+                )
+    return lines
+
+
+def consolidate(sweep_dir: str, repo_root: str) -> dict:
+    """Read `sweep_dir` and return the full consolidated report as a dict --
+    the exact shape written to `report/consolidated.json`."""
+    lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail = load_sweep(sweep_dir)
+    groups = _group_findings(findings, repo_root)
+    consolidated_findings = _finalize_findings(groups, lane_step_state)
+    coverage = build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
+    scanner_coverage = build_scanner_coverage(lanes, step_ids, load_scan_summaries(sweep_dir, lanes, step_ids))
+    provenance = build_provenance(sweep_dir, lanes, step_ids)
+    sweep_id = os.path.basename(os.path.normpath(sweep_dir))
+    dispatch = _load_dispatch_report(sweep_dir)
+
+    # Issue #3984: deterministic layers first (cross-step groups, the input
+    # hash over exactly what an adjudicator would be handed), then the
+    # adjudication envelope merged ONTO them if -- and only if -- it is
+    # complete, for this sweep, and over this input.
+    cross_step_groups = build_cross_step_groups(consolidated_findings)
+    # Issue #4258: verification is attached BEFORE the adjudication input is
+    # built, because that input carries each finding's verdict -- the pipeline
+    # runs the verifier first precisely so the adjudicator's severity rests on
+    # an established reachability rather than a guessed one. `adjudicate.py`
+    # builds its input from this function's findings, so both sides see the
+    # same verdicts and the `input_hash` agrees. A verifier re-run after
+    # adjudication changes that input, and the adjudication then reads as stale
+    # -- correctly, since it was judged without the current verdicts.
+    verification = _attach_verification(sweep_dir, consolidated_findings)
+    adjudication_input = build_adjudication_input(
+        sweep_id, _sweep_commit_sha(sweep_dir), consolidated_findings, cross_step_groups,
+        source_root=os.path.join(sweep_dir, "snapshot"),
+    )
+    evidence_redacted = adjudication_input.get("evidence_redacted", 0)
+    adjudication, envelope = load_adjudication(
+        sweep_dir,
+        dispatch,
+        sweep_id,
+        adjudication_input_hash(adjudication_input),
+        has_findings=bool(consolidated_findings),
+    )
+    # Issue #4080: recorded whether or not an adjudicator ran, because the
+    # redaction happened when the input was built. A reader must be able to
+    # tell evidence was WITHHELD from that stage rather than never written.
+    adjudication["evidence_redacted"] = evidence_redacted
+    if envelope is not None:
+        _apply_adjudication(consolidated_findings, cross_step_groups, envelope, adjudication)
+
+    # The sort key reads the verification verdict, so re-sort after merging --
+    # exactly as `_attach_adjudication` does for the adjudicated severity.
+    # `_finalize_findings` sorted this list before either annotation existed,
+    # so without this the verdict is recorded on each finding and changes
+    # nothing about the order a human reads them in.
+    consolidated_findings.sort(key=_group_rank_key)
+
+    return {
+        "sweep_id": sweep_id,
+        "lanes": lanes,
+        "steps_discovered": step_ids,
+        "plan_failed": plan_failed,
+        "scope_paths": _sweep_scope_paths(sweep_dir),
+        "coverage": coverage,
+        "scanner_coverage": scanner_coverage,
+        "timing": build_timing_rollup(sweep_dir, lanes),
+        "provenance": provenance,
+        "dispatch": dispatch,
+        "rejected_proposals": _load_rejected_proposals(sweep_dir),
+        "coverage_gates": load_coverage_gates(sweep_dir),
+        "adjudication": adjudication,
+        "verification": verification,
+        "cross_step_groups": cross_step_groups,
+        "findings": consolidated_findings,
+        "failed_step_tails": _failed_step_tails(lanes, step_ids, lane_step_state, lane_step_tail),
+    }
+
+
+def _sweep_scope_paths(sweep_dir: str) -> "list[str] | None":
+    """The repository-relative subtree filter this sweep was bounded to
+    (Issue #4012), read from `<sweep_dir>/manifest.json`'s `scope_paths`
+    field -- the same durable record `security-review.sh`'s `resume` command
+    reads back so an operator never re-passes `--path`. `None` (absent,
+    `null`, or a manifest that cannot be read) means an unscoped,
+    full-repository sweep, including every sweep created before this story.
+    Never read from a bundle's own `MANIFEST.json`: a multi-planner sweep has
+    one bundle per roster entry (`planners/<lane>/bundle/`), all filtered
+    identically by the one `--path` set `dispatch_planner()` passed to every
+    `planner.py prepare` call, so the sweep-root manifest is the one place
+    this fact is recorded exactly once rather than N times.
+    """
+    data = _load_json(os.path.join(sweep_dir, "manifest.json"))
+    if not isinstance(data, dict):
+        return None
+    scope_paths = data.get("scope_paths")
+    if isinstance(scope_paths, list) and scope_paths and all(isinstance(p, str) and p for p in scope_paths):
+        return scope_paths
+    return None
+
+
+def _sweep_commit_sha(sweep_dir: str) -> str:
+    """The commit a sweep reviewed, from the planner's own context sidecar
+    (`.plan-context.json`, written at the sweep root by `planner.prepare()`),
+    falling back to `manifest.json`. Carried into the adjudication input so
+    the adjudicator's envelope is bound to the same commit the findings
+    are."""
+    for filename, key in ((planner.CONTEXT_FILENAME, "commit_sha"), ("manifest.json", "commit_sha")):
+        data = _load_json(os.path.join(sweep_dir, filename))
+        if isinstance(data, dict) and isinstance(data.get(key), str) and data[key]:
+            return data[key]
+    return "unknown"
+
+
+def _md_escape_inline(text: object) -> str:
+    """Render arbitrary (possibly model-generated) text as literal Markdown
+    inline content: no raw HTML, and no way for an embedded newline to start
+    a fresh physical line that could be read as a heading or a new table
+    row. Backslashes are escaped first so the later escapes are unambiguous
+    on read-back, then pipes (table cell separator) and newlines."""
+    value = str(text)
+    value = value.replace("\\", "\\\\")
+    value = value.replace("|", "\\|")
+    value = value.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    return value
+
+
+def _location_suffix(finding: dict) -> str:
+    """`:line` or `:line-end_line`, rendered immediately after `file` in a
+    finding heading, or `""` when the finding carries no `line` (a finding
+    from a sweep written before Issue #3983's required `line` field). Never
+    part of the de-duplication key -- purely a reader's hint at where in
+    `file` to look, taken from `_first_occurrence_field`'s deterministic
+    pick, and never verified as a real offset into the file."""
+    line = finding.get("line")
+    if not isinstance(line, int):
+        return ""
+    end_line = finding.get("end_line")
+    if isinstance(end_line, int) and end_line != line:
+        return f":{line}-{end_line}"
+    return f":{line}"
+
+
+def _dispatch_identity(entry: dict) -> str:
+    """Derive a human-readable identity for a `dispatch_report.json`
+    planner/lane entry. Neither the "planners" nor the "lanes" array carries
+    a name field of its own (`security-review.sh`'s
+    `record_planner_dispatch_outcome`/`record_lane_dispatch_outcomes` record
+    only `requested_harness`/`requested_model`/...), so this reconstructs the
+    same `<harness>-<model>` shape `roster.Lane.lane_dir_name` uses, falling
+    back to the harness alone for the legacy single-planner entry, whose
+    `requested_model` is always empty."""
+    harness = entry.get("requested_harness") or ""
+    model = entry.get("requested_model") or ""
+    if model:
+        return f"{harness}-{model}" if harness else model
+    return harness or "unknown"
+
+
+def _sweep_complete(report: dict) -> bool:
+    """Whether every lane finished every planned step cleanly enough that an
+    empty findings list can be trusted to mean "nothing found" rather than
+    "nothing looked" (Issue #3961). Never the default in the absence of
+    evidence: a sweep with no frozen plan at all reads as incomplete, not
+    complete-by-omission.
+
+    False whenever:
+    - the frozen plan itself failed (`plan_failed`) or discovered zero steps
+      -- the two cases #3953 already special-cases in the Coverage section,
+      routed through this same flag rather than special-cased again here.
+    - any lane's coverage row shows `not_started > 0` or `files_short > 0`
+      (#3953, #3957).
+    - any lane's coverage row shows `failed > 0` -- `load_sweep()` counts a
+      step `failed` both for a schema-invalid envelope and for the #3959
+      incomplete-hypothesis-bundle exclusion (a `complete` envelope with any
+      `not_attempted` disposition); either way the step never became usable
+      coverage, so both fold into this one check.
+    - any lane's coverage row shows `parked > 0` or `refused > 0` -- a
+      rate-limited or model-refused step "never got far enough to have read
+      anything meaningful" (.claude/skills/security-review/docs/harness-architecture.md),
+      exactly like `failed`. Without these two, a sweep in which every step
+      was parked or refused -- zero code actually read -- would render as a
+      clean full sweep, which is the fail-open framing this check exists to
+      remove.
+    - a `dispatch_report.json` planner or lane entry recorded an outcome
+      other than `dispatched` (#3956).
+    - `plan/rejected_proposals.json` recorded any entry (#3956).
+    - no lane has produced any output at all -- a valid plan with zero
+      dispatched lanes has reviewed nothing, which is exactly the "clean
+      because unreviewed" failure mode this story exists to stop describing
+      as clean.
+    """
+    if report.get("plan_failed") or not report.get("steps_discovered"):
+        return False
+    if not report.get("lanes"):
+        return False
+    for row in report.get("coverage") or []:
+        if (
+            row.get("not_started", 0) > 0
+            or row.get("files_short", 0) > 0
+            or row.get("failed", 0) > 0
+            or row.get("parked", 0) > 0
+            or row.get("refused", 0) > 0
+        ):
+            return False
+    dispatch = report.get("dispatch") or {}
+    if any(entry.get("outcome") != "dispatched" for entry in dispatch.get("planners", [])):
+        return False
+    if any(entry.get("outcome") != "dispatched" for entry in dispatch.get("lanes", [])):
+        return False
+    if report.get("rejected_proposals"):
+        return False
+    coverage_gates = report.get("coverage_gates")
+    if isinstance(coverage_gates, dict):
+        # Issue #3980: a coverage-gate evaluation that could not run (missing
+        # or unparseable bundle tree listing) is treated exactly like a gate
+        # that ran and failed -- never a silent pass. A sweep with no
+        # coverage.json at all (produced before this story, or one whose
+        # finalize() returned before reaching the write) carries no signal
+        # here and is judged on every other check alone, same as any other
+        # optional artifact this function reads.
+        if not coverage_gates.get("evaluated"):
+            return False
+        if not (coverage_gates.get("g2") or {}).get("passed", False):
+            return False
+        if not (coverage_gates.get("g3") or {}).get("passed", False):
+            return False
+    adjudication = report.get("adjudication") or {}
+    if adjudication:
+        # Issue #3984: an adjudication stage that was configured but did not
+        # produce a usable, current envelope -- or that produced one which
+        # skipped findings -- is a gap exactly like a failed lane. A report
+        # must never look adjudicated when it is not.
+        if adjudication.get("status") not in ADJUDICATION_OK_STATUSES:
+            return False
+        if adjudication.get("omitted", 0) > 0 or adjudication.get("groups_omitted", 0) > 0:
+            return False
+    return True
+
+
+def _adjudication_partial_clause(adjudication: dict) -> str:
+    """How many verdicts survived an early exit, as a trailing sentence.
+
+    Empty when none did, so an exit that finished no batch reads exactly as
+    it did before Issue #4144 rather than gaining a "0 verdicts" line.
+    """
+    kept = adjudication.get("partial_adjudications", 0)
+    groups = adjudication.get("partial_group_assessments", 0)
+    if not kept and not groups:
+        return ""
+    parts = []
+    if kept:
+        parts.append(f"{kept} finding verdict(s)")
+    if groups:
+        parts.append(f"{groups} group assessment(s)")
+    return (
+        f" The batches that did finish are preserved on the envelope ({', '.join(parts)}), "
+        "so a resume re-runs only what is missing."
+    )
+
+
+def _adjudication_incomplete_lines(adjudication: dict) -> list[str]:
+    status = adjudication.get("status")
+    lines = []
+    if status == ADJUDICATION_AUTH_REVOKED:
+        # Issue #4144: a known-recoverable cause, labelled as such. It is
+        # still a gap -- severities below are raw -- but it is a gap with a
+        # known fix, and saying so is the difference between an operator
+        # re-running the stage and an operator opening an investigation.
+        reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
+        lines.append(
+            "- **Adjudication stage stopped on a credential failure** "
+            "(`auth_revoked`, a known-recoverable cause, not a defect in the code under "
+            f"review): {reasons or 'no detail recorded'}. Restore the adjudicator's "
+            "credential and re-run `security-review.sh resume <sweep-id>`. Every severity "
+            "below is a raw lane value until that happens."
+            + _adjudication_partial_clause(adjudication)
+        )
+    elif status not in ADJUDICATION_OK_STATUSES:
+        reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
+        lines.append(
+            f"- **Adjudication stage did not complete** (`{_md_escape_inline(status)}`): "
+            f"{reasons or 'no detail recorded'}. Every severity below is a raw lane value, "
+            "not an adjudicated one."
+            + _adjudication_partial_clause(adjudication)
+        )
+    else:
+        if adjudication.get("omitted", 0) > 0:
+            unsent = adjudication.get("unsent", 0)
+            why = (
+                f" ({unsent} of them never sent: over the adjudicator's prompt-size budget)"
+                if unsent
+                else ""
+            )
+            lines.append(
+                f"- **Adjudicator omitted {adjudication['omitted']} finding(s)** it was handed{why}; "
+                "each is still listed under `## Findings`, marked *not adjudicated*, with its raw "
+                "lane severities."
+            )
+        if adjudication.get("groups_omitted", 0) > 0:
+            groups_unsent = adjudication.get("groups_unsent", 0)
+            why = (
+                f" ({groups_unsent} of them never sent: the members could not share one "
+                "prompt, and a group is never assessed on partial evidence)"
+                if groups_unsent
+                else ""
+            )
+            lines.append(
+                f"- **Adjudicator did not assess {adjudication['groups_omitted']} cross-step "
+                f"group(s)** it was handed{why}; each is still listed under `## Cross-step groups` "
+                "with no assessment."
+            )
+    return lines
+
+
+def _planner_container_failure_lines(dispatch: dict) -> list[str]:
+    """One bullet per `dispatch_report.json` planner entry that recorded a
+    non-zero container exit code (Issue #4009's `container_exit_code`/
+    `container_stderr_tail`, written by `record_planner_dispatch_outcome()`
+    reading `security-review.sh`'s own `.planner-container.json` sidecar
+    back). Names the exit code and the stderr tail directly, rather than the
+    reader having to cross-reference `## Dispatch`'s bare `container_failed`
+    outcome string against a file on disk -- a broken planner entrypoint and
+    a model that cleanly declined to write a plan must read differently
+    here."""
+    lines = []
+    for entry in dispatch.get("planners", []):
+        exit_code = entry.get("container_exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            continue
+        identity = _dispatch_identity(entry)
+        stderr_tail = entry.get("container_stderr_tail") or ""
+        lines.append(
+            f"- Planner `{_md_escape_inline(identity)}` container exited "
+            f"**{exit_code}**: {_md_escape_inline(stderr_tail)}"
+        )
+    return lines
+
+
+def _incomplete_lines(report: dict) -> list[str]:
+    """One bullet per concrete gap behind a `False` `_sweep_complete()`,
+    named by lane where a lane is the relevant unit -- never a bare "this
+    sweep is incomplete" with no way to tell which task did not finish."""
+    if report.get("plan_failed") or not report.get("steps_discovered"):
+        return [
+            "- **Planning did not produce a usable frozen plan** for this "
+            "sweep; see `## Coverage` above."
+        ] + _planner_container_failure_lines(report.get("dispatch") or {})
+    if not report.get("lanes"):
+        return [
+            "- **No lane has produced any output for this sweep yet**; see "
+            "`## Coverage` above."
+        ]
+
+    lines = []
+    for row in report.get("coverage") or []:
+        lane = _md_escape_inline(row["lane"])
+        total = row["total_steps"]
+        if row.get("not_started", 0) > 0:
+            lines.append(f"- Lane `{lane}`: {row['not_started']}/{total} step(s) not started.")
+        if row.get("failed", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['failed']}/{total} step(s) failed "
+                "(schema-invalid, or a bundle left incomplete with an "
+                "unattempted hypothesis)."
+            )
+        if row.get("parked", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['parked']}/{total} step(s) parked "
+                "(stopped before reading anything meaningful; resumable)."
+            )
+        if row.get("refused", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['refused']}/{total} step(s) refused "
+                "(the model declined; nothing was reviewed)."
+            )
+        if row.get("files_short", 0) > 0:
+            lines.append(
+                f"- Lane `{lane}`: {row['files_short']} step(s) read fewer "
+                "files than declared (`files_short`)."
+            )
+
+    tails = report.get("failed_step_tails") or []
+    if tails:
+        lines.append(
+            f"- Harness output recorded for {len(tails)} non-complete step(s) -- the "
+            "diagnostic behind `stop_reason_raw`, not just its name:"
+        )
+        for entry in tails:
+            lines.append(
+                f"  - Lane `{_md_escape_inline(entry['lane'])}` step `{_md_escape_inline(entry['step_id'])}` "
+                f"(`{_md_escape_inline(entry['state'])}`): `{_md_escape_inline(entry['harness_output_tail'])}`"
+            )
+
+    dispatch = report.get("dispatch") or {}
+    dispatch_issues = sum(
+        1 for entry in dispatch.get("planners", []) if entry.get("outcome") != "dispatched"
+    ) + sum(1 for entry in dispatch.get("lanes", []) if entry.get("outcome") != "dispatched")
+    if dispatch_issues:
+        lines.append(f"- {dispatch_issues} dispatch issue(s) recorded; see `## Dispatch` below.")
+
+    rejected_count = len(report.get("rejected_proposals") or [])
+    if rejected_count:
+        lines.append(f"- {rejected_count} rejected proposal(s) recorded; see `## Dispatch` below.")
+
+    lines.extend(_coverage_gate_lines(report.get("coverage_gates")))
+    lines.extend(_adjudication_incomplete_lines(report.get("adjudication") or {}))
+
+    return lines
+
+
+def _coverage_gate_lines(coverage_gates: object) -> list[str]:
+    """One or two bullets naming a G-2/G-3 coverage-gate shortfall (Issue
+    #3980), or an evaluation failure -- never only a count. `coverage_gates`
+    is `None` when no `coverage.json` exists for this sweep (an older sweep,
+    or one whose `finalize()` returned before the write); that renders no
+    lines at all, since there is no signal to report, matching every other
+    optional artifact this module reads."""
+    if not isinstance(coverage_gates, dict):
+        return []
+    if not coverage_gates.get("evaluated"):
+        reason = coverage_gates.get("reason") or "no detail recorded"
+        return [
+            f"- **Coverage gates could not be evaluated**: {_md_escape_inline(reason)}. "
+            "G-2 (every file reviewed) and G-3 (high-risk files reviewed twice) status is "
+            "unknown for this sweep."
+        ]
+
+    lines: list[str] = []
+    g2 = coverage_gates.get("g2") or {}
+    if not g2.get("passed", True):
+        unassigned = g2.get("unassigned_files") or []
+        paths = ", ".join(f"`{_md_escape_inline(p)}`" for p in unassigned)
+        lines.append(
+            f"- **G-2 coverage gate failed**: {len(unassigned)} code-tier file(s) appear in "
+            f"zero plan steps: {paths}."
+        )
+    g3 = coverage_gates.get("g3") or {}
+    if not g3.get("passed", True):
+        short = g3.get("short_files") or []
+        paths = ", ".join(f"`{_md_escape_inline(p)}`" for p in short)
+        lines.append(
+            f"- **G-3 coverage gate failed**: {len(short)} entrypoint/security file(s) appear "
+            "in fewer than two steps, or in two steps whose hypothesis objectives do not "
+            f"genuinely differ: {paths}."
+        )
+    return lines
+
+
+def _scope_line(scope_paths: "list[str] | None") -> str:
+    """One Markdown sentence naming this sweep's scope (Issue #4012),
+    rendered at the top of `## Coverage` so the denominator's meaning is
+    never ambiguous: a scoped sweep's coverage counts (steps discovered, the
+    per-lane table, the G-2/G-3 gates) are all computed over the bundle's
+    already-filtered `01-tree.tsv`/plan, so they are relative to the named
+    subtree(s), never the full repository, and this line says so explicitly
+    rather than leaving a reader to infer it from a short-looking step
+    count."""
+    if scope_paths:
+        scope_list = ", ".join(f"`{_md_escape_inline(p)}`" for p in scope_paths)
+        return (
+            f"**Scope:** bounded to {scope_list} -- coverage below is relative to this scope, "
+            "not the full repository."
+        )
+    return "**Scope:** full repository."
+
+
+def render_markdown(report: dict) -> str:
+    sweep_complete = _sweep_complete(report)
+
+    lines = [f"# Security Review Consolidated Report — `{report['sweep_id']}`", ""]
+    if sweep_complete:
+        lines.append(
+            "Every planned step across every lane finished cleanly; the "
+            "findings below reflect the full sweep."
+        )
+    else:
+        lines.append(
+            "**This sweep is incomplete.** See `## Incomplete` below — the "
+            "findings in this report reflect only the tasks that completed, "
+            "not the full sweep."
+        )
+    lines.append("")
+
+    lines.append("## Coverage")
+    lines.append("")
+    lines.append(_scope_line(report.get("scope_paths")))
+    lines.append("")
+    if report.get("plan_failed"):
+        lines.append(
+            "**Coverage cannot be computed for this sweep.** No plan survived "
+            "planning: either `plan/PLANNING_FAILED` is present or `plan/` "
+            "contains zero `step-*.json` files, so there is no frozen set of "
+            "steps to measure any lane's output against. This is a planning "
+            "failure, not an empty sweep with nothing to review."
+        )
+        lines.append("")
+    else:
+        lines.append(f"Steps discovered across the sweep: {len(report['steps_discovered'])}")
+        lines.append("")
+        lines.append("| Lane | Complete | Parked | Refused | Failed | Not started | Files short |")
+        lines.append("|---|---|---|---|---|---|---|")
+        if report["coverage"]:
+            for row in report["coverage"]:
+                total = row["total_steps"]
+                lines.append(
+                    "| {lane} | {c}/{t} | {p}/{t} | {r}/{t} | {f}/{t} | {n}/{t} | {fs} |".format(
+                        lane=_md_escape_inline(row["lane"]),
+                        c=row["complete"],
+                        p=row["parked"],
+                        r=row["refused"],
+                        f=row["failed"],
+                        n=row["not_started"],
+                        t=total,
+                        fs=row["files_short"],
+                    )
+                )
+        else:
+            lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0 |")
+        lines.append("")
+
+    lines.append("## Provenance")
+    lines.append("")
+    lines.extend(_provenance_lines(report))
+    lines.append("")
+
+    if not sweep_complete:
+        lines.append("## Incomplete")
+        lines.append("")
+        lines.extend(_incomplete_lines(report))
+        lines.append("")
+
+    lines.extend(_timing_lines(report.get("timing") or []))
+
+    lines.append("## Scanner coverage")
+    lines.append("")
+    scanner_rows = report.get("scanner_coverage") or []
+    if not scanner_rows or all(r["checks"] == 0 and r["steps_without_scans"] == len(report.get("steps_discovered", [])) for r in scanner_rows):
+        lines.append(
+            "_(no scanner evidence recorded -- every lane envelope predates scanner "
+            "profiles, or no step declared a file any profile covers)_"
+        )
+        lines.append("")
+    else:
+        lines.append(
+            "Fixed, harness-owned tool profiles (Issue #3982) ran over each step's files; "
+            "a non-`ok` check or a step without scans is code the tools did not cover, "
+            "listed below. These gaps do not make the sweep incomplete -- the model still "
+            "reviewed the source -- but a bare empty tool result is never treated as clean. "
+            "Known suppression gap: staticcheck honours `//lint:ignore` directives in the audited "
+            "code (it has no switch to ignore them); semgrep `nosemgrep` and gosec `#nosec` "
+            "suppressions are disabled, and eslint inline config is disabled."
+        )
+        lines.append("")
+        lines.append("| Lane | Checks | Ok | Partial | Empty | Failed | Timeout | Rejected | Unavailable | Skipped | Truncated | Cached | Steps without scans |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for row in scanner_rows:
+            lines.append(
+                "| {lane} | {checks} | {ok} | {partial} | {empty} | {failed} | {timeout} | {rejected} | {unavailable} | {skipped} | {truncated} | {cached} | {sw} |".format(
+                    lane=_md_escape_inline(row["lane"]), sw=row["steps_without_scans"],
+                    **{k: row.get(k, 0) for k in ("checks", "ok", "partial", "empty", "failed", "timeout", "rejected", "unavailable", "skipped", "truncated", "cached")},
+                )
+            )
+        lines.append("")
+        all_gaps = [(row["lane"], g) for row in scanner_rows for g in row["gaps"]]
+        if all_gaps:
+            lines.append(f"Scanner gaps ({len(all_gaps)}):")
+            lines.append("")
+            for lane, gap in all_gaps[:200]:
+                detail = " ".join(f"{k}={_md_escape_inline(str(v))}" for k, v in gap["detail"].items() if v not in (None, ""))
+                lines.append(f"- Lane `{_md_escape_inline(lane)}` step `{_md_escape_inline(gap['step_id'])}`: **{_md_escape_inline(gap['kind'])}** {detail}".rstrip())
+            if len(all_gaps) > 200:
+                lines.append(f"- _(... {len(all_gaps) - 200} more scanner gap(s) in `consolidated.json`)_")
+            lines.append("")
+
+    lines.append("## Dispatch")
+    lines.append("")
+    dispatch = report.get("dispatch") or {}
+    unavailable = [
+        ("planner", entry) for entry in dispatch.get("planners", []) if entry.get("outcome") != "dispatched"
+    ] + [
+        ("lane", entry) for entry in dispatch.get("lanes", []) if entry.get("outcome") != "dispatched"
+    ]
+    rejected_proposals = report.get("rejected_proposals") or []
+    if not unavailable and not rejected_proposals:
+        lines.append("_(no dispatch or proposal issues recorded)_")
+        lines.append("")
+    else:
+        for kind, entry in unavailable:
+            identity = _dispatch_identity(entry)
+            outcome = entry.get("outcome", "unknown")
+            exit_code = entry.get("container_exit_code")
+            exit_suffix = (
+                f" (exit {exit_code})"
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                else ""
+            )
+            lines.append(
+                f"- **UNAVAILABLE** — {kind} `{_md_escape_inline(identity)}`: "
+                f"{_md_escape_inline(outcome)}{exit_suffix}"
+            )
+        for item in rejected_proposals:
+            filename = item.get("filename", "unknown") if isinstance(item, dict) else "unknown"
+            error = item.get("error", "") if isinstance(item, dict) else ""
+            lines.append(
+                f"- **REJECTED** — `{_md_escape_inline(filename)}`: {_md_escape_inline(error)}"
+            )
+        lines.append("")
+
+    lines.append("## Adjudication")
+    lines.append("")
+    lines.extend(_adjudication_lines(report.get("adjudication") or {}))
+    lines.append("")
+
+    lines.append("## Cross-step groups")
+    lines.append("")
+    lines.extend(_cross_step_group_lines(report.get("cross_step_groups") or []))
+    lines.append("")
+
+    lines.append("## Findings")
+    lines.append("")
+    if not report["findings"]:
+        if sweep_complete:
+            lines.append("_No findings after de-duplication and validation._")
+        else:
+            lines.append("No candidates reported in the tasks that completed.")
+        lines.append("")
+
+    for finding in report["findings"]:
+        agreement = finding["agreement"]
+        cwe = finding.get("cwe")
+        cwe_suffix = f" ({_md_escape_inline(cwe)})" if cwe else ""
+        # The heading leads with a lane's own prose label, not the key.
+        #
+        # Since Issue #4134 the consolidated `vuln_class` IS the normalised
+        # cwe, so leading with it would render "CWE-863 (CWE-863)" -- correct,
+        # and useless to read. A reader scanning a few hundred headings wants
+        # the human description; the identifier follows in parentheses where it
+        # always was. The prose is per-lane now, so it comes off an occurrence:
+        # a deterministic pick, exactly as `line`/`cwe` already are.
+        #
+        heading_label = _prose_label(finding)
+        lines.append(
+            f"### {_md_escape_inline(heading_label)}{cwe_suffix} — "
+            f"{_md_escape_inline(finding['file'])}{_location_suffix(finding)} :: "
+            f"{_md_escape_inline(finding['symbol'])}"
+        )
+        lines.append("")
+        lanes_text = ", ".join(_md_escape_inline(lane) for lane in finding["lanes"])
+        lines.append(
+            f"Reported by {agreement['reported']}/{agreement['eligible']} lanes that "
+            f"completed this step: {lanes_text}"
+        )
+        lines.append("")
+        lines.append(_severity_line(finding, report.get("adjudication") or {}))
+        lines.append("")
+        lines.append(_verification_line(finding, report.get("verification") or {}))
+        lines.append("")
+        for occ in finding["occurrences"]:
+            lines.append(
+                f"- **{_md_escape_inline(occ['lane'])}** "
+                f"({_md_escape_inline(occ['severity'])}/{_md_escape_inline(occ['confidence'])}): "
+                f"{_md_escape_inline(occ['title'])}"
+            )
+            lines.append(f"  - Evidence: {_md_escape_inline(occ['evidence'])}")
+            lines.append(f"  - Suggested fix: {_md_escape_inline(occ['suggested_fix'])}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _adjudication_lines(adjudication: dict) -> list[str]:
+    """The `## Adjudication` section body: the stage's status, then what was
+    withheld from it.
+
+    The redaction line is appended to EVERY status branch, including the ones
+    where no adjudicator ran (Issue #4080). The redaction happens when the
+    input is built, so it is a fact about this sweep whether or not the stage
+    was configured -- and a reader must be able to tell evidence was withheld
+    from that stage rather than never written."""
+    lines = _adjudication_status_lines(adjudication)
+    redacted = adjudication.get("evidence_redacted", 0)
+    return lines + [
+        "",
+        f"Evidence strings withheld because they quoted the source file they name: "
+        f"**{redacted}**. The adjudicator's contract is findings, never source, and its "
+        "container mounts an empty snapshot; this is that same boundary applied to what "
+        "the findings themselves carry. A withheld string is replaced with a marker, "
+        "never dropped -- the finding keeps its place, and the adjudicator is told it is "
+        "rating a claim it cannot read.",
+    ]
+
+
+def _adjudication_status_lines(adjudication: dict) -> list[str]:
+    """One status sentence a reader can act on, never a blank. Says plainly
+    when severities are raw."""
+    status = adjudication.get("status", ADJUDICATION_NOT_CONFIGURED)
+    harness = _md_escape_inline(adjudication.get("harness") or "unknown")
+    model_id = _md_escape_inline(adjudication.get("model_id") or "unknown")
+    if status == ADJUDICATION_NOT_CONFIGURED:
+        return [
+            "_Not run: no adjudicator is configured (`CFGMS_SECURITY_REVIEW_ADJUDICATOR` "
+            "unset). Every severity in this report is a **raw lane value**; where lanes "
+            "disagree, the finding says so and shows the full range._"
+        ]
+    if status == ADJUDICATION_SKIPPED_NO_FINDINGS:
+        return [
+            f"_Skipped: the deterministic set contained no findings for `{harness}`/`{model_id}` "
+            "to adjudicate._"
+        ]
+    if status == ADJUDICATION_COMPLETE:
+        return [
+            f"Adjudicated by `{harness}` / `{model_id}` over findings only (no source). "
+            f"Findings adjudicated: {adjudication.get('adjudicated', 0)}; omitted by the "
+            f"adjudicator: {adjudication.get('omitted', 0)}; adjudications matching no "
+            f"finding (dropped): {adjudication.get('unmatched', 0)}; cross-step groups "
+            f"assessed: {adjudication.get('groups_assessed', 0)}; groups not assessed: "
+            f"{adjudication.get('groups_omitted', 0)}; verdicts for items never sent "
+            f"(dropped): {adjudication.get('unsolicited', 0)}. An adjudicated severity "
+            "is rendered as **Severity (adjudicated)** with the lanes' raw values beside it; "
+            "a finding without one is rendered as **Severity (raw)**."
+        ]
+    reasons = "; ".join(_md_escape_inline(e) for e in adjudication.get("errors") or [])
+    return [
+        f"**Did not complete** (`{_md_escape_inline(status)}`, `{harness}` / `{model_id}`): "
+        f"{reasons or 'no detail recorded'}. Every severity in this report is a **raw lane "
+        "value**; see `## Incomplete`."
+    ]
+
+
+def _severity_line(finding: dict, adjudication_record: dict) -> str:
+    """One line per finding stating the severity a reader should act on and
+    exactly where it came from. Both original per-lane values are always
+    shown, so an adjudicated severity never hides what the lanes said, and a
+    disagreement without an adjudication is named as a disagreement rather
+    than rendered as one value with the other silently discarded."""
+    severity_range = finding["severity_range"]
+    by_lane = ", ".join(
+        f"{_md_escape_inline(lane)}={_md_escape_inline(sev)}"
+        for lane, sev in severity_range["by_lane"].items()
+    )
+    adjudication = finding.get("adjudication")
+    if isinstance(adjudication, dict):
+        return (
+            f"Severity (adjudicated): **{_md_escape_inline(adjudication['severity'])}** — by "
+            f"`{_md_escape_inline(adjudication['harness'])}` / "
+            f"`{_md_escape_inline(adjudication['model_id'])}`; lanes reported {by_lane}. "
+            f"Rationale: {_md_escape_inline(adjudication['rationale'])}"
+        )
+    status = adjudication_record.get("status", ADJUDICATION_NOT_CONFIGURED)
+    if status == ADJUDICATION_COMPLETE:
+        why = "the adjudicator omitted this finding"
+    elif status == ADJUDICATION_NOT_CONFIGURED:
+        why = "no adjudicator configured"
+    else:
+        why = f"adjudication stage `{_md_escape_inline(status)}`"
+    if severity_range["disagreement"]:
+        return (
+            f"Severity (raw): **DISAGREEMENT** {_md_escape_inline(severity_range['lowest'])} → "
+            f"{_md_escape_inline(severity_range['highest'])} — lanes reported {by_lane}; "
+            f"not adjudicated ({why}). Treat the highest value as the working severity "
+            "until a human resolves it."
+        )
+    return (
+        f"Severity (raw): **{_md_escape_inline(severity_range['highest'])}** — lanes reported "
+        f"{by_lane}; not adjudicated ({why})."
+    )
+
+
+# Reachability reads first because it is the fact severity depends on. A
+# verdict beside a severity says "high, and reached from an HTTP handler"; a
+# severity alone says "high, and nobody checked".
+_VERDICT_TEXT = {
+    "reachable_from_untrusted": "**reachable from untrusted input**",
+    "reachable_internal_only": "**reachable, internal callers only**",
+    "guarded": "**guarded**",
+    "not_reachable": "**not reachable**",
+    "undetermined": "**undetermined**",
+}
+
+
+def _verification_line(finding: dict, verification_record: dict) -> str:
+    """The reachability line for one finding (Issue #4071).
+
+    Renders BESIDE the severity, never instead of it, and a finding without a
+    verdict still says so plainly -- an unverified finding must not read as a
+    verified-and-clean one. That asymmetry is the whole point: `not_reachable`
+    and `no verdict` mean opposite things and a reader must be able to tell
+    them apart at a glance."""
+    verification = finding.get("verification")
+    if isinstance(verification, dict):
+        verdict = verification.get("verdict") or "undetermined"
+        text = _VERDICT_TEXT.get(verdict, f"**{_md_escape_inline(verdict)}**")
+        parts = [f"Reachability: {text}"]
+        entry = verification.get("entry_point")
+        if entry:
+            parts.append(f"entry point `{_md_escape_inline(entry)}`")
+        path = verification.get("call_path") or []
+        if path:
+            parts.append("via " + " → ".join(f"`{_md_escape_inline(str(p))}`" for p in path))
+        guard = verification.get("guard")
+        if guard:
+            parts.append(f"guarded by `{_md_escape_inline(guard)}`")
+        citation = verification.get("citation") or []
+        if citation:
+            parts.append("cited at " + ", ".join(f"`{_md_escape_inline(str(c))}`" for c in citation))
+        # What an attacker controls and how it is triggered: the difference
+        # between a reader believing the verdict and being able to check it.
+        attacker_input = verification.get("attacker_input")
+        if attacker_input:
+            parts.append(f"attacker controls {_md_escape_inline(attacker_input)}")
+        trigger = verification.get("trigger")
+        if trigger:
+            parts.append(f"triggered by {_md_escape_inline(trigger)}")
+        tail = (
+            f" — by `{_md_escape_inline(verification.get('harness'))}` / "
+            f"`{_md_escape_inline(verification.get('model_id'))}`. "
+            f"{_md_escape_inline(verification.get('rationale') or '')}"
+        )
+        # The falsifier goes LAST and is called out, because it is the line a
+        # reviewer uses to disagree with the verdict. A verdict a reader cannot
+        # argue with is one they either take on faith or ignore.
+        falsifier = verification.get("falsifier")
+        if falsifier:
+            tail += f" Overturned by: {_md_escape_inline(falsifier)}"
+        return "; ".join(parts) + tail
+
+    status = verification_record.get("status", "missing")
+    if status == "missing":
+        why = "no verifier configured"
+    elif status in ("complete",):
+        why = "the verifier returned no verdict for it"
+    else:
+        why = f"verification stage `{_md_escape_inline(status)}`"
+    return f"Reachability: **not verified** ({why})."
+
+
+def _cross_step_group_lines(groups: list[dict]) -> list[str]:
+    """The `## Cross-step groups` section body (Issue #3984)."""
+    if not groups:
+        return [
+            "_None: no two findings share a defect class across different plan steps._"
+        ]
+    lines = [
+        f"{len(groups)} group(s) of findings share a defect class across plan-step "
+        "boundaries. Read each as one possible defect whose evidence the planner split "
+        "between steps; an assessment, when present, is the adjudicator's judgement on "
+        "whether the members are the same defect."
+    ]
+    for group in groups:
+        lines.append("")
+        steps = ", ".join(f"`{_md_escape_inline(s)}`" for s in group["step_ids"])
+        lines.append(
+            f"### {_md_escape_inline(group['group_id'])} — "
+            f"{_md_escape_inline(group['defect_class'])} across {steps}"
+        )
+        lines.append("")
+        for member in group["members"]:
+            member_steps = ", ".join(_md_escape_inline(s) for s in member["step_ids"])
+            lines.append(
+                f"- `{_md_escape_inline(member['file'])}` :: "
+                f"{_md_escape_inline(member['symbol'])} ({_md_escape_inline(_prose_label(member))}; "
+                f"step(s) {member_steps})"
+            )
+        assessment = group.get("assessment")
+        if isinstance(assessment, dict):
+            lines.append(
+                f"- Assessment: **{_md_escape_inline(assessment['assessment'])}** — by "
+                f"`{_md_escape_inline(assessment['harness'])}` / "
+                f"`{_md_escape_inline(assessment['model_id'])}`. "
+                f"{_md_escape_inline(assessment['rationale'])}"
+            )
+        else:
+            lines.append("- Assessment: _none (not adjudicated)_")
+    return lines
+
+
+def _load_dispatch_report(sweep_dir: str) -> dict:
+    """Read `<sweep_dir>/dispatch_report.json` (Issue #3954) -- the
+    per-planner and per-lane requested/passed/resolved identity and dispatch
+    `outcome` `security-review.sh` records. Absent or malformed is not an
+    error here: it means nothing to report, matching every other optional
+    artifact this module reads (SEC3900's "excluded, never crashed on"
+    discipline)."""
+    data = _load_json(os.path.join(sweep_dir, "dispatch_report.json"))
+    if not isinstance(data, dict):
+        return {"planners": [], "lanes": []}
+    planners = data.get("planners")
+    lanes = data.get("lanes")
+    report = {
+        "planners": planners if isinstance(planners, list) else [],
+        "lanes": lanes if isinstance(lanes, list) else [],
+    }
+    # Issue #3984: the adjudicator's single dispatch entry, present only when
+    # CFGMS_SECURITY_REVIEW_ADJUDICATOR was set for the run. Its absence is
+    # itself a signal ("not configured"), so it is not normalised to an
+    # empty placeholder the way the two lists above are.
+    adjudicator = data.get("adjudicator")
+    if isinstance(adjudicator, dict):
+        report["adjudicator"] = adjudicator
+    return report
+
+
+def _load_rejected_proposals(sweep_dir: str) -> list[dict]:
+    """Read `<sweep_dir>/plan/rejected_proposals.json` (Issue #3956) --
+    `planner.py`'s `finalize()`/`finalize_multi_planner()` record of every
+    step-file proposal excluded during validation. Absent or malformed
+    renders as "nothing to report", never an error."""
+    data = _load_json(os.path.join(sweep_dir, "plan", planner.REJECTED_PROPOSALS_FILENAME))
+    return data if isinstance(data, list) else []
+
+
+def load_coverage_gates(sweep_dir: str) -> dict | None:
+    """Read `<sweep_dir>/plan/coverage.json` (Issue #3980) -- the G-2/G-3
+    coverage-gate result `planner.py`'s `finalize()`/`finalize_multi_planner()`
+    write over the finalized plan.
+
+    Absent or malformed returns `None` -- "no coverage-gate signal for this
+    sweep" -- matching every other optional artifact this module reads
+    (`_load_rejected_proposals`, `_load_dispatch_report`): a sweep produced
+    before this story landed, or one whose `finalize()` returned before
+    reaching the coverage-gate write (zero step files produced, or a missing
+    sweep context), has nothing here to report, and that absence must never
+    be read as the gates having passed. Public (no leading underscore, unlike
+    most of this module's loaders) because `security-review.sh status` reads
+    it directly, exactly as it already calls `load_sweep()`/
+    `build_coverage_table()` directly rather than through `render_markdown()`.
+    """
+    data = _load_json(os.path.join(sweep_dir, "plan", planner.COVERAGE_FILENAME))
+    return data if isinstance(data, dict) else None
+
+
+def _detect_repo_root() -> str | None:
+    """Same detection `planner.py` and `basedir.py` use, via the shared
+    `basedir.detect_repo_root()` (Issue #3929) -- `None` on any failure,
+    never a `cwd` guess. `basedir.detect_repo_root()` raises `BaseDirError`
+    on every failure mode (its own fail-closed contract); this wrapper
+    translates that to `None` so this module's external behavior on
+    detection failure is unchanged from before the dedup."""
+    try:
+        return basedir.detect_repo_root(None)
+    except basedir.BaseDirError:
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("sweep_dir", help="Path to the sweep directory (contains lanes/, report/)")
+    parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Repository root to validate finding `file` values against "
+        "(default: `git rev-parse --show-toplevel`)",
+    )
+    args = parser.parse_args(argv)
+
+    repo_root = args.repo_root or _detect_repo_root()
+    if not repo_root:
+        print(
+            "ERROR: cannot determine the repository root to validate findings against; "
+            "pass --repo-root explicitly",
+            file=sys.stderr,
+        )
+        return 1
+
+    report = consolidate(args.sweep_dir, repo_root)
+
+    report_dir = os.path.join(args.sweep_dir, "report")
+    os.makedirs(report_dir, exist_ok=True)
+    atomic_write.write_json_atomic(os.path.join(report_dir, "consolidated.json"), report)
+    atomic_write.write_text_atomic(os.path.join(report_dir, "consolidated.md"), render_markdown(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -381,7 +381,7 @@ ENV UV_OFFLINE=1
 # with `--no-config-lookup --config /opt/cfgms-scanner/eslint.config.js`
 # against these node_modules (never the audited project's), semgrep reads
 # only the rule files installed here, and every argv is a constant from
-# .claude/scripts/security-review/lanes/scan_profiles.py. rg, gosec and
+# .claude/skills/security-review/lanes/scan_profiles.py. rg, gosec and
 # staticcheck are already installed above and are NOT reinstalled.
 #
 # All three pins below are intentionally NOT tracked by

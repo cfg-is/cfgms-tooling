@@ -3978,17 +3978,17 @@ PROMPT_EOF
       # audited snapshot at /workspace. Mounted read-only at a fixed trusted
       # path; the lane bootstraps consult CFGMS_SECURITY_REVIEW_HARNESS_DIR
       # ahead of any /workspace fallback.
-      inv_harness_dir_host="${REPO_ROOT}/.claude/scripts/security-review"
+      inv_harness_dir_host="${REPO_ROOT}/.claude/skills/security-review"
       if [[ ! -d "$inv_harness_dir_host" ]]; then
         echo "ERROR: trusted harness directory not found: ${inv_harness_dir_host}"
         exit 1
       fi
       inv_lane_entrypoint_mount+=(-v "${inv_harness_dir_host}:/opt/cfgms-harness/security-review:ro")
       inv_lane_entrypoint_mount+=(-e "CFGMS_SECURITY_REVIEW_HARNESS_DIR=/opt/cfgms-harness/security-review")
-      # The review methodology (docs/security-review/methodology.md) is
-      # review POLICY and is loaded by harness_runner at import; it comes from
+      # The review methodology (.claude/skills/security-review/docs/methodology.md)
+      # is review POLICY and is loaded by harness_runner at import; it comes from
       # the same trusted host tree, beside the harness, never from /workspace.
-      inv_methodology_dir_host="${REPO_ROOT}/docs/security-review"
+      inv_methodology_dir_host="${REPO_ROOT}/.claude/skills/security-review/docs"
       if [[ ! -f "${inv_methodology_dir_host}/methodology.md" ]]; then
         echo "ERROR: trusted methodology not found: ${inv_methodology_dir_host}/methodology.md"
         exit 1
@@ -4046,8 +4046,8 @@ paths = [entrypoint_path, lane_entrypoint_path, agent_profile_path]
 # cover the whole tree, because its job is to say WHICH harness produced a
 # step, and a digest over the entrypoint alone could not answer that.
 if lane_entrypoint_path:
-    paths.append(os.path.join(repo_root, "docs", "security-review", "methodology.md"))
-    harness_dir = os.path.join(repo_root, ".claude", "scripts", "security-review")
+    paths.append(os.path.join(repo_root, ".claude", "skills", "security-review", "docs", "methodology.md"))
+    harness_dir = os.path.join(repo_root, ".claude", "skills", "security-review")
     for dirpath, dirnames, filenames in os.walk(harness_dir):
         dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
         for name in sorted(filenames):

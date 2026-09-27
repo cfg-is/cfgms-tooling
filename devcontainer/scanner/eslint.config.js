@@ -4,7 +4,7 @@
 // Image-owned ESLint configuration for the security-review finder lanes
 // (Issue #3982, epic #3975). Installed to /opt/cfgms-scanner/eslint.config.js
 // and loaded ONLY via `--no-config-lookup --config <this file>` by
-// `.claude/scripts/security-review/lanes/scan_profiles.py`.
+// `.claude/skills/security-review/lanes/scan_profiles.py`.
 //
 // Why a second config and not web/eslint.config.js: a flat config is
 // executable JavaScript. The lane container scans an UNTRUSTED snapshot of

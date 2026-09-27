@@ -41,9 +41,10 @@ classify() {  # classify <root> <file>...
 echo ""
 echo "classify-docs-only.sh"
 
-# AC3: the real repo, the exact file that broke develop in PR #4201.
+# AC3: the real repo, the exact file that broke develop in PR #4201 (moved to
+# .claude/skills/security-review/docs/methodology.md by Issue #4299).
 check_last_line "real repo: methodology.md alone is code (PR #4201 regression)" \
-  "$(classify "$REPO_ROOT" docs/security-review/methodology.md)" "code=true"
+  "$(classify "$REPO_ROOT" .claude/skills/security-review/docs/methodology.md)" "code=true"
 
 check_last_line "a doc no code reads is docs-only" \
   "$(classify "$FIX" docs/unread.md README.md)" "code=false"

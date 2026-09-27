@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""The Claude harness finder lane for the security review harness (Issue
+#3933, epic #3927's switchover cutover).
+
+This is the first lane built on the architectural correction the epic makes:
+model access by subscription agent harness, never a REST API key. Every REST
+lane this module replaces (`anthropic.py`, `openai.py`, `ollama.py`, all
+deleted by this same story) spoke a provider's HTTP API directly with a
+`urllib` request and classified a provider-specific `stop_reason`/
+`finish_reason` field. This lane instead invokes the `claude` CLI as a
+subprocess -- authenticated by the OAuth session `launch-investigator
+--harness claude` mounts read-only at `~/.claude/.credentials.json` (Issue
+#3932) -- and derives state purely from the artifact the harness process
+leaves behind, via the shared classifier `terminal_state.classify()` (Issue
+#3928, C3). It reuses the shared system prompt / output-schema description
+and the refusal-retry-once bookkeeping from `harness_runner.py` (Issue #3931,
+C4) rather than defining either a second time.
+
+For every step in the sweep's plan not already resolved for this lane
+(`resume.py::missing_steps`), this module:
+
+1. Reads the plan step (validated against the shared shape,
+   `schema.validate_plan_step`, epic #3927's contract C1 -- never a private,
+   ad hoc per-lane parse the way the three deleted REST lanes each did).
+2. Reads every declared `files` entry from the read-only `/workspace` repo
+   mount, through the same traversal/symlink containment guard the deleted
+   `openai.py` used (`_is_safe_repo_relative_path` + `_resolve_within_repo` +
+   `O_NOFOLLOW` open) -- `files` is planner output, which deliberately
+   ingests untrusted repository source, so a repo-relative name is not
+   evidence of a repo-relative real path.
+3. Builds a prompt around `harness_runner.SYSTEM_PROMPT` /
+   `OUTPUT_SCHEMA_DESCRIPTION`, naming one raw-output file path the harness
+   must write `{"findings": [...]}` to and nowhere else.
+4. Invokes `claude` (resolved on `PATH`, matching every other agent-container
+   invocation in this repository -- never a hardcoded absolute path) as a
+   subprocess, always with `--disallowedTools` derived from the launcher's
+   own `CFGMS_INVESTIGATOR_DISALLOWED_TOOLS` (see `resolve_disallowed_tools`
+   -- the prompt built in step 3 carries untrusted file bodies, so the tool
+   surface granted to that process is a control), and inspects its exit code
+   plus whatever it left at that path.
+
+**Why a raw-output file, not stdout.** `claude -p` prints prose to stdout by
+design; a subscription harness has no structured response body to parse the
+way a REST lane's JSON response did. Naming an exact file path in the prompt
+and treating its presence/shape as the artifact is what makes
+`terminal_state.classify()`'s "exit code plus findings-file artifact"
+contract meaningful for a harness instead of a REST call.
+
+**Why a second, enriched candidate file, not the raw file directly.**
+`terminal_state.classify()`'s own `_load_findings()` validates every finding
+in the artifact through `schema.validate_finding()`, which requires the
+harness-owned identity fields (`sweep_id`/`commit_sha`/`lane`/`step_id`) --
+fields the model is never trusted to supply itself (same principle
+`planner.finalize()` applies to a plan step's own `sweep_id`/`commit_sha`:
+never sourced from the model). This module therefore reads the model's raw,
+bare-shaped `{"findings": [...]}` output, enriches each entry with those four
+fields exactly as the deleted `openai.py::_enrich_and_validate` did, and
+writes *that* enriched shape to a second, candidate path -- the one actually
+handed to `classify()`. A raw response that never parses to a findings list
+at all (prose, an apology, a declined request) leaves the candidate path
+unwritten, which `classify()` reads as `refused` when the harness exited 0 --
+exactly the four-terminal-state table's "harness exits 0, no valid findings
+file written" row. A raw response that parses but contains a schema-invalid
+entry still gets a candidate file written (deliberately, so `classify()`'s
+own per-item validation is what decides), which correctly falls through to
+`failed` rather than being silently dropped.
+
+Run (in-container): `python3 claude_lane.py <lane-id>`, with `/workspace`
+(repo, ro), `/workspace-plan` (this sweep's `plan/`, ro), and `/workspace-out`
+(this lane's own `lanes/<lane-id>/`, rw) bind-mounted by `agent-dispatch.sh
+launch-investigator --harness claude --model <model>`. Every path is
+overridable via env var (see the `CFGMS_SECURITY_REVIEW_*_DIR` constants
+below), and the model id via `CFGMS_SECURITY_REVIEW_MODEL`, so this module
+runs standalone against a temp directory in tests -- including, for the
+integration test, with a stub `claude` binary placed on `PATH`.
+"""
+from __future__ import annotations
+
+import errno
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _bootstrap_harness_imports() -> None:
+    """Make `schema`/`atomic_write`/`resume` (one directory up) and
+    `terminal_state`/`harness_runner` (this directory) importable.
+
+    Two layouts have to work, exactly as `openai.py:_bootstrap_harness_imports`
+    documented (the one lane among the three deleted REST adapters that already
+    got this right, per finding 2's own text -- this module reuses that pattern
+    rather than the `__file__`-relative one `anthropic.py`/`ollama.py` used):
+    (1) run from a checkout, where this file lives at
+    `.claude/skills/security-review/lanes/claude_lane.py` and its siblings sit
+    one directory up (`schema.py` etc.) or beside it (`terminal_state.py`,
+    `harness_runner.py`); (2) run inside the investigator container, where only
+    this single file is bind-mounted (at
+    `/usr/local/bin/investigator-lane-entrypoint.py` -- see
+    `.devcontainer/scripts/investigator-entrypoint.sh`), so `__file__` resolves
+    to a path with no siblings at all, but the *whole* repository is separately
+    bind-mounted read-only at `/workspace`
+    (`agent-dispatch.sh launch-investigator`), which does have them.
+
+    `CFGMS_SECURITY_REVIEW_REPO_ROOT` is consulted as an extra candidate root
+    ahead of the `/workspace` default, matching the "every path is overridable
+    via env var" convention documented at the top of this module. The real
+    launcher never sets it, so layout (2) above is unaffected in production --
+    this exists so `claude_lane_test.py`'s single-file-layout check can point
+    at wherever the checkout actually is (a GitHub Actions runner's workspace
+    is not `/workspace`) instead of assuming the container's bind-mount path.
+    """
+    env_repo_root = os.environ.get("CFGMS_SECURITY_REVIEW_REPO_ROOT")
+
+    lane_candidates = [Path(__file__).resolve().parent]
+    harness_candidates = [Path(__file__).resolve().parent.parent]
+    # Issue #3982: inside the investigator container the harness modules --
+    # `harness_runner`, `scan_profiles` (the scanner allowlist), `schema`,
+    # `resume`, ... -- must come from the TRUSTED harness mount
+    # (`agent-dispatch.sh launch-investigator` bind-mounts the host's own
+    # `.claude/skills/security-review` read-only at
+    # `/opt/cfgms-harness/security-review` and exports its path in
+    # `CFGMS_SECURITY_REVIEW_HARNESS_DIR`), never from the audited snapshot at
+    # `/workspace`: the snapshot is the code under review, and a reviewed commit
+    # must not be able to replace the registry or run code on import beside the
+    # lane credential. The `/workspace` fallbacks below stay only for the
+    # pre-#3982 single-file layout when no harness mount is present.
+    trusted_harness = os.environ.get("CFGMS_SECURITY_REVIEW_HARNESS_DIR") or "/opt/cfgms-harness/security-review"
+    lane_candidates.append(Path(trusted_harness) / "lanes")
+    harness_candidates.append(Path(trusted_harness))
+    if env_repo_root:
+        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
+    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+
+    for candidate in lane_candidates:
+        if (candidate / "terminal_state.py").is_file():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+            break
+
+    for candidate in harness_candidates:
+        if (candidate / "schema.py").is_file():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+            break
+
+
+_bootstrap_harness_imports()
+import atomic_write  # noqa: E402
+import harness_runner  # noqa: E402
+import resume  # noqa: E402
+import schema  # noqa: E402
+import terminal_state  # noqa: E402
+
+# manifest.LANES no longer exists as a hardcoded tuple once this story lands
+# (roster.py derives lane directory names from CFGMS_SECURITY_REVIEW_LANES at
+# sweep-creation time); this default matches roster.py's own
+# `<harness>-<model>` lane_dir_name convention for a standalone invocation
+# with no CLI argument (e.g. exercising this module directly in a test).
+DEFAULT_LANE_ID = "claude-sonnet-5"
+DEFAULT_MODEL = "sonnet-5"
+
+DEFAULT_PLAN_DIR = "/workspace-plan"
+DEFAULT_OUT_DIR = "/workspace-out"
+DEFAULT_REPO_ROOT = "/workspace"
+
+# Single-sourced in `harness_runner` (Issue #4059) so one number covers every
+# lane and a slow finder does not need a per-lane edit. See that module for
+# why it is bounded rather than removed.
+CLAUDE_TIMEOUT_SECONDS = harness_runner.lane_timeout_seconds()
+
+# Passed to the harness subprocess's environment so a stub test binary has an
+# unambiguous, machine-readable place to look -- it never has to parse the
+# free-text prompt to find where to write. The prompt also names the same
+# path directly (see build_prompt) for a real harness, which discovers its
+# own environment via its own Bash tool rather than this module inspecting it.
+STEP_OUTPUT_FILE_ENV = "CFGMS_SECURITY_REVIEW_STEP_OUTPUT_FILE"
+
+# The launcher (`agent-dispatch.sh launch-investigator`) renders one
+# disallowed-tools list into the environment of EVERY investigator container,
+# lane containers included, and plan mode's entrypoint already forwards it
+# (`investigator-entrypoint.sh`: `--disallowedTools "$DISALLOWED_TOOLS"`). Lane
+# mode reads the same variable here so the two modes carry the same control.
+#
+# Lane mode needs it more than plan mode does, not less: a plan prompt is
+# metadata only, whereas `build_prompt` below embeds the full body of every
+# file the plan step names -- untrusted repository source a pull request author
+# controls -- into a prompt run under `--dangerously-skip-permissions`, in a
+# container that has the operator's Claude OAuth session bind-mounted at
+# `~/.claude/.credentials.json`. Without a denylist an instruction injected into
+# a reviewed file would face no tool-level obstacle to reading that session file
+# and handing it to an allowlisted egress domain.
+DISALLOWED_TOOLS_ENV = "CFGMS_INVESTIGATOR_DISALLOWED_TOOLS"
+
+# Denied whether or not the launcher set `DISALLOWED_TOOLS_ENV` -- a standalone
+# or misconfigured invocation must not silently run with no denylist at all.
+# The two hand-reachable exfiltration verbs (`curl`, `wget`) and the two
+# repository-mutating ones (`gh`, `git push`) mirror what the launcher already
+# renders; the editing tools are denied because the lane needs to create one
+# new file, never to modify an existing one. Same caveat the launcher states:
+# a denylist keyed on tool/binary name can never be complete, so this sits on
+# top of the container's default-DROP egress policy and read-only /workspace
+# mount rather than standing in for them.
+LANE_BASELINE_DISALLOWED_TOOLS = (
+    "Bash(curl:*)",
+    "Bash(wget:*)",
+    "Bash(gh:*)",
+    "Bash(git push:*)",
+    "Bash(git commit:*)",
+    "Bash(git branch:*)",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+)
+
+# `Write` is the one tool this lane's contract depends on -- the harness's sole
+# deliverable is the raw findings file it writes to the path named in the
+# prompt -- so it is stripped from the inherited list, which denies it for plan
+# mode (a mode that produces no file at all). Nothing else is stripped.
+LANE_REQUIRED_TOOLS = ("Write",)
+
+
+def resolve_disallowed_tools(env: "dict | None" = None) -> str:
+    """Build the `--disallowedTools` value for a lane harness invocation:
+    the lane baseline, plus every extra entry the launcher rendered into
+    `DISALLOWED_TOOLS_ENV`, minus the tools the lane's own contract requires.
+
+    Order is deterministic (baseline first, then inherited extras in the
+    launcher's order) so the rendered argument is stable and assertable."""
+    environ = os.environ if env is None else env
+    resolved: list = []
+    for entry in list(LANE_BASELINE_DISALLOWED_TOOLS) + environ.get(DISALLOWED_TOOLS_ENV, "").split(","):
+        tool = entry.strip()
+        if not tool or tool in LANE_REQUIRED_TOOLS or tool in resolved:
+            continue
+        resolved.append(tool)
+    return ",".join(resolved)
+
+# The lane runner's own rate-limit/quota-exhaustion signal (terminal_state.py
+# never sniffs this out of prose itself -- recognizing it is explicitly a
+# caller concern, per that module's docstring). A harness has no structured
+# equivalent of a REST 429; this is a best-effort text match over the
+# subprocess's combined stdout+stderr, case-insensitive.
+# Issue #4069: a rate limit must look like a rate limit, not like three digits.
+# The previous markers were bare substrings -- "rate limit", "usage limit",
+# "quota exceeded", "429" -- tested against the harness's COMBINED output, which
+# includes the model's own answer. A security review's answer is precisely the
+# text most likely to contain both: a finding that says an endpoint "has no rate
+# limit", and a stray 429 inside any number. Measured: a finished step was
+# parked because a scanner's timing value, 0.015944957733154297, contains 429.
+#
+# Every alternative below needs a companion word, so a number alone and a
+# finding that merely discusses rate limiting no longer match. A real limit that
+# is phrased differently is missed and the step records a failure instead --
+# visible and retryable, unlike silently discarding a complete review.
+
+
+# Issue #4006: the pinned CLI rejects a model id outside its catalog with this
+# exact marker on every single invocation --
+# `[claude-code:unrecognized_model] {"model":"sonnet-5","query_source":"sdk"}`
+# was the text the first end-to-end run (Issue #3985) had to reproduce by
+# hand to diagnose `--model sonnet-5`. The model id, not any step's content,
+# is what is broken, so `run_lane` treats this marker as a lane-stopping
+# condition rather than one more `harness_exit_<code>` recorded per step.
+_UNRECOGNIZED_MODEL_MARKER = "unrecognized_model"
+
+
+def _looks_like_unrecognized_model(text: str) -> bool:
+    return _UNRECOGNIZED_MODEL_MARKER in text.lower()
+
+
+
+
+
+
+
+
+
+
+
+
+def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
+    """Assemble the full prompt handed to the `claude` harness for one step:
+    the shared preamble -- system prompt, review methodology core, this
+    step's severity anchors, output-schema description
+    (`harness_runner.shared_preamble`, C4, never a second copy), the step's
+    own scope and hypotheses list, every readable
+    file's content, and an explicit, unambiguous instruction naming the one
+    file this harness must write its findings to."""
+    scope = step.get("scope")
+    if isinstance(scope, list):
+        scope_text = ", ".join(scope)
+    elif isinstance(scope, str):
+        scope_text = scope
+    else:
+        scope_text = ""
+    description = step.get("description", "")
+    hypotheses_text = harness_runner.render_hypotheses(step.get("hypotheses") or [])
+    sections = [f"## {path}\n```\n{content}\n```" for path, content in file_contents.items()]
+    body = "\n\n".join(sections)
+    return (
+        f"{harness_runner.shared_preamble(step)}\n\n"
+        f"Write your findings, and only your findings, to exactly this file path "
+        f"and no other: {output_path}\n\n"
+        f"Scope: {scope_text}\n"
+        f"Description: {description}\n\n"
+        f"Hypotheses to investigate (address every one by id in your dispositions array):\n"
+        f"{hypotheses_text}\n\n"
+        f"{body}\n\n"
+        f"{harness_runner.render_scan_evidence(step.get('scan_evidence'))}"
+    )
+
+
+def call_claude_harness(model: str, prompt: str, output_path: str, timeout: float = CLAUDE_TIMEOUT_SECONDS) -> tuple:
+    """Invoke the `claude` harness for one step. Returns `(exit_code,
+    rate_limited, output_tail)` -- `output_tail` (Issue #4008) is the
+    sanitized tail of the subprocess's own combined stdout+stderr, via
+    `harness_runner.sanitize_harness_output_tail`, so a step's envelope can
+    carry it when this call did not end `complete`. A transport-level
+    failure to even launch the subprocess (binary missing, timeout) is
+    folded into a synthetic non-zero exit code rather than propagating -- the
+    caller treats every step independently and must not abort the whole lane
+    over one step's launch failure.
+
+    `--disallowedTools` is always passed (see `resolve_disallowed_tools`): the
+    prompt carries attacker-controllable file bodies, so the tool surface this
+    process grants is a control, not a convenience.
+
+    Issue #4002: the prompt is sent on stdin (`input=prompt`, `-p` with no
+    argv value), never as a trailing argv element. Linux caps a single argv
+    string at MAX_ARG_STRLEN (131072 bytes); a step bundling ~13 files
+    routinely builds a prompt over that (166842 bytes measured for a real
+    `pkg/session` step), and `subprocess.run` raised `OSError(E2BIG)` on that
+    exact prompt before this fix -- folded into the synthetic exit code below
+    like any other launch failure, so it looked like an ordinary harness
+    failure rather than a transport limit."""
+    env = dict(os.environ)
+    env[STEP_OUTPUT_FILE_ENV] = output_path
+    disallowed_tools = resolve_disallowed_tools(env)
+    try:
+        result = subprocess.run(
+            [
+                harness_runner.resolve_harness_binary("claude"),
+                "--dangerously-skip-permissions",
+                "--disallowedTools",
+                disallowed_tools,
+                "--model",
+                model,
+                "-p",
+            ],
+            input=prompt,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        exit_code = result.returncode
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        combined = f"{stdout}\n{stderr}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        exit_code = 1
+        stdout = ""
+        stderr = str(exc)
+        combined = stderr
+    # Issue #4069: keep what a failing call printed. Without this the only
+    # surviving record is a 4,000-character tail, which is not enough to tell a
+    # truncated answer from a refusal from a rate-limit notice rendered as prose.
+    if exit_code != 0 or not os.path.isfile(output_path):
+        harness_runner.write_call_diagnostics(
+            output_path, model, exit_code, prompt, stdout, stderr, timeout
+        )
+    return exit_code, harness_runner.looks_rate_limited(combined), harness_runner.sanitize_harness_output_tail(combined)
+
+
+def _fatal_stop_reason(output_tail: str, model: str) -> "str | None":
+    """Issue #4006: the CLI rejects the configured model id identically on
+    every step, so the lane stops after recording it once rather than spending
+    a harness call per remaining step to learn the same thing."""
+    return f"unrecognized_model:{model}" if _looks_like_unrecognized_model(output_tail) else None
+
+
+LANE_SPEC = harness_runner.LaneSpec(
+    harness="claude",
+    call_harness=call_claude_harness,
+    build_prompt=build_prompt,
+    fatal_stop_reason=_fatal_stop_reason,
+)
+
+
+def run_lane(plan_dir, out_dir, repo_root, lane_id, model, call_harness_fn=None):
+    """This lane's entry into the one shared loop (Issue #4072).
+
+    Everything that used to live here -- step iteration, the per-step guard,
+    the budget split, the repair round, diagnostics, envelope assembly -- is
+    `harness_runner.run_lane`, driven by `LANE_SPEC` above. What remains in
+    this module is what is genuinely this harness's own: how it is invoked,
+    where it is told to put its answer, and the condition that makes further
+    steps pointless."""
+    return harness_runner.run_lane(
+        LANE_SPEC, plan_dir, out_dir, repo_root, lane_id, model,
+        call_harness_fn=call_harness_fn,
+    )
+
+
+def main(argv: "list | None" = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    lane_id = argv[0] if argv else DEFAULT_LANE_ID
+
+    plan_dir = os.environ.get("CFGMS_SECURITY_REVIEW_PLAN_DIR", DEFAULT_PLAN_DIR)
+    out_dir = os.environ.get("CFGMS_SECURITY_REVIEW_OUT_DIR", DEFAULT_OUT_DIR)
+    repo_root = os.environ.get("CFGMS_SECURITY_REVIEW_REPO_ROOT", DEFAULT_REPO_ROOT)
+    model = os.environ.get("CFGMS_SECURITY_REVIEW_MODEL", DEFAULT_MODEL)
+
+    run_lane(plan_dir, out_dir, repo_root, lane_id, model)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

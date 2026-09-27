@@ -35,13 +35,13 @@ never paste raw findings into an issue body.
 
 ## The CLI
 
-`.claude/scripts/security-review.sh` is the whole entry point — a thin host-side orchestrator you
+`.claude/skills/security-review/security-review.sh` is the whole entry point — a thin host-side orchestrator you
 drive through its three verbs, not something to re-implement by hand:
 
 ```bash
-.claude/scripts/security-review.sh launch <ref> [--scope-file <path>] [--path <subtree>]...  # start a new sweep (usually `develop`)
-.claude/scripts/security-review.sh resume <sweep-id> [--scope-file <path>]                    # continue an interrupted or parked sweep
-.claude/scripts/security-review.sh status <sweep-id>                                          # print per-lane x per-step coverage plus the G-2/G-3 plan coverage-gate result, read-only
+.claude/skills/security-review/security-review.sh launch <ref> [--scope-file <path>] [--path <subtree>]...  # start a new sweep (usually `develop`)
+.claude/skills/security-review/security-review.sh resume <sweep-id> [--scope-file <path>]                    # continue an interrupted or parked sweep
+.claude/skills/security-review/security-review.sh status <sweep-id>                                          # print per-lane x per-step coverage plus the G-2/G-3 plan coverage-gate result, read-only
 ```
 
 There is no `report` verb. `launch` and `resume` both run the consolidator themselves and print
@@ -140,12 +140,12 @@ unit at all, `ollama signin` as yourself is correct, exactly as before.
 Every roster entry dispatches through `.claude/scripts/agent-dispatch.sh launch-investigator`
 (Issue #3903): one short-lived, read-only container per lane per invocation — `/workspace`
 bind-mounted `:ro`, writable only in that lane's own `lanes/<lane-id>/` directory, egress
-default-deny behind a per-harness DNS allowlist. `docs/architecture/security-review-harness.md`
+default-deny behind a per-harness DNS allowlist. `.claude/skills/security-review/docs/harness-architecture.md`
 is the full architecture reference if you need more than this summary.
 
 **Plan steps come from three axes (Issue #4056, #4059).** Directory, so every file is looked at
 once. Configuration key, so files that never share a folder but share a setting are looked at
-together. And **scenario** — one step per entry in `docs/security-review/threat-scenarios.md`, which
+together. And **scenario** — one step per entry in `.claude/skills/security-review/docs/threat-scenarios.md`, which
 states the product-level risks a file tree cannot suggest on its own. Coverage over risk is
 structural: a scenario always has a step, so it cannot go unexamined.
 
@@ -153,7 +153,7 @@ A scenario step is the one place the planner picks its own files. Its id is the 
 models' plans line up and can be compared. A scenario with nothing in scope selects nothing and is
 recorded rather than dispatched.
 
-**Scoring a model** uses `docs/security-review/regression-corpus.md`: defects this repository has
+**Scoring a model** uses `.claude/skills/security-review/docs/regression-corpus.md`: defects this repository has
 had, pinned to commits where they are still present. Read that score beside the lanes' closure rate,
 never alone — the corpus rewards finding known defects, closure rate rewards narrow hypotheses, and
 either on its own tunes the harness in the wrong direction.
@@ -185,7 +185,7 @@ CFGMS_SECURITY_REVIEW_ADJUDICATOR=claude:claude-opus-5
 
 After every lane container has exited, `launch`/`resume` hand that model the de-duplicated
 findings — findings only, never source; its container's `/workspace` is an empty directory — in
-the same read-only investigator profile, and it applies `docs/security-review/methodology.md`'s
+the same read-only investigator profile, and it applies `.claude/skills/security-review/docs/methodology.md`'s
 rubric to each finding and assesses cross-step groups. It runs once per sweep, in batches bounded
 by prompt size (at most forty findings each; a group is assessed only when every member fits in
 one batch, otherwise it is reported as not assessed), and it can annotate but never delete: the
@@ -226,7 +226,7 @@ low-confidence, because a candidate dropped inside one lane can never be agreed 
 by another lane — which is the entire value of running independent lanes at all.
 
 Severity and `vuln_class` are calibrated by one shared methodology,
-`docs/security-review/methodology.md` — the CFGMS threat model, the attacker tiers, the four
+`.claude/skills/security-review/docs/methodology.md` — the CFGMS threat model, the attacker tiers, the four
 severity definitions and the worked examples every lane receives in its prompt. Read it before
 triaging a report: a `high` in the report means what that document says it means, for the attacker
 it names.
@@ -238,7 +238,7 @@ prompts the model (Issue #3982): gosec, staticcheck and semgrep for Go; eslint (
 config, never the repo's) and semgrep for TS/TSX; ripgrep for the CLAUDE.md banned patterns in
 shell/PowerShell/Python. The tool output is folded into the prompt after the shared preamble,
 labelled as untrusted evidence. No model chooses these commands — the registry is
-`.claude/scripts/security-review/lanes/scan_profiles.py`, every argv runs with no shell, every
+`.claude/skills/security-review/lanes/scan_profiles.py`, every argv runs with no shell, every
 path is confined to the snapshot, and no scanner has network access.
 
 A scan that did not happen is never silent. Each step envelope carries a `scans` list: one entry
