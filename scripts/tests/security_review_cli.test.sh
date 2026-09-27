@@ -638,6 +638,15 @@ else
   # resume.py and schema.py all run for real.
   var_name="STUB_OUTCOME_$(printf '%s' "$mode" | tr 'a-z-' 'A-Z_')"
   outcome="${!var_name:-complete}"
+  # On Windows, a hop through a native process (adjudicate.py launching
+  # agent-dispatch.sh, Issue #3984) hands this stub STUB_CLAUDE_BIN_DIR
+  # rewritten as a drive-letter path -- MSYS converts POSIX-looking
+  # environment values for native children and never converts them back.
+  # Prepended as-is, its "C:" splits the colon-separated PATH, the stub
+  # directory drops out, and the lane runs whatever real `claude` is
+  # installed instead (Issue #4198). cygpath exists only under MSYS/Cygwin.
+  stub_claude_bin="$STUB_CLAUDE_BIN_DIR"
+  if command -v cygpath >/dev/null 2>&1; then stub_claude_bin="$(cygpath -u "$stub_claude_bin")"; fi
   STUB_CLAUDE_OUTCOME="$outcome" \
   CFGMS_SECURITY_REVIEW_PLAN_DIR="$plan_dir" \
   CFGMS_SECURITY_REVIEW_OUT_DIR="$out_dir" \
@@ -646,7 +655,7 @@ else
   CFGMS_SECURITY_REVIEW_HARNESS="$harness" \
   CFGMS_SECURITY_REVIEW_HARNESS_DIR="${harness_dir:-/opt/cfgms-harness/security-review}" \
   CFGMS_SECURITY_REVIEW_METHODOLOGY="${methodology_dir:+${methodology_dir}/methodology.md}" \
-  PATH="${STUB_CLAUDE_BIN_DIR}:${PATH}" \
+  PATH="${stub_claude_bin}:${PATH}" \
   python3 "$entrypoint_path" "$mode" >>"${LANE_RUN_LOG:-/dev/null}" 2>&1 || true
 fi
 
@@ -1687,7 +1696,10 @@ out_dir=""
 plan_dir=""
 repo_root=""
 entrypoint_path=""
+harness_dir=""
+methodology_dir=""
 model=""
+harness=""
 cname=""
 for i in "${!args[@]}"; do
   a="${args[$i]}"
@@ -1696,7 +1708,18 @@ for i in "${!args[@]}"; do
     *:/workspace-plan:ro) plan_dir="${a%:/workspace-plan:ro}" ;;
     *:/workspace:ro) repo_root="${a%:/workspace:ro}" ;;
     *:/usr/local/bin/investigator-lane-entrypoint.py:ro) entrypoint_path="${a%:/usr/local/bin/investigator-lane-entrypoint.py:ro}" ;;
+    # The trusted harness and methodology mounts (Issue #3982), forwarded
+    # exactly as the shared FAKEBIN stub above does. Without them the lane
+    # falls back to importing its siblings out of the /workspace snapshot,
+    # and on Windows -- where NTFS ignores the POSIX write bits
+    # snapshot.py strips from directories -- the interpreter then writes
+    # __pycache__/*.pyc INTO the snapshot, which resume's byte-for-byte
+    # verify_snapshot() rightly rejects as content not in the commit tree
+    # (Issue #4198). The real container mounts both read-only.
+    *:/opt/cfgms-harness/security-review:ro) harness_dir="${a%:/opt/cfgms-harness/security-review:ro}" ;;
+    *:/opt/cfgms-harness/docs/security-review:ro) methodology_dir="${a%:/opt/cfgms-harness/docs/security-review:ro}" ;;
     CFGMS_SECURITY_REVIEW_MODEL=*) model="${a#CFGMS_SECURITY_REVIEW_MODEL=}" ;;
+    CFGMS_SECURITY_REVIEW_HARNESS=*) harness="${a#CFGMS_SECURITY_REVIEW_HARNESS=}" ;;
   esac
   [[ "$a" == "--name" ]] && cname="${args[$((i+1))]}"
 done
@@ -1747,12 +1770,24 @@ else
   # REAL lane execution (Issue #3934), same as the shared FAKEBIN stub above.
   var_name="STUB_OUTCOME_$(printf '%s' "$mode" | tr 'a-z-' 'A-Z_')"
   outcome="${!var_name:-complete}"
+  # On Windows, a hop through a native process (adjudicate.py launching
+  # agent-dispatch.sh, Issue #3984) hands this stub STUB_CLAUDE_BIN_DIR
+  # rewritten as a drive-letter path -- MSYS converts POSIX-looking
+  # environment values for native children and never converts them back.
+  # Prepended as-is, its "C:" splits the colon-separated PATH, the stub
+  # directory drops out, and the lane runs whatever real `claude` is
+  # installed instead (Issue #4198). cygpath exists only under MSYS/Cygwin.
+  stub_claude_bin="$STUB_CLAUDE_BIN_DIR"
+  if command -v cygpath >/dev/null 2>&1; then stub_claude_bin="$(cygpath -u "$stub_claude_bin")"; fi
   STUB_CLAUDE_OUTCOME="$outcome" \
   CFGMS_SECURITY_REVIEW_PLAN_DIR="$plan_dir" \
   CFGMS_SECURITY_REVIEW_OUT_DIR="$out_dir" \
   CFGMS_SECURITY_REVIEW_REPO_ROOT="$repo_root" \
   CFGMS_SECURITY_REVIEW_MODEL="$model" \
-  PATH="${STUB_CLAUDE_BIN_DIR}:${PATH}" \
+  CFGMS_SECURITY_REVIEW_HARNESS="$harness" \
+  CFGMS_SECURITY_REVIEW_HARNESS_DIR="${harness_dir:-/opt/cfgms-harness/security-review}" \
+  CFGMS_SECURITY_REVIEW_METHODOLOGY="${methodology_dir:+${methodology_dir}/methodology.md}" \
+  PATH="${stub_claude_bin}:${PATH}" \
   python3 "$entrypoint_path" "$mode" >>"${LANE_RUN_LOG:-/dev/null}" 2>&1 || true
 fi
 
@@ -1800,6 +1835,12 @@ if find "$STATE_DIR2" -name '*.state' -print -quit 2>/dev/null | grep -q .; then
 else
   bad "at least one investigator container is on record as exited after launch (no --rm)" "no state files found"
 fi
+# The lanes above must not have written anything into the pinned snapshot --
+# resume below re-verifies it byte-for-byte and refuses on any extra file.
+# On Windows this caught the stub importing harness modules out of the
+# snapshot and leaving __pycache__ behind in it (Issue #4198).
+snapshot_pycache="$(find "${SWEEP_DIR_4}/snapshot" -name '__pycache__' -print 2>/dev/null || true)"
+check_eq "launch left no __pycache__ inside the pinned snapshot (resume re-verifies it byte-for-byte)" "$snapshot_pycache" ""
 
 # Simulate an interrupted sweep: drop step-002's result for every lane. Every
 # investigator container from the launch above is still on record as
@@ -2178,8 +2219,13 @@ check_contains "both planner containers were dispatched (claude-model-b)" "$(cat
 # claude-model-b (launched second) is free to exit immediately; give it a
 # moment, then confirm it really has while claude-model-a (launched first)
 # is still held open by this test.
+#
+# The existence test must go through compgen -G: `[[ -f dir/exited-* ]]`
+# performs no pathname expansion, so it tests for a file literally named
+# "exited-cid-claude-model-b-*", never finds one, and the loop always spun the
+# full 20s deadline even when model-b had exited long before (Issue #4198).
 mp_deadline=$((SECONDS + 20))
-while [[ ! -f "${MP_SANDBOX}"/exited-cid-claude-model-b-* ]] && [[ $SECONDS -lt $mp_deadline ]]; do
+while [[ -z "$(compgen -G "${MP_SANDBOX}/exited-cid-claude-model-b-*")" ]] && [[ $SECONDS -lt $mp_deadline ]]; do
   sleep 0.05
 done
 mp_model_b_exited=0; [[ -n "$(compgen -G "${MP_SANDBOX}/exited-cid-claude-model-b-*")" ]] && mp_model_b_exited=1
@@ -2351,7 +2397,11 @@ check_eq "exactly one adjudicator container was dispatched" "$adj_call_count" "1
 check_contains "adjudicator container runs lane mode under the adjudicator lane id" "$adj_call" "CFGMS_SECURITY_REVIEW_LANE_ID=adjudicator"
 check_contains "adjudicator container carries the configured harness" "$adj_call" "CFGMS_SECURITY_REVIEW_HARNESS=claude"
 check_contains "adjudicator container carries the configured model" "$adj_call" "CFGMS_SECURITY_REVIEW_MODEL=judge"
-check_contains "adjudicator container mounts the real adjudicator.py as its lane entrypoint" "$adj_call" "${SECURITY_REVIEW_DIR}/lanes/adjudicator.py:/usr/local/bin/investigator-lane-entrypoint.py:ro"
+# adjudicate.py builds the entrypoint path with Path(__file__).resolve(), so
+# the expected value is resolved the same way: identical to the bash path on
+# Linux, a native drive-letter path on Windows (Issue #4198).
+adj_entrypoint_expected="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${SECURITY_REVIEW_DIR}/lanes/adjudicator.py" | tr -d '\r')"
+check_contains "adjudicator container mounts the real adjudicator.py as its lane entrypoint" "$adj_call" "${adj_entrypoint_expected}:/usr/local/bin/investigator-lane-entrypoint.py:ro"
 check_contains "adjudicator's /workspace mount is the adjudication sub-sweep's own snapshot" "$adj_call" "${SWEEP_DIR_ADJ}/adjudication/snapshot:/workspace:ro"
 if [[ -d "${SWEEP_DIR_ADJ}/adjudication/snapshot" ]] && [[ -z "$(ls -A "${SWEEP_DIR_ADJ}/adjudication/snapshot")" ]]; then
   ok "the snapshot mounted at the adjudicator's /workspace is EMPTY (findings only, never source)"

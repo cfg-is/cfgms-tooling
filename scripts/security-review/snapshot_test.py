@@ -207,6 +207,61 @@ def test_verify_snapshot_detects_deleted_file():
         )
 
 
+def test_hash_objects_matches_per_file_hash_object():
+    # verify_snapshot() hashes every file through ONE `git hash-object
+    # --stdin-paths` process (Issue #4198); each digest must be exactly what
+    # a per-file `git hash-object` gives, in input order -- a reordering or
+    # an off-by-one would pair a file with another file's digest.
+    with tempfile.TemporaryDirectory() as base:
+        paths = []
+        for i, content in enumerate(["alpha\n", "beta\n", "", "gamma with spaces\n", "alpha\n"]):
+            name = "file with space.txt" if i == 3 else f"f{i}.txt"
+            full = os.path.join(base, name)
+            with open(full, "w", newline="") as f:
+                f.write(content)
+            paths.append(full)
+        # A newline in a filename would split the --stdin-paths stream; such a
+        # path must be hashed on its own. NTFS forbids the character, so this
+        # half of the case only runs where the filesystem allows it.
+        try:
+            odd = os.path.join(base, "odd\nname.txt")
+            with open(odd, "w", newline="") as f:
+                f.write("odd\n")
+            paths.insert(2, odd)
+        except OSError:
+            print("  [N/A] filesystem does not allow a newline in a filename")
+
+        batched = snapshot._hash_objects(paths)
+        per_file = [snapshot._hash_object(p) for p in paths]
+        check(batched == per_file, "_hash_objects: batched digests equal per-file git hash-object, in order", f"{batched} != {per_file}")
+        check(snapshot._hash_objects([]) == [], "_hash_objects: an empty path list hashes nothing")
+
+
+def test_verify_snapshot_detects_tampered_file_among_many():
+    # The batched hash must still attribute a content mismatch to the right
+    # path when the tampered file sits in the middle of a larger tree.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
+        init_repo(repo)
+        for i in range(20):
+            write_file(repo, f"d{i % 3}/f{i:02d}.txt", f"content {i}\n")
+        sha = commit_all(repo, "init")
+
+        dest = os.path.join(base, "snap")
+        snapshot.create_snapshot(sha, repo, dest)
+
+        target = os.path.join(dest, "d1", "f10.txt")
+        os.chmod(target, os.stat(target).st_mode | stat.S_IWUSR)
+        with open(target, "w") as f:
+            f.write("tampered\n")
+
+        mismatches = snapshot.verify_snapshot(dest, sha, repo)
+        check(
+            mismatches == ["content mismatch: d1/f10.txt"],
+            "verify_snapshot: exactly the tampered file is reported among 20",
+            str(mismatches),
+        )
+
+
 def test_create_snapshot_raises_on_unresolvable_commit():
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
         init_repo(repo)

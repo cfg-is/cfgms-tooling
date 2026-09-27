@@ -231,6 +231,44 @@ def _hash_object(path: str) -> str:
     return result.stdout.strip()
 
 
+def _hash_objects(paths: list[str]) -> list[str]:
+    """`git hash-object` for every path, in order, from ONE process via
+    `--stdin-paths` -- the same command, filters and working directory as
+    `_hash_object`, so the digests are identical. One spawn per file was the
+    single largest cost of a verify on Windows, where process creation is
+    expensive (a ~230-file tree: 7.3s per-file vs 0.09s batched, Issue #4198).
+    `--stdin-paths` is newline-delimited, so a path containing a newline or
+    carriage return is hashed on its own instead of being split."""
+    digests: dict[int, str] = {}
+    batch: list[int] = []
+    for i, p in enumerate(paths):
+        if "\n" in p or "\r" in p:
+            digests[i] = _hash_object(p)
+        else:
+            batch.append(i)
+    if batch:
+        try:
+            result = subprocess.run(
+                ["git", "hash-object", "--stdin-paths"],
+                input="".join(paths[i] + "\n" for i in batch),
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SnapshotError(f"`git hash-object --stdin-paths` failed: {exc}") from exc
+        lines = result.stdout.split()
+        if len(lines) != len(batch):
+            raise SnapshotError(
+                f"`git hash-object --stdin-paths` returned {len(lines)} digests "
+                f"for {len(batch)} paths"
+            )
+        for i, digest in zip(batch, lines):
+            digests[i] = digest
+    return [digests[i] for i in range(len(paths))]
+
+
 def verify_snapshot(dest_dir: str, commit_sha: str, repo_root: str) -> list[str]:
     """Compare `dest_dir`'s actual file contents against `commit_sha`'s tree
     in `repo_root`. Returns a list of human-readable mismatch descriptions --
@@ -247,8 +285,9 @@ def verify_snapshot(dest_dir: str, commit_sha: str, repo_root: str) -> list[str]
     for path in sorted(snapshot_paths - tree_paths):
         mismatches.append(f"unexpected in snapshot (not in commit tree): {path}")
 
-    for path in sorted(tree_paths & snapshot_paths):
-        actual_sha = _hash_object(os.path.join(dest_dir, path))
+    common = sorted(tree_paths & snapshot_paths)
+    actual_shas = _hash_objects([os.path.join(dest_dir, path) for path in common])
+    for path, actual_sha in zip(common, actual_shas):
         if actual_sha != tree_blobs[path]:
             mismatches.append(f"content mismatch: {path}")
 
