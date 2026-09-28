@@ -636,5 +636,65 @@ class TestScopeCorpusDifferential(unittest.TestCase):
         )
 
 
+class TestSqlExtension(unittest.TestCase):
+    """Issue #4323: `sql` was absent from the extension alternation, so a SQL
+    migration declared in `## Files In Scope` was silently dropped from
+    `files_parsed` -- invisible to both conflict detection and coverage
+    checking."""
+
+    def test_migration_path_parses_into_files_parsed(self):
+        section = (
+            "- `pkg/storage/providers/database/migrations/004_add_sessions_stewards_commands.sql` "
+            "— add the RLS policy.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            ["pkg/storage/providers/database/migrations/004_add_sessions_stewards_commands.sql"],
+        )
+
+    def test_migration_path_with_trailing_line_reference_parses_to_same_path(self):
+        section = (
+            "- `pkg/storage/providers/database/migrations/004_add_sessions_stewards_commands.sql:52` "
+            "— add the RLS policy.\n"
+        )
+        self.assertEqual(
+            scope(section),
+            ["pkg/storage/providers/database/migrations/004_add_sessions_stewards_commands.sql"],
+        )
+
+    def test_bare_sql_word_in_prose_is_not_captured_as_a_path(self):
+        # Over-extraction guard: a bare word ending in `.sql` with no path
+        # shape (no directory component) must not be captured, same as any
+        # other extension already on the list.
+        self.assertEqual(
+            scope("This story adds a new schema.sql to the repo root."),
+            [],
+        )
+
+    def test_two_stories_declaring_the_same_migration_are_reported_as_overlapping(self):
+        migration = "pkg/storage/providers/database/migrations/004_add_sessions_stewards_commands.sql"
+        story_a = PF.parse_story(story(f"- `{migration}` — add the RLS policy.", number=4401))
+        story_b = PF.parse_story(story(f"- `{migration}` — add an index.", number=4402))
+        shared = set(story_a["files_parsed"]) & set(story_b["files_parsed"])
+        self.assertEqual(shared, {migration})
+
+
+class TestTxtExtension(unittest.TestCase):
+    """Issue #4323 audit: `txt` was hit in practice the same way as `sql` -- a
+    story declaring a plain-text allowlist had that path silently dropped."""
+
+    def test_txt_path_parses_into_files_parsed(self):
+        self.assertEqual(
+            scope("- `.devcontainer/scanner/semgrep-requirements.txt` — pin the new rule set.\n"),
+            [".devcontainer/scanner/semgrep-requirements.txt"],
+        )
+
+    def test_txt_path_with_trailing_line_reference_parses_to_same_path(self):
+        self.assertEqual(
+            scope("- `.devcontainer/scanner/semgrep-requirements.txt:12` — pin the new rule set.\n"),
+            [".devcontainer/scanner/semgrep-requirements.txt"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

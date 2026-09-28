@@ -46,13 +46,26 @@ ISSUE_NUM_RE = re.compile(r"#(\d+)")
 # edge; without this the parser extracted nothing and the dependency vanished
 # rather than holding. Matched only inside the Dependencies section.
 DRAFT_ITEM_RE = re.compile(r"\b(PVTI_[A-Za-z0-9_-]{8,})\b")
+#: File extensions a `## Files In Scope` declaration may carry, shared by
+#: BACKTICK_PATH_RE, BARE_PATH_RE and LINE_SUFFIX_RE below. A single source of
+#: truth so a future extension is added once and recognized everywhere, rather
+#: than being added to one regex and silently missed in the other two (Issue
+#: #4323 -- `sql` and `txt` were both dropped this way: a story declaring a SQL
+#: migration under `pkg/storage/providers/database/migrations/` and a story
+#: declaring a plain-text allowlist both had those paths silently excluded from
+#: `files_parsed`).
+SCOPE_PATH_EXTENSIONS = (
+    "go", "md", "proto", "sh", "yaml", "yml", "json", "toml", "ts", "tsx",
+    "ps1", "wxs", "py", "mod", "sum", "sql", "txt",
+)
+_SCOPE_EXT_ALTERNATION = "|".join(SCOPE_PATH_EXTENSIONS)
 BACKTICK_PATH_RE = re.compile(
-    r"`((?:[^`\n]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum))"
+    r"`((?:[^`\n]+\.(?:" + _SCOPE_EXT_ALTERNATION + r"))"
     r"|(?:[a-zA-Z0-9_./-]*/)?(?:Makefile|Dockerfile(?:\.[\w-]+)?|\.nancy-ignore))`"
 )
 BARE_PATH_RE = re.compile(
     r"(?:^|[\s(\[])"
-    r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum))"
+    r"([a-zA-Z0-9_./-]+/[a-zA-Z0-9_./-]+\.(?:" + _SCOPE_EXT_ALTERNATION + r"))"
 )
 #: A path may be written with the line it refers to (`handlers.go:114`, or a
 #: `:114-126` range). Both PATH regexes above end at the extension, so the colon
@@ -62,7 +75,7 @@ BARE_PATH_RE = re.compile(
 #: Covers extensionless names too (`Dockerfile:155`), which the PATH regexes match
 #: only when the name ends the reference.
 LINE_SUFFIX_RE = re.compile(
-    r"(\.(?:go|md|proto|sh|yaml|yml|json|toml|ts|tsx|ps1|wxs|py|mod|sum)"
+    r"(\.(?:" + _SCOPE_EXT_ALTERNATION + r")"
     r"|Makefile|Dockerfile(?:\.[\w-]+)?|\.nancy-ignore):\d+(?:-\d+)?"
 )
 
