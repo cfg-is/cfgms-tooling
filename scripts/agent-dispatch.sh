@@ -1493,12 +1493,28 @@ cleanup_pr_container_should_reap() {
 # its own git work tree, has no uncommitted or untracked files, no stash, and a
 # HEAD that some remote-tracking ref already contains. Every "could not tell"
 # (not a repo, git error, no HEAD) is false -- unknown is kept, never deleted.
+#
+# Files the dispatcher itself writes into a clone are not the agent's work, so
+# an untracked entry for exactly one of them, at the clone's top level, does
+# not count (Issue #4362). Without that, every review clone -- which always
+# carries REVIEW_PROMPT_FILE -- was kept as dirty forever.
+REVIEW_PROMPT_FILE=".acceptance-review-prompt.md"
+DISPATCH_CLONE_ARTIFACTS=("$REVIEW_PROMPT_FILE")
+
 clone_safe_to_discard() {
-  local dir="$1" top
+  local dir="$1" top status line artifact own
   top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
   [[ "$(cd "$top" && pwd -P)" == "$(cd "$dir" && pwd -P)" ]] || return 1
   git -C "$dir" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 1
-  [[ -z "$(git -C "$dir" status --porcelain 2>/dev/null || echo unknown)" ]] || return 1
+  status=$(git -C "$dir" status --porcelain 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    own=false
+    for artifact in "${DISPATCH_CLONE_ARTIFACTS[@]}"; do
+      [[ "$line" == "?? ${artifact}" ]] && own=true
+    done
+    $own || return 1
+  done <<< "$status"
   [[ -z "$(git -C "$dir" stash list 2>/dev/null || echo unknown)" ]] || return 1
   [[ -n "$(git -C "$dir" for-each-ref --contains HEAD refs/remotes 2>/dev/null)" ]] || return 1
   return 0
@@ -2924,7 +2940,7 @@ for i in items:
     # review-entrypoint.sh reads it and hands off to claude -p.
     if $is_item_branch; then
       # Item-branch prompt: story:0, cleanup via item_id (no linked issue to close).
-      cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
+      cat > "${clone_dir}/${REVIEW_PROMPT_FILE}" <<PROMPT_EOF
 You are operating as the Acceptance Reviewer agent for CFGMS.
 
 Your assignment: pr:${pr_num} story:0 --project-item ${item_id}
@@ -2950,7 +2966,7 @@ agent definition. Then take exactly ONE of these closing actions:
 PROMPT_EOF
     else
       # Story-branch prompt: includes issue closing and story cleanup.
-      cat > "${clone_dir}/.acceptance-review-prompt.md" <<PROMPT_EOF
+      cat > "${clone_dir}/${REVIEW_PROMPT_FILE}" <<PROMPT_EOF
 You are operating as the Acceptance Reviewer agent for CFGMS.
 
 Your assignment: pr:${pr_num} story:${story_num} --project-item ${item_id}

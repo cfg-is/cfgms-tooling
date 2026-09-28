@@ -133,7 +133,7 @@ mk_clone() {
     "${GIT[@]}" clone --quiet "$ORIGIN" "$d" 2>/dev/null
     case "$state" in
       untracked) : > "${d}/new-file" ;;
-      modified)  printf 'x\n' > "${d}/tracked"; "${GIT[@]}" -C "$d" add tracked
+      modified)  printf '%s\n' "$name" > "${d}/tracked"; "${GIT[@]}" -C "$d" add tracked
                  "${GIT[@]}" -C "$d" commit --quiet -m t; "${GIT[@]}" -C "$d" push --quiet origin HEAD:main
                  printf 'y\n' > "${d}/tracked" ;;
       unpushed)  "${GIT[@]}" -C "$d" commit --quiet --allow-empty -m local-only ;;
@@ -198,6 +198,41 @@ for keep in review-pr-502 pr-fix-503 story-504 story-505 story-506 story-507 res
 done
 grep -qxF "ORPHAN_KEPT:${WT}/story-506:dirty" <<< "$out" && ok "dirty orphan reported for salvage" || bad "dirty orphan reported for salvage" "$out"
 grep -qxF "ORPHAN_CLONES_DONE:cleaned=1:kept=6" <<< "$out" && ok "summary counts" || bad "summary counts" "$out"
+
+printf '\n== orphan clones: the dispatcher'"'"'s own prompt file is not unsaved work (#4362) ==\n'
+# Every review clone carries REVIEW_PROMPT_FILE, written by the dispatcher, so
+# counting it as dirty kept every review orphan forever. Only that exact
+# top-level untracked entry is ignored; anything beside or behind it still keeps.
+mk_clone review-pr-511 clean old
+: > "${WT}/review-pr-511/${REVIEW_PROMPT_FILE}"
+mk_clone review-pr-512 clean old
+: > "${WT}/review-pr-512/${REVIEW_PROMPT_FILE}"; : > "${WT}/review-pr-512/notes.txt"
+mk_clone review-pr-513 clean old
+mkdir -p "${WT}/review-pr-513/sub"; : > "${WT}/review-pr-513/sub/${REVIEW_PROMPT_FILE}"
+mk_clone review-pr-514 modified old
+: > "${WT}/review-pr-514/${REVIEW_PROMPT_FILE}"
+for d in 511 512 513 514; do touch -d "@$((NOW - GRACE - 60))" "${WT}/review-pr-${d}"; done
+decides "prompt file alone does not make a clone dirty"  review-pr-511 "" "reap review 511"
+decides "prompt file plus another untracked file keeps"   review-pr-512 "" "keep dirty"
+decides "same-named file in a subdirectory keeps"         review-pr-513 "" "keep dirty"
+decides "prompt file beside a modified tracked file keeps" review-pr-514 "" "keep dirty"
+# A tracked file that happens to share the name is the agent's content once
+# modified. Commit it upstream last: every later clone would carry it.
+mk_clone review-pr-515 clean old
+printf 'v1\n' > "${WT}/review-pr-515/${REVIEW_PROMPT_FILE}"
+"${GIT[@]}" -C "${WT}/review-pr-515" add "$REVIEW_PROMPT_FILE"
+"${GIT[@]}" -C "${WT}/review-pr-515" commit --quiet -m prompt
+"${GIT[@]}" -C "${WT}/review-pr-515" push --quiet origin HEAD:main
+printf 'v2\n' > "${WT}/review-pr-515/${REVIEW_PROMPT_FILE}"
+touch -d "@$((NOW - GRACE - 60))" "${WT}/review-pr-515"
+decides "modified TRACKED file of that name keeps"        review-pr-515 "" "keep dirty"
+writers=$(grep -c 'cat > "${clone_dir}/${REVIEW_PROMPT_FILE}"' "$DISPATCH" || true)
+literals=$(grep -c 'clone_dir}/\.acceptance-review-prompt\.md' "$DISPATCH" || true)
+if [[ "$writers" -eq 2 && "$literals" -eq 0 ]]; then
+  ok "both prompt writers use REVIEW_PROMPT_FILE (no drift-prone literal)"
+else
+  bad "both prompt writers use REVIEW_PROMPT_FILE (no drift-prone literal)" "writers=${writers} literals=${literals}"
+fi
 
 printf '\n== orphan clones: a failed container listing reaps nothing ==\n'
 # A daemon that is down makes `docker ps` exit non-zero with no names on
