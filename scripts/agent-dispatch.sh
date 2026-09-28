@@ -1426,20 +1426,43 @@ cleanup_reap_reason() {
 #
 # Adding a class here is how a new container kind gets coverage. A bare regex
 # with an else-continue is how it silently loses it -- which is the whole bug.
+#
+# The classes live in one table, CLEANUP_CLASSES, so that both directions of the
+# mapping -- container name -> clone (here) and clone -> container name
+# (cleanup_clone_owner, Issue #4358) -- come from the same rows. Each row is
+# "<class>|<clone prefix>|<container name prefix>"; the number follows both.
+CLEANUP_CLASSES=(
+  "story|story|cfg-agent-"
+  "fix-pr|pr-fix|cfg-agent-pr-fix-"
+  "resolve-conflict|resolve-conflict|cfg-agent-resolve-conflict-"
+  "review|review-pr|cfg-agent-review-pr-"
+)
+
 cleanup_container_class() {
-  local name="$1"
-  if [[ "$name" =~ ^cfg-agent-([0-9]+)$ ]]; then
-    printf 'story\tstory\t%s\n' "${BASH_REMATCH[1]}"; return 0
-  fi
-  if [[ "$name" =~ ^cfg-agent-pr-fix-([0-9]+)$ ]]; then
-    printf 'fix-pr\tpr-fix\t%s\n' "${BASH_REMATCH[1]}"; return 0
-  fi
-  if [[ "$name" =~ ^cfg-agent-resolve-conflict-([0-9]+)$ ]]; then
-    printf 'resolve-conflict\tresolve-conflict\t%s\n' "${BASH_REMATCH[1]}"; return 0
-  fi
-  if [[ "$name" =~ ^cfg-agent-review-pr-([0-9]+)$ ]]; then
-    printf 'review\treview-pr\t%s\n' "${BASH_REMATCH[1]}"; return 0
-  fi
+  local name="$1" row class clone_prefix cname_prefix
+  for row in "${CLEANUP_CLASSES[@]}"; do
+    IFS='|' read -r class clone_prefix cname_prefix <<< "$row"
+    if [[ "$name" =~ ^${cname_prefix}([0-9]+)$ ]]; then
+      printf '%s\t%s\t%s\n' "$class" "$clone_prefix" "${BASH_REMATCH[1]}"; return 0
+    fi
+  done
+  return 1
+}
+
+# cleanup_clone_owner <clone dir basename>
+# Inverse of cleanup_container_class: prints "<class>\t<container name>\t<num>"
+# for a clone directory a reaper owns, or returns 1 for any other name (po-live,
+# anything hand-made). Driven by the same CLEANUP_CLASSES rows, so a class added
+# there gets orphan-clone coverage without a second list to keep in step.
+cleanup_clone_owner() {
+  local dir="$1" row class clone_prefix cname_prefix
+  for row in "${CLEANUP_CLASSES[@]}"; do
+    IFS='|' read -r class clone_prefix cname_prefix <<< "$row"
+    if [[ "$dir" =~ ^${clone_prefix}-([0-9]+)$ ]]; then
+      printf '%s\t%s%s\t%s\n' "$class" "$cname_prefix" "${BASH_REMATCH[1]}" "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -1463,6 +1486,112 @@ cleanup_pr_container_should_reap() {
   [[ "$finished_ts" -gt 0 ]] || return 1
   (( now_ts - finished_ts >= max_age )) || return 1
   return 0
+}
+
+# clone_safe_to_discard <clone dir>
+# True only when the clone provably holds nothing that exists nowhere else: it is
+# its own git work tree, has no uncommitted or untracked files, no stash, and a
+# HEAD that some remote-tracking ref already contains. Every "could not tell"
+# (not a repo, git error, no HEAD) is false -- unknown is kept, never deleted.
+clone_safe_to_discard() {
+  local dir="$1" top
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [[ "$(cd "$top" && pwd -P)" == "$(cd "$dir" && pwd -P)" ]] || return 1
+  git -C "$dir" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 1
+  [[ -z "$(git -C "$dir" status --porcelain 2>/dev/null || echo unknown)" ]] || return 1
+  [[ -z "$(git -C "$dir" stash list 2>/dev/null || echo unknown)" ]] || return 1
+  [[ -n "$(git -C "$dir" for-each-ref --contains HEAD refs/remotes 2>/dev/null)" ]] || return 1
+  return 0
+}
+
+# orphan_clone_decision <clone dir> <container names, newline-separated> <now_ts> <grace_s>
+# Decides what the orphan-clone reap does with one directory under WORKTREE_BASE
+# (Issue #4358). Prints exactly one tab-separated line:
+#   ignore                    -- not an agent clone, or its container exists
+#   keep  <reason>            -- an orphan, but not provably safe to delete yet
+#   reap  <class>  <num>      -- an orphan past the grace window with nothing unsaved
+#
+# Why this exists: every other reaper starts from a container and deletes the
+# clone that matches it. Once the container is gone first (removed by hand, by a
+# re-dispatch, by a reap that died between its two rm calls) the clone was owned
+# by nothing, so POs improvised a raw `rm -rf` on WORKTREE_BASE and sat on the
+# permission prompt it needs. Measured 2026-09-28: eight such clones, the oldest
+# twelve days, across the review, fix and resolve-conflict classes.
+#
+# A container in ANY state keeps its clone: its own reaper owns that pair. The
+# grace window is measured from the clone's mtime, the only clock a clone
+# without a container still has.
+orphan_clone_decision() {
+  local dir="$1" names="$2" now_ts="$3" grace="$4" owner class cname num mtime
+  owner=$(cleanup_clone_owner "$(basename "$dir")") || { printf 'ignore\n'; return 0; }
+  IFS=$'\t' read -r class cname num <<< "$owner"
+  if grep -qxF -- "$cname" <<< "$names"; then
+    printf 'ignore\n'; return 0
+  fi
+  mtime=$(stat -c %Y "$dir" 2>/dev/null) || mtime=""
+  if [[ ! "$mtime" =~ ^[0-9]+$ ]]; then
+    printf 'keep\tmtime_unknown\n'; return 0
+  fi
+  if (( now_ts - mtime < grace )); then
+    printf 'keep\twithin_grace\n'; return 0
+  fi
+  if ! clone_safe_to_discard "$dir"; then
+    printf 'keep\tdirty\n'; return 0
+  fi
+  printf 'reap\t%s\t%s\n' "$class" "$num"
+}
+
+# reap_orphan_clones <worktree base> <container names, newline-separated> <now_ts> <grace_s>
+# Applies orphan_clone_decision to every directory directly under the base.
+# The caller supplies the container names and must NOT call this when it could
+# not list them: an empty list means "no containers exist", so a failed listing
+# passed in as empty would make every clone look orphaned.
+reap_orphan_clones() {
+  local base="$1" names="$2" now_ts="$3" grace="$4"
+  local dir decision action reason class num reaped=0 kept=0
+  for dir in "$base"/*/; do
+    dir="${dir%/}"
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    decision=$(orphan_clone_decision "$dir" "$names" "$now_ts" "$grace")
+    IFS=$'\t' read -r action reason num <<< "$decision"
+    case "$action" in
+      keep)
+        echo "ORPHAN_KEPT:${dir}:${reason}"
+        kept=$((kept + 1))
+        ;;
+      reap)
+        class="$reason"
+        # Same credential handling the container-driven reapers apply to
+        # these classes; fix and resolve-conflict agents never get one.
+        case "$class" in
+          story)  revoke_agent_creds "$num" || true
+                  rm -rf "${AGENT_CRED_BASE:?}/${num}" 2>/dev/null || true ;;
+          review) revoke_agent_creds "review-pr-${num}" || true
+                  rm -rf "${AGENT_CRED_BASE:?}/review-pr-${num}" 2>/dev/null || true ;;
+        esac
+        if rm -rf "$dir"; then
+          echo "CLEANED:orphan-clone:${dir}"
+          reaped=$((reaped + 1))
+        fi
+        ;;
+    esac
+  done
+  echo "ORPHAN_CLONES_DONE:cleaned=${reaped}:kept=${kept}"
+}
+
+# orphan_clone_pass <worktree base> <now_ts> <grace_s>
+# The cleanup-stale entry point. Lists EVERY container, not only labelled ones:
+# any container holding the name keeps the clone. If the listing fails -- daemon
+# down, docker missing -- nothing is reaped and the skip is reported, because a
+# failed listing is not the same as "no containers exist".
+orphan_clone_pass() {
+  local base="$1" now_ts="$2" grace="$3" names
+  [[ -d "$base" ]] || return 0
+  if ! names=$(docker ps -a --format '{{.Names}}' 2>/dev/null); then
+    echo "ORPHAN_CLONES_SKIPPED:docker_ps_failed"
+    return 0
+  fi
+  reap_orphan_clones "$base" "$names" "$now_ts" "$grace"
 }
 
 # Guard so po-act.sh can `source` this file to reuse prepare_session_dir and
@@ -3834,6 +3963,14 @@ PY
       cleaned=$((cleaned + 1))
     done < <(docker ps -a --filter "label=cfg-agent=true" \
                --filter "status=exited" --format '{{.Names}}' 2>/dev/null || true)
+
+    # --- Orphaned agent clone reap (Issue #4358) ---
+    # Runs after the container reaps above, so a pair they just removed is
+    # already gone and what is left has no container at all.
+    orphan_out=$(orphan_clone_pass "$WORKTREE_BASE" "$(date -u +%s)" 1800)
+    printf '%s\n' "$orphan_out"
+    orphan_cleaned=$(sed -n 's/^ORPHAN_CLONES_DONE:cleaned=\([0-9]*\):.*/\1/p' <<< "$orphan_out")
+    cleaned=$((cleaned + ${orphan_cleaned:-0}))
 
     # --- PR agent-status label reconcile ---
     # fix-agent / review-agent are display-only PR labels the dispatcher adds

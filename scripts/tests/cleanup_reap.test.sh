@@ -51,6 +51,15 @@ echo "--------------------"
 printf '\n== bash -n parses ==\n'
 if bash -n "$DISPATCH" 2>/dev/null; then ok "agent-dispatch.sh parses"; else bad "agent-dispatch.sh parses" "bash -n failed"; fi
 
+# The orphan-clone section below deletes directories and revokes credentials, so
+# point both bases at a throwaway tree BEFORE sourcing: the real ones are never
+# touched.
+TEST_TMP="$(mktemp -d)"
+trap 'rm -rf "$TEST_TMP"' EXIT
+export CFGMS_TEST_WORKTREE_BASE="${TEST_TMP}/worktrees"
+export CFGMS_TEST_CRED_BASE="${TEST_TMP}/cred"
+mkdir -p "$CFGMS_TEST_WORKTREE_BASE" "$CFGMS_TEST_CRED_BASE"
+
 # shellcheck source=/dev/null
 source "$DISPATCH"
 
@@ -97,6 +106,122 @@ if grep -q "running=\$(_ledger_docker_inspect '{{.State.Running}}' \"\$container
   ok "reap loop reads live container running state"
 else
   bad "reap loop reads live container running state" "no _ledger_docker_inspect Running lookup"
+fi
+
+# ---------------------------------------------------------------------------
+# Orphaned agent clones (Issue #4358): a clone under WORKTREE_BASE whose
+# container is already gone. Every container-driven reaper skips these, so POs
+# improvised a raw `rm -rf` on the base and hung on its permission prompt.
+# Exercised against real git clones of a real bare repo in TEST_TMP.
+# ---------------------------------------------------------------------------
+WT="$CFGMS_TEST_WORKTREE_BASE"
+ORIGIN="${TEST_TMP}/origin.git"
+GIT=(git -c user.name=cfgms-test -c user.email=test@example.invalid -c init.defaultBranch=main)
+"${GIT[@]}" init --quiet --bare "$ORIGIN"
+"${GIT[@]}" clone --quiet "$ORIGIN" "${TEST_TMP}/seed" 2>/dev/null
+"${GIT[@]}" -C "${TEST_TMP}/seed" commit --quiet --allow-empty -m seed
+"${GIT[@]}" -C "${TEST_TMP}/seed" push --quiet origin HEAD:main
+
+NOW=$(date -u +%s)
+GRACE=1800
+# mk_clone <name> [clean|untracked|modified|unpushed|stash|notgit] [old|new]
+mk_clone() {
+  local name="$1" state="${2:-clean}" age="${3:-old}" d="${WT}/$1"
+  if [[ "$state" == notgit ]]; then
+    mkdir -p "$d"; : > "${d}/file"
+  else
+    "${GIT[@]}" clone --quiet "$ORIGIN" "$d" 2>/dev/null
+    case "$state" in
+      untracked) : > "${d}/new-file" ;;
+      modified)  printf 'x\n' > "${d}/tracked"; "${GIT[@]}" -C "$d" add tracked
+                 "${GIT[@]}" -C "$d" commit --quiet -m t; "${GIT[@]}" -C "$d" push --quiet origin HEAD:main
+                 printf 'y\n' > "${d}/tracked" ;;
+      unpushed)  "${GIT[@]}" -C "$d" commit --quiet --allow-empty -m local-only ;;
+      stash)     printf 'stashed\n' > "${d}/stashed"; "${GIT[@]}" -C "$d" add stashed
+                 "${GIT[@]}" -C "$d" stash --quiet
+                 [[ -n "$("${GIT[@]}" -C "$d" stash list)" ]] || { echo "setup: stash is empty" >&2; exit 1; } ;;
+    esac
+  fi
+  if [[ "$age" == old ]]; then touch -d "@$((NOW - GRACE - 60))" "$d"; else touch -d "@$((NOW - 60))" "$d"; fi
+}
+
+# decides <desc> <dir name> <container names> <expected decision line, tabs as spaces>
+decides() {
+  local desc="$1" got
+  got="$(orphan_clone_decision "${WT}/$2" "$3" "$NOW" "$GRACE" | tr '\t' ' ')"
+  if [[ "$got" == "$4" ]]; then ok "$desc"; else bad "$desc" "want '$4', got '${got}'"; fi
+}
+
+printf '\n== orphan clones: ownership is derived from the container classes ==\n'
+for row in "story-12|cfg-agent-12" "pr-fix-12|cfg-agent-pr-fix-12" \
+           "resolve-conflict-12|cfg-agent-resolve-conflict-12" "review-pr-12|cfg-agent-review-pr-12"; do
+  dir="${row%%|*}"; cname="${row##*|}"
+  got="$(cleanup_clone_owner "$dir" | cut -f2)"
+  back="$(cleanup_container_class "$got" | awk -F'\t' '{print $2"-"$3}')"
+  if [[ "$got" == "$cname" && "$back" == "$dir" ]]; then ok "${dir} <-> ${cname} round-trips"
+  else bad "${dir} <-> ${cname} round-trips" "owner='${got}' back='${back}'"; fi
+done
+for dir in po-live story review-pr-x story-12-old notes; do
+  if cleanup_clone_owner "$dir" >/dev/null; then bad "${dir} is not an agent clone" "claimed as owned"
+  else ok "${dir} is not an agent clone"; fi
+done
+
+printf '\n== orphan clones: decision ==\n'
+mk_clone review-pr-501 clean old
+mk_clone review-pr-502 clean new
+mk_clone pr-fix-503 clean old
+mk_clone story-504 untracked old
+mk_clone story-505 modified old
+mk_clone story-506 unpushed old
+mk_clone story-507 stash old
+mk_clone resolve-conflict-508 notgit old
+mkdir -p "${WT}/po-live"; touch -d "@$((NOW - 999999))" "${WT}/po-live"
+decides "old clean orphan is reaped"                review-pr-501 ""                        "reap review 501"
+decides "orphan inside the grace window is kept"    review-pr-502 ""                        "keep within_grace"
+decides "running or exited container keeps it"      pr-fix-503    "$(printf 'x\ncfg-agent-pr-fix-503\ny')" "ignore"
+decides "container name match is exact"             pr-fix-503    "cfg-agent-pr-fix-5030"   "reap fix-pr 503"
+decides "untracked file keeps a story orphan"       story-504     ""                        "keep dirty"
+decides "modified tracked file keeps it"            story-505     ""                        "keep dirty"
+decides "unpushed commit keeps it"                  story-506     ""                        "keep dirty"
+decides "stash keeps it"                            story-507     ""                        "keep dirty"
+decides "not a git repo is kept, never guessed"     resolve-conflict-508 ""                 "keep dirty"
+decides "po-live is never an agent clone"           po-live       ""                        "ignore"
+
+printf '\n== orphan clones: reap pass deletes only what the decision allows ==\n'
+mkdir -p "${CFGMS_TEST_CRED_BASE}/review-pr-501"
+out="$(reap_orphan_clones "$WT" "cfg-agent-pr-fix-503" "$NOW" "$GRACE")"
+[[ ! -e "${WT}/review-pr-501" ]] && ok "reaped orphan removed" || bad "reaped orphan removed" "$out"
+grep -qxF "CLEANED:orphan-clone:${WT}/review-pr-501" <<< "$out" && ok "removal reported" || bad "removal reported" "$out"
+[[ ! -e "${CFGMS_TEST_CRED_BASE}/review-pr-501" ]] && ok "review cred dir removed" || bad "review cred dir removed" "$out"
+for keep in review-pr-502 pr-fix-503 story-504 story-505 story-506 story-507 resolve-conflict-508 po-live; do
+  [[ -d "${WT}/${keep}" ]] && ok "${keep} survives" || bad "${keep} survives" "$out"
+done
+grep -qxF "ORPHAN_KEPT:${WT}/story-506:dirty" <<< "$out" && ok "dirty orphan reported for salvage" || bad "dirty orphan reported for salvage" "$out"
+grep -qxF "ORPHAN_CLONES_DONE:cleaned=1:kept=6" <<< "$out" && ok "summary counts" || bad "summary counts" "$out"
+
+printf '\n== orphan clones: a failed container listing reaps nothing ==\n'
+# A daemon that is down makes `docker ps` exit non-zero with no names on
+# stdout. Stand in for it with a docker that does exactly that, first on PATH.
+mkdir -p "${TEST_TMP}/bin"
+printf '#!/bin/sh\necho "Cannot connect to the Docker daemon" >&2\nexit 1\n' > "${TEST_TMP}/bin/docker"
+chmod +x "${TEST_TMP}/bin/docker"
+mk_clone review-pr-509 clean old
+out="$(PATH="${TEST_TMP}/bin:$PATH" orphan_clone_pass "$WT" "$NOW" "$GRACE")"
+[[ -d "${WT}/review-pr-509" ]] && ok "orphan survives a failed listing" || bad "orphan survives a failed listing" "$out"
+[[ "$out" == "ORPHAN_CLONES_SKIPPED:docker_ps_failed" ]] && ok "skip is reported" || bad "skip is reported" "$out"
+
+printf '\n== orphan clones: wiring ==\n'
+# `ps -a` is what makes an EXITED container keep its clone, not only a running
+# one; the decision tests above take the listing as given.
+if sed -n '/^orphan_clone_pass() {/,/^}/p' "$DISPATCH" | grep -qF "docker ps -a --format '{{.Names}}'"; then
+  ok "orphan pass lists containers in every state (ps -a)"
+else
+  bad "orphan pass lists containers in every state (ps -a)" "listing is not 'docker ps -a'"
+fi
+if grep -q 'orphan_out=$(orphan_clone_pass "$WORKTREE_BASE"' "$DISPATCH"; then
+  ok "cleanup-stale runs the orphan clone pass"
+else
+  bad "cleanup-stale runs the orphan clone pass" "orphan_clone_pass is not called"
 fi
 
 printf '\n%d/%d checks passed, %d failed\n' "$((ran - fail))" "$ran" "$fail"
