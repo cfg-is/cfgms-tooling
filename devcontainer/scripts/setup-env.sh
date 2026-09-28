@@ -4,10 +4,71 @@
 # Idempotent: safe to call multiple times.
 set -euo pipefail
 
-# --- Firewall ---
-# Only initialize if iptables hasn't been configured yet (idempotent guard).
-if ! sudo iptables -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
+# --- Firewall (root-then-drop, Issue #4343) ---
+# `agent` carries no sudoers entry and no other escalation path — the egress
+# firewall is set up here ONLY while this process still happens to be root
+# (headless docker-run callers that don't set `-u`, matching the image's
+# now-root default; see Dockerfile), and this process then re-execs itself as
+# `agent` for everything below, one-way, before touching any dispatch-supplied
+# content. Once dropped, there is no way back to root within this container's
+# life, so a SECOND call to this script within the same container (e.g.
+# entrypoint.sh's own root-then-drop already ran, then entrypoint.sh calls
+# this script again as a normal step) correctly sees non-root and moves on to
+# the non-root branch below, which verifies the firewall is up rather than
+# re-running an init it could not perform anyway.
+if [[ "$(id -u)" -eq 0 ]]; then
     init-firewall.sh
+    exec runuser -u agent -- "$0" "$@"
+fi
+
+# Reached as a non-root process. Two shapes get here, and they must not be
+# treated the same way:
+#
+#   a) the firewall is already up -- the re-exec above, or entrypoint.sh
+#      calling this script again as a normal step after its own root-then-drop.
+#   b) nothing ever ran init-firewall.sh -- e.g. the interactive devcontainer's
+#      postCreate/postStart hooks, which run as `remoteUser: agent` per
+#      devcontainer.json, or any `docker run -u agent` / --entrypoint override.
+#
+# (b) must fail closed. `agent` has no sudoers entry and no other escalation
+# path by design, so this process cannot establish the firewall itself; simply
+# skipping the init would leave the container on default-ALLOW egress with no
+# DNS allowlist, which is precisely the silent security degradation the
+# no-insecure-defaults rule exists to prevent (Issue #4343).
+#
+# The check cannot read the iptables tables -- `iptables -L` needs the same
+# privilege as writing a rule -- so it verifies the two post-conditions a
+# non-root process CAN observe, both established by init-firewall.sh: DNS is
+# pinned to the local filtered resolver, and that resolver is running. Neither
+# holds in an unfirewalled container.
+firewall_resolv_conf="${CFGMS_TEST_RESOLV_CONF_PATH:-/etc/resolv.conf}"
+firewall_active=1
+if ! grep -qE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.1[[:space:]]*$' \
+        "$firewall_resolv_conf" 2>/dev/null; then
+    firewall_active=0
+elif ! pgrep -x dnsmasq >/dev/null 2>&1; then
+    firewall_active=0
+fi
+
+if [[ "$firewall_active" -ne 1 ]]; then
+    cat >&2 <<EOF
+ERROR: egress firewall is not established, and this process cannot establish it.
+       Running as $(id -un) (uid $(id -u)); init-firewall.sh needs root, and
+       \`agent\` deliberately has no sudoers entry and no other escalation
+       path (Issue #4343).
+       Refusing to continue: proceeding would leave this container with
+       default-ALLOW egress and no DNS allowlist.
+
+       Establish it from outside the agent's reach, then re-run this script:
+         - headless dispatch: launch the container without \`-u\` so its
+           entrypoint starts as root (agent-dispatch.sh already does this) and
+           this script's own root-then-drop path runs the init.
+         - interactive devcontainer / any -u agent container:
+             docker exec -u root <container> init-firewall.sh
+           (the container needs --cap-add NET_ADMIN, which devcontainer.json's
+           \`capAdd\` already grants).
+EOF
+    exit 1
 fi
 
 # --- Claude credentials (symlink pattern) ---

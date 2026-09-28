@@ -3,6 +3,23 @@
 # Supports four modes: issue (default), branch, pr-fix, and resolve-conflict.
 set -euo pipefail
 
+# Root-then-drop (Issue #4343): the image now starts this entrypoint as root
+# (see Dockerfile) specifically so the egress firewall can be set up from
+# outside the agent's reach -- `agent` carries no sudoers entry and no other
+# escalation path, so once this process re-execs as `agent` below there is no
+# way back to root for the rest of the container's life, regardless of what a
+# prompt-injected agent session is told to run. This must be the very first
+# thing the script does, before sourcing anything or touching any
+# dispatch-supplied content (issue/PR body, prompt).
+# CFGMS_ENTRYPOINT_SOURCE_ONLY short-circuits this too: entrypoint_test.sh
+# sources this file to reach the helper-function definitions below without
+# running any agent flow, and must never trigger a real firewall init or a
+# re-exec even if the test happens to run as root.
+if [[ "${CFGMS_ENTRYPOINT_SOURCE_ONLY:-}" != "1" ]] && [[ "$(id -u)" -eq 0 ]]; then
+    init-firewall.sh
+    exec runuser -u agent -- "$0" "$@"
+fi
+
 # Helper library for prompt context assembly (fetch_* / render_* / no-op detection).
 # shellcheck source=./agent-context.sh
 source "$(dirname "${BASH_SOURCE[0]}")/agent-context.sh"
@@ -251,7 +268,15 @@ print(int((exp_ms / 1000) - time.time()))" 2>/dev/null || echo "0")
 
 if [ "$TOKEN_REMAINING" -lt 300 ] 2>/dev/null; then
     echo "OAuth token expired or expiring in <5min (${TOKEN_REMAINING}s remaining), refreshing..."
-    if claude -p 'ping' --dangerously-skip-permissions --model haiku >/dev/null 2>&1; then
+    # Run from outside /workspace: for branch/fix-pr/resolve-conflict modes,
+    # /workspace is already a checkout of the branch/PR under dispatch by this
+    # point, and this call has nothing to do with reviewing or fixing its
+    # content -- it exists purely to refresh the OAuth token. Starting `claude`
+    # there anyway would let it pick up that branch's own CLAUDE.md/hooks for
+    # no reason connected to the actual review/fix work (Issue #4343); running
+    # from a neutral directory keeps this incidental call from being an
+    # execution surface for whatever the checked-out branch contains.
+    if (cd /tmp && claude -p 'ping' --dangerously-skip-permissions --model haiku >/dev/null 2>&1); then
         echo "OAuth token refreshed (persisted via symlink)"
     else
         echo "ERROR: OAuth token refresh failed — credentials may be expired"

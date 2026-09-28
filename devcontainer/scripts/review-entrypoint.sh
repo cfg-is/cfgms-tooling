@@ -16,6 +16,17 @@
 
 set -euo pipefail
 
+# Root-then-drop (Issue #4343): agent-dispatch.sh review-pr launches this as
+# the container's entrypoint with no `-u`, so it starts as root (see
+# Dockerfile). `agent` carries no sudoers entry and no other escalation path,
+# so the egress firewall must be set up here, as root, before this process
+# re-execs itself as `agent` for everything else -- one-way, before reading
+# any PR content. Must be the very first thing this script does.
+if [[ "$(id -u)" -eq 0 ]]; then
+    init-firewall.sh
+    exec runuser -u agent -- "$0" "$@"
+fi
+
 # Helper library for prompt context assembly, incl. ac_resolve_agent_model
 # (Issue #3030). Layout differs between the source tree (this script lives
 # under .devcontainer/scripts/, agent-context.sh under .devcontainer/) and the
@@ -63,7 +74,14 @@ print(int((exp_ms / 1000) - time.time()))" 2>/dev/null || echo "0")
 
 if [ "$TOKEN_REMAINING" -lt 300 ] 2>/dev/null; then
     echo "OAuth token expired or expiring in <5min (${TOKEN_REMAINING}s remaining), refreshing..."
-    if claude -p 'ping' --dangerously-skip-permissions --model haiku >/dev/null 2>&1; then
+    # Run from outside /workspace: by this point /workspace is already a
+    # checkout of the PR branch under review, and this call has nothing to do
+    # with reviewing its content -- it exists purely to refresh the OAuth
+    # token. Starting `claude` there anyway would let it pick up that branch's
+    # own CLAUDE.md/hooks for no reason connected to the review itself (Issue
+    # #4343); running from a neutral directory keeps this incidental call from
+    # being an execution surface for whatever the checked-out branch contains.
+    if (cd /tmp && claude -p 'ping' --dangerously-skip-permissions --model haiku >/dev/null 2>&1); then
         echo "OAuth token refreshed (persisted via symlink)"
     else
         echo "ERROR: OAuth token refresh failed — credentials may be expired"

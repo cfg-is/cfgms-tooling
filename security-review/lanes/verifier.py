@@ -183,13 +183,26 @@ OUTPUT_SHAPE = (
 
 
 def excerpt(repo_root: str, path: str, line: "int | None", radius: int = EXCERPT_RADIUS) -> str:
-    """The lines around `line` in `path`, or `""` when the file cannot be read.
+    """The lines around `line` in `path`, or `""` when the file cannot be read
+    or does not resolve inside `repo_root`.
 
     Only the neighbourhood of a finding is read, never the whole file: the
     stage's contract is that it reads the locations findings name. A finding
     without a usable line gets the head of the file, which is where package
-    declarations and imports establish what the file is."""
-    full = os.path.join(repo_root, path or "")
+    declarations and imports establish what the file is.
+
+    `path` is finder-supplied (Issue #4343): `os.path.join(repo_root, path)`
+    alone is not a containment guarantee -- an absolute `path` makes
+    `os.path.join` discard `repo_root` entirely, and a relative one carrying
+    `../` segments walks out of it either way. The joined path is resolved
+    with `os.path.realpath` (following symlinks) and rejected unless it is
+    `repo_root` itself or falls strictly under it, so a finding naming
+    `/etc/passwd` or `../../../etc/passwd` reads nothing rather than an
+    arbitrary file on the host this stage's own process can reach."""
+    real_root = os.path.realpath(repo_root)
+    full = os.path.realpath(os.path.join(repo_root, path or ""))
+    if full != real_root and not full.startswith(real_root + os.sep):
+        return ""
     try:
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()

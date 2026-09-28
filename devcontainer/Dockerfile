@@ -42,13 +42,16 @@ ARG TARGETARCH
 # best-effort by design.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# System dependencies
+# System dependencies. No `sudo`: the egress firewall (iptables/dnsmasq) is
+# initialized as root by the container's own entrypoints before they drop to
+# the unprivileged `agent` user below, so no in-container escalation path is
+# needed by anyone, ever (Issue #4343) — see the `agent` user block for the
+# threat this closes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     jq \
     make \
-    sudo \
     iptables \
     ca-certificates \
     gnupg \
@@ -226,7 +229,13 @@ RUN set -eu; \
     install -m 0755 /tmp/bin/ollama /usr/local/bin/ollama; \
     rm -rf "/tmp/${ARCHIVE}" /tmp/bin
 
-# Non-root agent user with sudo for iptables only. The three harness credential
+# Non-root agent user with NO privilege escalation path of any kind -- no
+# sudoers entry, no setuid/setcap grant on iptables/dnsmasq (Issue #4343). A
+# prompt-injected agent process cannot touch its own egress restriction
+# because there is nothing in its reach that would let it: every entrypoint
+# (entrypoint.sh, setup-env.sh, investigator-entrypoint.sh) runs the firewall
+# setup as root BEFORE dropping to this user via `runuser`, and that drop is
+# one-way for the life of the container. The three harness credential
 # directories below (.claude/.ollama/.codex) are pre-created agent-owned so a
 # later `docker run -v <host-file>:<this-dir>/<file>:ro` (agent-dispatch.sh)
 # lands in an already-writable directory: Docker creates a missing bind-mount
@@ -236,7 +245,6 @@ RUN set -eu; \
 # "Permission denied (os error 13)" before any network call when ~/.codex is
 # root-owned (Issue #4004).
 RUN useradd -m -s /bin/bash agent \
-    && echo "agent ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/dnsmasq, /usr/bin/tee /etc/resolv.conf" > /etc/sudoers.d/agent \
     && mkdir -p /persist && chown agent:agent /persist \
     && mkdir -p /home/agent/.cache/go-build /home/agent/go/pkg/mod \
     && chown -R agent:agent /home/agent/.cache /home/agent/go \
@@ -437,6 +445,28 @@ RUN chmod -R a+rX /opt/cfgms-scanner
 # agent containers. HEALTHCHECK NONE suppresses the Trivy DS-0026 advisory.
 HEALTHCHECK NONE
 
-USER agent
+# Stay root at container start (Issue #4343): entrypoint.sh's first action is
+# always to run the egress firewall setup as root and then drop to `agent` via
+# `runuser` for everything else -- one-way, for the life of the container.
+# `agent` has no sudoers entry and no path back to root, so this is the ONLY
+# place root code ever runs, and it runs before any dispatch-supplied content
+# (issue/PR body, prompt) has been read.
+#
+# Trivy DS-0002 ("last USER command in Dockerfile should not be root") is
+# suppressed deliberately, in-file, the same way HEALTHCHECK NONE above
+# suppresses DS-0026. The check's premise is that the container's workload runs
+# as root; here it does not. Every entrypoint in this image
+# (entrypoint.sh, scripts/review-entrypoint.sh, scripts/investigator-entrypoint.sh,
+# scripts/setup-env.sh) re-execs itself under `runuser -u agent` as its first
+# action, so root exists only for the few hundred milliseconds it takes to
+# install the egress firewall -- the one thing that MUST happen outside the
+# agent's reach. The alternative the check would push us to (final `USER agent`
+# plus a sudoers/setcap grant over iptables) is the exact configuration this
+# story removed: it hands the agent the ability to tear down its own egress
+# restriction. Non-root is enforced here by the entrypoints, and a caller that
+# overrides the entrypoint and reaches setup-env.sh as `agent` fails closed
+# rather than running unfirewalled (see scripts/setup-env.sh).
+#trivy:ignore:DS-0002
+USER root
 WORKDIR /workspace
 ENTRYPOINT ["entrypoint.sh"]

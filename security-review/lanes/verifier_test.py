@@ -86,6 +86,68 @@ def test_excerpt_of_a_missing_file_is_empty_not_an_error():
               "excerpt: an unreadable file returns empty rather than raising")
 
 
+# --- path containment (Issue #4343) -----------------------------------------
+
+def test_excerpt_refuses_an_absolute_path_outside_the_repo():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_with_source(tmp)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".secret", delete=False) as outside:
+            outside.write("outside-repo-secret\n" * 50)
+            outside_path = outside.name
+        try:
+            # os.path.join(repo_root, path) discards repo_root entirely when
+            # path is absolute -- exactly the shape a finder-supplied "file"
+            # field could carry.
+            check(verifier.excerpt(tmp, outside_path, 1) == "",
+                  "excerpt: an absolute path outside the repo reads nothing",
+                  outside_path)
+        finally:
+            os.remove(outside_path)
+
+
+def test_excerpt_refuses_a_relative_path_that_walks_out_of_the_repo():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_with_source(tmp)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".secret", delete=False) as outside:
+            outside.write("outside-repo-secret\n" * 50)
+            outside_path = outside.name
+        try:
+            # A relative path with enough ../ segments walks out of repo_root
+            # the same way, without ever being absolute.
+            depth = len(Path(tmp).resolve().parts)
+            traversal = os.path.join(*(([".."] * (depth + 2)) + [outside_path.lstrip(os.sep)]))
+            check(verifier.excerpt(tmp, traversal, 1) == "",
+                  "excerpt: a ../-walking relative path reads nothing",
+                  traversal)
+        finally:
+            os.remove(outside_path)
+
+
+def test_excerpt_refuses_a_symlink_that_resolves_outside_the_repo():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_with_source(tmp)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".secret", delete=False) as outside:
+            outside.write("outside-repo-secret\n" * 50)
+            outside_path = outside.name
+        try:
+            link_path = os.path.join(tmp, "pkg", "example", "escape.go")
+            os.symlink(outside_path, link_path)
+            # The finding names a path that LOOKS like it is inside the repo
+            # -- containment must be checked after symlink resolution, not
+            # against the pre-resolution string.
+            check(verifier.excerpt(tmp, "pkg/example/escape.go", 1) == "",
+                  "excerpt: a symlink resolving outside the repo reads nothing")
+        finally:
+            os.remove(outside_path)
+
+
+def test_excerpt_still_reads_a_legitimate_file_inside_the_repo():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_with_source(tmp)
+        got = verifier.excerpt(tmp, "pkg/example/thing.go", 150)
+        check(got != "", "excerpt: containment does not break a normal in-repo read")
+
+
 def test_read_locations_reads_each_location_once():
     with tempfile.TemporaryDirectory() as tmp:
         repo_with_source(tmp)

@@ -19,13 +19,17 @@
 # api.openai.com/ollama.com are gone from every fragment and the base file.
 #
 # Two complementary strategies, matching investigator_launch.test.sh's own
-# precedent for testing a script that needs `sudo`/root it doesn't have here:
+# precedent for testing a script that needs root it doesn't have here:
 #
-#   1. init-firewall.sh is run for real, with `sudo`/`iptables`/`ip6tables`/
-#      `tee`/`pgrep`/`dig`/`dnsmasq` stubbed on PATH -- real argument
-#      parsing, real harness-selection logic, just no real firewall or DNS
-#      server. This proves the fragment-selection and fail-closed behavior
-#      without requiring root or colliding with this sandbox's own network.
+#   1. init-firewall.sh is run for real, with `iptables`/`ip6tables`/`pgrep`/
+#      `dig`/`dnsmasq` stubbed on PATH -- real argument parsing, real
+#      harness-selection logic, just no real firewall or DNS server. This
+#      proves the fragment-selection and fail-closed behavior without
+#      requiring root or colliding with this sandbox's own network.
+#      init-firewall.sh runs unprivileged commands directly, with no `sudo`
+#      prefix (Issue #4343 -- it is invoked only when already root, by its
+#      callers' own root-then-drop), and writes the resolver pin via
+#      CFGMS_TEST_RESOLV_CONF_PATH rather than the real /etc/resolv.conf.
 #   2. A real (unprivileged, alternate-port) dnsmasq instance is started
 #      directly against dnsmasq-allowlist-base.conf plus
 #      dnsmasq-allowlist.d/claude.conf together -- the same combination
@@ -128,6 +132,20 @@ assert_eq() {
 echo "=== init-firewall.sh: per-harness egress fragment selection (Issue #3932) ==="
 
 echo ""
+echo "--- REQUIRED TEST: init-firewall.sh invokes no privileged command via sudo (Issue #4343) ---"
+# This script now runs ONLY as root (its callers root-then-drop before
+# invoking it), so a `sudo `-prefixed command anywhere in it would mean
+# something still expects to reach it as the unprivileged `agent` user --
+# reopening the escalation path this story closes.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -vE '^[[:space:]]*#' "$INIT_FIREWALL" | grep -qE '(^|[^A-Za-z0-9_])sudo[[:space:]]'; then
+    _fail "init-firewall.sh must not invoke sudo anywhere — found a sudo-prefixed command"
+else
+    echo "    ✓ init-firewall.sh invokes no command via sudo"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+
+echo ""
 echo "--- REQUIRED TEST: Issue #3935/#3936 add no domain to the base allowlist file ---"
 base_src="$(cat "$BASE_CONF")"
 assert_not_contains "$base_src" "openai.com" "base conf carries no openai.com entry (Codex's domains live only in codex.conf)"
@@ -137,18 +155,15 @@ assert_not_contains "$base_src" "ollama.com" "base conf carries no ollama.com en
 assert_not_contains "$base_src" "registry.ollama.ai" "base conf carries no registry.ollama.ai entry (Ollama's domains live only in ollama.conf)"
 
 # ----------------------------------------------------------------------------
-# Strategy 1: stubbed sudo/iptables/dnsmasq/etc — real init-firewall.sh logic
+# Strategy 1: stubbed iptables/dnsmasq/etc — real init-firewall.sh logic
 # ----------------------------------------------------------------------------
 
 FAKEBIN="$(mktemp -d)"
 CALL_LOG="$(mktemp)"
-cleanup_stubs() { rm -rf "$FAKEBIN" "$CALL_LOG"; }
+RESOLV_STUB="$(mktemp)"
+cleanup_stubs() { rm -rf "$FAKEBIN" "$CALL_LOG" "$RESOLV_STUB"; }
 trap cleanup_stubs EXIT
 
-cat > "${FAKEBIN}/sudo" <<'STUB'
-#!/usr/bin/env bash
-exec "$@"
-STUB
 cat > "${FAKEBIN}/iptables" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -156,12 +171,6 @@ STUB
 cat > "${FAKEBIN}/ip6tables" <<'STUB'
 #!/usr/bin/env bash
 exit 0
-STUB
-cat > "${FAKEBIN}/tee" <<'STUB'
-#!/usr/bin/env bash
-# Discards stdin regardless of the target path -- avoids writing to this
-# sandbox's real /etc/resolv.conf.
-cat >/dev/null
 STUB
 cat > "${FAKEBIN}/pgrep" <<'STUB'
 #!/usr/bin/env bash
@@ -184,7 +193,7 @@ echo ""
 echo "--- no harness value (default): loads base + claude.conf (Issue #3933) ---"
 : > "$CALL_LOG"
 set +e
-out=$(CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+out=$(CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "no-harness launch exits 0"
@@ -198,7 +207,7 @@ echo ""
 echo "--- --harness claude (CFGMS_SECURITY_REVIEW_HARNESS=claude): loads base + claude.conf ---"
 : > "$CALL_LOG"
 set +e
-out=$(CFGMS_SECURITY_REVIEW_HARNESS=claude CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=claude CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "--harness claude launch exits 0"
@@ -213,7 +222,7 @@ echo ""
 echo "--- --harness codex (CFGMS_SECURITY_REVIEW_HARNESS=codex): loads base + codex.conf ---"
 : > "$CALL_LOG"
 set +e
-out=$(CFGMS_SECURITY_REVIEW_HARNESS=codex CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=codex CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "--harness codex launch exits 0"
@@ -228,7 +237,7 @@ echo ""
 echo "--- --harness opencode (CFGMS_SECURITY_REVIEW_HARNESS=opencode): loads base + opencode.conf ---"
 : > "$CALL_LOG"
 set +e
-out=$(CFGMS_SECURITY_REVIEW_HARNESS=opencode CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=opencode CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "--harness opencode launch exits 0"
@@ -244,7 +253,7 @@ echo ""
 echo "--- --harness ollama (CFGMS_SECURITY_REVIEW_HARNESS=ollama): loads base + ollama.conf ---"
 : > "$CALL_LOG"
 set +e
-out=$(CFGMS_SECURITY_REVIEW_HARNESS=ollama CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=ollama CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "--harness ollama launch exits 0"
@@ -261,7 +270,7 @@ echo ""
 echo "--- --harness opencode_agent (Issue #4293): loads base + opencode_agent.conf, never opencode.ai ---"
 : > "$CALL_LOG"
 set +e
-out=$(CFGMS_SECURITY_REVIEW_HARNESS=opencode_agent CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+out=$(CFGMS_SECURITY_REVIEW_HARNESS=opencode_agent CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "--harness opencode_agent launch exits 0"
@@ -285,7 +294,7 @@ echo "--- REQUIRED TEST: an unrecognized harness value fails to start ---"
 for bad_harness in bogus-harness-xyz "../etc" "totally-unknown-harness"; do
     : > "$CALL_LOG"
     set +e
-    bad_out=$(CFGMS_SECURITY_REVIEW_HARNESS="$bad_harness" CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
+    bad_out=$(CFGMS_SECURITY_REVIEW_HARNESS="$bad_harness" CFGMS_TEST_DNSMASQ_BASE_CONF="$BASE_CONF" CFGMS_TEST_DNSMASQ_FRAGMENT_DIR="$FRAGMENT_DIR" CFGMS_TEST_RESOLV_CONF_PATH="$RESOLV_STUB" PATH="${FAKEBIN}:${PATH}" bash "$INIT_FIREWALL" 2>&1)
     bad_rc=$?
     set -e
     TESTS_RUN=$((TESTS_RUN + 1))

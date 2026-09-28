@@ -37,12 +37,15 @@
 # a prompt injection.
 set -euo pipefail
 
-MODE="${1:?investigator-entrypoint.sh requires a mode argument: plan or a lane id}"
-
-# --- Egress firewall (default-deny + DNS allowlist) ---
-# Same call setup-env.sh makes, with the same idempotent guard, and nothing
-# else from that script. init-firewall.sh needs CAP_NET_ADMIN, which the
-# launcher grants with --cap-add NET_ADMIN.
+# Root-then-drop (Issue #4343): agent-dispatch.sh launch-investigator starts
+# this container with no `-u`, so it starts as root (see Dockerfile). `agent`
+# carries no sudoers entry and no other escalation path -- more load-bearing
+# here than on any other profile, since this container simultaneously holds a
+# live model-provider credential and deliberately ingests untrusted content
+# (see header). The firewall init AND its own post-condition verification
+# both need root (reading `iptables -L` needs the same privilege as writing
+# it), so both happen here, before this process re-execs itself as `agent` for
+# the rest of the script -- one-way, before MODE is even parsed.
 #
 # Fail closed: if the firewall cannot be established this container must not
 # run at all. `set -e` already aborts on a non-zero init-firewall.sh, and the
@@ -50,14 +53,17 @@ MODE="${1:?investigator-entrypoint.sh requires a mode argument: plan or a lane i
 # loaded but dnsmasq down, or resolv.conf still pointing at an unfiltered
 # upstream), which would leave the DNS allowlist unenforced while iptables
 # still permits all outbound 443.
-if ! sudo iptables -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
+if [[ "$(id -u)" -eq 0 ]]; then
     init-firewall.sh
+    if ! iptables -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
+        echo "ERROR: egress firewall not active (OUTPUT policy is not DROP); refusing to start"
+        exit 1
+    fi
+    exec runuser -u agent -- "$0" "$@"
 fi
 
-if ! sudo iptables -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
-    echo "ERROR: egress firewall not active (OUTPUT policy is not DROP); refusing to start"
-    exit 1
-fi
+MODE="${1:?investigator-entrypoint.sh requires a mode argument: plan or a lane id}"
+
 # CFGMS_TEST_RESOLV_CONF_PATH lets investigator-entrypoint_test.sh point this
 # post-condition at a fixture file it controls -- /etc/resolv.conf is read by
 # absolute path below and cannot be intercepted via a PATH-prepended stub the

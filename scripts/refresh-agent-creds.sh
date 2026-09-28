@@ -38,8 +38,7 @@ exec docker run --rm -it \
   --user root \
   --entrypoint bash \
   cfg-agent:latest \
-  -c 'mkdir -p /workspace && su agent -c '"'"'
-    init-firewall.sh
+  -c 'mkdir -p /workspace && init-firewall.sh && su agent -c '"'"'
     echo ""
     echo "Step 1/4: OAuth login..."
     claude --dangerously-skip-permissions -p ready

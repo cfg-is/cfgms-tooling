@@ -1133,6 +1133,41 @@ _post_quarantine_comment() {
     2>/dev/null || true
 }
 
+# _branch_author_gate <branch>
+#   External-author gate for create-clone-branch (Issue #1786, closed for this
+#   path by #4343). create-clone-pr and review-pr both check trust BEFORE any
+#   clone/fetch of PR content; create-clone-branch had no such check, even
+#   though it is reachable with a bare branch name from the "dispatch
+#   interactive <branch>" path (.claude/commands/dispatch.md) -- a PR opened
+#   from an external/untrusted branch could be cloned and handed straight to
+#   `claude` there. A branch with no open PR (the common case: the agent's own
+#   fresh work, or a human-named branch with nothing to quarantine) needs no
+#   check -- nothing about it is "a pull request's own branch" yet.
+#
+# Stdout: "internal" (no open PR, or PR author is trusted -- proceed) or
+#   "external:<pr_num>:<author_login>:<trust>" (PR author gate failed --
+#   caller must quarantine and refuse). Never fails the caller: a `gh`/`jq`
+#   error resolves to "internal" (fail OPEN on the lookup itself) exactly like
+#   the branch-has-no-PR case, since the alternative -- refusing every branch
+#   dispatch whenever `gh` has a transient hiccup -- would break the common,
+#   safe case (the agent's own branch) far more often than it would catch a
+#   genuine external PR.
+_branch_author_gate() {
+  local branch="$1"
+  local pr_meta pr_num pr_author trust
+  pr_meta=$(gh pr list --repo cfg-is/cfgms --head "$branch" --state open \
+    --json number,author --jq '.[0] // empty' 2>/dev/null || echo "")
+  [[ -n "$pr_meta" ]] || { echo "internal"; return 0; }
+  pr_num=$(echo "$pr_meta" | jq -r '.number')
+  pr_author=$(echo "$pr_meta" | jq -r '.author.login // empty')
+  trust=$(_check_author_permission "$pr_author" "$pr_num" "")
+  if [[ "$trust" != "internal" ]]; then
+    echo "external:${pr_num}:${pr_author}:${trust}"
+  else
+    echo "internal"
+  fi
+}
+
 # Gate on credential availability before launching any agent container.
 #
 # Agent containers bind-mount the host's live ~/.claude/.credentials.json
@@ -1774,6 +1809,16 @@ case "$cmd" in
     dest="${WORKTREE_BASE}/${sanitized}"
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
+    # External-author gate (Issue #4343) -- see _branch_author_gate for why
+    # this path needs one create-clone-pr and review-pr already have.
+    branch_gate_result=$(_branch_author_gate "$branch")
+    if [[ "$branch_gate_result" == external:* ]]; then
+      IFS=: read -r _ branch_pr_num branch_pr_author branch_author_trust <<<"$branch_gate_result"
+      _post_quarantine_comment "$branch_pr_num" "$branch_pr_author"
+      echo "BRANCH_REFUSED:${branch}:external_author_${branch_pr_author}:${branch_author_trust}"
+      exit 3
+    fi
+
     # Check if branch exists on remote
     trap "rm -rf '$dest'" ERR
     if git -C "$REPO_ROOT" ls-remote --heads origin "$branch" | grep -q .; then
@@ -2111,7 +2156,7 @@ case "$cmd" in
       --cap-add NET_ADMIN \
       --entrypoint /bin/bash \
       cfg-agent:latest \
-      -c "setup-env.sh && exec claude --dangerously-skip-permissions"
+      -c "setup-env.sh && exec runuser -u agent -- claude --dangerously-skip-permissions"
     ;;
 
   po-live)
@@ -2279,7 +2324,7 @@ case "$cmd" in
       --cap-add NET_ADMIN \
       --entrypoint /bin/bash \
       cfg-agent:latest \
-      -c 'setup-env.sh && exec claude --dangerously-skip-permissions "$@"' \
+      -c 'setup-env.sh && exec runuser -u agent -- claude --dangerously-skip-permissions "$@"' \
       _ \
       "${claude_args[@]}"
     ;;
@@ -2305,9 +2350,9 @@ case "$cmd" in
     setup_cmds+=" && echo ' Connect at: https://claude.ai/code'"
     setup_cmds+=" && echo '================================================'"
     setup_cmds+=" && echo 'Warming up workspace trust...'"
-    setup_cmds+=" && claude -p 'ready' --dangerously-skip-permissions 2>&1 || echo 'WARN: trust warmup failed (non-fatal)'"
+    setup_cmds+=" && runuser -u agent -- claude -p 'ready' --dangerously-skip-permissions 2>&1 || echo 'WARN: trust warmup failed (non-fatal)'"
     setup_cmds+=" && echo 'Starting remote-control...'"
-    setup_cmds+=" && exec claude remote-control --permission-mode bypassPermissions --name '${branch}' 2>&1"
+    setup_cmds+=" && exec runuser -u agent -- claude remote-control --permission-mode bypassPermissions --name '${branch}' 2>&1"
 
     # Launch container in detached mode with remote-control server
     if container_id=$(docker run -d \
@@ -2608,7 +2653,13 @@ PYEOF
     if [[ -n "${CFGMS_TEST_SMOKE_RUN_CMD:-}" ]]; then
       smoke_out=$(bash -c "${CFGMS_TEST_SMOKE_RUN_CMD}" 2>&1) || smoke_exit=$?
     else
+      # --cap-add NET_ADMIN: this container runs through the baked
+      # entrypoint.sh (ENTRYPOINT + a CMD override), whose first action is now
+      # always the root-then-drop firewall init (Issue #4343) regardless of
+      # what CMD is -- without the capability, init-firewall.sh's iptables
+      # calls fail and the smoke test never reaches `cfg config list` at all.
       smoke_out=$(docker run --rm \
+        --cap-add NET_ADMIN \
         "${smoke_docker_env[@]}" \
         cfg-agent:latest \
         cfg config list --tenant="agent-test/${num}" --no-bundle 2>&1) || smoke_exit=$?
