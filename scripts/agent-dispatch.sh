@@ -4361,8 +4361,12 @@ PY
         fi
         clone_dir="${WORKTREE_BASE}/story-${num}"
         if [[ -d "$clone_dir" ]]; then
-          rm -rf "$clone_dir"
-          echo "CLEANED:clone:${clone_dir}"
+          if clone_safe_to_discard "$clone_dir"; then
+            rm -rf "$clone_dir"
+            echo "CLEANED:clone:${clone_dir}"
+          else
+            echo "KEPT:clone:${clone_dir}:unpushed_work"
+          fi
         fi
         cleaned=$((cleaned + 1))
       fi
@@ -4405,8 +4409,12 @@ PY
       fi
       clone_dir="${WORKTREE_BASE}/${clone_prefix}-${reap_num}"
       if [[ -d "$clone_dir" ]]; then
-        rm -rf "$clone_dir"
-        echo "CLEANED:clone:${clone_dir}"
+        if clone_safe_to_discard "$clone_dir"; then
+          rm -rf "$clone_dir"
+          echo "CLEANED:clone:${clone_dir}"
+        else
+          echo "KEPT:clone:${clone_dir}:unpushed_work"
+        fi
       fi
       cleaned=$((cleaned + 1))
     done < <(docker ps -a --filter "label=cfg-agent=true" \

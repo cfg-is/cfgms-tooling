@@ -259,5 +259,75 @@ else
   bad "cleanup-stale runs the orphan clone pass" "orphan_clone_pass is not called"
 fi
 
+printf '\n== exited-container clone reap is gated by clone_safe_to_discard (Issue #4441) ==\n'
+# Before this, the story loop and the fix/resolve-conflict loop deleted a
+# clone unconditionally once its container had exited -- the only guard was
+# on the orphan-clone path, which runs after a container is already gone by
+# some OTHER means. An agent that exits with unpushed work went through the
+# unconditional path every time, so salvage had nothing left to find.
+#
+# Exercised directly against clone_safe_to_discard -- the same gate function
+# both deletion sites now call at the point of `rm -rf` -- using real git
+# clones from mk_clone, rather than re-implementing the decision here.
+gate_keeps() {
+  local desc="$1" dir="$2"
+  if clone_safe_to_discard "${WT}/${dir}"; then
+    bad "$desc" "clone_safe_to_discard allowed deletion of a clone with unsaved work"
+  else
+    ok "$desc"
+  fi
+}
+gate_deletes() {
+  local desc="$1" dir="$2"
+  if clone_safe_to_discard "${WT}/${dir}"; then
+    ok "$desc"
+  else
+    bad "$desc" "clone_safe_to_discard kept a clean, pushed clone"
+  fi
+}
+
+mk_clone story-601 untracked old
+mk_clone story-602 modified old
+mk_clone story-603 unpushed old
+mk_clone story-604 clean old
+gate_keeps  "uncommitted (untracked) change: gate keeps the clone"        story-601
+gate_keeps  "uncommitted (modified tracked) change: gate keeps the clone" story-602
+gate_keeps  "committed but unpushed: gate keeps the clone"                story-603
+gate_deletes "clean and pushed: gate allows deletion"                     story-604
+
+printf '\n== both exited-container reap sites call the gate before rm -rf (wiring) ==\n'
+# A correct clone_safe_to_discard nobody calls at the deletion site would
+# leave the bug in place -- assert the call sites, not just the function.
+story_loop=$(sed -n '/^    for container_name in \$containers; do$/,/^    done$/p' "$DISPATCH")
+if grep -qF 'if clone_safe_to_discard "$clone_dir"; then' <<< "$story_loop" \
+  && grep -qF 'echo "KEPT:clone:${clone_dir}:unpushed_work"' <<< "$story_loop"; then
+  ok "story loop gates clone rm -rf on clone_safe_to_discard and reports KEPT"
+else
+  bad "story loop gates clone rm -rf on clone_safe_to_discard and reports KEPT" "guard not found in story loop"
+fi
+fix_loop=$(sed -n '/Exited fix \/ resolve-conflict container reap/,/^    done < <(docker ps -a --filter "label=cfg-agent=true" \\$/p' "$DISPATCH")
+if grep -qF 'if clone_safe_to_discard "$clone_dir"; then' <<< "$fix_loop" \
+  && grep -qF 'echo "KEPT:clone:${clone_dir}:unpushed_work"' <<< "$fix_loop"; then
+  ok "fix/resolve-conflict loop gates clone rm -rf on clone_safe_to_discard and reports KEPT"
+else
+  bad "fix/resolve-conflict loop gates clone rm -rf on clone_safe_to_discard and reports KEPT" "guard not found in fix/resolve-conflict loop"
+fi
+if grep -qF 'docker rm -f "cfg-agent-${num}"' "$DISPATCH" && grep -qF 'revoke_agent_creds "$num" || true' "$DISPATCH"; then
+  ok "container removal and cred revoke are unaffected (still unconditional)"
+else
+  bad "container removal and cred revoke are unaffected (still unconditional)" "unconditional calls missing"
+fi
+
+printf '\n== a clone kept by the exited-container gate is not later deleted by the orphan pass (AC3) ==\n'
+# Once docker rm -f removes the container, the clone becomes an orphan by
+# cleanup_clone_owner's classification. orphan_clone_decision already keeps a
+# dirty orphan past the grace window (see the "keep dirty" cases above) -- this
+# proves that interaction directly against clones seeded the same way as the
+# AC5 cases, rather than assuming it from the earlier story-50x fixtures.
+decides "kept-by-gate clone (untracked) also kept by the orphan pass"        story-601 "" "keep dirty"
+decides "kept-by-gate clone (modified tracked) also kept by the orphan pass" story-602 "" "keep dirty"
+decides "kept-by-gate clone (unpushed commit) also kept by the orphan pass"  story-603 "" "keep dirty"
+decides "clean/pushed clone is reapable by the orphan pass instead"         story-604 "" "reap story 604"
+
 printf '\n%d/%d checks passed, %d failed\n' "$((ran - fail))" "$ran" "$fail"
 [[ $fail -eq 0 ]]
