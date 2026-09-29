@@ -220,9 +220,13 @@ check_eq "no docker binary: prints nothing" "$t5_gate_out" ""
 
 # ---------------------------------------------------------------------------
 # T6: rebuilds are serialized — two concurrent rebuild attempts never run the
-# build command at the same time.
+# build command at the same time. This host has a real flock binary (checked
+# at the top of the file), so this exercises the flock path specifically —
+# its behaviour must stay unchanged (Issue #4419 touches only the mkdir
+# fallback). The fallback path gets its own equivalent coverage below (T10),
+# forced via the no-flock PATH built next.
 # ---------------------------------------------------------------------------
-printf '\n== rebuilds are serialized ==\n'
+printf '\n== rebuilds are serialized (flock path) ==\n'
 LOCK_MARKER="${SANDBOX}/rebuild-in-progress"
 OVERLAP_LOG="${SANDBOX}/overlap.log"
 rm -f "$LOCK_MARKER" "$OVERLAP_LOG"
@@ -238,6 +242,344 @@ pid1=$!
 pid2=$!
 wait "$pid1" "$pid2"
 check_eq "concurrent rebuilds never overlap" "$(cat "$OVERLAP_LOG")" ""
+
+# ---------------------------------------------------------------------------
+# Fixture: a curated PATH with every real binary this host has (mkdir, rmdir,
+# ps, git, bash, ...) symlinked in EXCEPT flock, so `command -v flock` fails
+# and _image_rebuild takes the mkdir-spinlock fallback branch even though the
+# real flock is installed on this host. A shell function named `flock` would
+# not work for this: bash's `command -v` reports a defined function as found,
+# which is the opposite of what "flock unavailable" (Issue #4419's AC) needs.
+# Functions DO work to fake out `sleep` below, since that only needs the call
+# to return fast, not to be unresolvable.
+# ---------------------------------------------------------------------------
+printf '\n== fixture: curated PATH with flock removed ==\n'
+NOFLOCK_BIN="${SANDBOX}/noflock-bin"
+mkdir -p "$NOFLOCK_BIN"
+IFS=':' read -r -a _path_dirs <<< "$PATH"
+for _d in "${_path_dirs[@]}"; do
+  [[ -d "$_d" ]] || continue
+  while IFS= read -r -d '' _f; do
+    _name="$(basename "$_f")"
+    [[ "$_name" == "flock" ]] && continue
+    [[ -e "${NOFLOCK_BIN}/${_name}" ]] && continue
+    ln -s "$_f" "${NOFLOCK_BIN}/${_name}" 2>/dev/null || true
+  done < <(find "$_d" -maxdepth 1 -type f -perm -u+x -print0 2>/dev/null)
+done
+unset _path_dirs _d _f _name
+
+noflock_sanity_rc=0
+( PATH="$NOFLOCK_BIN"; command -v flock ) >/dev/null 2>&1 || noflock_sanity_rc=$?
+if [[ $noflock_sanity_rc -ne 0 ]]; then ok "sanity: flock is unresolvable under the curated PATH"
+else bad "sanity: flock is unresolvable under the curated PATH" "flock still resolved"; fi
+noflock_mkdir_rc=0
+( PATH="$NOFLOCK_BIN"; command -v mkdir ) >/dev/null 2>&1 || noflock_mkdir_rc=$?
+check_eq "sanity: mkdir still resolves under the curated PATH" "$noflock_mkdir_rc" "0"
+
+# ---------------------------------------------------------------------------
+# T7: mkdir fallback, stale lock — a lock directory left by a holder that is
+# no longer alive (simulated with a pid that was spawned and reaped, so it is
+# guaranteed dead but was real) is reclaimed instead of spinning out the
+# 3000-iteration budget, and the launch proceeds.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: stale holder (dead pid) is reclaimed, no full spin wait ==\n'
+rm -rf "${IMAGE_REBUILD_LOCK}.d"
+( exit 0 ) &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null || true
+mkdir -p "${IMAGE_REBUILD_LOCK}.d"
+{
+  printf 'pid=%s\n' "$dead_pid"
+  printf 'host=%s\n' "$(hostname 2>/dev/null || uname -n)"
+  printf 'start=%s\n' "a-start-time-that-cannot-match-anything-alive"
+} > "${IMAGE_REBUILD_LOCK}.d/holder"
+
+rm -f "${SANDBOX}/rebuild-happened-t7"
+t7_start_s=$(date +%s)
+t7_rc=0
+t7_out=$(
+  (
+    PATH="$NOFLOCK_BIN"
+    CFGMS_TEST_IMAGE_STALENESS_CHECK=1 \
+    FAKE_IMAGE_LABEL="some-old-hash" \
+    CFGMS_TEST_IMAGE_REBUILD_CMD="touch '${SANDBOX}/rebuild-happened-t7'; exit 0" \
+    gate_image_staleness_for_launch
+  ) 2>&1
+) || t7_rc=$?
+t7_elapsed=$(( $(date +%s) - t7_start_s ))
+check_eq "stale holder: launch proceeds (returns 0)" "$t7_rc" "0"
+[[ -f "${SANDBOX}/rebuild-happened-t7" ]] && ok "stale holder: rebuild command ran (lock reclaimed)" \
+  || bad "stale holder: rebuild command ran (lock reclaimed)" "rebuild marker missing"
+if [[ $t7_elapsed -lt 30 ]]; then ok "stale holder: reclaimed promptly, did not wait out the spin budget"
+else bad "stale holder: reclaimed promptly, did not wait out the spin budget" "took ${t7_elapsed}s"; fi
+[[ ! -d "${IMAGE_REBUILD_LOCK}.d" ]] && ok "stale holder: lock directory cleaned up after rebuild" \
+  || bad "stale holder: lock directory cleaned up after rebuild" "lock dir still present"
+
+# ---------------------------------------------------------------------------
+# T8: mkdir fallback, live holder — a lock held by this very (definitely
+# alive) test process is respected: a waiter does not proceed while it is
+# held, and proceeds once it is released, exactly as a real holder finishing
+# its build and removing the directory would look from the waiter's side.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: live holder is respected until it releases ==\n'
+rm -rf "${IMAGE_REBUILD_LOCK}.d"
+mkdir -p "${IMAGE_REBUILD_LOCK}.d"
+# The holder record is written by the implementation's own writer rather than
+# hand-rolled here: this test process IS the live holder being simulated, and
+# the start-time fingerprint's format is an internal detail of that writer
+# (procfs clock ticks where /proc exists, `ps -o lstart=` where it does not).
+# Hand-rolling one form would make this test assert the holder-record format
+# instead of the liveness behaviour it is here for — and would silently invert
+# into "live holder gets reclaimed" on any host taking the other branch.
+_image_rebuild_write_holder "${IMAGE_REBUILD_LOCK}.d"
+
+rm -f "${SANDBOX}/rebuild-happened-t8" "${SANDBOX}/t8_rc"
+(
+  PATH="$NOFLOCK_BIN"
+  CFGMS_TEST_IMAGE_STALENESS_CHECK=1 \
+  FAKE_IMAGE_LABEL="some-old-hash" \
+  CFGMS_TEST_IMAGE_REBUILD_CMD="touch '${SANDBOX}/rebuild-happened-t8'; exit 0" \
+  gate_image_staleness_for_launch >"${SANDBOX}/t8_out.log" 2>&1
+  echo $? > "${SANDBOX}/t8_rc"
+) &
+t8_pid=$!
+
+sleep 1
+if [[ ! -f "${SANDBOX}/rebuild-happened-t8" ]]; then
+  ok "live holder: waiter has not proceeded while the lock is held"
+else
+  bad "live holder: waiter has not proceeded while the lock is held" "rebuild ran despite a live holder"
+fi
+
+rm -rf "${IMAGE_REBUILD_LOCK}.d"
+wait "$t8_pid"
+t8_rc="$(cat "${SANDBOX}/t8_rc" 2>/dev/null || echo unknown)"
+check_eq "live holder: waiter proceeds once the live holder releases" "$t8_rc" "0"
+[[ -f "${SANDBOX}/rebuild-happened-t8" ]] && ok "live holder: rebuild ran after release" \
+  || bad "live holder: rebuild ran after release" "rebuild marker missing"
+
+# ---------------------------------------------------------------------------
+# T9: mkdir fallback, live holder held throughout — the bounded wait still
+# ends in REBUILD_FAILED and a refused launch; the lock is never reclaimed
+# out from under a holder that never dies. `sleep` is overridden with a
+# no-op function for this one call, scoped to its own subshell, so the
+# 3000-iteration spin budget itself is untouched (Out of Scope: changing that
+# count) while its wall-clock cost collapses enough to run in a test.
+#
+# Stubbing `sleep` removes the only *intended* per-iteration cost, which makes
+# this test the standing guard on the unintended one: every iteration's
+# liveness probe must stay on shell builtins. An implementation that forks
+# per iteration (sed/hostname/ps/tr) puts this single case above the suite's
+# 180s timeout on a container host, and puts the real 600s bounded wait well
+# past 600s on every host.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: live holder held throughout ends in REBUILD_FAILED ==\n'
+rm -rf "${IMAGE_REBUILD_LOCK}.d"
+mkdir -p "${IMAGE_REBUILD_LOCK}.d"
+_image_rebuild_write_holder "${IMAGE_REBUILD_LOCK}.d"
+t9_start_s=$(date +%s)
+
+rm -f "${SANDBOX}/rebuild-happened-t9"
+t9_rc=0
+t9_out=$(
+  (
+    PATH="$NOFLOCK_BIN"
+    sleep() { return 0; }
+    CFGMS_TEST_IMAGE_STALENESS_CHECK=1 \
+    FAKE_IMAGE_LABEL="some-old-hash" \
+    CFGMS_TEST_IMAGE_REBUILD_CMD="touch '${SANDBOX}/rebuild-happened-t9'; exit 0" \
+    gate_image_staleness_for_launch
+  ) 2>&1
+) || t9_rc=$?
+t9_elapsed=$(( $(date +%s) - t9_start_s ))
+rm -rf "${IMAGE_REBUILD_LOCK}.d"
+
+check_eq "live holder throughout: refuses the launch (exit 11)" "$t9_rc" "11"
+check_contains "live holder throughout: reports IMAGE_REBUILD_FAILED naming the lock path" \
+  "$t9_out" "IMAGE_REBUILD_FAILED:${IMAGE_REBUILD_LOCK}"
+[[ ! -f "${SANDBOX}/rebuild-happened-t9" ]] && ok "live holder throughout: rebuild command never ran" \
+  || bad "live holder throughout: rebuild command never ran" "rebuild marker present"
+# 60s for 3000 sleep-free iterations leaves room for a slow shared runner while
+# still failing loudly on a per-iteration fork (~71s of pure fork overhead at
+# the measured ~71ms/iteration on this container host, and the whole suite is
+# killed at 180s).
+if [[ $t9_elapsed -lt 60 ]]; then ok "live holder throughout: spins the budget on builtins, not forks (${t9_elapsed}s)"
+else bad "live holder throughout: spins the budget on builtins, not forks" "3000 sleep-free iterations took ${t9_elapsed}s"; fi
+
+# ---------------------------------------------------------------------------
+# T10: mkdir fallback, serialized — the same property T6 proves for the
+# flock path, forced onto the mkdir fallback via the no-flock PATH, per this
+# story's REQUIRED TEST: concurrent fallback rebuilds never overlap.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: concurrent rebuilds do not overlap ==\n'
+rm -rf "${IMAGE_REBUILD_LOCK}.d"
+FALLBACK_LOCK_MARKER="${SANDBOX}/fallback-rebuild-in-progress"
+FALLBACK_OVERLAP_LOG="${SANDBOX}/fallback-overlap.log"
+rm -f "$FALLBACK_LOCK_MARKER" "$FALLBACK_OVERLAP_LOG"
+: > "$FALLBACK_OVERLAP_LOG"
+fallback_overlap_cmd="if [[ -f '${FALLBACK_LOCK_MARKER}' ]]; then echo overlap >> '${FALLBACK_OVERLAP_LOG}'; fi; touch '${FALLBACK_LOCK_MARKER}'; sleep 0.3; rm -f '${FALLBACK_LOCK_MARKER}'"
+(
+  PATH="$NOFLOCK_BIN" CFGMS_TEST_IMAGE_REBUILD_CMD="$fallback_overlap_cmd" _image_rebuild "hash-fallback" >/dev/null 2>&1
+) &
+fb_pid1=$!
+(
+  PATH="$NOFLOCK_BIN" CFGMS_TEST_IMAGE_REBUILD_CMD="$fallback_overlap_cmd" _image_rebuild "hash-fallback" >/dev/null 2>&1
+) &
+fb_pid2=$!
+wait "$fb_pid1" "$fb_pid2"
+check_eq "fallback: concurrent rebuilds never overlap" "$(cat "$FALLBACK_OVERLAP_LOG")" ""
+[[ ! -d "${IMAGE_REBUILD_LOCK}.d" ]] && ok "fallback: lock directory removed after both complete" \
+  || bad "fallback: lock directory removed after both complete" "lock dir still present"
+
+# ---------------------------------------------------------------------------
+# T11: mkdir fallback, concurrent reclaim — T10's no-overlap property must also
+# hold when both waiters arrive at a lock left behind by a DEAD holder, which
+# is the case reclaim introduces: both judge the directory stale, and both act
+# on that judgement.
+#
+# End-to-end coverage of that path, not a reproducer: whether a remove and a
+# create from two waiters actually interleave the wrong way is down to the
+# scheduler, and this test cannot force it (it passes against a deliberately
+# non-atomic remove-then-create too — measured). The property is pinned
+# structurally by T12 instead, which tests the serialization that makes the
+# interleaving impossible rather than hoping to observe it.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: concurrent reclaim of a dead holder does not double-build ==\n'
+rm -rf "${IMAGE_REBUILD_LOCK}.d" "${IMAGE_REBUILD_LOCK}.d.reclaim"
+( exit 0 ) &
+dead_pid2=$!
+wait "$dead_pid2" 2>/dev/null || true
+mkdir -p "${IMAGE_REBUILD_LOCK}.d"
+{
+  printf 'pid=%s\n' "$dead_pid2"
+  printf 'host=%s\n' "$(hostname 2>/dev/null || uname -n)"
+  printf 'start=%s\n' "a-start-time-that-cannot-match-anything-alive"
+} > "${IMAGE_REBUILD_LOCK}.d/holder"
+
+RECLAIM_MARKER="${SANDBOX}/reclaim-rebuild-in-progress"
+RECLAIM_OVERLAP_LOG="${SANDBOX}/reclaim-overlap.log"
+RECLAIM_RUNS_LOG="${SANDBOX}/reclaim-runs.log"
+rm -f "$RECLAIM_MARKER" "$RECLAIM_OVERLAP_LOG" "$RECLAIM_RUNS_LOG"
+: > "$RECLAIM_OVERLAP_LOG"
+: > "$RECLAIM_RUNS_LOG"
+reclaim_overlap_cmd="echo run >> '${RECLAIM_RUNS_LOG}'; if [[ -f '${RECLAIM_MARKER}' ]]; then echo overlap >> '${RECLAIM_OVERLAP_LOG}'; fi; touch '${RECLAIM_MARKER}'; sleep 0.3; rm -f '${RECLAIM_MARKER}'"
+(
+  PATH="$NOFLOCK_BIN" CFGMS_TEST_IMAGE_REBUILD_CMD="$reclaim_overlap_cmd" _image_rebuild "hash-reclaim" >/dev/null 2>&1
+) &
+rc_pid1=$!
+(
+  PATH="$NOFLOCK_BIN" CFGMS_TEST_IMAGE_REBUILD_CMD="$reclaim_overlap_cmd" _image_rebuild "hash-reclaim" >/dev/null 2>&1
+) &
+rc_pid2=$!
+wait "$rc_pid1" "$rc_pid2"
+check_eq "concurrent reclaim: rebuilds never overlap" "$(cat "$RECLAIM_OVERLAP_LOG")" ""
+check_eq "concurrent reclaim: both waiters still got their rebuild, serialized" \
+  "$(grep -c run "$RECLAIM_RUNS_LOG" || true)" "2"
+[[ ! -d "${IMAGE_REBUILD_LOCK}.d" ]] && ok "concurrent reclaim: lock directory removed after both complete" \
+  || bad "concurrent reclaim: lock directory removed after both complete" "lock dir still present"
+[[ ! -d "${IMAGE_REBUILD_LOCK}.d.reclaim" ]] && ok "concurrent reclaim: nested reclaim lock left clean" \
+  || bad "concurrent reclaim: nested reclaim lock left clean" "reclaim dir still present"
+
+# ---------------------------------------------------------------------------
+# T12: the nested reclaim lock, which is what makes T11's interleaving
+# impossible rather than merely unlikely. Removing a dead holder's directory
+# and re-creating it has to be one indivisible step; <lockdir>.reclaim is what
+# makes it one. Two deterministic halves:
+#
+#   (a) a reclaim already in progress (its nested lock held by a LIVE process)
+#       stops every other waiter from touching the main lock at all — they
+#       spin out the budget rather than run a second, overlapping reclaim of
+#       the same stale directory;
+#   (b) a nested lock stranded by a reclaimer that DIED mid-reclaim is itself
+#       recovered, so one crash cannot disable stale-lock recovery on the host
+#       until someone deletes the directory by hand.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: reclaim is serialized through a nested lock ==\n'
+seed_dead_holder() {  # seed_dead_holder <dir> <dead-pid>
+  mkdir -p "$1"
+  {
+    printf 'pid=%s\n' "$2"
+    printf 'host=%s\n' "$(hostname 2>/dev/null || uname -n)"
+    printf 'start=%s\n' "a-start-time-that-cannot-match-anything-alive"
+  } > "$1/holder"
+}
+
+rm -rf "${IMAGE_REBUILD_LOCK}.d" "${IMAGE_REBUILD_LOCK}.d.reclaim"
+seed_dead_holder "${IMAGE_REBUILD_LOCK}.d" "$dead_pid2"
+mkdir -p "${IMAGE_REBUILD_LOCK}.d.reclaim"
+_image_rebuild_write_holder "${IMAGE_REBUILD_LOCK}.d.reclaim"   # live: this test process
+
+rm -f "${SANDBOX}/rebuild-happened-t12a"
+t12a_rc=0
+t12a_out=$(
+  (
+    PATH="$NOFLOCK_BIN"
+    sleep() { return 0; }
+    CFGMS_TEST_IMAGE_STALENESS_CHECK=1 \
+    FAKE_IMAGE_LABEL="some-old-hash" \
+    CFGMS_TEST_IMAGE_REBUILD_CMD="touch '${SANDBOX}/rebuild-happened-t12a'; exit 0" \
+    gate_image_staleness_for_launch
+  ) 2>&1
+) || t12a_rc=$?
+check_eq "reclaim in progress: waiter refuses rather than reclaiming in parallel" "$t12a_rc" "11"
+check_contains "reclaim in progress: reports IMAGE_REBUILD_FAILED" \
+  "$t12a_out" "IMAGE_REBUILD_FAILED:${IMAGE_REBUILD_LOCK}"
+[[ ! -f "${SANDBOX}/rebuild-happened-t12a" ]] && ok "reclaim in progress: rebuild command never ran" \
+  || bad "reclaim in progress: rebuild command never ran" "rebuild marker present"
+check_contains "reclaim in progress: the stale lock is left untouched for the reclaimer" \
+  "$(cat "${IMAGE_REBUILD_LOCK}.d/holder" 2>/dev/null || echo MISSING)" "pid=${dead_pid2}"
+
+rm -rf "${IMAGE_REBUILD_LOCK}.d" "${IMAGE_REBUILD_LOCK}.d.reclaim"
+seed_dead_holder "${IMAGE_REBUILD_LOCK}.d" "$dead_pid2"
+seed_dead_holder "${IMAGE_REBUILD_LOCK}.d.reclaim" "$dead_pid2"
+
+rm -f "${SANDBOX}/rebuild-happened-t12b"
+t12b_rc=0
+(
+  PATH="$NOFLOCK_BIN"
+  CFGMS_TEST_IMAGE_STALENESS_CHECK=1 \
+  FAKE_IMAGE_LABEL="some-old-hash" \
+  CFGMS_TEST_IMAGE_REBUILD_CMD="touch '${SANDBOX}/rebuild-happened-t12b'; exit 0" \
+  gate_image_staleness_for_launch
+) >/dev/null 2>&1 || t12b_rc=$?
+check_eq "dead reclaimer: recovery still works (launch proceeds)" "$t12b_rc" "0"
+[[ -f "${SANDBOX}/rebuild-happened-t12b" ]] && ok "dead reclaimer: stale lock reclaimed and rebuild ran" \
+  || bad "dead reclaimer: stale lock reclaimed and rebuild ran" "rebuild marker missing"
+[[ ! -d "${IMAGE_REBUILD_LOCK}.d" ]] && ok "dead reclaimer: lock directory cleaned up after rebuild" \
+  || bad "dead reclaimer: lock directory cleaned up after rebuild" "lock dir still present"
+[[ ! -d "${IMAGE_REBUILD_LOCK}.d.reclaim" ]] && ok "dead reclaimer: stranded nested lock cleaned up" \
+  || bad "dead reclaimer: stranded nested lock cleaned up" "reclaim dir still present"
+
+# ---------------------------------------------------------------------------
+# T13: an unusable holder record reads as "not stale" — the fail-closed
+# direction — and does not take the script down with it. A holder file is
+# written by one process while others read it, so a reader can see it empty or
+# half-written; the lock directory can also exist with no holder file at all,
+# in the window between the mkdir that wins it and the write that records the
+# winner. All of these must answer "cannot judge this lock, keep waiting".
+#
+# A non-numeric pid is the sharp one: it reaches `kill -0 <garbage>`, which
+# fails exactly like a dead process does, so a record validated only for
+# non-emptiness reads as stale and a live holder's lock gets taken away.
+# Called directly rather than through the gate because a waiter that correctly
+# keeps waiting is observable here in one call, instead of as a 600s timeout.
+# ---------------------------------------------------------------------------
+printf '\n== fallback lock: an unusable holder record is never judged stale ==\n'
+T13_DIR="${SANDBOX}/holder-cases"
+for case_name in empty-file no-holder-file garbage no-pid-key non-numeric-pid; do
+  rm -rf "${T13_DIR}/${case_name}"
+  mkdir -p "${T13_DIR}/${case_name}"
+done
+: > "${T13_DIR}/empty-file/holder"
+printf 'not a holder record at all' > "${T13_DIR}/garbage/holder"
+printf 'host=%s\nstart=1\n' "$(hostname 2>/dev/null || uname -n)" > "${T13_DIR}/no-pid-key/holder"
+printf 'pid=notanumber\nhost=%s\n' "$(hostname 2>/dev/null || uname -n)" > "${T13_DIR}/non-numeric-pid/holder"
+
+for case_name in empty-file no-holder-file garbage no-pid-key non-numeric-pid; do
+  t13_rc=0
+  _image_rebuild_lock_stale "${T13_DIR}/${case_name}" || t13_rc=$?
+  check_eq "holder record '${case_name}': not stale (waiter keeps waiting)" "$t13_rc" "1"
+done
 
 # ---------------------------------------------------------------------------
 # Structural wiring: every container-launching case calls

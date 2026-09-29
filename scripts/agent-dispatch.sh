@@ -1274,12 +1274,217 @@ _image_rebuild__body() {
   echo "REBUILD_OK"
 }
 
+# Liveness probing below runs once per 0.2s spin iteration, for up to the full
+# 3000-iteration budget, so every helper here answers through shell builtins
+# and shared state rather than a command substitution or an external binary.
+# That is a correctness requirement, not a micro-optimisation: the first cut of
+# this code forked sed three times plus hostname, ps and tr on every iteration,
+# which measured ~71ms of probe cost per iteration on a container host — the
+# budget that is supposed to bound the wait at 3000 x 0.2s = 600s (matching the
+# flock branch's -w 600) instead bounded it at ~810s, and a test that spins the
+# budget with sleep stubbed out still took >210s of pure fork overhead.
+_IMAGE_REBUILD_HOSTNAME=""
+_IMAGE_REBUILD_PROC_START=""
+_IMAGE_REBUILD_HOLDER_PID=""
+_IMAGE_REBUILD_HOLDER_HOST=""
+_IMAGE_REBUILD_HOLDER_START=""
+
+# _image_rebuild_hostname — best-effort host identity for the fallback lock's
+# holder record, published in _IMAGE_REBUILD_HOSTNAME rather than on stdout so
+# that reading it costs no command substitution. Resolved once per process and
+# memoised: a host does not rename itself mid-rebuild. Never fails the caller —
+# falls back to a fixed string if neither hostname(1) nor `uname -n` resolves.
+_image_rebuild_hostname() {
+  if [[ -z "$_IMAGE_REBUILD_HOSTNAME" ]]; then
+    _IMAGE_REBUILD_HOSTNAME=$(hostname 2>/dev/null || uname -n 2>/dev/null || true)
+    [[ -n "$_IMAGE_REBUILD_HOSTNAME" ]] || _IMAGE_REBUILD_HOSTNAME="unknown-host"
+  fi
+  return 0
+}
+
+# _image_rebuild_proc_start <pid> — a fingerprint of <pid>'s start time,
+# published in _IMAGE_REBUILD_PROC_START. Used to tell a live process that
+# legitimately still holds the fallback lock apart from an unrelated process
+# later assigned the same pid.
+#
+# Reads /proc/<pid>/stat field 22 (starttime, in clock ticks since boot) with
+# builtins where procfs exists, and only falls back to ps(1) where it does not
+# (macOS/BSD — `ps -o lstart=` is supported there and on Linux, and between
+# them they cover every host the mkdir fallback actually runs on; see the
+# flock-absence comment on _image_rebuild below). The two forms are never
+# compared against each other: a fingerprint is only ever compared with another
+# fingerprint taken by this same function on this same host.
+#
+# Empty on any failure — callers treat "can't verify" as "assume live", so a
+# lookup failure can never falsely reclaim a live holder's lock.
+_image_rebuild_proc_start() {
+  local pid="$1"
+  # Field splitting below (both the `read -a` and the `${fields[*]}` join) is
+  # done against a known IFS rather than whatever the caller left set.
+  local IFS=$' \t\n'
+  _IMAGE_REBUILD_PROC_START=""
+
+  local stat_line=""
+  if [[ -r "/proc/${pid}/stat" ]]; then
+    { read -r stat_line < "/proc/${pid}/stat"; } 2>/dev/null || stat_line=""
+  fi
+
+  local -a fields=()
+  if [[ -n "$stat_line" ]]; then
+    # Field 2 (comm) is parenthesised and may itself contain spaces; every
+    # field after the final ')' is fixed position, so count from there.
+    # fields[0] is field 3 (state), which puts starttime at index 19.
+    read -r -a fields <<< "${stat_line##*') '}"
+    # Numeric or it did not parse (a comm containing ") " would shift the
+    # columns), in which case fall through to ps rather than fingerprint the
+    # process with a wrong column.
+    if [[ "${fields[19]:-}" =~ ^[0-9]+$ ]]; then
+      _IMAGE_REBUILD_PROC_START="${fields[19]}"
+      return 0
+    fi
+  fi
+
+  local lstart=""
+  lstart=$(ps -o lstart= -p "$pid" 2>/dev/null) || lstart=""
+  fields=()
+  read -r -a fields <<< "$lstart"
+  _IMAGE_REBUILD_PROC_START="${fields[*]:-}"
+  return 0
+}
+
+# _image_rebuild_write_holder <lockdir> — records this process's identity
+# (pid, host, start time) into a just-acquired fallback lock directory. Called
+# once, immediately after the mkdir that wins the lock, so the window where
+# the lock directory exists without a holder record is as small as possible.
+#
+# Records $BASHPID, not $$: the gate calls _image_rebuild inside a command
+# substitution, so $$ names the dispatch script while $BASHPID names the
+# subshell that actually runs the build and removes the directory. A dead
+# holder is exactly that subshell being gone.
+_image_rebuild_write_holder() {
+  local lockdir="$1"
+  _image_rebuild_hostname
+  _image_rebuild_proc_start "$BASHPID"
+  {
+    printf 'pid=%s\n' "$BASHPID"
+    printf 'host=%s\n' "$_IMAGE_REBUILD_HOSTNAME"
+    printf 'start=%s\n' "$_IMAGE_REBUILD_PROC_START"
+  } >"${lockdir}/holder" 2>/dev/null || true
+}
+
+# _image_rebuild_read_holder <holder_file> — parses a holder record into
+# _IMAGE_REBUILD_HOLDER_{PID,HOST,START}. Returns non-zero when there is no
+# usable record (absent, unreadable, mid-write, or a non-numeric pid), which
+# every caller treats as "cannot judge this lock".
+_image_rebuild_read_holder() {
+  local holder="$1"
+  _IMAGE_REBUILD_HOLDER_PID=""
+  _IMAGE_REBUILD_HOLDER_HOST=""
+  _IMAGE_REBUILD_HOLDER_START=""
+  [[ -f "$holder" ]] || return 1
+
+  # Initialised, not merely declared: the loop's `|| [[ -n "$line" ]]` (which
+  # catches a final line with no trailing newline) reads $line on the path
+  # where read returned non-zero, and under `set -u` a declared-but-unset
+  # local is an unbound variable — fatal to the whole dispatch script, not
+  # just this function. It survives today only because bash's read assigns the
+  # empty partial line before failing; an empty or truncated holder file is a
+  # routine input here (a record caught mid-write is exactly what this
+  # function must fail closed on), so it does not rest on that.
+  local line="" key="" value=""
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      key="${line%%=*}"
+      value="${line#*=}"
+      case "$key" in
+        pid)   _IMAGE_REBUILD_HOLDER_PID="$value" ;;
+        host)  _IMAGE_REBUILD_HOLDER_HOST="$value" ;;
+        start) _IMAGE_REBUILD_HOLDER_START="$value" ;;
+      esac
+    done < "$holder"
+  } 2>/dev/null || true
+
+  [[ "$_IMAGE_REBUILD_HOLDER_PID" =~ ^[0-9]+$ ]]
+}
+
+# _image_rebuild_lock_stale <lockdir> — true if <lockdir>'s recorded holder is
+# provably no longer running it, so a waiter may reclaim it instead of
+# spinning out the full budget (Issue #4419: a holder that dies mid-build --
+# OOM-killed docker build, kill -9, host reboot -- never removes the
+# directory, and nothing else did either). Fails closed at every ambiguous
+# step -- no holder record yet, a record from a different host, or a start
+# time that can't be compared -- by reporting "not stale": a wrongly reclaimed
+# live lock breaks the one guarantee this lock exists for (two concurrent
+# docker builds), while a wrongly retained dead lock only costs the waiter the
+# bounded spin budget.
+_image_rebuild_lock_stale() {
+  local lockdir="$1"
+  _image_rebuild_read_holder "${lockdir}/holder" || return 1
+
+  _image_rebuild_hostname
+  [[ "$_IMAGE_REBUILD_HOLDER_HOST" == "$_IMAGE_REBUILD_HOSTNAME" ]] || return 1
+
+  kill -0 "$_IMAGE_REBUILD_HOLDER_PID" 2>/dev/null || return 0
+
+  local recorded_start="$_IMAGE_REBUILD_HOLDER_START"
+  _image_rebuild_proc_start "$_IMAGE_REBUILD_HOLDER_PID"
+  [[ -n "$recorded_start" && -n "$_IMAGE_REBUILD_PROC_START" \
+     && "$recorded_start" != "$_IMAGE_REBUILD_PROC_START" ]]
+}
+
+# _image_rebuild_reclaim <lockdir> — take a lock directory away from a holder
+# that is provably dead. Returns 0 only when this process now holds a freshly
+# created <lockdir> (holder record written); non-zero means keep waiting.
+#
+# Removing and re-creating the directory has to be one indivisible step. Two
+# waiters that independently judge the same directory stale otherwise
+# interleave as remove / create / remove / create and BOTH end up believing
+# they hold the lock — the concurrent `docker build` this lock exists to
+# prevent, and a likelier interleaving than it looks, since waiters spin in
+# lockstep on the same 0.2s cadence. A nested lock directory
+# (<lockdir>.reclaim, held for the handful of syscalls below and nothing else)
+# admits one reclaimer at a time, and re-checking liveness inside it means a
+# waiter that queued behind the reclaimer sees the new, live holder and goes
+# back to waiting instead of deleting it.
+_image_rebuild_reclaim() {
+  local lockdir="$1" reclaim="${lockdir}.reclaim"
+  _image_rebuild_lock_stale "$lockdir" || return 1
+
+  if ! mkdir "$reclaim" 2>/dev/null; then
+    # Either another waiter is mid-reclaim (leave it to them), or a previous
+    # reclaimer died holding this directory. The same liveness check that
+    # recovers the main lock recovers this one, so that one dead reclaimer
+    # cannot disable stale-lock recovery on the host until someone deletes the
+    # directory by hand.
+    _image_rebuild_lock_stale "$reclaim" || return 1
+    rm -rf "$reclaim" 2>/dev/null || true
+    mkdir "$reclaim" 2>/dev/null || return 1
+  fi
+  _image_rebuild_write_holder "$reclaim"
+
+  local held=1
+  if _image_rebuild_lock_stale "$lockdir"; then
+    rm -rf "$lockdir" 2>/dev/null || true
+    if mkdir "$lockdir" 2>/dev/null; then
+      _image_rebuild_write_holder "$lockdir"
+      held=0
+    fi
+  fi
+  rm -rf "$reclaim" 2>/dev/null || true
+  return $held
+}
+
 # _image_rebuild <checkout_hash> — serializes _image_rebuild__body so two
-# concurrent launches never build at the same time. Prefers flock; falls back
-# to the same mkdir spinlock _cfgms_locked_do uses when flock is absent. Unlike
-# _cfgms_locked_do this is NOT best-effort — a rebuild that is silently
+# concurrent launches never build at the same time. Prefers flock (the kernel
+# releases an FD lock when its holder dies, so a crash can't strand it); falls
+# back to the same mkdir spinlock _cfgms_locked_do uses when flock is absent.
+# Unlike _cfgms_locked_do this is NOT best-effort — a rebuild that is silently
 # skipped under lock contention would let the caller launch on the stale image
-# it was trying to replace, so a lock timeout is itself a rebuild failure.
+# it was trying to replace, so a lock timeout is itself a rebuild failure. On
+# the mkdir fallback specifically, a dead holder's directory is never removed
+# by the kernel, so every waiter checks holder liveness each time mkdir loses
+# the race and reclaims the directory (_image_rebuild_reclaim) instead of
+# spinning out the budget against a lock nobody is going to release.
 _image_rebuild() {
   local checkout_hash="$1"
   mkdir -p "$(dirname "$IMAGE_REBUILD_LOCK")" 2>/dev/null || true
@@ -1292,6 +1497,11 @@ _image_rebuild() {
   else
     local lockdir="${IMAGE_REBUILD_LOCK}.d" waited=0
     while ! mkdir "$lockdir" 2>/dev/null; do
+      # Reclaim hands back a lock directory this process now holds, so there is
+      # nothing left to race for — break out rather than re-entering mkdir.
+      if _image_rebuild_reclaim "$lockdir"; then
+        break
+      fi
       waited=$((waited + 1))
       if [[ $waited -gt 3000 ]]; then
         echo "REBUILD_FAILED"
@@ -1299,9 +1509,10 @@ _image_rebuild() {
       fi
       sleep 0.2
     done
+    _image_rebuild_write_holder "$lockdir"
     local rc=0
     _image_rebuild__body "$checkout_hash" || rc=$?
-    rmdir "$lockdir" 2>/dev/null || true
+    rm -rf "$lockdir" 2>/dev/null || true
     return $rc
   fi
 }
@@ -1344,7 +1555,7 @@ gate_image_staleness_for_launch() {
     return 0
   fi
 
-  echo "IMAGE_REBUILD_FAILED"
+  echo "IMAGE_REBUILD_FAILED:${IMAGE_REBUILD_LOCK}"
   exit 11
 }
 
