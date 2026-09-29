@@ -24,7 +24,13 @@ Story lifecycle:
                                                  consuming product capability; multi-valued, e.g.
                                                  cms,twin). Deferred: intent rides a body marker until
                                                  materialize. Vocabulary: docs/product/roadmap.md.
-  edit-body <issue_num> <body_file>              Replace issue body from file
+  edit-body <issue_num> <body_file> <expected_updated_at>
+                                                 Replace issue body from file. Fails closed
+                                                 (non-zero, no write) when the issue's live
+                                                 updatedAt no longer matches expected_updated_at —
+                                                 fetch it from `view <issue_num>` immediately before
+                                                 writing. On refusal, the live body is written to a
+                                                 predictable conflict file for merging (Issue #4433).
   append-section <issue_num> <section> <file>    Append content after ## <section> heading
 
 Sub-issue linking:
@@ -36,7 +42,7 @@ Comments:
   comment-inline <issue_num> <text>              Post short comment (single line, no special chars)
 
 Issue queries:
-  view <issue_num>                               View issue JSON (title, body, labels, state)
+  view <issue_num>                               View issue JSON (title, body, labels, state, updatedAt)
   list-prs <search>                              List open PRs matching search (JSON)
 
 Epic operations:
@@ -251,15 +257,88 @@ SPLICE_EOF
     ;;
 
   edit-body)
-    issue_num="${1:?Usage: edit-body <issue_num> <body_file>}"
-    body_file="${2:?Usage: edit-body <issue_num> <body_file>}"
+    issue_num="${1:?Usage: edit-body <issue_num> <body_file> <expected_updated_at>}"
+    body_file="${2:?Usage: edit-body <issue_num> <body_file> <expected_updated_at>}"
+    expected_updated_at="${3:?Usage: edit-body <issue_num> <body_file> <expected_updated_at> — fetch expected_updated_at from 'view <issue_num>' immediately before writing; there is no flag to skip this check}"
 
     if [ ! -f "$body_file" ]; then
       echo "ERROR: Body file not found: $body_file"
       exit 1
     fi
 
-    gh issue edit "$issue_num" --repo "$REPO" --body-file "$body_file"
+    # Scratch files hold complete issue bodies in cleartext, so they never live
+    # in a world-writable directory: a predictable name under /tmp is both a
+    # symlink-traversal write primitive (`mkdir -p` succeeds silently on a
+    # pre-existing symlink-to-directory and the later redirect writes through
+    # it) and a world-readable copy of the body. Use the caller's own runtime
+    # or cache directory, verify what we ended up with, and keep it 0700.
+    scratch_root="${XDG_RUNTIME_DIR:-}"
+    if [ -z "$scratch_root" ]; then
+      if [ -z "${HOME:-}" ]; then
+        echo "ERROR: edit-body needs XDG_RUNTIME_DIR or HOME set for its scratch directory"
+        exit 1
+      fi
+      scratch_root="${HOME}/.cache"
+    fi
+    scratch_dir="${scratch_root}/cfgms/edit-body"
+    umask 077
+    mkdir -p "$scratch_dir"
+    # -L catches the symlink swap on the components we create ourselves; -O
+    # catches a directory planted by another user before we ever ran.
+    for scratch_check in "${scratch_root}/cfgms" "$scratch_dir"; do
+      if [ -L "$scratch_check" ]; then
+        echo "ERROR: refusing edit-body — scratch path is a symlink: ${scratch_check}"
+        exit 1
+      fi
+    done
+    for scratch_check in "$scratch_root" "${scratch_root}/cfgms" "$scratch_dir"; do
+      if [ ! -d "$scratch_check" ]; then
+        echo "ERROR: refusing edit-body — scratch path is not a directory: ${scratch_check}"
+        exit 1
+      fi
+      if [ ! -O "$scratch_check" ]; then
+        echo "ERROR: refusing edit-body — scratch path is not owned by the current user: ${scratch_check}"
+        exit 1
+      fi
+    done
+    chmod 700 "$scratch_dir"
+    conflict_file="${scratch_dir}/${issue_num}-conflict.md"
+    applied_file="${scratch_dir}/${issue_num}-applied.md"
+
+    # Optimistic concurrency (Issue #4433): two sessions that both read a body,
+    # both revise it, and both write it used to silently last-writer-wins —
+    # both were told UPDATED. Refuse the write instead when the live issue has
+    # moved since the caller's read.
+    live_json=$(gh issue view "$issue_num" --repo "$REPO" --json updatedAt,body)
+    live_updated_at=$(printf '%s' "$live_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['updatedAt'])")
+
+    if [ "$live_updated_at" != "$expected_updated_at" ]; then
+      rm -f "$conflict_file"
+      printf '%s' "$live_json" | python3 -c "import json,sys; sys.stdout.write(json.load(sys.stdin)['body'])" > "$conflict_file"
+      chmod 600 "$conflict_file"
+      echo "ERROR: refusing edit-body for #${issue_num} — issue changed since it was read."
+      echo "  expected updatedAt: ${expected_updated_at}"
+      echo "  live updatedAt:     ${live_updated_at}"
+      echo "  live body written to: ${conflict_file}"
+      echo "Merge your intended changes into that file, re-read updatedAt, and retry."
+      exit 1
+    fi
+
+    # Stage the body at a predictable path (not a random mktemp name) so that
+    # if the edit below is lost, it is recoverable without the caller having
+    # kept its own copy.
+    rm -f "$applied_file"
+    cp "$body_file" "$applied_file"
+    chmod 600 "$applied_file"
+
+    if ! gh issue edit "$issue_num" --repo "$REPO" --body-file "$body_file"; then
+      echo "ERROR: gh issue edit failed for #${issue_num} — intended body retained at: ${applied_file}"
+      exit 1
+    fi
+    # The copy exists only to make a *lost* write recoverable. Once GitHub has
+    # the body, retaining a cleartext issue body on disk is exposure with no
+    # recovery value, so it is removed on success.
+    rm -f "$applied_file"
     echo "UPDATED:${issue_num}"
     ;;
 
@@ -342,7 +421,7 @@ SPLICE_EOF
 
   view)
     issue_num="${1:?Usage: view <issue_num>}"
-    gh issue view "$issue_num" --repo "$REPO" --json number,title,body,labels,state,assignees
+    gh issue view "$issue_num" --repo "$REPO" --json number,title,body,labels,state,assignees,updatedAt
     ;;
 
   list-prs)
