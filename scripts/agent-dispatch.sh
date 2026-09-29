@@ -1201,6 +1201,153 @@ gate_credentials_for_launch() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Build-inputs staleness gate (Issue #4388).
+#
+# Nothing rebuilds cfg-agent:latest when .devcontainer/ changes on develop.
+# Some of the scripts that image runs (review-entrypoint.sh,
+# investigator-entrypoint.sh, agent-context.sh, setup-env.sh) are ALSO
+# bind-mounted fresh from this checkout at every launch, so a merge that
+# changes their contract can combine a new mounted script with an old image.
+# That is exactly what happened on 2026-09-28: PR #4378 moved the entrypoint
+# to root-then-drop, the mounted review-entrypoint.sh started running as
+# uid 1000 against an image still on Config.User=agent, and every review
+# container died silently for ~50 minutes until a manual rebuild.
+#
+# cfg-agent:latest carries a `cfgms.build_inputs_hash` label — the git tree
+# hash of `.devcontainer` at HEAD (the Dockerfile's own COPY sources and the
+# exact directory every runtime-mounted script above lives under). The
+# documented build command in .claude/commands/agent-setup.md sets it.
+# ---------------------------------------------------------------------------
+IMAGE_REBUILD_LOCK="${CFGMS_TEST_IMAGE_REBUILD_LOCK:-${AGENT_LEDGER_DIR}/image-rebuild.lock}"
+
+# _image_build_inputs_hash — this checkout's build-inputs identity. Empty if
+# REPO_ROOT is not a git checkout (never true in production).
+_image_build_inputs_hash() {
+  git -C "$REPO_ROOT" rev-parse "HEAD:.devcontainer" 2>/dev/null || true
+}
+
+# _image_build_inputs_label — cfg-agent:latest's recorded build-inputs
+# identity. Empty if the image or the label is absent.
+_image_build_inputs_label() {
+  docker inspect cfg-agent:latest \
+    --format '{{index .Config.Labels "cfgms.build_inputs_hash"}}' 2>/dev/null || true
+}
+
+# _image_rebuild__body <checkout_hash> — the guarded section of a rebuild:
+# re-checks freshness (another launch may have rebuilt while this one waited
+# on the lock), tags the current image as a timestamped backup so a bad build
+# can be rolled back by hand, then rebuilds. Echoes REBUILD_OK or
+# REBUILD_FAILED; never raises — the caller decides what a failure means.
+#
+# Test hook: CFGMS_TEST_IMAGE_REBUILD_CMD replaces `docker build` for
+# hermetic tests, same shape as CFGMS_TEST_SMOKE_RUN_CMD above.
+_image_rebuild__body() {
+  local checkout_hash="$1"
+
+  local current_label
+  current_label=$(_image_build_inputs_label)
+  if [[ -n "$current_label" && "$current_label" == "$checkout_hash" ]]; then
+    echo "REBUILD_OK"
+    return 0
+  fi
+
+  if docker image inspect cfg-agent:latest >/dev/null 2>&1; then
+    docker tag cfg-agent:latest "cfg-agent:backup-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  fi
+
+  local build_exit=0
+  if [[ -n "${CFGMS_TEST_IMAGE_REBUILD_CMD:-}" ]]; then
+    bash -c "${CFGMS_TEST_IMAGE_REBUILD_CMD}" >&2 || build_exit=$?
+  else
+    docker build \
+      --label "cfgms.build_inputs_hash=${checkout_hash}" \
+      -t cfg-agent:latest \
+      -f "${REPO_ROOT}/.devcontainer/Dockerfile" \
+      "${REPO_ROOT}" >&2 || build_exit=$?
+  fi
+
+  if [[ $build_exit -ne 0 ]]; then
+    echo "REBUILD_FAILED"
+    return 1
+  fi
+  echo "REBUILD_OK"
+}
+
+# _image_rebuild <checkout_hash> — serializes _image_rebuild__body so two
+# concurrent launches never build at the same time. Prefers flock; falls back
+# to the same mkdir spinlock _cfgms_locked_do uses when flock is absent. Unlike
+# _cfgms_locked_do this is NOT best-effort — a rebuild that is silently
+# skipped under lock contention would let the caller launch on the stale image
+# it was trying to replace, so a lock timeout is itself a rebuild failure.
+_image_rebuild() {
+  local checkout_hash="$1"
+  mkdir -p "$(dirname "$IMAGE_REBUILD_LOCK")" 2>/dev/null || true
+
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -w 600 200 || { echo "REBUILD_FAILED"; exit 1; }
+      _image_rebuild__body "$checkout_hash"
+    ) 200>"$IMAGE_REBUILD_LOCK"
+  else
+    local lockdir="${IMAGE_REBUILD_LOCK}.d" waited=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      waited=$((waited + 1))
+      if [[ $waited -gt 3000 ]]; then
+        echo "REBUILD_FAILED"
+        return 1
+      fi
+      sleep 0.2
+    done
+    local rc=0
+    _image_rebuild__body "$checkout_hash" || rc=$?
+    rmdir "$lockdir" 2>/dev/null || true
+    return $rc
+  fi
+}
+
+# gate_image_staleness_for_launch — refuses to launch a container from an
+# image built from stale .devcontainer inputs (Issue #4388). Called
+# immediately before every `docker run` that starts an agent container.
+#
+# No docker binary at all means no container is starting regardless of what
+# this gate decides (the docker run right after would fail the same way), so
+# it is a no-op rather than a second, earlier failure mode for that case.
+#
+# Hermetic dispatch tests set CFGMS_TEST_REPO_ROOT to keep every path off of
+# live git/docker state (see REPO_ROOT above); by default this gate is a
+# no-op under that flag too, so the many launch-path tests that predate this
+# gate don't need to know about it. image_staleness.test.sh, which exercises
+# this gate for real against a disposable git fixture and a stubbed `docker`,
+# opts back in with CFGMS_TEST_IMAGE_STALENESS_CHECK=1.
+gate_image_staleness_for_launch() {
+  command -v docker >/dev/null 2>&1 || return 0
+  if [[ -n "${CFGMS_TEST_REPO_ROOT:-}" && -z "${CFGMS_TEST_IMAGE_STALENESS_CHECK:-}" ]]; then
+    return 0
+  fi
+
+  local checkout_hash image_hash
+  checkout_hash=$(_image_build_inputs_hash)
+  image_hash=$(_image_build_inputs_label)
+
+  if [[ -n "$checkout_hash" && -n "$image_hash" && "$checkout_hash" == "$image_hash" ]]; then
+    return 0
+  fi
+
+  # Missing label counts as a mismatch (empty image_hash never equals a
+  # non-empty checkout_hash above).
+  echo "IMAGE_STALE:${image_hash:-none}:${checkout_hash:-none}"
+
+  local rebuild_result
+  rebuild_result=$(_image_rebuild "$checkout_hash") || true
+  if [[ "$rebuild_result" == "REBUILD_OK" ]]; then
+    return 0
+  fi
+
+  echo "IMAGE_REBUILD_FAILED"
+  exit 11
+}
+
 # Stream an investigator container's log to disk for the container's lifetime.
 #
 # Writes to <sweep_dir>/container-logs/<mode>.log, where sweep_dir is whatever
@@ -1907,6 +2054,7 @@ case "$cmd" in
     num="$1"
     [[ "$num" =~ ^[0-9]+$ ]] || { echo "launch requires a numeric issue number"; exit 1; }
     gate_credentials_for_launch
+    gate_image_staleness_for_launch
     clone_path="${WORKTREE_BASE}/story-${num}"
     real_path=$(realpath "$clone_path")
     gh_token=$(gh auth token)
@@ -1983,6 +2131,7 @@ case "$cmd" in
     entrypoint_args=("$@")
 
     gate_credentials_for_launch
+    gate_image_staleness_for_launch
     real_path=$(realpath "$clone_dir")
     gh_token=$(gh auth token)
 
@@ -2121,6 +2270,7 @@ case "$cmd" in
 
     real_path=$(realpath "$clone_dir")
     gh_token=$(gh auth token)
+    gate_image_staleness_for_launch
 
     # Remove stale container with the same name if it exists
     docker rm -f "$container_name" 2>/dev/null || true
@@ -2295,6 +2445,8 @@ case "$cmd" in
       session_desc="/po"
     fi
 
+    gate_image_staleness_for_launch
+
     echo "================================================"
     echo " CFGMS PO Live Session"
     echo " Session:        ${session_desc}"
@@ -2338,6 +2490,7 @@ case "$cmd" in
     real_path=$(realpath "$clone_dir")
     gh_token=$(gh auth token)
     container_name="cfg-agent-interactive-${sanitized}"
+    gate_image_staleness_for_launch
 
     # Use setup-env.sh for shared setup (firewall, credential symlinks, git config).
     # setup-env.sh is baked into the image at /usr/local/bin/ so it works even when
@@ -2691,6 +2844,16 @@ PYEOF
         echo "WARN:image_age:Image is ${age_days} days old — Trivy DB and Go modules may be stale. Run /agent-setup rebuild"
         warnings=$((warnings + 1))
       fi
+
+      # Build-inputs staleness check (Issue #4388) — independent of image_age
+      # above: a same-day merge under .devcontainer/ is stale immediately, not
+      # after a week.
+      checkout_inputs_hash=$(_image_build_inputs_hash)
+      image_inputs_label=$(_image_build_inputs_label)
+      if [[ -n "$checkout_inputs_hash" && "$checkout_inputs_hash" != "$image_inputs_label" ]]; then
+        echo "WARN:image_inputs_stale:Image build-inputs label (${image_inputs_label:-none}) does not match checkout .devcontainer (${checkout_inputs_hash}). Run /agent-setup rebuild"
+        warnings=$((warnings + 1))
+      fi
     fi
 
     # Claude version comparison
@@ -2786,6 +2949,7 @@ PYEOF
     fi
 
     gate_credentials_for_launch
+    gate_image_staleness_for_launch
 
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
@@ -3774,6 +3938,11 @@ PY
     if inv_sessions_dir=$(prepare_session_dir "$container_name" "investigator-${inv_mode_safe}" "" "" ""); then
       inv_session_mount=(-v "${inv_sessions_dir}:${AGENT_SESSIONS_MOUNT}")
     fi
+
+    # Applies to every harness (claude/codex/opencode/ollama) -- they all
+    # converge on the one `docker run -d` below, unlike gate_credentials_for_launch
+    # above which only the claude harness needs.
+    gate_image_staleness_for_launch
 
     ledger_append_launch "$container_name" "investigator-${inv_mode_safe}" "" "" "" "investigator" ""
 
