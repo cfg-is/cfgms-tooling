@@ -2054,8 +2054,9 @@ case "$cmd" in
     num="$1"
     [[ "$num" =~ ^[0-9]+$ ]] || { echo "launch requires a numeric issue number"; exit 1; }
     gate_credentials_for_launch
-    gate_image_staleness_for_launch
     clone_path="${WORKTREE_BASE}/story-${num}"
+    [[ -d "$clone_path" ]] || { echo "ERROR: clone not found: ${clone_path}"; exit 1; }
+    gate_image_staleness_for_launch
     real_path=$(realpath "$clone_path")
     gh_token=$(gh auth token)
 
@@ -2131,6 +2132,7 @@ case "$cmd" in
     entrypoint_args=("$@")
 
     gate_credentials_for_launch
+    [[ -d "$clone_dir" ]] || { echo "ERROR: clone not found: ${clone_dir}"; exit 1; }
     gate_image_staleness_for_launch
     real_path=$(realpath "$clone_dir")
     gh_token=$(gh auth token)
@@ -2948,14 +2950,13 @@ PYEOF
       exit 1
     fi
 
-    gate_credentials_for_launch
-    gate_image_staleness_for_launch
-
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
       --json state,headRefName,body,labels,headRepositoryOwner,author,mergeStateStatus 2>/dev/null) || {
       _emit_review_refused "$pr_num" "pr_not_found"
     }
+    gate_credentials_for_launch
+    gate_image_staleness_for_launch
     state=$(echo "$pr_meta" | jq -r '.state')
     merge_state=$(echo "$pr_meta" | jq -r '.mergeStateStatus // empty' | tr '[:lower:]' '[:upper:]')
     pr_branch=$(echo "$pr_meta" | jq -r '.headRefName')

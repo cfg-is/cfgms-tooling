@@ -377,8 +377,17 @@ assert_review_refusal() {
   # contain "merge_conflicts", which a creds-deferred message also satisfies.
   # Injecting CREDS_OK is what actually exercises the guard. (Issue #3459 --
   # found when .claude/scripts/tests/ was first wired into `make test`.)
+  #
+  # Also stub CFGMS_TEST_REPO_ROOT so gate_image_staleness_for_launch (#4388)
+  # is a no-op here, same as every other pre-existing launch-path test. Without
+  # it, this test's result depends on the real host's cfg-agent:latest state:
+  # on a CI runner with docker present and no matching image, the gate's own
+  # "IMAGE_STALE:..." line becomes the first line of output, colliding with
+  # this test's `head -1` and failing the DIRTY assertion regardless of the
+  # conflict guard it's meant to exercise (Issue #4423).
   actual=$(GH_FIXTURE="$fixture" PATH="$CONFLICT_STUB_DIR:$PATH" \
     CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+    CFGMS_TEST_REPO_ROOT="$CONFLICT_STUB_DIR" \
     "$DISPATCH" review-pr 4242 2>&1 | head -1) || true
   case "$expected" in
     refused)
