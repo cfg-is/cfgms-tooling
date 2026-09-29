@@ -32,15 +32,45 @@ echo "capacity.test.sh — resource admission gate"
 echo "------------------------------------------"
 
 # T1: an impossible disk ceiling forces CAPACITY_FULL (rc1), binding = disk.
+# The mem/cpu ceilings are pinned to 1.0 (cannot bind) so disk is unambiguously
+# the reported binding resource regardless of live host memory/CPU state —
+# _capacity_compute's reason = min(slots, key=slots.get) picks "mem" over "disk"
+# on a tie, and slots["mem"] hits 0 whenever the host is already memory-full
+# (Issue #4364), which previously made this case host-load-dependent.
 rc=0; out="$(bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
 # (host-dependent OK/FULL — only assert the format is one of the two)
 check_contains "capacity prints CAPACITY_ status" "$out" "CAPACITY_"
-rc=0; out="$(CFGMS_AGENT_DISK_CEIL=0.0 bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+rc=0
+out="$(CFGMS_AGENT_DISK_CEIL=0.0 CFGMS_AGENT_MEM_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=1.0 \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
 check_contains "0% disk ceiling -> CAPACITY_FULL:disk" "$out" "CAPACITY_FULL:disk"
 check_rc "forced-full exits 1" "$rc" "1"
 
+# T1-env: a genuinely memory-full host must not change T1's result. Export
+# CFGMS_AGENT_MEM_CEIL=0.0 into the surrounding environment (simulating the
+# memory-full host from Issue #4364) and re-run T1's exact command — its own
+# CFGMS_AGENT_MEM_CEIL=1.0 assignment overrides the inherited one for that
+# invocation, so the outcome must be identical to T1 above.
+export CFGMS_AGENT_MEM_CEIL=0.0
+rc=0
+out="$(CFGMS_AGENT_DISK_CEIL=0.0 CFGMS_AGENT_MEM_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=1.0 \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+check_contains "T1 immune to memory-full host env" "$out" "CAPACITY_FULL:disk"
+check_rc "forced-full exits 1 (env mem-full)" "$rc" "1"
+unset CFGMS_AGENT_MEM_CEIL
+
+# T1-mem: an impossible mem ceiling forces CAPACITY_FULL (rc1), binding = mem.
+# Mirrors T1: pins disk/cpu to 1.0 so mem is unambiguously the binding resource,
+# and is host-load-independent (mem_ceil=0.0 always yields slots["mem"]=0).
+rc=0
+out="$(CFGMS_AGENT_MEM_CEIL=0.0 CFGMS_AGENT_DISK_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=1.0 \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+check_contains "0% mem ceiling -> CAPACITY_FULL:mem" "$out" "CAPACITY_FULL:mem"
+check_rc "mem-forced-full exits 1" "$rc" "1"
+
 # T2: --json reports can_launch=false under the impossible ceiling.
-out="$(CFGMS_AGENT_DISK_CEIL=0.0 bash "$DISPATCH" capacity --json 2>/dev/null)" || true
+out="$(CFGMS_AGENT_DISK_CEIL=0.0 CFGMS_AGENT_MEM_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=1.0 \
+       bash "$DISPATCH" capacity --json 2>/dev/null)" || true
 check_contains "json can_launch false" "$out" '"can_launch": false'
 check_contains "json names binding resource" "$out" '"binding"'
 
