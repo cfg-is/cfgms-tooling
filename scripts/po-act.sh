@@ -58,7 +58,10 @@ if [[ -z "$WORKTREE_BASE" ]]; then
   WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
 fi
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
-PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
+# CFGMS_TEST_PROJECT_QUEUE: same test-hook shape as CFGMS_TEST_DISPATCH /
+# CFGMS_TEST_PIPELINE_HELPER -- lets hermetic tests stand in for the real
+# script (gh-backed, no test hooks of its own) rather than hitting GitHub.
+PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh}"
 PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/pipeline-helper.sh}"
 
 # Default lease TTLs (seconds). A held lease past its TTL is reclaimable by any
@@ -638,7 +641,7 @@ fi
 case "$cmd" in
   dispatch)
     arg="${1:?story number or item_id required}"
-    PROJECT_QUEUE="$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh"
+    PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh}"
 
     # Resource admission gate (before any lease/materialize/clone). Defer if the
     # host has no room for another agent container — RAM/disk 90%, CPU 75%.
@@ -786,6 +789,13 @@ except Exception: print('')" 2>/dev/null || echo "")
     fi
 
     ledger_append_launch "$container_name" "issue" "${story:-}" "" "" "dev-agent" "story-${item_id}"
+
+    # Refuse to launch on a stale cfg-agent:latest (Issue #4484). Every other
+    # docker-run launch site gates immediately before its `docker run`; this
+    # inlined dispatch path (see the "Inlined from agent-dispatch.sh launch"
+    # comment above) was the one that didn't, so dev-agent dispatch kept
+    # running on images built from stale .devcontainer inputs.
+    gate_image_staleness_for_launch
 
     if container_id=$(docker run -d \
       --name "$container_name" \

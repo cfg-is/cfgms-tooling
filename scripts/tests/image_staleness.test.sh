@@ -642,6 +642,94 @@ else
   bad "agent-setup.md exists" "not found: $AGENT_SETUP_MD"
 fi
 
+# ---------------------------------------------------------------------------
+# Structural wiring, widened (Issue #4484): the checks above only ever read
+# agent-dispatch.sh. #4388 gated every launch site IN THAT FILE, but
+# po-act.sh dispatch builds its own inlined `docker run -d` (see the comment
+# at po-act.sh:41) rather than calling agent-dispatch.sh launch, so it had no
+# test anywhere that would catch a missing gate on that path -- which is
+# exactly how it shipped ungated. This section scans every script under
+# .claude/scripts/ (not just agent-dispatch.sh) so the same gap can't reopen
+# in a different file next time.
+#
+# A "launch" is a `docker run` invocation shaped like the ones that actually
+# start a persistent or interactive agent container:
+#   container_id=$(docker run -d ...      (detached, like every dev-agent/
+#                                           review/investigator launch)
+#   exec docker run -it --rm ...          (interactive, like po-live/live)
+# This deliberately excludes the short synchronous `--rm`-only one-off
+# commands (version checks at agent-dispatch.sh:3074+, the smoke-test run at
+# :3027) -- those exit immediately after a single subcommand and never start
+# the long-running agent entrypoint, so gating them would be pointless. The
+# cfg-agent: image-reference check within a 40-line lookahead confirms the
+# match is actually an agent-container launch and not an unrelated `-d`/`-it`
+# docker invocation that happens to share the shape.
+#
+# "Same case branch" is approximated by resetting "gate seen" at each
+# top-level case-label line (the two-space-indented `  label)` convention
+# both agent-dispatch.sh and po-act.sh use for their subcommand dispatch). A
+# script with no case statement at all (refresh-agent-creds.sh) is one single
+# branch spanning the whole file.
+printf '\n== structural: every agent-container docker run under .claude/scripts/ is gated ==\n'
+
+# refresh-agent-creds.sh:34 (`exec docker run --rm -it ...`) is a human-run,
+# TTY-requiring credential refresh -- operator-invoked, not autonomous dev-
+# agent dispatch, and explicitly Out of Scope for Issue #4484. The structural
+# scan below would otherwise flag it (it IS an ungated agent-container
+# launch); this allowlist documents that as a known, deliberate exception
+# rather than silently skipping it.
+UNGATED_LAUNCH_ALLOWLIST=(
+  "refresh-agent-creds.sh"
+)
+
+is_allowlisted_ungated_launch() {
+  local base="$1" entry
+  for entry in "${UNGATED_LAUNCH_ALLOWLIST[@]}"; do
+    [[ "$base" == "$entry" ]] && return 0
+  done
+  return 1
+}
+
+while IFS= read -r -d '' script; do
+  base="$(basename "$script")"
+
+  mapfile -t findings < <(awk '
+    /^  [A-Za-z][A-Za-z0-9_-]*\)[[:space:]]*$/ { gate_seen = 0 }
+    /gate_image_staleness_for_launch/ { gate_seen = 1 }
+    /container_id=\$\(docker run/ || /^[[:space:]]*exec docker run/ {
+      if ($0 ~ /[[:space:]]-d[[:space:]]/ || $0 ~ /[[:space:]]-it[[:space:]]/) {
+        launch_line[++n] = NR
+        launch_gated[n] = gate_seen
+      }
+    }
+    END {
+      for (i = 1; i <= n; i++) print launch_line[i] ":" launch_gated[i]
+    }
+  ' "$script")
+
+  for finding in "${findings[@]}"; do
+    line="${finding%%:*}"
+    gated="${finding##*:}"
+    # Confirm this launch actually targets a cfg-agent image before counting
+    # it -- a 40-line lookahead comfortably covers every real call site
+    # (largest measured offset was 29 lines, at agent-dispatch.sh:4177).
+    is_agent_launch=$(awk -v start="$line" 'NR>=start && NR<=start+40 && /cfg-agent:/{print "1"; exit}' "$script")
+    [[ -n "$is_agent_launch" ]] || continue
+
+    if is_allowlisted_ungated_launch "$base"; then
+      ok "${base}:${line} agent-container docker run is a documented ungated exception"
+      continue
+    fi
+
+    if [[ "$gated" == "1" ]]; then
+      ok "${base}:${line} agent-container docker run is gated by gate_image_staleness_for_launch"
+    else
+      bad "${base}:${line} agent-container docker run is gated by gate_image_staleness_for_launch" \
+        "no gate_image_staleness_for_launch call found earlier in the same case branch"
+    fi
+  done
+done < <(find "${REPO_ROOT_REAL}/.claude/scripts" -maxdepth 1 -name '*.sh' -print0)
+
 echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"
