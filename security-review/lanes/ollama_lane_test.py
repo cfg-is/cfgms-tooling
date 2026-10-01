@@ -391,8 +391,23 @@ def test_http_429_is_rate_limited_by_status_not_prose() -> None:
             "429-by-status: the synthesized `HTTP 429` prefix is what the fallback matches",
             "the status check is what survives a change to that format string",
         )
-        exit_code, rate_limited, _tail = _run_with_fake_ollama(
-            out_dir, raw_path, stdout="", stderr="", returncode=0, raises=err
+        # `time.sleep` is recorded, never served: this 429 names `Retry-After:
+        # 42`, which the lane OBEYS, so an unstubbed run spends 42s of real wall
+        # clock inside a hermetic unit test. Recording it asserts the obeyed
+        # wait as well, which the timed version never did.
+        slept: list = []
+        real_sleep = ollama_lane.time.sleep
+        ollama_lane.time.sleep = lambda s: slept.append(s)
+        try:
+            exit_code, rate_limited, _tail = _run_with_fake_ollama(
+                out_dir, raw_path, stdout="", stderr="", returncode=0, raises=err
+            )
+        finally:
+            ollama_lane.time.sleep = real_sleep
+        check(
+            slept == [42.0],
+            "429: the server's own Retry-After is the wait that was served",
+            repr(slept),
         )
         check(rate_limited is True, "429: reported rate limited", repr(rate_limited))
         check(exit_code != 0, "429: reports a non-zero code", repr(exit_code))
@@ -1521,14 +1536,29 @@ def test_an_http_exception_is_caught_and_diagnosed():
         def _truncated(request, *a, **k):
             raise ollama_lane.http.client.IncompleteRead(b"partial body")
 
+        # `time.sleep` is recorded, never served. `IncompleteRead` is transient,
+        # so every attempt in the retry ladder is made and its delay waited:
+        # unstubbed, this one test spends the whole of
+        # TRANSIENT_RETRY_DELAYS_SECONDS (130s) in real wall clock. Recording
+        # the delays also asserts that a truncated read is retried as a
+        # transient failure rather than failing on the first attempt.
+        slept: list = []
         real_urlopen = ollama_lane.urllib.request.urlopen
+        real_sleep = ollama_lane.time.sleep
         ollama_lane.urllib.request.urlopen = _truncated
+        ollama_lane.time.sleep = lambda s: slept.append(s)
         try:
             exit_code, _rl, _tail = ollama_lane.call_ollama_harness("m", "p", raw_path)
         finally:
             ollama_lane.urllib.request.urlopen = real_urlopen
+            ollama_lane.time.sleep = real_sleep
 
         check(exit_code != 0, "IncompleteRead: non-zero code", str(exit_code))
+        check(
+            slept == list(ollama_lane.TRANSIENT_RETRY_DELAYS_SECONDS),
+            "IncompleteRead: retried as a transient failure, serving every backoff delay",
+            repr(slept),
+        )
         diag = harness_runner.step_diagnostics_dir(out_dir)
         names = sorted(os.listdir(diag)) if os.path.isdir(diag) else []
         check(

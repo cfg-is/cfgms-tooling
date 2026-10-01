@@ -152,7 +152,7 @@ RUN set -eu; \
     && chmod +x "$GOPATH/bin/nancy"
 
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.4/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.4 || true
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.9/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.9 || true
 
 # Claude Code — pinned, never @latest (same supply-chain rule as every other
 # tool here; see dependency-pin-check.yml). An unpinned install also froze
