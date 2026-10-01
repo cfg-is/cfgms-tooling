@@ -1234,6 +1234,36 @@ _image_build_inputs_label() {
     --format '{{index .Config.Labels "cfgms.build_inputs_hash"}}' 2>/dev/null || true
 }
 
+# _resolve_claude_code_version — the npm `stable` dist-tag for
+# @anthropic-ai/claude-code, resolved once per rebuild so the
+# CLAUDE_CODE_VERSION_OVERRIDE build-arg passed to `docker build` and the
+# `cfgms.claude_code_version` label it stamps always agree (Issue #4473:
+# Claude Code is exempt from the pin-and-cooldown policy every other tool in
+# .devcontainer/Dockerfile follows -- it installs whatever is current at
+# build time instead of a hand-maintained version). Pinning the resolved
+# value via the override build-arg, rather than leaving the Dockerfile's own
+# `@stable` resolution to run unobserved inside the RUN step, is what makes
+# the label trustworthy: a label can only be set from a value this shell
+# already knows, and a plain `docker build` with no args has no way to learn
+# what `@stable` resolved to inside the layer.
+#
+# Falls back to the literal string "stable" if the registry can't be
+# resolved from this host -- the build must not fail just because this host
+# (not the build's own network) can't reach npm; passing "stable" through
+# unchanged lets the Dockerfile's own `@stable` install path (used by a bare
+# `docker build` too) resolve it the normal way, and the label will truthfully
+# read "stable" rather than claim a version this shell never actually verified.
+_resolve_claude_code_version() {
+  local resolved
+  resolved=$(curl -fsSL "https://registry.npmjs.org/@anthropic-ai/claude-code" 2>/dev/null \
+    | jq -r '.["dist-tags"].stable // empty' 2>/dev/null) || true
+  if [[ -z "$resolved" || "$resolved" == "null" ]]; then
+    echo "stable"
+    return 0
+  fi
+  echo "$resolved"
+}
+
 # _image_rebuild__body <checkout_hash> — the guarded section of a rebuild:
 # re-checks freshness (another launch may have rebuilt while this one waited
 # on the lock), tags the current image as a timestamped backup so a bad build
@@ -1260,8 +1290,12 @@ _image_rebuild__body() {
   if [[ -n "${CFGMS_TEST_IMAGE_REBUILD_CMD:-}" ]]; then
     bash -c "${CFGMS_TEST_IMAGE_REBUILD_CMD}" >&2 || build_exit=$?
   else
+    local cc_version
+    cc_version=$(_resolve_claude_code_version)
     docker build \
       --label "cfgms.build_inputs_hash=${checkout_hash}" \
+      --build-arg "CLAUDE_CODE_VERSION_OVERRIDE=${cc_version}" \
+      --label "cfgms.claude_code_version=${cc_version}" \
       -t cfg-agent:latest \
       -f "${REPO_ROOT}/.devcontainer/Dockerfile" \
       "${REPO_ROOT}" >&2 || build_exit=$?
@@ -3078,6 +3112,15 @@ PYEOF
       warnings=$((warnings + 1))
     fi
 
+    # Claude Code image label (Issue #4473) — Claude Code is exempt from the
+    # pin-and-cooldown policy every other tool in this image follows; it
+    # installs npm's current `stable` release at build time instead of a
+    # pinned version, so this label (not a Dockerfile ARG) is where the
+    # exact installed version is recorded and traceable.
+    claude_code_label=$(docker inspect cfg-agent:latest \
+      --format '{{index .Config.Labels "cfgms.claude_code_version"}}' 2>/dev/null || true)
+    echo "INFO:claude_code_version:${claude_code_label:-unknown}"
+
     # cfg CLI version check
     cfg_version=$(docker run --rm --entrypoint cfg cfg-agent:latest version 2>/dev/null \
       | grep -oP '(?<=Version: )\S+(?=,)' || echo "unknown")
@@ -3671,9 +3714,11 @@ PROMPT_EOF
     # line, or drops --agent from the entrypoint invocation, still leaves
     # this CLI-level denial in place rather than depending on one control
     # alone for the metadata-only boundary AC2 requires.
-    # MultiEdit is not a tool name the pinned claude CLI (2.1.258, see
-    # .devcontainer/Dockerfile CLAUDE_CODE_VERSION) recognizes -- it prints
-    # `Permission deny rule "MultiEdit" matches no known tool` at every
+    # MultiEdit is not a tool name the claude CLI (2.1.258 at the time this
+    # was observed; the image now installs npm's current `stable` release at
+    # build time rather than a pinned version -- Issue #4473, see the
+    # cfgms.claude_code_version label on the agent image for what's actually
+    # installed) recognizes -- it prints
     # investigator start (Issue #4013). Edit is the CLI's actual file-edit
     # tool name and already appears below, so removing the stale entry does
     # not change what capability is denied.

@@ -3,6 +3,11 @@
 # Pre-caches Go modules and Trivy DB to minimize per-agent startup time.
 #
 # Build: docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
+#   (resolves Claude Code's current `stable` npm release; the documented
+#   agent-setup.md / agent-dispatch.sh build paths additionally pass
+#   --build-arg CLAUDE_CODE_VERSION_OVERRIDE=<resolved version> and
+#   --label cfgms.claude_code_version=<resolved version> so a bare build
+#   above still installs current Claude Code but skips that label)
 # Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .devcontainer/Dockerfile .
 
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
@@ -154,18 +159,40 @@ RUN set -eu; \
 # truffleHog (optional, best-effort secret scanning — pinned version, not @main)
 RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.9/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.9 || true
 
-# Claude Code — pinned, never @latest (same supply-chain rule as every other
-# tool here; see dependency-pin-check.yml). An unpinned install also froze
-# silently: the RUN layer cache-hits until something above it changes, so the
-# image kept shipping whatever version was current when the layer was first
-# built while `npm latest` moved on. The pin makes the layer key change with
-# the version, and dependency-pin-check.yml files a weekly issue when npm's
-# dist-tags.latest moves ahead of it.
-ARG CLAUDE_CODE_VERSION=2.1.273
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+# Claude Code — exempt from this repo's pin-and-cooldown rule (every other
+# tool below still follows it; see dependency-pin-check.yml). Founder
+# decision 2026-10-01 (Issue #4473): Claude Code ships several releases a
+# week, so the standard 3-day cooldown (refresh-pins' cooldown-policy.md)
+# almost always lags what's actually shipping -- on 2026-10-01, 2.1.285 was
+# held until 2026-10-02 while 2.1.286 had already shipped. Each lag cost a
+# bump story and a review for no supply-chain benefit. The image installs
+# npm's `stable` dist-tag at build time instead: `stable`, not `latest` --
+# `latest` is npm's most-recently-published tag and can sit ahead of general
+# availability, while `stable` is the vetted-rollout tag the CLI's own
+# auto-updater follows. CLAUDE_CODE_VERSION_OVERRIDE pins one exact release
+# when that's needed (holding back a bad release, reproducing a past build);
+# empty (the default) always resolves `stable` fresh at build time. The name
+# deliberately does not match discover-pins.py's old `CLAUDE_CODE_VERSION`
+# pin pattern -- this tool is no longer pin-tracked, by design.
+#
+# The resolved version is stamped as the `cfgms.claude_code_version` image
+# label by the `docker build --build-arg CLAUDE_CODE_VERSION_OVERRIDE=...
+# --label cfgms.claude_code_version=...` invocation in
+# .claude/commands/agent-setup.md and .claude/scripts/agent-dispatch.sh (the
+# same place that already stamps `cfgms.build_inputs_hash`), so any run can
+# still be traced to an exact Claude Code version even though none is pinned
+# in this file. `agent-dispatch.sh health-check` prints it.
+ARG CLAUDE_CODE_VERSION_OVERRIDE=
+RUN set -eu; \
+    if [ -n "${CLAUDE_CODE_VERSION_OVERRIDE}" ]; then \
+      npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION_OVERRIDE}"; \
+    else \
+      npm install -g "@anthropic-ai/claude-code@stable"; \
+    fi
 
-# Codex CLI — pinned, never @latest (same supply-chain rule as Claude Code
-# above; see dependency-pin-check.yml). This is the second subscription
+# Codex CLI — pinned, never @latest (same supply-chain rule as every other
+# tool here except Claude Code above, which is exempt -- see its own comment
+# block; see dependency-pin-check.yml). This is the second subscription
 # agent harness the security review harness dispatches (Issue #3935,
 # epic #3927) — `codex_lane.py` invokes this binary as a subprocess,
 # authenticated by the operator's own `~/.codex/auth.json` session
@@ -174,8 +201,9 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 ARG CODEX_CLI_VERSION=0.153.4
 RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 
-# OpenCode CLI — pinned, never @latest (same supply-chain rule as Claude Code
-# and Codex above; see dependency-pin-check.yml). This is the third
+# OpenCode CLI — pinned, never @latest (same supply-chain rule as Codex
+# above; see dependency-pin-check.yml. Claude Code above is the one
+# exemption -- see its own comment block). This is the third
 # subscription agent harness the security review harness dispatches (Issue
 # #3936, epic #3927) — `opencode_lane.py` invokes this binary as a
 # subprocess, authenticated by the operator's own
@@ -187,8 +215,9 @@ RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 ARG OPENCODE_CLI_VERSION=1.18.29
 RUN npm install -g "opencode-ai@${OPENCODE_CLI_VERSION}"
 
-# Ollama CLI — pinned, never @latest (same supply-chain rule as Claude Code,
-# Codex and OpenCode above). This pin is intentionally NOT tracked by
+# Ollama CLI — pinned, never @latest (same supply-chain rule as Codex and
+# OpenCode above; Claude Code above is the one exemption -- see its own
+# comment block). This pin is intentionally NOT tracked by
 # dependency-pin-check.yml -- that workflow's freshness checks are
 # hand-written per tool and adding one is out of scope for the story that
 # introduced this pin (Issue #3976). This is the fourth subscription agent
