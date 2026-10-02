@@ -442,7 +442,7 @@ COPY .devcontainer/scanner/eslint.config.js /opt/cfgms-scanner/eslint.config.js
 # private virtualenv on the system Python. Network is needed only here, at
 # build time; the runner sets SEMGREP_SEND_METRICS=off and every profile
 # passes --metrics=off --disable-version-check, so nothing phones home later.
-ARG SEMGREP_VERSION=1.176.1
+ARG SEMGREP_VERSION=1.179.0
 COPY .devcontainer/scanner/semgrep-requirements.txt /opt/cfgms-scanner/semgrep-requirements.txt
 RUN grep -q "^semgrep==${SEMGREP_VERSION} " /opt/cfgms-scanner/semgrep-requirements.txt \
     && UV_OFFLINE=0 uv venv --python /usr/bin/python3 /opt/cfgms-scanner/venv \

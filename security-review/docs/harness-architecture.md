@@ -471,7 +471,7 @@ root `./...` never compiles them, and excluded from CodeQL via `paths-ignore`): 
 
 **Image supply chain.** `.devcontainer/Dockerfile` installs the scanner home in one block:
 eslint and plugins from the scanner lockfile (integrity-pinned; `--ignore-scripts`); semgrep
-`1.176.1` via `uv pip install --require-hashes` from
+`1.179.0` via `uv pip install --require-hashes` from
 `.devcontainer/scanner/semgrep-requirements.txt` (the full wheel closure, sha256 per artifact for
 both `x86_64` and `aarch64`) into a private virtualenv; the curated upstream Go and TS/React
 security rules fetched at the commit pinned in `semgrep/upstream/SOURCE` and verified file by
