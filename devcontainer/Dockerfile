@@ -39,7 +39,7 @@ FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c5
 ARG TARGETARCH
 
 # Run every RUN step in this stage under bash with pipefail, so a failure on the
-# LEFT side of a pipe (a curl download feeding `| bash -` / `| sh` / `| gpg`)
+# LEFT side of a pipe (a curl download feeding `| gpg` / `| sha256sum`)
 # aborts the build instead of being masked by the default /bin/sh (dash has no
 # pipefail) — which would silently proceed with an empty/partial download (e.g.
 # a 404 on an unpublished Node major would otherwise let apt install Debian's
@@ -73,7 +73,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # need checking here since this Node also runs Claude Code.)
 COPY web/.nvmrc /tmp/nvmrc
 RUN NODE_MAJOR="$(cut -d. -f1 < /tmp/nvmrc)" \
-    && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource.key \
+    && gpg --show-keys --with-colons /tmp/nodesource.key \
+      | awk -F: '$1=="fpr"{print $10}' | grep -qx '6F71F525282841EEDAF851B42F59B5F99B1BE0B4' \
+    && gpg --dearmor -o /usr/share/keyrings/nodesource.gpg < /tmp/nodesource.key \
+    && rm -f /tmp/nodesource.key \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+      > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -f /tmp/nvmrc \
     && rm -rf /var/lib/apt/lists/*
@@ -156,8 +163,27 @@ RUN set -eu; \
        -o "$GOPATH/bin/nancy" \
     && chmod +x "$GOPATH/bin/nancy"
 
-# truffleHog (optional, best-effort secret scanning — pinned version, not @main)
-RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/v3.97.9/scripts/install.sh | sh -s -- -b /usr/local/bin v3.97.9 || true
+# truffleHog (optional, best-effort secret scanning — pinned release archive,
+# per-architecture SHA-256 from trufflehog_<ver>_checksums.txt at
+# https://github.com/trufflesecurity/trufflehog/releases/download/<ver>/trufflehog_<ver>_checksums.txt
+# `|| true` is deliberate: the tool is optional, so a download or checksum
+# failure leaves it absent rather than failing the image build. Nothing
+# unverified is ever extracted or installed.
+RUN ( set -eu; \
+    TRUFFLEHOG_VERSION='v3.97.9'; \
+    case "$TARGETARCH" in \
+      amd64) TRUFFLEHOG_SHA256='40377e6572495412fb9ba0bc21c9401f73b72f1d2afd11b9931bc4a5ed622866' ;; \
+      arm64) TRUFFLEHOG_SHA256='372c568695d49e53517075b5f74d1ee9a19053f13661d689c7928ee1fc27d705' ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ARCHIVE="trufflehog_${TRUFFLEHOG_VERSION#v}_linux_${TARGETARCH}.tar.gz"; \
+    curl -sSfL -o "/tmp/${ARCHIVE}" \
+      "https://github.com/trufflesecurity/trufflehog/releases/download/${TRUFFLEHOG_VERSION}/${ARCHIVE}"; \
+    printf '%s  /tmp/%s\n' "${TRUFFLEHOG_SHA256}" "${ARCHIVE}" | sha256sum -c -; \
+    tar -xzf "/tmp/${ARCHIVE}" -C /tmp trufflehog; \
+    install -m 0755 /tmp/trufflehog /usr/local/bin/trufflehog; \
+    rm -f "/tmp/${ARCHIVE}" /tmp/trufflehog \
+    ) || true
 
 # Claude Code — exempt from this repo's pin-and-cooldown rule (every other
 # tool below still follows it; see dependency-pin-check.yml). Founder
