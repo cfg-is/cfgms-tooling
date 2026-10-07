@@ -422,6 +422,92 @@ ac_post_no_op_comment() {
     return 0
 }
 
+# ac_promote_salvaged_pr <pr_num> <issue_num>
+# Finishes a salvaged WIP draft PR whose work already passed validation, so a
+# fix-pr run that needed no further commit does not fail as a no-op (Issue #4709).
+#
+# The salvage path opens such PRs as drafts titled
+# "WIP: <branch> (agent produced no PR)", with a WIP commit subject that would
+# otherwise become the squash subject. This helper:
+#   1. confirms the PR is a draft whose title starts with "WIP:" (else refuses),
+#   2. retitles it "<issue title> (Issue #N)" and sets a "Fixes #N" body via the
+#      REST API (`gh pr edit` is unusable in this repo),
+#   3. pushes an empty commit whose subject is the new title,
+#   4. marks the PR ready for review.
+#
+# Every value travels as a quoted argument or a file -- no eval, no command
+# strings -- so an issue title cannot inject shell. Returns 0 only when every
+# step succeeded; otherwise prints the failed step and returns 1.
+ac_promote_salvaged_pr() {
+    local pr_num="${1:-}" issue_num="${2:-}"
+    if [[ ! "$pr_num" =~ ^[0-9]+$ ]] || [[ ! "$issue_num" =~ ^[0-9]+$ ]]; then
+        echo "promote-salvaged-pr: invalid PR or issue number" >&2
+        return 1
+    fi
+
+    local pr_json is_draft pr_title head_ref
+    if ! pr_json=$(gh pr view "$pr_num" --json isDraft,title,headRefName 2>/dev/null); then
+        echo "promote-salvaged-pr: step 'gh pr view' failed for PR #${pr_num}" >&2
+        return 1
+    fi
+    is_draft=$(jq -r '.isDraft' <<<"$pr_json" 2>/dev/null) || is_draft=""
+    pr_title=$(jq -r '.title' <<<"$pr_json" 2>/dev/null) || pr_title=""
+    head_ref=$(jq -r '.headRefName // empty' <<<"$pr_json" 2>/dev/null) || head_ref=""
+    if [[ "$is_draft" != "true" ]]; then
+        echo "promote-salvaged-pr: PR #${pr_num} is not a draft; not promoting" >&2
+        return 1
+    fi
+    if [[ "$pr_title" != WIP:* ]]; then
+        echo "promote-salvaged-pr: PR #${pr_num} title does not start with 'WIP:'; not promoting" >&2
+        return 1
+    fi
+    if [[ -z "$head_ref" ]]; then
+        echo "promote-salvaged-pr: step 'resolve head branch' failed for PR #${pr_num}" >&2
+        return 1
+    fi
+
+    local issue_title
+    if ! issue_title=$(gh issue view "$issue_num" --json title --jq .title 2>/dev/null) \
+        || [[ -z "$issue_title" ]]; then
+        echo "promote-salvaged-pr: step 'gh issue view' failed for issue #${issue_num}" >&2
+        return 1
+    fi
+
+    local new_title="${issue_title} (Issue #${issue_num})"
+    local body_file
+    if ! body_file=$(mktemp); then
+        echo "promote-salvaged-pr: step 'mktemp' failed" >&2
+        return 1
+    fi
+    cat > "$body_file" <<EOF
+Fixes #${issue_num}
+
+This PR is a salvaged agent session: the original run pushed its work and opened a WIP draft without finishing the PR. A fix-pr agent then validated that work and found it complete, so it passed validation with no further changes. The entrypoint retitled the PR, added an empty commit carrying the final squash subject, and marked it ready for review.
+EOF
+
+    if ! gh api -X PATCH "repos/{owner}/{repo}/pulls/${pr_num}" \
+        -f "title=${new_title}" -F "body=@${body_file}" >/dev/null 2>&1; then
+        rm -f "$body_file"
+        echo "promote-salvaged-pr: step 'PATCH title/body' failed for PR #${pr_num}" >&2
+        return 1
+    fi
+    rm -f "$body_file"
+
+    if ! git commit --allow-empty -q -m "$new_title" -m "Fixes #${issue_num}" >/dev/null 2>&1; then
+        echo "promote-salvaged-pr: step 'git commit --allow-empty' failed" >&2
+        return 1
+    fi
+    if ! git push origin "HEAD:${head_ref}" >/dev/null 2>&1; then
+        echo "promote-salvaged-pr: step 'git push' failed for branch ${head_ref}" >&2
+        return 1
+    fi
+    if ! gh pr ready "$pr_num" >/dev/null 2>&1; then
+        echo "promote-salvaged-pr: step 'gh pr ready' failed for PR #${pr_num}" >&2
+        return 1
+    fi
+    return 0
+}
+
 # ----------------------------------------------------------------------------
 # Per-segment model routing (Issue #3030)
 # ----------------------------------------------------------------------------

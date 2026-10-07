@@ -170,6 +170,50 @@ _salvage_no_pr() {
     fi
 }
 
+# _handle_no_op_run — a fix-pr / resolve-conflict run exited 0 without advancing
+# HEAD. Normally that is a silent no-op and fails the run (exit 1 + an
+# idempotent breadcrumb comment on the PR).
+#
+# One exception (Issue #4709): a fix-pr run on a salvaged WIP draft whose work
+# already passed validation has nothing left to commit. When the validation
+# marker exists and a linked issue is known, ac_promote_salvaged_pr finishes the
+# PR (title, body, empty commit, ready) and the run succeeds. If promotion is
+# not applicable or any step of it fails, today's failure path runs unchanged.
+#
+# $1 — path of the validation marker (normally /tmp/agent-validation-passed).
+# Globals used: MODE, PR_NUM, ISSUE_NUM, PRE_FIX_HEAD, HOSTNAME
+# Globals set:  EXIT_CODE (and POST_FIX_HEAD, HEAD_ADVANCED on promotion)
+_handle_no_op_run() {
+    local marker="$1"
+    if [[ "$MODE" == "fix-pr" ]] && [[ -f "$marker" ]] && [[ -n "${ISSUE_NUM:-}" ]]; then
+        echo "fix-pr run left HEAD unchanged but validation passed — promoting salvaged PR #${PR_NUM}"
+        if ac_promote_salvaged_pr "$PR_NUM" "$ISSUE_NUM"; then
+            echo "PROMOTED_SALVAGED_PR:${PR_NUM}"
+            EXIT_CODE=0
+            # The promotion pushed an empty commit, so the result manifest must
+            # report the HEAD that actually landed.
+            POST_FIX_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "${POST_FIX_HEAD:-}")
+            HEAD_ADVANCED="true"
+            return 0
+        fi
+        echo "WARN: salvaged-PR promotion not applied; falling back to no-op failure"
+    fi
+
+    echo "ERROR: ${MODE} agent ran but made no commits (HEAD unchanged at ${PRE_FIX_HEAD:-})"
+    echo "Skipping make test-agent-complete fallback (would pass trivially on unchanged code)."
+    EXIT_CODE=1
+    # Best-effort idempotent breadcrumb on the PR.
+    local fix_owner fix_repo container_name
+    fix_owner=$(gh repo view --json owner -q '.owner.login' 2>/dev/null || echo "")
+    fix_repo=$(gh repo view --json name -q '.name' 2>/dev/null || echo "")
+    container_name="${HOSTNAME:-cfg-agent-pr-fix-${PR_NUM}}"
+    if [[ -n "$fix_owner" ]] && [[ -n "$fix_repo" ]]; then
+        ac_post_no_op_comment "$fix_owner" "$fix_repo" "$PR_NUM" "$container_name" || \
+            echo "WARN: failed to post no-op comment on PR #${PR_NUM}"
+    fi
+    return 0
+}
+
 # Testability hook: sourcing this file with CFGMS_ENTRYPOINT_SOURCE_ONLY=1
 # yields the helper definitions above without running any agent flow.
 if [[ "${CFGMS_ENTRYPOINT_SOURCE_ONLY:-}" == "1" ]]; then
@@ -965,18 +1009,10 @@ fi
 # In fix-pr mode, a run that exits 0 but never advanced HEAD is a silent no-op.
 # The make test-agent-complete fallback would pass trivially on unchanged code,
 # masking the failure. Detect the no-op first and skip the fallback entirely.
+# A fix-pr no-op on a salvaged WIP draft whose work already passed validation is
+# promoted instead of failed (Issue #4709) — see _handle_no_op_run.
 if [[ "$MODE" == "fix-pr" || "$MODE" == "resolve-conflict" ]] && [ "$EXIT_CODE" -eq 0 ] && [ "$HEAD_ADVANCED" != "true" ]; then
-    echo "ERROR: ${MODE} agent ran but made no commits (HEAD unchanged at ${PRE_FIX_HEAD})"
-    echo "Skipping make test-agent-complete fallback (would pass trivially on unchanged code)."
-    EXIT_CODE=1
-    # Best-effort idempotent breadcrumb on the PR.
-    _fix_owner=$(gh repo view --json owner -q '.owner.login' 2>/dev/null || echo "")
-    _fix_repo=$(gh repo view --json name -q '.name' 2>/dev/null || echo "")
-    _container_name="${HOSTNAME:-cfg-agent-pr-fix-${PR_NUM}}"
-    if [[ -n "$_fix_owner" ]] && [[ -n "$_fix_repo" ]]; then
-        ac_post_no_op_comment "$_fix_owner" "$_fix_repo" "$PR_NUM" "$_container_name" || \
-            echo "WARN: failed to post no-op comment on PR #${PR_NUM}"
-    fi
+    _handle_no_op_run /tmp/agent-validation-passed
 elif [ "$EXIT_CODE" -eq 0 ] && [ ! -f /tmp/agent-validation-passed ]; then
     # The agent is instructed to write /tmp/agent-validation-passed only when the
     # story-review workflow returns passed:true. If the marker is missing, the

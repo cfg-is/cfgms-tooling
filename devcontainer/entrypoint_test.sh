@@ -900,6 +900,210 @@ test_23_outcome_classification_by_mode() {
 }
 
 # ============================================================================
+# TEST 24 — salvaged WIP PR promotion (Issue #4709)
+# A fix-pr run that made no commit on a salvaged WIP draft whose work already
+# passed validation finishes the PR instead of failing. gh is a PATH double
+# driven by files in $PROMO_DIR; git is real except `push`, which is recorded.
+# ============================================================================
+
+setup_promo_env() {
+    PROMO_DIR="$(mktemp -d)"
+    export PROMO_DIR
+    PROMO_LOG="$PROMO_DIR/calls.log"
+    : > "$PROMO_LOG"
+    # Defaults: a salvaged WIP draft and a linked issue.
+    printf '%s\n' '{"isDraft":true,"title":"WIP: feature/story-9999-agent (agent produced no PR)","headRefName":"feature/story-9999-agent"}' \
+        > "$PROMO_DIR/pr_view.json"
+    printf '%s\n' "ci: harden the widget's \$(rm -rf) \`path\` handling" > "$PROMO_DIR/issue_title.txt"
+    : > "$PROMO_DIR/fail_step"
+
+    cat > "$PROMO_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'gh' >> "$PROMO_DIR/calls.log"
+printf ' [%s]' "$@" >> "$PROMO_DIR/calls.log"
+printf '\n' >> "$PROMO_DIR/calls.log"
+fail_step=$(cat "$PROMO_DIR/fail_step")
+case "$1 $2" in
+    "pr view")
+        [[ "$fail_step" == "pr-view" ]] && exit 1
+        cat "$PROMO_DIR/pr_view.json" ;;
+    "issue view")
+        [[ "$fail_step" == "issue-view" ]] && exit 1
+        cat "$PROMO_DIR/issue_title.txt" ;;
+    "api -X")
+        [[ "$fail_step" == "patch" ]] && exit 1
+        for arg in "$@"; do
+            case "$arg" in
+                title=*) printf '%s' "${arg#title=}" > "$PROMO_DIR/patched_title.txt" ;;
+                body=@*) cp "${arg#body=@}" "$PROMO_DIR/patched_body.txt" ;;
+            esac
+        done
+        echo '{}' ;;
+    "pr ready")
+        [[ "$fail_step" == "ready" ]] && exit 1
+        echo "ready" ;;
+    "repo view")
+        case "$*" in
+            *owner*) echo "o" ;;
+            *) echo "r" ;;
+        esac ;;
+    "pr comment") echo "https://github.com/o/r/pull/42#issuecomment-1" ;;
+    *) echo "[]" ;;
+esac
+STUB
+    chmod +x "$PROMO_DIR/gh"
+
+    PROMO_REPO="$PROMO_DIR/repo"
+    mkdir -p "$PROMO_REPO"
+    git -C "$PROMO_REPO" init -q
+    git -C "$PROMO_REPO" config user.email "test@example.com"
+    git -C "$PROMO_REPO" config user.name "Test"
+    echo "seed" > "$PROMO_REPO/seed.txt"
+    git -C "$PROMO_REPO" add seed.txt
+    git -C "$PROMO_REPO" commit -q -m "WIP: agent attempt for issue #9999 (failed validation)"
+
+    cat > "$PROMO_DIR/git" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "push" ]]; then
+    printf 'git' >> "$PROMO_LOG"
+    printf ' [%s]' "\$@" >> "$PROMO_LOG"
+    printf '\n' >> "$PROMO_LOG"
+    [[ "\$(cat "$PROMO_DIR/fail_step")" == "push" ]] && exit 1
+    exit 0
+fi
+exec $(command -v git) "\$@"
+STUB
+    chmod +x "$PROMO_DIR/git"
+
+    : > "$PROMO_DIR/agent-validation-passed"
+
+    ORIG_PROMO_PATH="$PATH"
+    export PATH="$PROMO_DIR:$PATH"
+    # shellcheck disable=SC1090
+    CFGMS_ENTRYPOINT_SOURCE_ONLY=1 source "$SCRIPT_DIR/entrypoint.sh"
+}
+
+teardown_promo_env() {
+    export PATH="$ORIG_PROMO_PATH"
+    rm -rf "$PROMO_DIR"
+    unset PROMO_DIR PROMO_LOG PROMO_REPO ORIG_PROMO_PATH
+}
+
+# _promo_run_no_op <mode> <marker_path> <issue_num> — drives _handle_no_op_run
+# in the throwaway repo and prints stdout followed by "EXIT_CODE=<n>".
+_promo_run_no_op() {
+    (
+        cd "$PROMO_REPO" || exit 1
+        MODE="$1"
+        PR_NUM="42"
+        ISSUE_NUM="$3"
+        PRE_FIX_HEAD=$(git rev-parse HEAD)
+        POST_FIX_HEAD="$PRE_FIX_HEAD"
+        HEAD_ADVANCED="false"
+        EXIT_CODE=0
+        HOSTNAME="cfg-agent-pr-fix-42"
+        _handle_no_op_run "$2" 2>&1
+        echo "EXIT_CODE=${EXIT_CODE}"
+        echo "HEAD_ADVANCED=${HEAD_ADVANCED}"
+    )
+}
+
+test_24a_promotes_salvaged_pr() {
+    setup_promo_env
+    local out
+    out=$(_promo_run_no_op fix-pr "$PROMO_DIR/agent-validation-passed" 9999)
+    local log; log=$(cat "$PROMO_LOG")
+    local want_title="ci: harden the widget's \$(rm -rf) \`path\` handling (Issue #9999)"
+
+    assert_contains "$out" "PROMOTED_SALVAGED_PR:42" "promotion is announced"
+    assert_contains "$out" "EXIT_CODE=0" "run exits 0"
+    assert_contains "$out" "HEAD_ADVANCED=true" "result manifest reports the pushed commit"
+    assert_not_contains "$out" "made no commits" "no-op error is not printed"
+    assert_contains "$log" "[api] [-X] [PATCH] [repos/{owner}/{repo}/pulls/42]" "PR is patched via REST"
+    assert_equals "$(cat "$PROMO_DIR/patched_title.txt")" "$want_title" \
+        "title is '<issue title> (Issue #N)', shell metacharacters passed verbatim"
+    assert_equals "$(head -1 "$PROMO_DIR/patched_body.txt")" "Fixes #9999" "body starts with Fixes #N"
+    assert_contains "$(cat "$PROMO_DIR/patched_body.txt")" "passed validation with no further changes" \
+        "body states the work passed validation unchanged"
+    assert_equals "$(git -C "$PROMO_REPO" log --format=%s -1)" "$want_title" "empty commit subject is the new title"
+    assert_contains "$(git -C "$PROMO_REPO" log --format=%b -1)" "Fixes #9999" "empty commit body carries Fixes #N"
+    assert_equals "$(git -C "$PROMO_REPO" diff --stat HEAD~1 HEAD)" "" "commit is empty"
+    assert_contains "$log" "git [push] [origin] [HEAD:feature/story-9999-agent]" "commit is pushed to the PR branch"
+    assert_contains "$log" "gh [pr] [ready] [42]" "PR is marked ready"
+    assert_not_contains "$log" "[pr] [comment]" "no no-op comment is posted"
+    teardown_promo_env
+}
+
+test_24b_no_marker_not_promoted() {
+    setup_promo_env
+    local out
+    out=$(_promo_run_no_op fix-pr "$PROMO_DIR/missing-marker" 9999)
+    local log; log=$(cat "$PROMO_LOG")
+    assert_contains "$out" "made no commits" "no-op error is printed"
+    assert_contains "$out" "EXIT_CODE=1" "run exits 1"
+    assert_not_contains "$out" "PROMOTED_SALVAGED_PR" "PR is not promoted"
+    assert_not_contains "$log" "[PATCH]" "PR is not patched"
+    assert_contains "$log" "gh [pr] [comment] [42]" "no-op comment is posted"
+    teardown_promo_env
+}
+
+test_24c_resolve_conflict_and_no_issue_not_promoted() {
+    setup_promo_env
+    local out
+    out=$(_promo_run_no_op resolve-conflict "$PROMO_DIR/agent-validation-passed" 9999)
+    assert_contains "$out" "EXIT_CODE=1" "resolve-conflict no-op still exits 1"
+    out=$(_promo_run_no_op fix-pr "$PROMO_DIR/agent-validation-passed" "")
+    assert_contains "$out" "EXIT_CODE=1" "fix-pr no-op without a linked issue still exits 1"
+    assert_not_contains "$(cat "$PROMO_LOG")" "[PATCH]" "neither run patches the PR"
+    teardown_promo_env
+}
+
+test_24d_non_wip_or_non_draft_not_promoted() {
+    setup_promo_env
+    local before; before=$(git -C "$PROMO_REPO" rev-parse HEAD)
+    printf '%s\n' '{"isDraft":true,"title":"ci: a normal title (Issue #9999)","headRefName":"feature/story-9999-agent"}' \
+        > "$PROMO_DIR/pr_view.json"
+    local rc=0
+    (cd "$PROMO_REPO" && ac_promote_salvaged_pr 42 9999) 2>/dev/null || rc=$?
+    assert_equals "$rc" "1" "non-WIP title: helper refuses"
+
+    printf '%s\n' '{"isDraft":false,"title":"WIP: feature/story-9999-agent (agent produced no PR)","headRefName":"feature/story-9999-agent"}' \
+        > "$PROMO_DIR/pr_view.json"
+    rc=0
+    (cd "$PROMO_REPO" && ac_promote_salvaged_pr 42 9999) 2>/dev/null || rc=$?
+    assert_equals "$rc" "1" "non-draft PR: helper refuses"
+
+    local out
+    out=$(_promo_run_no_op fix-pr "$PROMO_DIR/agent-validation-passed" 9999)
+    assert_contains "$out" "EXIT_CODE=1" "caller falls back to the failure path"
+    assert_contains "$(cat "$PROMO_LOG")" "gh [pr] [comment] [42]" "no-op comment is posted"
+    assert_not_contains "$(cat "$PROMO_LOG")" "[PATCH]" "PR is never patched"
+    assert_equals "$(git -C "$PROMO_REPO" rev-parse HEAD)" "$before" "no commit is made"
+    teardown_promo_env
+}
+
+test_24e_failed_gh_step_falls_back() {
+    setup_promo_env
+    local step rc out
+    for step in issue-view patch ready push; do
+        echo "$step" > "$PROMO_DIR/fail_step"
+        rc=0
+        (cd "$PROMO_REPO" && ac_promote_salvaged_pr 42 9999) >/dev/null 2>&1 || rc=$?
+        assert_equals "$rc" "1" "helper returns non-zero when '$step' fails"
+    done
+
+    echo "patch" > "$PROMO_DIR/fail_step"
+    : > "$PROMO_LOG"
+    out=$(_promo_run_no_op fix-pr "$PROMO_DIR/agent-validation-passed" 9999)
+    assert_contains "$out" "step 'PATCH title/body' failed" "failed step is named"
+    assert_contains "$out" "made no commits" "caller prints the no-op error"
+    assert_contains "$out" "EXIT_CODE=1" "caller falls back to exit 1"
+    assert_not_contains "$out" "PROMOTED_SALVAGED_PR" "PR is not reported as promoted"
+    assert_contains "$(cat "$PROMO_LOG")" "gh [pr] [comment] [42]" "no-op comment is posted"
+    teardown_promo_env
+}
+
+# ============================================================================
 # runner
 # ============================================================================
 
@@ -927,6 +1131,11 @@ run_test "T20 — regression guard: exit-0 branch checks PR_URL" test_20_exit_ze
 run_test "T21 — ended-turn-waiting detection (Issue #4178)" test_21_ended_turn_waiting_detection
 run_test "T22 — headless no-bg-wait rule reaches every prompt (Issue #4178)" test_22_no_bg_wait_rule_in_prompts
 run_test "T23 — outcome classification per mode (Issue #4178)" test_23_outcome_classification_by_mode
+run_test "T24a — salvaged WIP PR with passing validation is promoted (Issue #4709)" test_24a_promotes_salvaged_pr
+run_test "T24b — no validation marker: no promotion, exit 1 (Issue #4709)" test_24b_no_marker_not_promoted
+run_test "T24c — resolve-conflict / no linked issue: no promotion (Issue #4709)" test_24c_resolve_conflict_and_no_issue_not_promoted
+run_test "T24d — non-WIP or non-draft PR: no promotion (Issue #4709)" test_24d_non_wip_or_non_draft_not_promoted
+run_test "T24e — failed gh/git step: helper non-zero, caller falls back (Issue #4709)" test_24e_failed_gh_step_falls_back
 
 echo ""
 echo "============================================================"
