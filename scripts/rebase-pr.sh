@@ -33,7 +33,7 @@ if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
 fi
 
 # Fetch PR metadata up-front so we fail fast on bad input.
-pr_meta=$(gh pr view "$pr" --repo "$REPO" --json number,headRefName,state,isDraft,headRepositoryOwner 2>/dev/null) || {
+pr_meta=$(gh pr view "$pr" --repo "$REPO" --json number,headRefName,baseRefName,state,isDraft,headRepositoryOwner 2>/dev/null) || {
   echo "REBASE_REFUSED:${pr}:pr_not_found"
   exit 3
 }
@@ -44,6 +44,17 @@ fork_owner=$(printf '%s' "$pr_meta" | jq -r '.headRepositoryOwner.login // empty
 
 if [ "$state" != "OPEN" ]; then
   echo "REBASE_REFUSED:${pr}:pr_state_${state}"
+  exit 3
+fi
+
+# Only develop-based PRs are rebased onto develop (Issue #4693). A release or
+# backport PR (base release/*) or the release PR itself (head release/*, base
+# main) must never be rebased onto develop: that would fast-forward the next
+# milestone's work into the release branch, which non_fast_forward does not
+# block.
+base=$(printf '%s' "$pr_meta" | jq -r '.baseRefName')
+if [ "$base" != "develop" ]; then
+  echo "REBASE_REFUSED:${pr}:base_not_develop_${base}"
   exit 3
 fi
 

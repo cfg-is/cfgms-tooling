@@ -417,7 +417,7 @@ query {
       }
     }
   }
-  storyPRs: search(query: "repo:cfg-is/cfgms is:pr is:open", type: ISSUE, first: 50) {
+  storyPRs: search(query: "repo:cfg-is/cfgms is:pr is:open base:develop", type: ISSUE, first: 50) {
     nodes {
       ... on PullRequest {
         number
@@ -1457,6 +1457,12 @@ def ci_summary(checks):
         overall = "red"
     elif pending_count > 0:
         overall = "pending"
+    elif pass_count == 0 and skipped_count == 0:
+        # No check reported at all is not a pass (Issue #4693): a PR whose base
+        # has no CI (e.g. release/*) or whose workflows have not started yet
+        # would otherwise score green and be sent to the reviewer and enqueued.
+        overall = "pending"
+        pending_names.append("(no checks reported)")
     else:
         overall = "green"
 

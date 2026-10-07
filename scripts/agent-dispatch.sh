@@ -2253,7 +2253,7 @@ case "$cmd" in
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
     # Fetch all PR metadata in one call (author gate + branch + body).
-    pr_meta_fix=$(gh pr view "$pr_num" --json headRefName,body,labels,author 2>/dev/null) || {
+    pr_meta_fix=$(gh pr view "$pr_num" --json headRefName,baseRefName,body,labels,author 2>/dev/null) || {
       echo "ERROR: Failed to get metadata for PR #${pr_num}"
       exit 1
     }
@@ -2267,11 +2267,27 @@ case "$cmd" in
       exit 1
     fi
 
+
     # External-author gate (Issue #1786): check trust BEFORE git clone/fetch of PR content.
     author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels_fix")
     if [[ "$author_trust" != "internal" ]]; then
       _post_quarantine_comment "$pr_num" "$pr_author_login"
       echo "FIX_REFUSED:${pr_num}:external_author_${pr_author_login}:${author_trust}"
+      exit 3
+    fi
+
+    # Agents only ever fix develop-based PRs (Issue #4693). A fix/resolve agent
+    # pushes to the PR's head branch, so a release PR (head release/*) or a
+    # backport PR (base release/*) would let an agent push straight to a
+    # release line. Refuse anything not based on develop, and any protected
+    # head name, before cloning.
+    pr_base=$(echo "$pr_meta_fix" | jq -r '.baseRefName // empty')
+    if [[ "$pr_base" != "develop" ]]; then
+      echo "FIX_REFUSED:${pr_num}:base_not_develop_${pr_base:-unknown}"
+      exit 3
+    fi
+    if [[ "$pr_branch" == "develop" || "$pr_branch" == "main" || "$pr_branch" == release/* ]]; then
+      echo "FIX_REFUSED:${pr_num}:protected_head_${pr_branch}"
       exit 3
     fi
 

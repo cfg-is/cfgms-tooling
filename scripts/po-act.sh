@@ -944,6 +944,16 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "ENQUEUE_REFUSED:${pr}:external_author"
       exit 3
     fi
+    # Only develop-based PRs go through the pipeline's merge path (Issue #4693).
+    # develop is the only branch with a merge queue; on any other base,
+    # `gh pr merge --squash` merges immediately with no queue re-validation
+    # (and a release/* base has no PR CI at all). Release and backport PRs are
+    # merged by a human. Fail closed if the base cannot be read.
+    base=$(gh pr view "$pr" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null || echo "")
+    if [ "$base" != "develop" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:base_not_develop_${base:-unknown}"
+      exit 3
+    fi
     # If a story is provided, ensure the PR body contains a GitHub auto-close
     # keyword for that issue. Dev agents miss this ~85% of the time, leaving
     # orphan issues that stay open after the PR merges. Patching here is cheap
