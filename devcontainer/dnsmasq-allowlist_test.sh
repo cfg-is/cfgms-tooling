@@ -16,6 +16,30 @@
 # Run: bash .devcontainer/dnsmasq-allowlist_test.sh
 set -euo pipefail
 
+# Resolve the real tools this suite drives. dnsmasq is commonly in /usr/sbin,
+# which is off a non-root user's PATH (agent containers, some hosts), so fall
+# back to it. A missing tool skips (exit 77, the runner's skip signal) on a dev
+# box, but fails loudly when CI is set: CI installs these, so absence there is
+# a broken runner, not a reason to skip.
+require_tool() {
+    local tool="$1"
+    REQUIRED_BIN="$(command -v "$tool" 2>/dev/null || true)"
+    if [[ -z "$REQUIRED_BIN" && "$tool" == "dnsmasq" && -x /usr/sbin/dnsmasq ]]; then
+        REQUIRED_BIN=/usr/sbin/dnsmasq
+    fi
+    [[ -n "$REQUIRED_BIN" ]] && return 0
+    if [[ -n "${CI:-}" ]]; then
+        echo "ERROR: $tool not installed, but CI is set. Install it on the runner (apt-get install bind9-dnsutils dnsmasq)." >&2
+        exit 1
+    fi
+    echo "SKIP: $tool not installed (install bind9-dnsutils and dnsmasq to run this suite)"
+    exit 77
+}
+
+require_tool dig
+require_tool dnsmasq
+DNSMASQ_BIN="$REQUIRED_BIN"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALLOWLIST="$SCRIPT_DIR/dnsmasq-allowlist.conf"
 PORT=15353
@@ -42,7 +66,7 @@ cleanup() {
 trap cleanup EXIT
 
 start_dnsmasq() {
-    dnsmasq --conf-file="$ALLOWLIST" --listen-address=127.0.0.1 --port="$PORT" \
+    "$DNSMASQ_BIN" --conf-file="$ALLOWLIST" --listen-address=127.0.0.1 --port="$PORT" \
         --no-daemon --log-facility=- >"$LOG_FILE" 2>&1 &
     DNSMASQ_PID=$!
 

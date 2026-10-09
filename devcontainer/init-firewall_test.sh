@@ -40,6 +40,26 @@
 # Run: bash .devcontainer/init-firewall_test.sh
 set -euo pipefail
 
+# Resolve the real tools this suite drives. dnsmasq is commonly in /usr/sbin,
+# which is off a non-root user's PATH (agent containers, some hosts), so fall
+# back to it. A missing tool skips (exit 77, the runner's skip signal) on a dev
+# box, but fails loudly when CI is set: CI installs these, so absence there is
+# a broken runner, not a reason to skip.
+require_tool() {
+    local tool="$1"
+    REQUIRED_BIN="$(command -v "$tool" 2>/dev/null || true)"
+    if [[ -z "$REQUIRED_BIN" && "$tool" == "dnsmasq" && -x /usr/sbin/dnsmasq ]]; then
+        REQUIRED_BIN=/usr/sbin/dnsmasq
+    fi
+    [[ -n "$REQUIRED_BIN" ]] && return 0
+    if [[ -n "${CI:-}" ]]; then
+        echo "ERROR: $tool not installed, but CI is set. Install it on the runner (apt-get install bind9-dnsutils dnsmasq)." >&2
+        exit 1
+    fi
+    echo "SKIP: $tool not installed (install bind9-dnsutils and dnsmasq to run this suite)"
+    exit 77
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INIT_FIREWALL="$SCRIPT_DIR/init-firewall.sh"
 BASE_CONF="$SCRIPT_DIR/dnsmasq-allowlist-base.conf"
@@ -321,6 +341,17 @@ done
 # dnsmasq-allowlist_test.sh's own technique.
 # ----------------------------------------------------------------------------
 
+# Strategy 2 needs the real binaries; Strategy 1 above does not. Report
+# Strategy 1 failures before skipping so a skip can never mask them.
+if [[ ${#FAILURES[@]} -gt 0 ]] && { ! command -v dig >/dev/null 2>&1 || { ! command -v dnsmasq >/dev/null 2>&1 && [[ ! -x /usr/sbin/dnsmasq ]]; }; }; then
+    echo "FAILURES (before Strategy 2 could run):"
+    printf '  - %s\n' "${FAILURES[@]}"
+    exit 1
+fi
+require_tool dig
+require_tool dnsmasq
+DNSMASQ_BIN="$REQUIRED_BIN"
+
 echo ""
 echo "--- REQUIRED TEST: a no-harness (default) or --harness claude launch resolves"
 echo "    the Claude domains and does NOT resolve api.openai.com/ollama.com ---"
@@ -336,7 +367,7 @@ cleanup_dnsmasq() {
 }
 trap 'cleanup_stubs; cleanup_dnsmasq' EXIT
 
-dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/claude.conf" \
+"$DNSMASQ_BIN" --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/claude.conf" \
     --listen-address=127.0.0.1 --port="$PORT" --no-daemon --log-facility=- >"$LOG_FILE" 2>&1 &
 DNSMASQ_PID=$!
 
@@ -413,7 +444,7 @@ cleanup_dnsmasq2() {
 }
 trap 'cleanup_stubs; cleanup_dnsmasq2' EXIT
 
-dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/codex.conf" \
+"$DNSMASQ_BIN" --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/codex.conf" \
     --listen-address=127.0.0.1 --port="$PORT2" --no-daemon --log-facility=- >"$LOG_FILE2" 2>&1 &
 DNSMASQ_PID=$!
 
@@ -492,7 +523,7 @@ cleanup_dnsmasq3() {
 }
 trap 'cleanup_stubs; cleanup_dnsmasq3' EXIT
 
-dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/opencode.conf" \
+"$DNSMASQ_BIN" --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/opencode.conf" \
     --listen-address=127.0.0.1 --port="$PORT3" --no-daemon --log-facility=- >"$LOG_FILE3" 2>&1 &
 DNSMASQ_PID=$!
 
@@ -575,7 +606,7 @@ cleanup_dnsmasq4() {
 }
 trap 'cleanup_stubs; cleanup_dnsmasq4' EXIT
 
-dnsmasq --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/ollama.conf" \
+"$DNSMASQ_BIN" --conf-file="$BASE_CONF" --conf-file="${FRAGMENT_DIR}/ollama.conf" \
     --listen-address=127.0.0.1 --port="$PORT4" --no-daemon --log-facility=- >"$LOG_FILE4" 2>&1 &
 DNSMASQ_PID=$!
 
