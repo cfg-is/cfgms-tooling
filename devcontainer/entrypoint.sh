@@ -105,6 +105,77 @@ _zero_work_retry() {
     fi
 }
 
+# Untracked files at or above this size are left out of a salvage commit. The
+# salvage runs unattended and pushes to a public repo: a file this large in a
+# Go source tree is a build or test artifact, not work, and a file over
+# GitHub's 100 MB limit would make the push fail and lose everything with it.
+SALVAGE_MAX_UNTRACKED_BYTES="${SALVAGE_MAX_UNTRACKED_BYTES:-5242880}"
+
+# _salvage_stage_work — stage everything the agent changed for the WIP commit:
+# modifications and deletions of tracked files, plus new untracked files.
+# `git add --update` alone skips new files, so a salvage silently dropped every
+# file the agent created. Untracked files are taken from
+# `git ls-files --others --exclude-standard`, which honours .gitignore (keys,
+# certs, *.env, databases and build output stay out). Nested repositories and
+# files of SALVAGE_MAX_UNTRACKED_BYTES or more are skipped, each with a log line.
+_salvage_stage_work() {
+    git add --update 2>/dev/null || echo "WARN: salvage: git add --update failed"
+
+    local f size
+    local -a new_files=()
+    while IFS= read -r -d '' f; do
+        if [[ "$f" == */ ]]; then
+            echo "WARN: salvage: skipping nested repository ${f}"
+            continue
+        fi
+        # The branch is pushed to a public repo. .gitignore covers the repo's
+        # own secret patterns; also refuse credential-style names it does not.
+        case "${f##*/}" in
+            id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|.netrc|.npmrc|.pypirc|.git-credentials|*.p12|*.pfx|*.jks|*.keystore|*.kdbx)
+                echo "WARN: salvage: skipping credential-like untracked file ${f}"
+                continue
+                ;;
+        esac
+        size=$(wc -c < "$f" 2>/dev/null) || size=""
+        if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+            echo "WARN: salvage: skipping unreadable untracked file ${f}"
+            continue
+        fi
+        if [ "$size" -ge "$SALVAGE_MAX_UNTRACKED_BYTES" ]; then
+            echo "WARN: salvage: skipping untracked file ${f} (${size} bytes >= ${SALVAGE_MAX_UNTRACKED_BYTES})"
+            continue
+        fi
+        new_files+=("$f")
+    done < <(git ls-files -z --others --exclude-standard 2>/dev/null)
+
+    if [ "${#new_files[@]}" -gt 0 ]; then
+        git add -- "${new_files[@]}" 2>/dev/null || \
+            echo "WARN: salvage: failed to stage ${#new_files[@]} untracked file(s)"
+    fi
+}
+
+# _salvage_merged_pr — print the number of a merged PR whose head commit
+# contains HEAD, i.e. this branch's work already landed (squash merges leave the
+# branch's own commits off develop, so `origin/develop..HEAD` is never empty).
+# Prints nothing when no such PR exists, when the gh query fails, or when HEAD
+# has commits beyond the merged head — every uncertain case falls through to
+# the draft-PR salvage, because a needless draft is recoverable and discarded
+# work is not.
+_salvage_merged_pr() {
+    local branch="$1" rows num oid
+    [[ -n "$branch" && "$branch" != "unknown" ]] || return 0
+    rows=$(gh pr list --head "$branch" --state merged --limit 20 \
+        --json number,headRefOid --jq '.[] | "\(.number) \(.headRefOid)"' 2>/dev/null) || return 0
+    while read -r num oid; do
+        [[ "$num" =~ ^[0-9]+$ && "$oid" =~ ^[0-9a-f]{40}$ ]] || continue
+        if git merge-base --is-ancestor HEAD "$oid" 2>/dev/null; then
+            echo "$num"
+            return 0
+        fi
+    done <<< "$rows"
+    return 0
+}
+
 # _salvage_no_pr — the run produced no PR. Capture whatever work exists so the
 # item is resumable, or route it for re-dispatch when there is nothing to keep.
 #
@@ -129,11 +200,29 @@ _salvage_no_pr() {
     [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty=1
     ahead=$(git rev-list --count origin/develop..HEAD 2>/dev/null) || ahead="unknown"
 
+    # A clean tree whose commits already landed through a merged PR is not
+    # unsaved work. Re-pushing it as a "WIP ... (agent produced no PR)" draft
+    # duplicates delivered work, and resetting it to Ready would re-dispatch a
+    # finished story. Route it to Done — the same rule the cron applies to an
+    # item whose PR is MERGED.
+    if [[ -z "$dirty" && "$ahead" != "0" ]]; then
+        local merged_pr
+        merged_pr=$(_salvage_merged_pr "${CURRENT_BRANCH:-}")
+        if [[ -n "$merged_pr" ]]; then
+            echo "Salvage skipped: ${CURRENT_BRANCH} has no unsaved work — its commits landed via merged PR #${merged_pr}"
+            if [[ -n "${CFGMS_PROJECT_ITEM_ID:-}" ]]; then
+                bash "$PROJECT_QUEUE" update-field "$CFGMS_PROJECT_ITEM_ID" status "Done" \
+                    2>/dev/null || echo "WARN: failed to set status Done"
+            fi
+            return
+        fi
+    fi
+
     if [[ -n "$dirty" || "$ahead" != "0" ]]; then
         # The agent produced work but opened no PR — capture it as a draft PR so
         # the cron's resume_failed_session path can pick it up.
         if [[ -n "$dirty" ]]; then
-            git add --update
+            _salvage_stage_work
             local local_issue_ref=""
             if [[ -n "${ISSUE_NUM:-}" ]]; then
                 local_issue_ref=" for issue #${ISSUE_NUM}"

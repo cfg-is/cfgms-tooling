@@ -598,10 +598,17 @@ setup_salvage_env() {
     SALVAGE_LOG="$SALVAGE_DIR/calls.log"
     : > "$SALVAGE_LOG"
 
-    # gh stub — records every invocation.
+    # gh stub — records every invocation. `gh pr list` prints the contents of
+    # gh-pr-list.out (already in the post---jq "<number> <headRefOid>" shape)
+    # when a test writes one, and exits non-zero when gh-pr-list.fail exists.
     cat > "$SALVAGE_DIR/gh" <<STUB
 #!/usr/bin/env bash
 echo "gh \$*" >> "$SALVAGE_LOG"
+if [[ "\$1" == "pr" && "\$2" == "list" ]]; then
+    [[ -f "$SALVAGE_DIR/gh-pr-list.fail" ]] && exit 1
+    [[ -f "$SALVAGE_DIR/gh-pr-list.out" ]] && cat "$SALVAGE_DIR/gh-pr-list.out"
+fi
+exit 0
 STUB
     chmod +x "$SALVAGE_DIR/gh"
 
@@ -722,6 +729,148 @@ test_18b_salvage_captures_committed_work() {
     subject=$(git -C "$SALVAGE_REPO" log --format=%s -1)
     assert_equals "$subject" "ci: the agent's own commit (Issue #9999)" \
         "no empty WIP commit is stacked on the agent's own commit"
+
+    teardown_salvage_env
+}
+
+# T18c — new (untracked) files are part of the salvage commit. `git add
+# --update` alone skipped them, so a salvage dropped every file the agent
+# created. .gitignore is honoured, and oversized untracked files are left out.
+test_18c_salvage_includes_untracked_files() {
+    setup_salvage_env
+
+    echo "agent edit" > "$SALVAGE_REPO/seed.txt"
+    mkdir -p "$SALVAGE_REPO/pkg/testutil"
+    echo "package testutil" > "$SALVAGE_REPO/pkg/testutil/new_store.go"
+    echo "package testutil" > "$SALVAGE_REPO/pkg/testutil/new_cluster_test.go"
+    printf '*.key\n' > "$SALVAGE_REPO/.gitignore"
+    git -C "$SALVAGE_REPO" add .gitignore
+    git -C "$SALVAGE_REPO" commit -q -m "ignore keys"
+    git -C "$SALVAGE_REPO" update-ref refs/remotes/origin/develop HEAD
+    echo "not-a-real-key" > "$SALVAGE_REPO/agent.key"
+    head -c 2048 /dev/zero > "$SALVAGE_REPO/big.bin"
+    echo "not-a-real-key" > "$SALVAGE_REPO/id_ed25519"
+    echo "machine example.invalid" > "$SALVAGE_REPO/pkg/.netrc"
+
+    local out
+    out=$(
+        cd "$SALVAGE_REPO" || exit 1
+        CURRENT_BRANCH="feature/story-9999-agent"
+        ISSUE_NUM="9999"
+        EXIT_CODE=1
+        PROJECT_QUEUE="$SALVAGE_DIR/project-queue.sh"
+        CFGMS_PROJECT_ITEM_ID="pv2-test-item"
+        SALVAGE_MAX_UNTRACKED_BYTES=1024
+        _salvage_no_pr "failed validation" 2>&1
+    )
+
+    local committed
+    committed=$(git -C "$SALVAGE_REPO" show --name-only --format= HEAD)
+    assert_contains "$committed" "pkg/testutil/new_store.go" \
+        "new untracked source file is in the WIP commit"
+    assert_contains "$committed" "pkg/testutil/new_cluster_test.go" \
+        "new untracked test file is in the WIP commit"
+    assert_contains "$committed" "seed.txt" \
+        "tracked modification is still in the WIP commit"
+    assert_not_contains "$committed" "agent.key" \
+        ".gitignore'd file is not committed"
+    assert_not_contains "$committed" "big.bin" \
+        "oversized untracked file is not committed"
+    assert_contains "$out" "skipping untracked file big.bin" \
+        "oversized file is logged as skipped"
+    assert_not_contains "$committed" "id_ed25519" \
+        "credential-like file not covered by .gitignore is not committed"
+    assert_not_contains "$committed" ".netrc" \
+        "credential-like file in a subdirectory is not committed"
+    assert_contains "$out" "skipping credential-like untracked file id_ed25519" \
+        "credential-like file is logged as skipped"
+    assert_contains "$(cat "$SALVAGE_LOG")" "pr create --base develop --draft" \
+        "salvaged work becomes a draft PR"
+
+    teardown_salvage_env
+}
+
+# T18d — the branch's commits already landed through a squash-merged PR. They
+# are never ancestors of develop, so `ahead` > 0, but they are not unsaved
+# work: no push, no duplicate "agent produced no PR" draft, no re-dispatch.
+test_18d_salvage_skips_branch_with_merged_pr() {
+    setup_salvage_env
+
+    echo "agent fix" > "$SALVAGE_REPO/fix.txt"
+    git -C "$SALVAGE_REPO" add fix.txt
+    git -C "$SALVAGE_REPO" commit -q -m "fix (Issue #9999)"
+    echo "4242 $(git -C "$SALVAGE_REPO" rev-parse HEAD)" > "$SALVAGE_DIR/gh-pr-list.out"
+
+    local out
+    out=$(
+        cd "$SALVAGE_REPO" || exit 1
+        CURRENT_BRANCH="feature/story-9999-agent"
+        ISSUE_NUM="9999"
+        EXIT_CODE=0
+        PROJECT_QUEUE="$SALVAGE_DIR/project-queue.sh"
+        CFGMS_PROJECT_ITEM_ID="pv2-test-item"
+        _salvage_no_pr "exited 0 without opening a pull request" 2>&1
+    )
+
+    local log
+    log=$(cat "$SALVAGE_LOG")
+    assert_contains "$log" "gh pr list --head feature/story-9999-agent --state merged" \
+        "merged PRs for the branch are queried"
+    assert_not_contains "$log" "pr create" \
+        "no duplicate draft PR for already-merged work"
+    assert_not_contains "$log" "git push" \
+        "already-merged branch is not re-pushed"
+    assert_not_contains "$log" "status Ready" \
+        "merged story is not reset to Ready"
+    assert_not_contains "$log" "ZeroWorkRetries" \
+        "merged story is not counted as a zero-work retry"
+    assert_contains "$log" "project-queue update-field pv2-test-item status Done" \
+        "item whose PR merged is routed to Done"
+    assert_contains "$out" "merged PR #4242" \
+        "skip is logged with the merged PR number"
+
+    teardown_salvage_env
+}
+
+# T18e — fail-safe direction: commits beyond the merged head, or a failed gh
+# query, still produce the draft PR.
+test_18e_salvage_merged_check_fails_safe() {
+    setup_salvage_env
+
+    echo "agent fix" > "$SALVAGE_REPO/fix.txt"
+    git -C "$SALVAGE_REPO" add fix.txt
+    git -C "$SALVAGE_REPO" commit -q -m "fix (Issue #9999)"
+    echo "4242 $(git -C "$SALVAGE_REPO" rev-parse HEAD)" > "$SALVAGE_DIR/gh-pr-list.out"
+    echo "follow-up" > "$SALVAGE_REPO/more.txt"
+    git -C "$SALVAGE_REPO" add more.txt
+    git -C "$SALVAGE_REPO" commit -q -m "follow-up after the merge"
+
+    _t18e_run() {
+        (
+            cd "$SALVAGE_REPO" || exit 1
+            CURRENT_BRANCH="feature/story-9999-agent"
+            ISSUE_NUM="9999"
+            EXIT_CODE=1
+            PROJECT_QUEUE="$SALVAGE_DIR/project-queue.sh"
+            CFGMS_PROJECT_ITEM_ID="pv2-test-item"
+            _salvage_no_pr "failed validation" > /dev/null 2>&1
+        )
+    }
+
+    _t18e_run
+    assert_contains "$(cat "$SALVAGE_LOG")" "pr create --base develop --draft" \
+        "commits beyond the merged PR head still become a draft PR"
+
+    : > "$SALVAGE_LOG"
+    git -C "$SALVAGE_REPO" reset -q --hard HEAD~1
+    touch "$SALVAGE_DIR/gh-pr-list.fail"
+    _t18e_run
+    local log
+    log=$(cat "$SALVAGE_LOG")
+    assert_contains "$log" "pr create --base develop --draft" \
+        "a failed merged-PR query falls back to the draft PR"
+    assert_not_contains "$log" "status Done" \
+        "a failed merged-PR query does not mark the item Done"
 
     teardown_salvage_env
 }
@@ -1126,6 +1275,9 @@ run_test "T16 — hard refusal when CFGMS_PROJECT_ITEM_ID unset" test_16_hard_re
 run_test "T17 — dry-run: review gate invokes story-review workflow" test_17_review_gate_uses_story_review_workflow
 run_test "T18 — salvage: exit-0 with work becomes a draft PR" test_18_salvage_captures_uncommitted_work
 run_test "T18b — salvage: committed-only work becomes a draft PR, never a zero-work retry" test_18b_salvage_captures_committed_work
+run_test "T18c — salvage: new untracked files are committed (gitignore + size cap honoured)" test_18c_salvage_includes_untracked_files
+run_test "T18d — salvage: a branch whose PR already merged gets no duplicate draft" test_18d_salvage_skips_branch_with_merged_pr
+run_test "T18e — salvage: merged-PR check fails safe to the draft PR" test_18e_salvage_merged_check_fails_safe
 run_test "T19 — salvage: exit-0 with no work routes for re-dispatch" test_19_salvage_routes_zero_work_for_redispatch
 run_test "T20 — regression guard: exit-0 branch checks PR_URL" test_20_exit_zero_branch_checks_pr_url
 run_test "T21 — ended-turn-waiting detection (Issue #4178)" test_21_ended_turn_waiting_detection
