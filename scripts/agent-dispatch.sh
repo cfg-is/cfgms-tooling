@@ -1551,6 +1551,110 @@ _image_rebuild() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Docker space reclaim (Issue #4861)
+#
+# Every `/agent-setup rebuild` (a --no-cache build) leaves the previous
+# cfg-agent image and its layers behind, and BuildKit cache accumulates with
+# nothing to age it out, so the host's disk climbs until the capacity gate
+# (CFGMS_AGENT_DISK_CEIL) refuses launches. `cleanup-stale` (PO Step 1.5) calls
+# _docker_prune_reclaim every cycle; it is a no-op until disk usage reaches
+# CFGMS_AGENT_DOCKER_PRUNE_AT.
+#
+# Knobs (env-overridable, same style as CFGMS_AGENT_DISK_CEIL):
+#   CFGMS_AGENT_DOCKER_PRUNE_AT         disk fraction that triggers a prune (0.80,
+#                                       below the 0.90 dispatch ceiling so space
+#                                       is reclaimed before launches are refused)
+#   CFGMS_AGENT_DOCKER_PRUNE_IMAGE_AGE  keep unused images newer than this (168h)
+#   CFGMS_AGENT_DOCKER_PRUNE_CACHE_AGE  keep build cache newer than this (168h)
+#
+# Never removed: any image used by a container (docker refuses, running or
+# stopped), the current cfg-agent:latest (pinned for the duration by a
+# throwaway container, because `image prune -a` has no exclusion list), or any
+# volume (no --volumes, no `system prune`). The prune holds IMAGE_REBUILD_LOCK
+# non-blocking: if a rebuild holds it, the prune is skipped, never queued.
+# ---------------------------------------------------------------------------
+_docker_prune_age() {
+  # _docker_prune_age <value> <default> — docker `until` durations only.
+  if [[ "$1" =~ ^[0-9]+[smh]$ ]]; then echo "$1"; else echo "$2"; fi
+}
+
+_docker_prune_size_bytes() {
+  # Parses "Total reclaimed space: 16.63GB" (docker's decimal units) to bytes.
+  python3 -c '
+import re, sys
+m = re.search(r"reclaimed space:\s*([0-9.]+)\s*([kKMGT]?B)", sys.stdin.read())
+u = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}
+print(round(float(m.group(1)) * u[m.group(2).upper()]) if m else 0)
+' 2>/dev/null || echo 0
+}
+
+_docker_prune_disk_frac() {
+  if [[ -n "${CFGMS_TEST_DOCKER_PRUNE_DISK_FRAC:-}" ]]; then
+    echo "$CFGMS_TEST_DOCKER_PRUNE_DISK_FRAC"; return
+  fi
+  local root
+  root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+  CAP_ROOT="$root" python3 -c '
+import os, shutil
+p = os.path.abspath(os.environ["CAP_ROOT"])
+while not os.path.exists(p) and os.path.dirname(p) != p:
+    p = os.path.dirname(p)
+du = shutil.disk_usage(p)
+print(du.used / du.total)
+' 2>/dev/null || echo 0
+}
+
+_docker_prune_body() {
+  local image_age="$1" cache_age="$2" guard="cfg-prune-guard" img_out cache_out images=0 cache=0
+  # A guard orphaned by a killed run would pin latest forever; clear it first.
+  docker rm -f "$guard" >/dev/null 2>&1 || true
+  if docker image inspect cfg-agent:latest >/dev/null 2>&1; then
+    if ! docker create --name "$guard" --entrypoint /bin/true cfg-agent:latest >/dev/null 2>&1; then
+      echo "DOCKER_PRUNED:skipped=guard_failed"
+      return 0
+    fi
+  else
+    guard=""
+  fi
+  img_out=$(docker image prune -a -f --filter "until=${image_age}" 2>/dev/null || true)
+  cache_out=$(docker builder prune -f --filter "until=${cache_age}" 2>/dev/null || true)
+  [[ -n "$guard" ]] && { docker rm -f "$guard" >/dev/null 2>&1 || true; }
+  images=$(printf '%s' "$img_out" | _docker_prune_size_bytes)
+  cache=$(printf '%s' "$cache_out" | _docker_prune_size_bytes)
+  echo "DOCKER_PRUNED:images=${images:-0}:cache=${cache:-0}"
+}
+
+_docker_prune_reclaim() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local at frac image_age cache_age
+  at="${CFGMS_AGENT_DOCKER_PRUNE_AT:-0.80}"
+  frac=$(_docker_prune_disk_frac)
+  if ! DP_FRAC="${frac:-0}" DP_AT="$at" python3 -c \
+      'import os, sys; sys.exit(0 if float(os.environ["DP_FRAC"]) >= float(os.environ["DP_AT"]) else 1)' 2>/dev/null; then
+    return 0
+  fi
+  image_age=$(_docker_prune_age "${CFGMS_AGENT_DOCKER_PRUNE_IMAGE_AGE:-}" 168h)
+  cache_age=$(_docker_prune_age "${CFGMS_AGENT_DOCKER_PRUNE_CACHE_AGE:-}" 168h)
+
+  mkdir -p "$(dirname "$IMAGE_REBUILD_LOCK")" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -n 200 || { echo "DOCKER_PRUNED:skipped=build_in_progress"; exit 0; }
+      _docker_prune_body "$image_age" "$cache_age"
+    ) 200>"$IMAGE_REBUILD_LOCK"
+  else
+    local lockdir="${IMAGE_REBUILD_LOCK}.d"
+    if ! mkdir "$lockdir" 2>/dev/null; then
+      echo "DOCKER_PRUNED:skipped=build_in_progress"
+      return 0
+    fi
+    _image_rebuild_write_holder "$lockdir"
+    _docker_prune_body "$image_age" "$cache_age" || true
+    rm -rf "$lockdir" 2>/dev/null || true
+  fi
+}
+
 # gate_image_staleness_for_launch — refuses to launch a container from an
 # image built from stale .devcontainer inputs (Issue #4388). Called
 # immediately before every `docker run` that starts an agent container.
@@ -4365,6 +4469,10 @@ PY
         echo "PRUNED_SESSION_DIRS:${pruned_sessions}:older_than_${AGENT_SESSIONS_RETENTION_DAYS}d"
       fi
     fi
+
+    # Reclaim unused Docker images and build cache once disk usage crosses
+    # CFGMS_AGENT_DOCKER_PRUNE_AT (Issue #4861). Best-effort: never fails cleanup.
+    _docker_prune_reclaim || true
 
     # Find agent containers (running or exited) whose stories no longer need them.
     # A container is stale if its story issue is CLOSED or has project status Failed or Blocked.
