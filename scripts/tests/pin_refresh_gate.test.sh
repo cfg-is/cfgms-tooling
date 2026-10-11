@@ -69,7 +69,7 @@ fi
 
 # --- Extract the real issue-creation/comment bash from the workflow ------------
 # Everything from the "any findings?" branch to end-of-step is the logic under
-# test; this is the actual run-block tail, dedented, not a rewritten copy.
+# test, bounded to the end of the run block; this is the actual run-block tail, dedented, not a rewritten copy.
 start_line=$(grep -n 'if \[ -z "\$outdated" \] && \[ -z "\$warnings" \]; then' "$WORKFLOW" | head -1 | cut -d: -f1)
 [[ -n "$start_line" ]] || { printf 'FAIL: could not locate extraction anchor in %s\n' "$WORKFLOW" >&2; exit 1; }
 
@@ -79,7 +79,10 @@ trap 'rm -rf "$TMP"' EXIT
 SNIPPET="$TMP/snippet.sh"
 {
   printf '#!/usr/bin/env bash\n'
-  tail -n "+${start_line}" "$WORKFLOW" | sed 's/^        //'
+  # Stop at the first non-blank line indented less than the run block (the
+  # next step or job key), so later jobs are never pulled into the snippet.
+  tail -n "+${start_line}" "$WORKFLOW" \
+    | awk 'NF && !/^        / { exit } { print }' | sed 's/^        //'
 } > "$SNIPPET"
 chmod +x "$SNIPPET"
 
