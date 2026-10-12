@@ -176,10 +176,10 @@ RUN set -eu; \
 # failure leaves it absent rather than failing the image build. Nothing
 # unverified is ever extracted or installed.
 RUN ( set -eu; \
-    TRUFFLEHOG_VERSION='v3.97.9'; \
+    TRUFFLEHOG_VERSION='v3.99.2'; \
     case "$TARGETARCH" in \
-      amd64) TRUFFLEHOG_SHA256='40377e6572495412fb9ba0bc21c9401f73b72f1d2afd11b9931bc4a5ed622866' ;; \
-      arm64) TRUFFLEHOG_SHA256='372c568695d49e53517075b5f74d1ee9a19053f13661d689c7928ee1fc27d705' ;; \
+      amd64) TRUFFLEHOG_SHA256='3c7b0d1dc4278294269bfdd7594bca8bb28c78da0a4a06ad202ded37b48deca4' ;; \
+      arm64) TRUFFLEHOG_SHA256='929b81efffca752eafd58bf6f17bf725d354f338636a7bbbee65c086d2f9ddf3' ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     ARCHIVE="trufflehog_${TRUFFLEHOG_VERSION#v}_linux_${TARGETARCH}.tar.gz"; \
