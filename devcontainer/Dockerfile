@@ -13,7 +13,7 @@
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
 # and .git history are never baked into the final image's layers.
 # CLI_BINARY=cfg  Entry point: ./cmd/cfg
-FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183 AS cfg-builder
+FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.2-trixie@sha256:e58d6f83b3416618d8bcac2b3dde1b7f7e3c4a77d25e88637f8bbae81536c48d AS cfg-builder
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
@@ -31,7 +31,7 @@ RUN set -eu; \
        ./cmd/cfg
 
 # Stage 1 (runtime): main agent container with full tooling
-FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183
+FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.2-trixie@sha256:e58d6f83b3416618d8bcac2b3dde1b7f7e3c4a77d25e88637f8bbae81536c48d
 
 # Declare TARGETARCH so BuildKit auto-populates it from the build platform.
 # Must be declared inside the consuming stage; an undeclared ${TARGETARCH}
