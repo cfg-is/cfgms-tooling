@@ -29,6 +29,9 @@ case "$1 $2" in
   "image prune") echo "Total reclaimed space: 16.63GB" ;;
   "builder prune") echo "Total reclaimed space: 74.61GB" ;;
   "image inspect") exit 0 ;;
+  "run --rm")
+    [[ -n "${GOCACHE_FAIL:-}" ]] && exit 1
+    echo "${GOCACHE_OUT:-300 100}" ;;
 esac
 exit 0
 SHIM
@@ -103,6 +106,43 @@ else
 fi
 out="$(run_prune 0.95)"
 check_contains "lock released: prune proceeds" "$out" "DOCKER_PRUNED:images="
+
+echo ""
+echo "== go build cache trim =="
+out="$(run_prune 0.50)"; log="$(cat "$TMP/docker.log")"
+check_not_contains "below threshold: no trim" "$out" "GO_CACHE_TRIMMED"
+check_not_contains "below threshold: no trim container" "$log" "cfgms-go-build-cache"
+out="$(run_prune 0.85)"; log="$(cat "$TMP/docker.log")"
+check_contains "above threshold: trim reports bytes" "$out" "GO_CACHE_TRIMMED:before=300:after=100"
+check_contains "trim mounts the volume, default 24h = 1440m" "$log" "-v cfgms-go-build-cache:/cache cfg-agent:latest -c"
+check_contains "default age passed as 1440 minutes" "$log" " sh 1440"
+check_not_contains "trim never removes the volume" "$log" "volume"
+check_not_contains "trim never runs go clean" "$log" "go clean"
+run_prune 0.85 CFGMS_AGENT_GO_CACHE_MAX_AGE=2h >/dev/null; log="$(cat "$TMP/docker.log")"
+check_contains "age knob honoured (2h = 120m)" "$log" " sh 120"
+run_prune 0.85 CFGMS_AGENT_GO_CACHE_MAX_AGE=30m >/dev/null; log="$(cat "$TMP/docker.log")"
+check_contains "age knob honoured in minutes" "$log" " sh 30"
+for bad in "" "abc" "0h" "-5h" "1;rm -rf /"; do
+  run_prune 0.85 "CFGMS_AGENT_GO_CACHE_MAX_AGE=$bad" >/dev/null; log="$(cat "$TMP/docker.log")"
+  check_contains "bad age '$bad' falls back to default" "$log" " sh 1440"
+done
+out="$(run_prune 0.85 GOCACHE_FAIL=1)"
+check_contains "failing trim reports skipped" "$out" "GO_CACHE_TRIMMED:skipped=trim_failed"
+check_contains "failing trim does not fail prune" "$out" "DOCKER_PRUNED:images="
+out="$(run_prune 0.85 GOCACHE_OUT=garbage)"
+check_contains "garbled trim output reports skipped" "$out" "GO_CACHE_TRIMMED:skipped=trim_failed"
+if run_prune 0.85 GOCACHE_FAIL=1 >/dev/null; then rc=0; else rc=1; fi
+check_contains "failing trim exits 0" "rc=$rc" "rc=0"
+if command -v flock >/dev/null 2>&1; then
+  (
+    exec 200>"$TMP/rebuild.lock"; flock 200
+    out="$(run_prune 0.95)"; log="$(cat "$TMP/docker.log")"
+    check_not_contains "held build lock: no go cache trim" "$out" "GO_CACHE_TRIMMED"
+    check_not_contains "held build lock: no trim container" "$log" "cfgms-go-build-cache"
+    echo "$fail $ran" > "$TMP/counts"
+  )
+  read -r fail ran < "$TMP/counts"
+fi
 
 echo ""
 echo "== wired into cleanup-stale =="

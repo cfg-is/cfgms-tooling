@@ -1567,6 +1567,17 @@ _image_rebuild() {
 #                                       is reclaimed before launches are refused)
 #   CFGMS_AGENT_DOCKER_PRUNE_IMAGE_AGE  keep unused images newer than this (168h)
 #   CFGMS_AGENT_DOCKER_PRUNE_CACHE_AGE  keep build cache newer than this (168h)
+#   CFGMS_AGENT_GO_CACHE_MAX_AGE        trim cfgms-go-build-cache files not modified
+#                                       within this window (24h; <n>m|h|d, else
+#                                       the default). Same PRUNE_AT trigger.
+#
+# The shared cfgms-go-build-cache volume is trimmed in place (Issue #4936):
+# files older than the window, then empty directories, deleted by a short-lived
+# container mounting the volume. Go refreshes an entry's mtime on reuse, so live
+# entries survive and a deleted one is just a cache miss. The volume itself is
+# never removed and `go clean -cache` is never run (both would break live
+# builds). Prints GO_CACHE_TRIMMED:before=<bytes>:after=<bytes> or
+# GO_CACHE_TRIMMED:skipped=<reason>; best-effort, never fails the prune.
 #
 # Never removed: any image used by a container (docker refuses, running or
 # stopped), the current cfg-agent:latest (pinned for the duration by a
@@ -1577,6 +1588,41 @@ _image_rebuild() {
 _docker_prune_age() {
   # _docker_prune_age <value> <default> — docker `until` durations only.
   if [[ "$1" =~ ^[0-9]+[smh]$ ]]; then echo "$1"; else echo "$2"; fi
+}
+
+_docker_go_cache_age_minutes() {
+  # _docker_go_cache_age_minutes <value> — <n>m|h|d (n > 0) to minutes; else 1440.
+  local n u
+  if [[ "$1" =~ ^([0-9]+)([mhd])$ ]]; then
+    n=$((10#${BASH_REMATCH[1]})); u="${BASH_REMATCH[2]}"
+    if [[ "$n" -gt 0 ]]; then
+      case "$u" in m) echo "$n" ;; h) echo $((n * 60)) ;; d) echo $((n * 1440)) ;; esac
+      return
+    fi
+  fi
+  echo 1440
+}
+
+_docker_go_cache_trim() {
+  # Runs under the build lock (called from _docker_prune_body). Always returns 0.
+  local mins out before after
+  mins=$(_docker_go_cache_age_minutes "${CFGMS_AGENT_GO_CACHE_MAX_AGE:-}")
+  if ! docker image inspect cfg-agent:latest >/dev/null 2>&1; then
+    echo "GO_CACHE_TRIMMED:skipped=no_image"; return 0
+  fi
+  if ! out=$(docker run --rm --entrypoint sh -v "cfgms-go-build-cache:/cache" cfg-agent:latest -c '
+    b=$(du -sb /cache | cut -f1)
+    find /cache -type f -mmin +"$1" -delete
+    find /cache -mindepth 1 -type d -empty -delete
+    a=$(du -sb /cache | cut -f1)
+    echo "$b $a"' sh "$mins" 2>/dev/null); then
+    echo "GO_CACHE_TRIMMED:skipped=trim_failed"; return 0
+  fi
+  read -r before after <<<"$(printf '%s\n' "$out" | tail -n1)"
+  if [[ ! "${before:-}" =~ ^[0-9]+$ || ! "${after:-}" =~ ^[0-9]+$ ]]; then
+    echo "GO_CACHE_TRIMMED:skipped=trim_failed"; return 0
+  fi
+  echo "GO_CACHE_TRIMMED:before=${before}:after=${after}"
 }
 
 _docker_prune_size_bytes() {
@@ -1619,6 +1665,7 @@ _docker_prune_body() {
   fi
   img_out=$(docker image prune -a -f --filter "until=${image_age}" 2>/dev/null || true)
   cache_out=$(docker builder prune -f --filter "until=${cache_age}" 2>/dev/null || true)
+  _docker_go_cache_trim || true
   [[ -n "$guard" ]] && { docker rm -f "$guard" >/dev/null 2>&1 || true; }
   images=$(printf '%s' "$img_out" | _docker_prune_size_bytes)
   cache=$(printf '%s' "$cache_out" | _docker_prune_size_bytes)
