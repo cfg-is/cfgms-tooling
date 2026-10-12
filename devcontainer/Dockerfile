@@ -95,8 +95,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Go-based security and quality tools
 # Versions MUST match .github/workflows/dependency-pin-check.yml
-RUN go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0 \
-    && go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 \
+# gosec and staticcheck are built by scripts/install-go-analyzers.sh, the same
+# script security-scan.yml uses: it builds the pinned releases against a
+# golang.org/x/tools that can read this Go's export data. A plain `go install`
+# of the pinned releases cannot read Go 1.27.2 export data ("export data version
+# 5 is greater than maximum supported version 4") and fails on every package.
+COPY scripts/install-go-analyzers.sh /tmp/install-go-analyzers.sh
+RUN bash /tmp/install-go-analyzers.sh \
+    && rm /tmp/install-go-analyzers.sh \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
     && go install github.com/google/go-licenses/v2@v2.0.1
 
