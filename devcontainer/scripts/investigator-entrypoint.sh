@@ -181,7 +181,7 @@ case "$MODE" in
     # -- confirmed fixed in the same image by piping instead.
     case "$PLAN_HARNESS" in
       claude)
-        if [ ! -f "${HOME}/.claude/.credentials.json" ]; then
+        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ ! -f "${HOME}/.claude/.credentials.json" ]; then
             echo "ERROR: No Claude credentials found at ~/.claude/.credentials.json"
             exit 1
         fi

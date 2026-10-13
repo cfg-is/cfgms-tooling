@@ -606,7 +606,7 @@ assert_gate_before_run() {
   # "docker run" earlier in the block (e.g. "docker run -it needs a real
   # TTY", "same `docker run -d` shape as review-pr").
   gate_line=$( (grep -n 'gate_image_staleness_for_launch' <<<"$block" || true) | head -1 | cut -d: -f1)
-  run_line=$( (grep -n -E 'container_id=\$\(docker run -d|exec docker run -it --rm' <<<"$block" || true) | head -1 | cut -d: -f1)
+  run_line=$( (grep -n -E 'container_id=\$\((CLAUDE_CODE_OAUTH_TOKEN=\S+ )?docker run -d|exec docker run -it --rm' <<<"$block" || true) | head -1 | cut -d: -f1)
   if [[ -n "$gate_line" && -n "$run_line" && "$gate_line" -lt "$run_line" ]]; then
     ok "${label}: gate_image_staleness_for_launch precedes docker run"
   else
@@ -696,7 +696,7 @@ while IFS= read -r -d '' script; do
   mapfile -t findings < <(awk '
     /^  [A-Za-z][A-Za-z0-9_-]*\)[[:space:]]*$/ { gate_seen = 0 }
     /gate_image_staleness_for_launch/ { gate_seen = 1 }
-    /container_id=\$\(docker run/ || /^[[:space:]]*exec docker run/ {
+    /container_id=\$\((CLAUDE_CODE_OAUTH_TOKEN=[^ ]+ )?docker run/ || /^[[:space:]]*exec docker run/ {
       if ($0 ~ /[[:space:]]-d[[:space:]]/ || $0 ~ /[[:space:]]-it[[:space:]]/) {
         launch_line[++n] = NR
         launch_gated[n] = gate_seen

@@ -59,13 +59,19 @@ trap release_cfgms_lease EXIT
 setup-env.sh
 
 # Verify credentials are available (hard fail for headless dispatch).
-if [ ! -f ~/.claude/.credentials.json ]; then
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    : # Long-lived token mode (Issue #4854): no credentials file is mounted
+elif [ ! -f ~/.claude/.credentials.json ]; then
     echo "ERROR: No Claude credentials found at /persist/.credentials.json"
     echo "Run: /agent-setup creds on host to configure"
     exit 1
 fi
 
 # --- Phase 0b: Validate OAuth token (refresh if expiring) ---
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    # Long-lived token (Issue #4854): never refreshed, so no expiry check.
+    echo "Auth: long-lived token"
+else
 TOKEN_REMAINING=$(python3 -c "
 import json, time
 d = json.load(open('$HOME/.claude/.credentials.json'))
@@ -89,6 +95,7 @@ if [ "$TOKEN_REMAINING" -lt 300 ] 2>/dev/null; then
     fi
 else
     echo "OAuth token valid (${TOKEN_REMAINING}s remaining)"
+fi
 fi
 
 # --- Phase 1: Run the review ---

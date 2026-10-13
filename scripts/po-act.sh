@@ -797,7 +797,8 @@ except Exception: print('')" 2>/dev/null || echo "")
     # running on images built from stale .devcontainer inputs.
     gate_image_staleness_for_launch
 
-    if container_id=$(docker run -d \
+    agent_token_args
+    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
       --label "issue=${story:-}" \
@@ -806,7 +807,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      "${AGENT_CRED_ARGS[@]}" \
       -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \

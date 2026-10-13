@@ -630,6 +630,15 @@ set -e
 assert_eq "$rc" "0" "claude planner: entrypoint exits 0"
 assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "claude-was-invoked" \
   "claude planner: claude was invoked"
+# Issue #4854: token mode needs no credentials file.
+rm -f "${WORK_HOME}/.claude/.credentials.json" "${WORK_HOME}/claude-invoked"
+set +e
+out=$(CLAUDE_CODE_OAUTH_TOKEN="test-token-not-real" run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "claude" "claude-fable-5-1" 2>&1)
+rc=$?
+set -e
+assert_eq "$rc" "0" "claude planner in token mode without a credentials file: exits 0"
+assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "claude-was-invoked" \
+  "claude planner in token mode: claude was invoked"
 rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
 
 echo ""

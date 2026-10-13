@@ -529,8 +529,10 @@ check_contains "usage() documents --harness/--model" "$dispatch_src" '--harness 
 # `--harness`, so a writable Claude credential in plan mode would be handed
 # to whichever harness the roster names.
 check_not_contains "no credential mount in this block is writable" "$launch_block_code" '.credentials.json:/home/agent/.claude/.credentials.json"'
-check_contains "plan mode's own credential mount is read-only" "$launch_block_code" 'claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
-check_contains "the --harness claude mount is read-only" "$launch_block_code" 'inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")'
+check_contains "plan mode's own credential mount is read-only (agent_token_args ro)" "$launch_block_code" 'agent_token_args ro
+        claude_creds_mount=("${AGENT_CRED_ARGS[@]}")'
+check_contains "the --harness claude mount is read-only (agent_token_args ro)" "$launch_block_code" 'agent_token_args ro
+          inv_harness_creds_mount=("${AGENT_CRED_ARGS[@]}")'
 
 : > "$DOCKER_CALL_LOG"
 harness_out=$(PATH="${FAKEBIN}:${PATH}" \

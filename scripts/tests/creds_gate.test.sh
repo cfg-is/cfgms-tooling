@@ -63,20 +63,19 @@ check_not_contains "po-act.sh no longer copies creds into a volume before launch
   'cp /host-creds.json /persist/.credentials.json'
 
 echo ""
-echo "== every dispatch launch path bind-mounts the host's live credentials file =="
+echo "== every dispatch launch path takes its Claude credential from agent_token_args =="
 cred_mount='.claude/.credentials.json:/home/agent/.claude/.credentials.json'
-dispatch_mount_count=$(grep -c "$cred_mount" "$DISPATCH")
-# 6 since Issue #3932 added a distinct --harness claude mount
-# (inv_harness_creds_mount) alongside the 5 pre-existing ones
-# (launch/launch-generic/launch-interactive/po-live/launch-investigator plan
-# mode), so the count grew rather than one of the 5 being replaced. Both
-# investigator mounts are read-only; the other 4 remain writable. This check
-# asserts only that a live-file bind mount exists on every launch path --
-# the :ro-ness of the investigator ones is asserted in
-# investigator_launch.test.sh, which is where that distinction lives.
-check_contains "agent-dispatch.sh bind-mounts host creds at least 6x (launch/launch-generic/launch-interactive/po-live/launch-investigator plan mode/launch-investigator --harness claude)" \
-  "$dispatch_mount_count" "6"
-check_contains "po-act.sh bind-mounts host creds for its inlined launch" "$po_act_src" "$cred_mount"
+# Since Issue #4854 the file mount is the FALLBACK, built once by
+# agent_token_args (agent_token.test.sh covers its behaviour); every headless
+# launch site splices AGENT_CRED_ARGS / the investigator arrays instead.
+fallback_count=$(grep -c "$cred_mount" "$DISPATCH")
+check_contains "agent-dispatch.sh keeps the file mount only in agent_token_args and the (superseded) po-live path" \
+  "$(( fallback_count >= 1 ? 1 : 0 ))" "1"
+splice_count=$(grep -c 'AGENT_CRED_ARGS\[@\]' "$DISPATCH")
+check_contains "agent-dispatch.sh splices AGENT_CRED_ARGS at launch/launch-generic/launch-interactive/review-pr" \
+  "$(( splice_count >= 4 ? 1 : 0 ))" "1"
+check_contains "po-act.sh splices AGENT_CRED_ARGS for its inlined launch" "$po_act_src" 'AGENT_CRED_ARGS[@]'
+check_not_contains "po-act.sh no longer bind-mounts the credentials file directly" "$po_act_src" "$cred_mount"
 
 echo ""
 echo "== check-creds reads the host file directly, no docker run needed =="

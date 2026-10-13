@@ -91,7 +91,9 @@ if [ -d /agent-sessions ] && [ ! -e ~/.claude/projects ]; then
     ln -sfn /agent-sessions ~/.claude/projects
 fi
 
-if [ -f ~/.claude/.credentials.json ]; then
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    : # Long-lived token mode (Issue #4854) — no credentials file needed
+elif [ -f ~/.claude/.credentials.json ]; then
     : # Credentials already present (e.g. host mount) — nothing to do
 elif [ -f /persist/.credentials.json ]; then
     ln -sf /persist/.credentials.json ~/.claude/.credentials.json

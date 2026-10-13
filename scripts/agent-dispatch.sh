@@ -1189,6 +1189,7 @@ gate_credentials_for_launch() {
     creds_status=$(bash "$0" check-creds 2>/dev/null)
   fi
   case "$creds_status" in
+    CREDS_MODE:token) ;;  # long-lived token: host-token freshness is irrelevant
     CREDS_OK:*|CREDS_LOW:*|CREDS_EXPIRED:*) ;;
     CREDS_MISSING:*|CREDS_ERROR:*)
       echo "DISPATCH_DEFERRED:creds_missing:${creds_status}"
@@ -1199,6 +1200,73 @@ gate_credentials_for_launch() {
       exit 10
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Long-lived agent token (Issue #4854).
+#
+# The host and every container used to share ONE OAuth session and its single
+# refresh token, so whichever copy refreshed first invalidated all the others
+# (including the host). Containers now authenticate with a separate long-lived
+# subscription token from `claude setup-token`, passed as
+# CLAUDE_CODE_OAUTH_TOKEN. It is never refreshed, so container sessions and the
+# host session no longer interact.
+#
+# The token is held as a TPM2-bound systemd-creds credential (ciphertext only
+# on disk). CFGMS_AGENT_TOKEN_CRED overrides the path and CFGMS_SYSTEMD_CREDS_BIN
+# the executable (hermetic tests; same override scripts/tier1-bootstrap.sh uses).
+# ---------------------------------------------------------------------------
+AGENT_TOKEN_CRED_NAME="claude-oauth-token"
+AGENT_TOKEN_TIMEOUT_SECS="${CFGMS_AGENT_TOKEN_TIMEOUT:-15}"
+(( AGENT_TOKEN_TIMEOUT_SECS >= 1 && AGENT_TOKEN_TIMEOUT_SECS <= 15 )) 2>/dev/null || AGENT_TOKEN_TIMEOUT_SECS=15
+AGENT_TOKEN_VALUE=""
+AGENT_TOKEN_REASON=""
+AGENT_CRED_ARGS=()
+
+# _agent_token_fetch — decrypt the credential into AGENT_TOKEN_VALUE (shell
+# variable only; never written to disk or argv). Returns 0 on success, else 1
+# with AGENT_TOKEN_REASON set to absent | decrypt_failed | timeout. Silent.
+_agent_token_fetch() {
+  local cred="${CFGMS_AGENT_TOKEN_CRED:-${HOME}/.config/cfgms/claude-oauth-token.cred}"
+  local bin="${CFGMS_SYSTEMD_CREDS_BIN:-systemd-creds}" rc=0
+  AGENT_TOKEN_VALUE=""
+  AGENT_TOKEN_REASON=""
+  if [[ ! -f "$cred" ]]; then
+    AGENT_TOKEN_REASON="absent"
+    return 1
+  fi
+  AGENT_TOKEN_VALUE=$(timeout "$AGENT_TOKEN_TIMEOUT_SECS" "$bin" decrypt \
+    --name="$AGENT_TOKEN_CRED_NAME" "$cred" - 2>/dev/null </dev/null) || rc=$?
+  if [[ $rc -ne 0 || -z "$AGENT_TOKEN_VALUE" ]]; then
+    AGENT_TOKEN_VALUE=""
+    if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+      AGENT_TOKEN_REASON="timeout"
+    else
+      AGENT_TOKEN_REASON="decrypt_failed"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# agent_token_args [ro] — fill AGENT_CRED_ARGS with the docker-run arguments
+# that give a container its Claude credential:
+#   token mode:    (-e CLAUDE_CODE_OAUTH_TOKEN)  — name only; the caller puts the
+#                  value in the docker process environment with
+#                  `CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run ...`
+#   fallback mode: (-v <host .credentials.json>:...[:ro]) plus one
+#                  WARN:agent_token:<reason> line.
+# Call it directly (not in $(...)) so the array and value reach the caller.
+# Never blocks longer than the decrypt timeout.
+agent_token_args() {
+  local suffix=""
+  [[ "${1:-}" == "ro" ]] && suffix=":ro"
+  if _agent_token_fetch; then
+    AGENT_CRED_ARGS=(-e CLAUDE_CODE_OAUTH_TOKEN)
+  else
+    echo "WARN:agent_token:${AGENT_TOKEN_REASON}"
+    AGENT_CRED_ARGS=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json${suffix}")
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2520,7 +2588,8 @@ case "$cmd" in
 
     ledger_append_launch "cfg-agent-${num}" "issue" "${num}" "" "" "dev-agent" ""
 
-    if container_id=$(docker run -d \
+    agent_token_args
+    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
       --name "cfg-agent-${num}" \
       --label "cfg-agent=true" \
       --label "issue=${num}" \
@@ -2529,7 +2598,7 @@ case "$cmd" in
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      "${AGENT_CRED_ARGS[@]}" \
       -v "$(agent_trust_file "cfg-agent-${num}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
@@ -2611,7 +2680,8 @@ case "$cmd" in
     ledger_append_launch "$container_name" "$mode_label" "${issue_arg:-}" "${fix_pr_num:-}" \
       "${branch_arg:-}" "$ledger_segment" "${CFGMS_LEASE_KEY:-}"
 
-    if container_id=$(docker run -d \
+    agent_token_args
+    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
       --label "mode=${mode_label}" \
@@ -2620,7 +2690,7 @@ case "$cmd" in
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      "${AGENT_CRED_ARGS[@]}" \
       -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
@@ -2945,7 +3015,8 @@ case "$cmd" in
     setup_cmds+=" && exec runuser -u agent -- claude remote-control --permission-mode bypassPermissions --name '${branch}' 2>&1"
 
     # Launch container in detached mode with remote-control server
-    if container_id=$(docker run -d \
+    agent_token_args
+    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
       --label "mode=interactive" \
@@ -2954,7 +3025,7 @@ case "$cmd" in
       --cpus=4 \
       --stop-timeout=3600 \
       -v "${real_path}:/workspace" \
-      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      "${AGENT_CRED_ARGS[@]}" \
       -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
@@ -2995,8 +3066,13 @@ case "$cmd" in
     # — agent containers bind-mount this exact file, so it is what they use.
     # CREDS_LOW / CREDS_EXPIRED are advisory only: agents refresh the live file
     # in place (see gate_credentials_for_launch). Only MISSING / ERROR block.
+    # Token mode (Issue #4854): a decryptable long-lived token needs no host
+    # token freshness check.
     host_creds="$HOME/.claude/.credentials.json"
-    if [[ ! -f "$host_creds" ]]; then
+    if _agent_token_fetch; then
+      AGENT_TOKEN_VALUE=""
+      echo "CREDS_MODE:token"
+    elif [[ ! -f "$host_creds" ]]; then
       echo "CREDS_MISSING:no host credentials file at ${host_creds}"
     else
       result=$(CFGMS_HOST_CREDS="$host_creds" python3 -c "
@@ -3344,7 +3420,10 @@ PYEOF
     fi
 
     # Credentials check — agents bind-mount the host credentials file directly.
-    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+    if _agent_token_fetch; then
+      AGENT_TOKEN_VALUE=""
+      echo "INFO:creds:Long-lived agent token credential present (token mode)"
+    elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
       echo "INFO:creds:Host credentials file present (bind-mounted into agents)"
     else
       echo "WARN:creds:No credentials found — run /agent-setup creds"
@@ -3675,7 +3754,8 @@ PROMPT_EOF
 
     # Launch headless. Mount the review entrypoint at runtime — no image rebuild
     # required when this script changes.
-    if container_id=$(docker run -d \
+    agent_token_args
+    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
       --name "$container_name" \
       --label "cfg-agent=true" \
       --label "mode=review" \
@@ -3685,7 +3765,7 @@ PROMPT_EOF
       --cpus=4 \
       --stop-timeout=1800 \
       -v "${real_path}:/workspace" \
-      -v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json" \
+      "${AGENT_CRED_ARGS[@]}" \
       -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
@@ -3964,7 +4044,8 @@ PROMPT_EOF
         gate_credentials_for_launch
       fi
       if [[ -z "$inv_harness" ]]; then
-        claude_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+        agent_token_args ro
+        claude_creds_mount=("${AGENT_CRED_ARGS[@]}")
       fi
 
       # Issue #4003: since #3979 moved /workspace from a repo checkout to the
@@ -4033,7 +4114,8 @@ PROMPT_EOF
     if [[ -n "$inv_harness" ]]; then
       case "$inv_harness" in
         claude)
-          inv_harness_creds_mount=(-v "${HOME}/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+          agent_token_args ro
+          inv_harness_creds_mount=("${AGENT_CRED_ARGS[@]}")
           ;;
         codex)
           # Codex's own session credential (Issue #3935): $CODEX_HOME/auth.json,
@@ -4409,7 +4491,7 @@ PY
     # that holds the host's live Claude OAuth credentials (plan mode) and a
     # provider API key (lane mode) while deliberately ingesting untrusted
     # repository source and third-party model output.
-    if container_id=$(docker run -d \
+    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="${AGENT_TOKEN_VALUE:-}" docker run -d \
       --cap-add NET_ADMIN \
       --name "$container_name" \
       --label "cfg-agent=true" \
