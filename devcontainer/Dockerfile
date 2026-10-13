@@ -6,8 +6,9 @@
 #   (resolves Claude Code's current `stable` npm release; the documented
 #   agent-setup.md / agent-dispatch.sh build paths additionally pass
 #   --build-arg CLAUDE_CODE_VERSION_OVERRIDE=<resolved version> and
-#   --label cfgms.claude_code_version=<resolved version> so a bare build
-#   above still installs current Claude Code but skips that label)
+#   --label cfgms.claude_code_version=<resolved version>, and likewise
+#   CODEX_CLI_VERSION_OVERRIDE / cfgms.codex_version, so a bare build
+#   above still installs current Claude Code and Codex but skips the labels)
 # Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .devcontainer/Dockerfile .
 
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
@@ -222,20 +223,36 @@ RUN set -eu; \
       npm install -g "@anthropic-ai/claude-code@stable"; \
     fi
 
-# Codex CLI — pinned, never @latest (same supply-chain rule as every other
-# tool here except Claude Code above, which is exempt -- see its own comment
-# block; see dependency-pin-check.yml). This is the second subscription
-# agent harness the security review harness dispatches (Issue #3935,
-# epic #3927) — `codex_lane.py` invokes this binary as a subprocess,
-# authenticated by the operator's own `~/.codex/auth.json` session
-# (`agent-dispatch.sh launch-investigator --harness codex`), never an
+# Codex CLI — exempt from this file's pin-and-cooldown policy, like Claude
+# Code above (founder decision 2026-10-13, Issue #4969). Codex is the
+# security review harness's subscription lane and the account-side model list
+# changes often, so a stale CLI can lag what the account serves; a
+# hand-maintained pin and its bump stories cost more than they protect. The
+# image installs npm's `latest` dist-tag at build time -- `latest`, not
+# `stable`, because Codex publishes no `stable` tag (alphas are published
+# under `alpha`, so `latest` is the release channel).
+# CODEX_CLI_VERSION_OVERRIDE pins one exact release when that's needed
+# (holding back a bad release, reproducing a past build); empty (the default)
+# resolves `latest` fresh at build time. The resolved version is stamped as
+# the `cfgms.codex_version` image label by the build invocations in
+# .claude/commands/agent-setup.md and .claude/scripts/agent-dispatch.sh, and
+# `agent-dispatch.sh health-check` prints the installed codex version.
+# This is the second subscription agent harness the security review harness
+# dispatches (Issue #3935, epic #3927) — `codex_lane.py` invokes this binary
+# as a subprocess, authenticated by the operator's own `~/.codex/auth.json`
+# session (`agent-dispatch.sh launch-investigator --harness codex`), never an
 # OS-keychain API key.
-ARG CODEX_CLI_VERSION=0.153.4
-RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
+ARG CODEX_CLI_VERSION_OVERRIDE=
+RUN set -eu; \
+    if [ -n "${CODEX_CLI_VERSION_OVERRIDE}" ]; then \
+      npm install -g "@openai/codex@${CODEX_CLI_VERSION_OVERRIDE}"; \
+    else \
+      npm install -g "@openai/codex@latest"; \
+    fi
 
-# OpenCode CLI — pinned, never @latest (same supply-chain rule as Codex
-# above; see dependency-pin-check.yml. Claude Code above is the one
-# exemption -- see its own comment block). This is the third
+# OpenCode CLI — pinned, never @latest (same supply-chain rule as every
+# other pinned tool here; see dependency-pin-check.yml. Claude Code and Codex
+# above are the exemptions -- see their own comment blocks). This is the third
 # subscription agent harness the security review harness dispatches (Issue
 # #3936, epic #3927) — `opencode_lane.py` invokes this binary as a
 # subprocess, authenticated by the operator's own
@@ -247,9 +264,9 @@ RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 ARG OPENCODE_CLI_VERSION=1.18.29
 RUN npm install -g "opencode-ai@${OPENCODE_CLI_VERSION}"
 
-# Ollama CLI — pinned, never @latest (same supply-chain rule as Codex and
-# OpenCode above; Claude Code above is the one exemption -- see its own
-# comment block). This pin is intentionally NOT tracked by
+# Ollama CLI — pinned, never @latest (same supply-chain rule as OpenCode
+# above; Claude Code and Codex above are the exemptions -- see their own
+# comment blocks). This pin is intentionally NOT tracked by
 # dependency-pin-check.yml -- that workflow's freshness checks are
 # hand-written per tool and adding one is out of scope for the story that
 # introduced this pin (Issue #3976). This is the fourth subscription agent

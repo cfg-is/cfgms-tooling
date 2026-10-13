@@ -1264,6 +1264,25 @@ _resolve_claude_code_version() {
   echo "$resolved"
 }
 
+# _resolve_codex_version — the npm `latest` dist-tag for @openai/codex,
+# resolved once per rebuild so the CODEX_CLI_VERSION_OVERRIDE build-arg and
+# the `cfgms.codex_version` label always agree (Issue #4969: Codex is exempt
+# from the pin-and-cooldown policy, like Claude Code above). `latest`, not
+# `stable`, because Codex publishes no `stable` tag; alphas live under `alpha`.
+# Same contract as _resolve_claude_code_version: falls back to the literal
+# "latest" when the registry can't be resolved from this host, which the
+# Dockerfile's own `@latest` install path resolves normally.
+_resolve_codex_version() {
+  local resolved
+  resolved=$(curl -fsSL "https://registry.npmjs.org/@openai/codex" 2>/dev/null \
+    | jq -r '.["dist-tags"].latest // empty' 2>/dev/null) || true
+  if [[ -z "$resolved" || "$resolved" == "null" ]]; then
+    echo "latest"
+    return 0
+  fi
+  echo "$resolved"
+}
+
 # _image_rebuild__body <checkout_hash> — the guarded section of a rebuild:
 # re-checks freshness (another launch may have rebuilt while this one waited
 # on the lock), tags the current image as a timestamped backup so a bad build
@@ -1292,10 +1311,14 @@ _image_rebuild__body() {
   else
     local cc_version
     cc_version=$(_resolve_claude_code_version)
+    local codex_version
+    codex_version=$(_resolve_codex_version)
     docker build \
       --label "cfgms.build_inputs_hash=${checkout_hash}" \
       --build-arg "CLAUDE_CODE_VERSION_OVERRIDE=${cc_version}" \
       --label "cfgms.claude_code_version=${cc_version}" \
+      --build-arg "CODEX_CLI_VERSION_OVERRIDE=${codex_version}" \
+      --label "cfgms.codex_version=${codex_version}" \
       -t cfg-agent:latest \
       -f "${REPO_ROOT}/.devcontainer/Dockerfile" \
       "${REPO_ROOT}" >&2 || build_exit=$?

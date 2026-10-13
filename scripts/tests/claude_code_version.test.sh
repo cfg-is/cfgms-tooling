@@ -208,7 +208,7 @@ label_value="$(sed -n 's/.*cfgms\.claude_code_version=\([^ ]*\).*/\1/p' <<<"$bui
 check_eq "rebuild: build-arg pins the resolved version" "$build_arg_value" "2.1.286"
 check_eq "rebuild: label records the resolved version" "$label_value" "2.1.286"
 check_eq "rebuild: build-arg and label agree" "$build_arg_value" "$label_value"
-check_eq "rebuild: resolved once, not once per use" "$(grep -c . "$CURL_CALL_LOG" || true)" "1"
+check_eq "rebuild: resolved once, not once per use" "$(grep -c 'claude-code' "$CURL_CALL_LOG" || true)" "1"
 check_contains "rebuild: still stamps the build-inputs hash label" "$build_line" \
   "cfgms.build_inputs_hash=${CHECKOUT_HASH}"
 check_contains "rebuild: builds the agent image tag" "$build_line" "-t cfg-agent:latest"
