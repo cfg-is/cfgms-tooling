@@ -65,6 +65,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dnsutils \
     dnsmasq \
     zstd \
+    # OpenSSL headers: go-tpm-tools simulator links -lcrypto (cgo TPM tests, #4976)
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js — major version tracks web/.nvmrc, the same file frontend-ci.yml reads
