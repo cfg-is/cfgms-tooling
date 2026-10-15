@@ -428,7 +428,16 @@ echo "--- review-pr: adversarial security-review gate (Issue #5025) ---"
 # gate, so a refusal here means no lease was taken and nothing was launched.
 ADV_ROOT=$(mktemp -d)
 trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR" "$ADV_ROOT"' EXIT
-mkdir -p "$ADV_ROOT/scripts" "$ADV_ROOT/home"
+mkdir -p "$ADV_ROOT/scripts" "$ADV_ROOT/home" "$ADV_ROOT/bin"
+# The container conflict gate runs `docker ps -a` before the adversarial gate.
+# Stub it to report no existing container so the test does not depend on a
+# host docker CLI (absent docker fails that pipeline under pipefail/errexit and
+# the dispatch exits before reaching the gate under test).
+cat > "$ADV_ROOT/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$ADV_ROOT/bin/docker"
 cat > "$ADV_ROOT/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
@@ -454,7 +463,7 @@ printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #
 run_adv_review() {
   ADV_CALLS="$ADV_ROOT/calls-$1.log"; : > "$ADV_CALLS"
   ADV_VERDICT="$2" ADV_CALLS="$ADV_CALLS" GH_FIXTURE="$ADV_ROOT/meta.json" \
-    PATH="$CONFLICT_STUB_DIR:$PATH" HOME="$ADV_ROOT/home" \
+    PATH="$ADV_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$ADV_ROOT/home" \
     CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" CFGMS_TEST_REPO_ROOT="$ADV_ROOT" \
     CFGMS_TEST_ADVERSARIAL_SCRIPT="$ADV_ROOT/adversarial.sh" \
     CFGMS_TEST_PIPELINE_HELPER="$ADV_ROOT/pipeline-helper.sh" \
