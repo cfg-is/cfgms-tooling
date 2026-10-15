@@ -328,9 +328,41 @@ agreed as real work, file it with `pipeline-helper.sh create-story` — and use 
 anything carrying exploit-grade detail, so the body stays a private draft rather than a
 world-readable issue on a public repo.
 
+## Adversarial review of security-fix PRs
+
+When triage files fix stories, record each story's project item ID with its finding IDs in
+`<sweep>/triage/stories/index.json` (`{"NN": {"slug", "title", "item_id", "findings",
+"sweep_id"}}`). That private file is what makes a story's PR a security-fix PR. A project item
+keeps its ID when a deferred draft is materialized, so no public field is needed.
+
+`security-review.sh adversarial-review <pr>` then:
+
+- looks the PR's story item up in every sweep's index (no match: `not_applicable`, nothing runs);
+- snapshots the PR head and builds one plan step whose description carries the private finding
+  detail (entry point, call path, attacker, citations, intended fix) and the PR diff, with one
+  hypothesis per original weakness plus a variant hunt and a regression check;
+- runs `CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS` (default 3) independent `opencode_agent` runs of
+  `CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL` (default `glm-5.3:cloud`), at most 3 at once, and
+  unions them. One run is not enough: two runs of the same prompt shared about 28% of their
+  findings when measured;
+- prints `ADVERSARIAL_REVIEW:pass` only when every run completed with nothing at medium or above,
+  `hold:<n>` otherwise, and `error:<reason>` when any run produced no result.
+
+Results stay under `<sweep>/adversarial/pr-<N>/adv-pr<N>-<head12>/` and are keyed by the PR head.
+They are never posted. `agent-dispatch.sh review-pr` runs the verb with `--check` (never waits:
+`pending` starts a background run) before the acceptance review. On `hold` it sets the story
+`Blocked` and posts one comment that says only that the PR is held. Read `result.json`, then
+either get the PR fixed (a new head is reviewed again) or clear the hold with
+`security-review.sh adversarial-review <pr> --release`. `CFGMS_ADVERSARIAL_REVIEW_GATE=off`
+disables the gate.
+
+The index lives on one host. A review-pr run on a host without it sees `not_applicable`, so run
+security-fix reviews on the host that holds the sweep.
+
 ## What this does not do
 
-- It does not block PRs. It is advisory and runs on demand.
+- A sweep does not block PRs. It is advisory and runs on demand. Only the adversarial review of a
+  security-fix PR above gates a merge.
 - It does not replace any CI scanner.
 - It does not write exploits or proof-of-concept code. It identifies and explains defects.
 - It does not modify the repository.

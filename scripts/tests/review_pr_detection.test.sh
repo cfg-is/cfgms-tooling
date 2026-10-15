@@ -267,6 +267,9 @@ assert_has_hint "lease_held" "lease_held"
 assert_has_hint "lease_error" "lease_error"
 assert_has_hint "no_new_commit_since_review" "no_new_commit_since_review"
 assert_has_hint "merge_conflicts" "merge_conflicts"
+assert_has_hint "adversarial_review_pending" "adversarial_review_pending"
+assert_has_hint "adversarial_review_hold" "adversarial_review_hold"
+assert_has_hint "adversarial_review_error" "adversarial_review_error"
 
 echo
 echo "--- review-pr: stale-head guard (_review_is_stale) ---"
@@ -414,6 +417,84 @@ assert_review_refusal "UNKNOWN (still computing) → not refused" "UNKNOWN" "not
 assert_review_refusal "BEHIND → not refused" "BEHIND" "not_refused"
 assert_review_refusal "BLOCKED → not refused" "BLOCKED" "not_refused"
 assert_review_refusal "CLEAN → not refused" "CLEAN" "not_refused"
+
+echo
+echo "--- review-pr: adversarial security-review gate (Issue #5025) ---"
+
+# End-to-end through the real CLI, as above. The stub repo root carries a
+# project-queue.sh that resolves the story to an item and records status
+# writes; the adversarial verb and the pipeline helper are stubs that record
+# their calls. The gate sits after item resolution and before the capacity
+# gate, so a refusal here means no lease was taken and nothing was launched.
+ADV_ROOT=$(mktemp -d)
+trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR" "$ADV_ROOT"' EXIT
+mkdir -p "$ADV_ROOT/scripts" "$ADV_ROOT/home"
+cat > "$ADV_ROOT/scripts/project-queue.sh" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  add-issue)    echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  update-field) echo "$*" >> "$ADV_CALLS" ; echo '{"updated": true}' ;;
+  *)            echo '[]' ;;
+esac
+STUB
+cat > "$ADV_ROOT/adversarial.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "adversarial $*" >> "$ADV_CALLS"
+echo "progress line that is not the verdict"
+echo "$ADV_VERDICT"
+STUB
+cat > "$ADV_ROOT/pipeline-helper.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "helper $*" >> "$ADV_CALLS"
+STUB
+chmod +x "$ADV_ROOT/scripts/project-queue.sh" "$ADV_ROOT/adversarial.sh" "$ADV_ROOT/pipeline-helper.sh"
+printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' \
+  > "$ADV_ROOT/meta.json"
+
+run_adv_review() {
+  ADV_CALLS="$ADV_ROOT/calls-$1.log"; : > "$ADV_CALLS"
+  ADV_VERDICT="$2" ADV_CALLS="$ADV_CALLS" GH_FIXTURE="$ADV_ROOT/meta.json" \
+    PATH="$CONFLICT_STUB_DIR:$PATH" HOME="$ADV_ROOT/home" \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" CFGMS_TEST_REPO_ROOT="$ADV_ROOT" \
+    CFGMS_TEST_ADVERSARIAL_SCRIPT="$ADV_ROOT/adversarial.sh" \
+    CFGMS_TEST_PIPELINE_HELPER="$ADV_ROOT/pipeline-helper.sh" \
+    CFGMS_AGENT_CAPACITY_GATE=off \
+    "$DISPATCH" review-pr 4242 2>&1 | head -1 || true
+}
+
+assert_adv() {
+  local description="$1" cond="$2"
+  ran=$((ran + 1))
+  if eval "$cond"; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n        condition: %s\n' "$description" "$cond"
+    fail=$((fail + 1))
+  fi
+}
+
+out=$(run_adv_review hold "ADVERSARIAL_REVIEW:hold:2")
+assert_adv "hold → refused adversarial_review_hold" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_hold"* ]]'
+assert_adv "hold → the gate got the resolved item and --check" 'grep -q "adversarial-review 4242 --item PVTI_adv_test --check" "$ADV_ROOT/calls-hold.log"'
+assert_adv "hold → story set Blocked" 'grep -q "update-field PVTI_adv_test Status Blocked" "$ADV_ROOT/calls-hold.log"'
+assert_adv "hold → one detail-free PR comment" 'grep -q "helper comment-inline 4242 Held for a security review" "$ADV_ROOT/calls-hold.log"'
+assert_adv "hold → no lease taken" '! grep -q "lease-acquire" "$ADV_ROOT/calls-hold.log"'
+out=$(run_adv_review hold2 "ADVERSARIAL_REVIEW:hold:2")
+assert_adv "hold again → no second comment" '! grep -q "comment-inline" "$ADV_ROOT/calls-hold2.log"'
+
+out=$(run_adv_review pending "ADVERSARIAL_REVIEW:pending")
+assert_adv "pending → refused adversarial_review_pending" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_pending"* ]]'
+assert_adv "pending → story status untouched" '! grep -q "update-field" "$ADV_ROOT/calls-pending.log"'
+
+out=$(run_adv_review error "ADVERSARIAL_REVIEW:error:fetch")
+assert_adv "error → refused adversarial_review_error" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_error"* ]]'
+out=$(run_adv_review empty "")
+assert_adv "no verdict line → refused adversarial_review_error (fails closed)" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_error"* ]]'
+
+for verdict in "ADVERSARIAL_REVIEW:pass" "ADVERSARIAL_REVIEW:pass:released" "ADVERSARIAL_REVIEW:not_applicable"; do
+  out=$(run_adv_review pass "$verdict")
+  assert_adv "$verdict → gate passes and review continues to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-pass.log" && [[ "$out" != *adversarial* ]]'
+done
 
 echo
 echo "ran ${ran} assertions; failures: ${fail}"

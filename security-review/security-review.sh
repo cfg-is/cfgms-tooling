@@ -95,6 +95,19 @@ Commands:
   status <sweep-id>   Print the per-lane x per-step coverage breakdown, plus the G-2/G-3
                        plan coverage-gate result (Issue #3980), for an existing sweep.
                        Read-only: never re-runs the planner, a lane, or the consolidator.
+  adversarial-review <pr-number> [--item <item-id>] [--check | --release]
+                       Adversarial review of a security-fix PR (Issue #5025). Applies only
+                       when the PR's story project item is in a sweep's private
+                       triage/stories/index.json; otherwise prints
+                       ADVERSARIAL_REVIEW:not_applicable. Builds a prompt from the private
+                       finding detail plus the PR diff, runs
+                       CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS (default 3) agent-loop runs (harness: adversarial.py)
+                       of CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL (default: adversarial.py)
+                       against a snapshot of the PR head, and unions them. Results stay under
+                       <base>/<sweep-id>/adversarial/pr-<N>/ and are never posted anywhere.
+                       Last line: ADVERSARIAL_REVIEW:pass | hold:<n> | error:<reason> |
+                       pending | not_applicable. --check never waits (review-pr uses it);
+                       --release clears a hold for the current head after the founder read it.
 
 CFGMS_SECURITY_REVIEW_LANES (required) is a comma-separated list of harness:model
 pairs, e.g. "claude:claude-sonnet-5" (full id; the pinned CLI rejects short
@@ -1227,9 +1240,167 @@ else:
 PYEOF
 }
 
+# cmd_adversarial_review <pr-number> [--item <item-id>] [--check | --release]
+#
+# Adversarial review of a security-fix PR (Issue #5025); adversarial.py owns
+# the private prompt and the verdict. Results live only under
+# <base>/<sweep-id>/adversarial/pr-<N>/<head-sha>/ and are keyed by the PR head,
+# so a head that has a result is never reviewed twice. The last stdout line is
+# always one ADVERSARIAL_REVIEW:<status> line.
+#
+#   (default)  run now: snapshot the PR head, launch N agent-loop runs, wait,
+#              union them.
+#   --check    never waits: print the stored result for this head, `pending`
+#              while a run is in progress, or start one in the background and
+#              print `pending`. This is what review-pr calls.
+#   --release  the founder read a `hold` result and clears it for this head.
+cmd_adversarial_review() {
+  local pr="" item="" mode="run"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --item)    item="${2:?--item requires a value}"; shift 2 ;;
+      --check)   mode="check"; shift ;;
+      --release) mode="release"; shift ;;
+      -*)        echo "ERROR: unknown flag: $1" >&2; exit 1 ;;
+      *)         pr="$1"; shift ;;
+    esac
+  done
+  [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: adversarial-review requires a PR number" >&2; exit 1; }
+
+  local runs="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS:-3}"
+  # adversarial.py names the harness and default model, so this CLI stays
+  # harness-agnostic; the entrypoint resolves like dispatch_roster_lanes'.
+  local adv_harness default_model model
+  IFS=$'\t' read -r adv_harness default_model < <(python3 "${SECURITY_REVIEW_DIR}/adversarial.py" harness)
+  model="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL:-$default_model}"
+  local adv_entrypoint="${CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR:-$SECURITY_REVIEW_DIR/lanes}/${adv_harness}_lane.py"
+  [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS must be a positive integer" >&2; exit 1; }
+
+  local base pr_json head base_ref story
+  base="$(resolve_base_dir)" || { echo "ADVERSARIAL_REVIEW:error:base_dir"; return 0; }
+  pr_json="$(gh pr view "$pr" --repo cfg-is/cfgms --json headRefOid,headRefName,baseRefName,body 2>/dev/null)" \
+    || { echo "ADVERSARIAL_REVIEW:error:pr_lookup"; return 0; }
+  head="$(printf '%s' "$pr_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["headRefOid"])')"
+  base_ref="$(printf '%s' "$pr_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["baseRefName"])')"
+
+  if [[ -z "$item" ]]; then
+    story="$(printf '%s' "$pr_json" | python3 -c '
+import json, re, sys
+d = json.load(sys.stdin)
+m = re.match(r"feature/story-(\d+)", d.get("headRefName") or "") or \
+    re.search(r"(?:Fixes|Closes|Resolves) #(\d+)", d.get("body") or "")
+print(m.group(1) if m else "")')"
+    [[ -n "$story" ]] || { echo "ADVERSARIAL_REVIEW:not_applicable"; return 0; }
+    item="$(bash "${REPO_ROOT}/scripts/project-queue.sh" add-issue "$story" 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("item_id",""))' 2>/dev/null || true)"
+    [[ -n "$item" ]] || { echo "ADVERSARIAL_REVIEW:error:item_lookup"; return 0; }
+  fi
+
+  local entry sweep_dir
+  entry="$(python3 "${SECURITY_REVIEW_DIR}/adversarial.py" lookup --base "$base" --item "$item")"
+  if [[ "$entry" == "ADVERSARIAL_REVIEW:not_applicable" ]]; then
+    echo "$entry"
+    return 0
+  fi
+  sweep_dir="$(printf '%s' "$entry" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sweep_dir"])')"
+
+  # The run dir is sweep-shaped for launch-investigator (snapshot/, plan/,
+  # lanes/<mode>/); its basename names the containers.
+  local pr_dir="${sweep_dir}/adversarial/pr-${pr}"
+  local run_dir="${pr_dir}/adv-pr${pr}-${head:0:12}"
+  local result="${run_dir}/result.json" released="${run_dir}/released.json" lock="${run_dir}/.running"
+
+  _adv_stored_status() {
+    if [[ -f "$released" ]]; then echo "ADVERSARIAL_REVIEW:pass:released"; return 0; fi
+    python3 -c 'import json,sys; print("ADVERSARIAL_REVIEW:" + json.load(open(sys.argv[1]))["status"])' "$result"
+  }
+  # Only pass and hold are final for a head. An error result is kept for
+  # diagnosis under a timestamped name and the head is reviewed again.
+  if [[ -f "$result" ]] && [[ "$(_adv_stored_status)" == ADVERSARIAL_REVIEW:error:* ]]; then
+    mv "$result" "${run_dir}/result.error.$(date +%Y%m%dT%H%M%S).json"
+  fi
+  # A run in progress owns the lock; the background run started by --check
+  # finds its own PID there.
+  _adv_running() {
+    [[ -f "$lock" ]] && [[ "$(cat "$lock")" != "$$" ]] && kill -0 "$(cat "$lock")" 2>/dev/null
+  }
+
+  case "$mode" in
+    release)
+      [[ -f "$result" ]] || { echo "ERROR: no adversarial result for PR #${pr} at head ${head}" >&2; exit 1; }
+      python3 -c 'import json,sys,datetime; json.dump({"released_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "head": sys.argv[2]}, open(sys.argv[1], "w"))' "$released" "$head"
+      echo "ADVERSARIAL_REVIEW:pass:released"
+      return 0
+      ;;
+    check)
+      if [[ -f "$result" ]]; then _adv_stored_status; return 0; fi
+      if _adv_running; then echo "ADVERSARIAL_REVIEW:pending"; return 0; fi
+      mkdir -p "$run_dir"
+      nohup "$0" adversarial-review "$pr" --item "$item" >"${pr_dir}/run-${head:0:12}.log" 2>&1 &
+      echo "$!" >"$lock"
+      echo "ADVERSARIAL_REVIEW:pending"
+      return 0
+      ;;
+  esac
+
+  # mode=run
+  if [[ -f "$result" ]]; then _adv_stored_status; return 0; fi
+  mkdir -p "$run_dir"
+  if _adv_running; then echo "ADVERSARIAL_REVIEW:pending"; return 0; fi
+  echo "$$" >"$lock"
+  trap 'rm -f "'"$lock"'"' EXIT
+
+  git -C "$REPO_ROOT" fetch --quiet origin "pull/${pr}/head" "${base_ref}" \
+    || { echo "ADVERSARIAL_REVIEW:error:fetch"; return 0; }
+  [[ "$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD)" == "$head" ]] \
+    || { echo "ADVERSARIAL_REVIEW:error:head_moved"; return 0; }
+  git -C "$REPO_ROOT" diff "origin/${base_ref}...${head}" >"${run_dir}/pr.diff" \
+    || { echo "ADVERSARIAL_REVIEW:error:diff"; return 0; }
+  git -C "$REPO_ROOT" diff --name-only --diff-filter=d "origin/${base_ref}...${head}" >"${run_dir}/changed-files.txt"
+
+  if [[ ! -d "${run_dir}/snapshot" ]]; then
+    python3 "${SECURITY_REVIEW_DIR}/snapshot.py" create "$head" "$REPO_ROOT" "${run_dir}/snapshot" >/dev/null \
+      || { echo "ADVERSARIAL_REVIEW:error:snapshot"; return 0; }
+  fi
+  python3 "${SECURITY_REVIEW_DIR}/snapshot.py" verify "${run_dir}/snapshot" "$head" "$REPO_ROOT" >/dev/null \
+    || { echo "ADVERSARIAL_REVIEW:error:snapshot_verify"; return 0; }
+  python3 "${SECURITY_REVIEW_DIR}/adversarial.py" prepare --base "$base" --item "$item" --pr "$pr" \
+    --head "$head" --run-dir "$run_dir" --diff-file "${run_dir}/pr.diff" \
+    --changed-files-file "${run_dir}/changed-files.txt" >/dev/null \
+    || { echo "ADVERSARIAL_REVIEW:error:prepare"; return 0; }
+
+  # Ollama Pro allows 3 concurrent requests and each run is one agent loop, so
+  # at most 3 run at once.
+  local n cids=() out cid
+  for ((n = 1; n <= runs; n++)); do
+    mkdir -p "${run_dir}/lanes/adv-${n}"
+    out="$("$AGENT_DISPATCH_SCRIPT" launch-investigator --sweep-dir "$run_dir" \
+      --snapshot-dir "${run_dir}/snapshot" --mode "adv-${n}" --harness "$adv_harness" \
+      --model "$model" --lane-entrypoint "$adv_entrypoint" 2>&1)" || true
+    cid="$(printf '%s\n' "$out" | sed -n "s/^LAUNCHED_INVESTIGATOR:adv-${n}://p")"
+    if [[ -z "$cid" ]]; then
+      printf '%s\n' "$out" >"${run_dir}/lanes/adv-${n}/launch-error.txt"
+      continue
+    fi
+    cids+=("$cid")
+    if (( ${#cids[@]} % 3 == 0 )); then
+      docker wait "${cids[@]: -3}" >/dev/null 2>&1 || true
+    fi
+  done
+  [[ ${#cids[@]} -gt 0 ]] && docker wait "${cids[@]}" >/dev/null 2>&1 || true
+
+  python3 -c 'import json,sys; json.dump({"pr": sys.argv[1], "head": sys.argv[2], "model": sys.argv[3], "runs": int(sys.argv[4])}, open(sys.argv[5], "w"))' \
+    "$pr" "$head" "$model" "$runs" "${run_dir}/run-meta.json"
+  python3 "${SECURITY_REVIEW_DIR}/adversarial.py" collect --run-dir "$run_dir" --runs "$runs"
+}
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
+    adversarial-review)
+      shift
+      cmd_adversarial_review "$@"
+      ;;
     launch)
       shift
       cmd_launch "$@"

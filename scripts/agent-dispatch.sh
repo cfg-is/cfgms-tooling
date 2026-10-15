@@ -796,6 +796,12 @@ _review_refusal_hint() {
       echo "no Fixes/Closes/Resolves #N in the body and no feature/story-N branch — manually associate a story or skip." ;;
     no_project_item_for_story_*)
       echo "story number resolved but no matching project item was found — check the project board." ;;
+    adversarial_review_pending)
+      echo "a security-fix PR's adversarial review is running in the background (security-review.sh adversarial-review). Retry next cycle; no action needed." ;;
+    adversarial_review_hold)
+      echo "the adversarial review found open paths; the story is Blocked. The founder reads the private result under the sweep's adversarial/ dir and clears it with 'security-review.sh adversarial-review <PR> --release', or the PR gets fixed." ;;
+    adversarial_review_error)
+      echo "the adversarial review could not produce a result (see the run log under the sweep's adversarial/pr-<N>/). It retries on the next review-pr; persistent errors need the founder." ;;
     already_in_flight)
       echo "a review container for this PR is still running — another review is genuinely in progress. Check /isoagents; no action needed." ;;
     container_exists)
@@ -3632,6 +3638,33 @@ for i in items:
       if [[ -z "$item_id" ]]; then
         _emit_review_refused "$pr_num" "no_project_item_for_story_${story_num}"
       fi
+    fi
+
+    # Adversarial security review (Issue #5025). A PR whose story came from a
+    # security sweep's triage is reviewed adversarially, with the private
+    # finding detail, before the acceptance review may run. Every other PR gets
+    # not_applicable and continues. The detail never leaves this host: a hold
+    # posts only the fact of the hold.
+    if [[ "${CFGMS_ADVERSARIAL_REVIEW_GATE:-on}" != "off" ]]; then
+      adv_script="${CFGMS_TEST_ADVERSARIAL_SCRIPT:-${REPO_ROOT}/.claude/skills/security-review/security-review.sh}"
+      adv_line=$("$adv_script" adversarial-review "$pr_num" --item "$item_id" --check 2>/dev/null | tail -n 1 || true)
+      case "$adv_line" in
+        ADVERSARIAL_REVIEW:not_applicable|ADVERSARIAL_REVIEW:pass|ADVERSARIAL_REVIEW:pass:released) ;;
+        ADVERSARIAL_REVIEW:pending) _emit_review_refused "$pr_num" "adversarial_review_pending" ;;
+        ADVERSARIAL_REVIEW:hold:*)
+          bash "$PROJECT_QUEUE" update-field "$item_id" Status Blocked >/dev/null 2>&1 || true
+          # Comment once per PR, not once per cycle.
+          adv_marker="${HOME}/.cache/cfgms-adversarial-hold/notified-pr-${pr_num}"
+          if [[ ! -f "$adv_marker" ]]; then
+            if "${CFGMS_TEST_PIPELINE_HELPER:-${REPO_ROOT}/scripts/pipeline-helper.sh}" comment-inline "$pr_num" \
+              "Held for a security review before acceptance. The founder will clear it." >/dev/null 2>&1; then
+              mkdir -p "$(dirname "$adv_marker")" && touch "$adv_marker" || true
+            fi
+          fi
+          _emit_review_refused "$pr_num" "adversarial_review_hold"
+          ;;
+        *) _emit_review_refused "$pr_num" "adversarial_review_error" ;;
+      esac
     fi
 
     # Resource admission gate before claiming the lease / cloning.
