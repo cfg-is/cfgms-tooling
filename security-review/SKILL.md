@@ -335,6 +335,11 @@ When triage files fix stories, record each story's project item ID with its find
 "sweep_id"}}`). That private file is what makes a story's PR a security-fix PR. A project item
 keeps its ID when a deferred draft is materialized, so no public field is needed.
 
+When a story is split out of another, move its finding IDs to the new entry. A story written
+from triage reasoning, with no sweep finding behind it, keeps an empty `findings` list; the
+review then sends the story's own private text, `stories/NN-<slug>.md`, as the weakness instead.
+A story whose listed IDs are all missing from the triage files is an error, not a fallback.
+
 `security-review.sh adversarial-review <pr>` then:
 
 - looks the PR's story item up in every sweep's index (no match: `not_applicable`, nothing runs);

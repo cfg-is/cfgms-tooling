@@ -33,6 +33,9 @@ HOLD_SEVERITIES = {"medium", "high", "critical"}
 # itself. Bound it so a large refactor cannot crowd out the finding detail.
 MAX_DIFF_CHARS = 40000
 
+# A story with no sweep finding sends its own text instead; bound it the same way.
+MAX_STORY_CHARS = 20000
+
 STEP_ID = "step-001"
 PLANNER = "adversarial-review"
 
@@ -117,9 +120,29 @@ def load_finding_detail(sweep_dir: str, finding_ids: list) -> list:
     return detail
 
 
+def load_story_detail(sweep_dir: str, story: str, slug: str) -> list:
+    """The story's own private text as the one weakness block, for a story
+    written from triage reasoning with no sweep finding behind it. Empty when
+    the story file is missing or blank."""
+    path = os.path.join(sweep_dir, "triage", "stories", f"{story}-{slug}.md")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read().strip()
+    except OSError:
+        return []
+    if not text:
+        return []
+    if len(text) > MAX_STORY_CHARS:
+        text = text[:MAX_STORY_CHARS] + f"\n[story text truncated at {MAX_STORY_CHARS} characters]"
+    return [{"id": f"story-{story}", "story_text": text}]
+
+
 def _render_detail(detail: list) -> str:
     blocks = []
     for d in detail:
+        if d.get("story_text"):
+            blocks.append(f"### Original weakness {d['id']} (from the story; no sweep finding)\n{d['story_text']}")
+            continue
         lines = [f"### Original weakness {d['id']}: {d.get('file')} :: {d.get('symbol')} ({d.get('cwe') or d.get('vuln_class')})"]
         for label, key in (("Attacker", "triage_attacker"), ("Entry point", "entry_point"),
                            ("Attacker input", "attacker_input"), ("Evidence", "evidence"),
@@ -153,10 +176,11 @@ def build_step(*, sweep_id: str, head_sha: str, pr: str, story: str,
     )
     hypotheses = []
     for i, d in enumerate(detail, 1):
+        where = "the weakness the story describes" if d.get("story_text") else f"{d.get('file')} :: {d.get('symbol')}"
         hypotheses.append({
             "id": f"h{i}",
             "objective": (f"Show whether any path from untrusted input still reaches the sink of "
-                          f"{d['id']} ({d.get('file')} :: {d.get('symbol')}) after this change."),
+                          f"{d['id']} ({where}) after this change."),
             "required_evidence": ("Every entry point that reaches the sink, with the guard on each path "
                                   "cited by file and line, or the unguarded path."),
             "planner": PLANNER,
@@ -269,8 +293,11 @@ def main(argv: list) -> int:
             print("ERROR: item is not in any triage index", file=sys.stderr)
             return 1
         detail = load_finding_detail(entry["sweep_dir"], entry["findings"])
+        if not detail and not entry["findings"]:
+            detail = load_story_detail(entry["sweep_dir"], entry["story"], entry["slug"])
         if not detail:
-            print("ERROR: none of the story's findings were found in the sweep's triage files", file=sys.stderr)
+            print("ERROR: none of the story's findings were found in the sweep's triage files, "
+                  "and a story without findings has no story text", file=sys.stderr)
             return 1
         with open(args.diff_file, encoding="utf-8", errors="replace") as fh:
             diff = fh.read()

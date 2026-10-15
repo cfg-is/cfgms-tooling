@@ -30,7 +30,12 @@ class SweepFixture(unittest.TestCase):
         triage = os.path.join(self.sweep, "triage")
         _write(os.path.join(triage, "stories", "index.json"), {
             "03": {"slug": "gitsync", "item_id": "PVTI_a", "findings": ["F0007", "F0099"], "sweep_id": SWEEP},
+            "28": {"slug": "relay", "item_id": "PVTI_b", "sweep_id": SWEEP},
+            "30": {"slug": "nothing", "item_id": "PVTI_c", "findings": [], "sweep_id": SWEEP},
         })
+        stories = os.path.join(triage, "stories")
+        Path(stories, "28-relay.md").write_text(
+            "## Summary\n\nThe relay keeps running after the admin session is revoked.\n")
         _write(os.path.join(triage, "tier-high.json"), [{
             "_id": "F0007", "file": "pkg/gitsync/syncer.go", "symbol": "importConfigs", "cwe": "CWE-59",
             "vuln_class": "link following", "evidence": "reads entries with os.ReadFile",
@@ -107,6 +112,47 @@ class BuildStepTest(SweepFixture):
         self.assertTrue(new)
         for p in new:
             self.assertTrue(str(p).startswith(run_dir), p)
+
+
+class StoryTextFallbackTest(SweepFixture):
+    """A story written from triage reasoning has no sweep finding; its own
+    private story text is the weakness the review checks against."""
+
+    def _prepare(self, item):
+        run_dir = os.path.join(self.sweep, "adversarial", "pr-2", "adv-pr2-bbbb")
+        os.makedirs(run_dir)
+        diff = os.path.join(run_dir, "pr.diff")
+        changed = os.path.join(run_dir, "changed-files.txt")
+        Path(diff).write_text("diff")
+        Path(changed).write_text("features/controller/transport/terminal_handler.go\n")
+        rc = adversarial.main(["prepare", "--base", self.base, "--item", item, "--pr", "2", "--head", "b" * 40,
+                               "--run-dir", run_dir, "--diff-file", diff, "--changed-files-file", changed])
+        return rc, run_dir
+
+    def test_story_text_becomes_the_weakness_block(self):
+        detail = adversarial.load_story_detail(self.sweep, "28", "relay")
+        self.assertEqual([d["id"] for d in detail], ["story-28"])
+        step = adversarial.build_step(sweep_id="adv-pr2-bbbb", head_sha="b" * 40, pr="2", story="28",
+                                      detail=detail, changed_files=["x.go"], diff="")
+        self.assertEqual(schema.validate_plan_step(step), [])
+        self.assertIn("keeps running after the admin session is revoked", step["description"])
+        self.assertEqual([h["id"] for h in step["hypotheses"]], ["h1", "h-variant", "h-regression"])
+
+    def test_prepare_uses_story_text_when_the_story_has_no_findings(self):
+        rc, run_dir = self._prepare("PVTI_b")
+        self.assertEqual(rc, 0)
+        with open(os.path.join(run_dir, "plan", "step-001.json")) as fh:
+            self.assertIn("admin session is revoked", json.load(fh)["description"])
+
+    def test_no_findings_and_no_story_text_is_an_error(self):
+        rc, _ = self._prepare("PVTI_c")
+        self.assertEqual(rc, 1)
+
+    def test_large_story_text_is_truncated(self):
+        Path(self.sweep, "triage", "stories", "28-relay.md").write_text("y" * (adversarial.MAX_STORY_CHARS + 100))
+        detail = adversarial.load_story_detail(self.sweep, "28", "relay")
+        self.assertIn("story text truncated", detail[0]["story_text"])
+        self.assertLess(len(detail[0]["story_text"]), adversarial.MAX_STORY_CHARS + 200)
 
 
 class CollectTest(unittest.TestCase):
