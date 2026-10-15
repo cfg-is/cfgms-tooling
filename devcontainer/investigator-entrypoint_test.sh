@@ -642,6 +642,49 @@ assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "claude-was
 rm -rf "$BIN_DIR" "$WORK_HOME" "$PLAN_OUT_DIR"
 
 echo ""
+echo "--- exec_as_agent keeps docker's supplementary groups (real image, as root) ---"
+# launch-investigator mounts the ollama key readable only through a numeric
+# group it adds with --group-add. The drop to `agent` must keep that group, or
+# the key is unreadable and every ollama call fails 401. This needs root and
+# the real `agent` account, so it runs in cfg-agent:latest; without Docker or
+# the image it is reported as NOT RUN, never as passed.
+DROP_IMAGE="${CFGMS_TEST_AGENT_IMAGE:-cfg-agent:latest}"
+if command -v docker >/dev/null 2>&1 && docker image inspect "$DROP_IMAGE" >/dev/null 2>&1; then
+    set +e
+    out=$(docker run --rm --group-add 4242 \
+        -v "$ENTRYPOINT:/opt/investigator-entrypoint.sh:ro" \
+        -e CFGMS_INVESTIGATOR_ENTRYPOINT_SOURCE_ONLY=1 \
+        --entrypoint bash "$DROP_IMAGE" \
+        -c 'source /opt/investigator-entrypoint.sh && exec_as_agent bash -c "echo uid=\$(id -u) user=\$(id -un) groups=\$(id -G | tr \" \" ,) home=\$HOME USER=\$USER LOGNAME=\$LOGNAME; grep -E \"^CapEff\" /proc/self/status"' 2>&1)
+    rc=$?
+    set -e
+    agent_uid=$(docker run --rm --entrypoint id "$DROP_IMAGE" -u agent)
+    assert_eq "$rc" "0" "exec_as_agent: container exits 0"
+    assert_contains "$out" "uid=${agent_uid} user=agent" "exec_as_agent: runs as agent"
+    assert_contains "$out" ",4242" "exec_as_agent: keeps the --group-add gid"
+    assert_not_contains "$out" "groups=0," "exec_as_agent: drops root's group"
+    assert_contains "$out" "home=/home/agent USER=agent LOGNAME=agent" "exec_as_agent: sets agent's HOME/USER/LOGNAME"
+    assert_contains "$out" "CapEff:	0000000000000000" "exec_as_agent: no effective capabilities"
+else
+    echo "  NOT RUN: docker or image $DROP_IMAGE unavailable — exec_as_agent group test did not run"
+fi
+
+echo ""
+echo "--- source-only hook fails closed when the entrypoint is executed ---"
+# The hook `return`s, which is only legal when sourced. Executed with the
+# variable set (as a real container could be launched by mistake), bash must
+# refuse rather than skip the firewall and run a mode.
+set +e
+out=$(CFGMS_INVESTIGATOR_ENTRYPOINT_SOURCE_ONLY=1 bash "$ENTRYPOINT" plan 2>&1)
+rc=$?
+set -e
+if [[ "$rc" -ne 0 ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    _fail "source-only hook: executing the entrypoint with it set must exit non-zero (got 0: $out)"
+fi
+
+echo ""
 echo "=== Summary: $TESTS_PASSED/$TESTS_RUN passed ==="
 if [[ ${#FAILURES[@]} -gt 0 ]]; then
     echo ""

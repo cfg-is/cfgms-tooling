@@ -53,13 +53,37 @@ set -euo pipefail
 # loaded but dnsmasq down, or resolv.conf still pointing at an unfiltered
 # upstream), which would leave the DNS allowlist unenforced while iptables
 # still permits all outbound 443.
+#
+# exec_as_agent keeps the supplementary groups docker gave this container.
+# `runuser -u agent` resets them to agent's own, which silently dropped the
+# ollama key's group that launch-investigator adds with --group-add: the key
+# was then unreadable and every ollama step failed 401. runuser takes group
+# names only and that gid has no name in here, so setpriv, which takes
+# numbers. setpriv leaves HOME/USER/LOGNAME alone; set them as runuser did.
+exec_as_agent() {
+    local agent_groups gid
+    agent_groups="$(id -G agent | tr ' ' ',')"
+    for gid in $(id -G); do
+        [[ "$gid" -eq 0 ]] || agent_groups+=",${gid}"
+    done
+    exec setpriv --reuid=agent --regid=agent --groups="$agent_groups" -- \
+        env HOME=/home/agent USER=agent LOGNAME=agent "$@"
+}
+
+# investigator-entrypoint_test.sh sources this file with this set to reach
+# exec_as_agent without running the firewall or a mode. Unset in every real
+# container.
+if [[ "${CFGMS_INVESTIGATOR_ENTRYPOINT_SOURCE_ONLY:-}" == "1" ]]; then
+    return 0
+fi
+
 if [[ "$(id -u)" -eq 0 ]]; then
     init-firewall.sh
     if ! iptables -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
         echo "ERROR: egress firewall not active (OUTPUT policy is not DROP); refusing to start"
         exit 1
     fi
-    exec runuser -u agent -- "$0" "$@"
+    exec_as_agent "$0" "$@"
 fi
 
 MODE="${1:?investigator-entrypoint.sh requires a mode argument: plan or a lane id}"
