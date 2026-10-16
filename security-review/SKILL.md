@@ -351,14 +351,22 @@ A story whose listed IDs are all missing from the triage files is an error, not 
   unions them. One run is not enough: two runs of the same prompt shared about 28% of their
   findings when measured;
 - prints `ADVERSARIAL_REVIEW:pass` only when every run completed with nothing at medium or above,
-  `hold:<n>` otherwise, and `error:<reason>` when any run produced no result.
+  `hold:<n>` otherwise, and `error:<reason>` when any run produced no result. A failure before
+  the runs start (`fetch`, `head_moved`, `diff`, `snapshot`, `snapshot_verify`, `prepare`) is
+  stored as `result.json` too, so it is never reported as `pending`;
+- bounds the re-runs: `--check` starts at most `CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS`
+  (default 3) runs per head and prints `ADVERSARIAL_REVIEW_ATTEMPT:<n>/<max>` before the final
+  `pending` line. Once the attempts are used, a stored `error:*` stays the answer, and a run that
+  died without a result ends as `error:attempts_exhausted`. A `result.json` that cannot be read is
+  `error:result_unreadable`.
 
 Results stay under `<sweep>/adversarial/pr-<N>/adv-pr<N>-<head12>/` and are keyed by the PR head.
 They are never posted. `agent-dispatch.sh review-pr` runs the verb with `--check` (never waits:
 `pending` starts a background run) before the acceptance review. On `hold` it sets the story
 `Blocked` and posts one comment that says only that the PR is held. Read `result.json`, then
-either get the PR fixed (a new head is reviewed again) or clear the hold with
-`security-review.sh adversarial-review <pr> --release`. `CFGMS_ADVERSARIAL_REVIEW_GATE=off`
+either get the PR fixed (a new head is reviewed again) or clear the hold, or an exhausted error,
+with `security-review.sh adversarial-review <pr> --release`. `--release` exits non-zero and writes
+nothing when `CFGMS_AUTONOMOUS=true`: an autonomous agent never clears a hold or an error. `CFGMS_ADVERSARIAL_REVIEW_GATE=off`
 disables the gate.
 
 The index lives on one host. A review-pr run on a host without it sees `not_applicable`, so run

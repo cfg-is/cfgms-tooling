@@ -302,6 +302,13 @@ assert_has_hint "merge_conflicts" "merge_conflicts"
 assert_has_hint "adversarial_review_pending" "adversarial_review_pending"
 assert_has_hint "adversarial_review_hold" "adversarial_review_hold"
 assert_has_hint "adversarial_review_error" "adversarial_review_error"
+err_hint=$("$DISPATCH" _test-review-refusal-hint "adversarial_review_error")
+ran=$((ran + 1))
+if [[ "$err_hint" != *"retries on the next review-pr"* && "$err_hint" == *"--release"* && "$err_hint" == *"MAX_ATTEMPTS"* ]]; then
+  printf '  ok    adversarial_review_error hint states the bounded attempts and --release\n'
+else
+  printf '  FAIL  adversarial_review_error hint: %s\n' "$err_hint"; fail=$((fail + 1))
+fi
 
 echo
 echo "--- review-pr: stale-head guard (_review_is_stale) ---"
@@ -549,6 +556,10 @@ assert_adv "pending → story status untouched" '! grep -q "update-field" "$ADV_
 
 out=$(run_adv_review error "ADVERSARIAL_REVIEW:error:fetch")
 assert_adv "error → refused adversarial_review_error" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_error"* ]]'
+out=$(run_adv_review prepare_err "ADVERSARIAL_REVIEW:error:prepare")
+assert_adv "error:prepare → refused adversarial_review_error" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_error"* ]]'
+out=$(run_adv_review unreadable "ADVERSARIAL_REVIEW:error:result_unreadable")
+assert_adv "error:result_unreadable → refused adversarial_review_error" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_error"* ]]'
 out=$(run_adv_review empty "")
 assert_adv "no verdict line → refused adversarial_review_error (fails closed)" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_error"* ]]'
 

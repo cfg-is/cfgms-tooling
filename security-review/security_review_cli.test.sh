@@ -2554,6 +2554,131 @@ check_contains "this file's docker stub stubs only the harness CLI binary (claud
 check_contains "the roster fixture mounts a real copy of claude_lane.py, not a fake never-executed stand-in" "$self_src" 'cp "$CLAUDE_LANE_SCRIPT" "${ROSTER_ENTRYPOINT_DIR}/claude_lane.py"'
 
 echo ""
+echo "== adversarial-review: bounded attempts and stored errors (Issue #5097) =="
+ADV_TMP="$(mktemp -d)"
+ADV_BASE="${ADV_TMP}/base"; ADV_BIN="${ADV_TMP}/bin"; ADV_REPO="${ADV_TMP}/repo"; ADV_ORIGIN="${ADV_TMP}/origin.git"
+mkdir -p "$ADV_BASE" "$ADV_BIN"
+# Real git repo with a real origin carrying main and refs/pull/77/head, so the
+# background run gets past fetch/diff/snapshot and fails in `prepare` (the
+# sweep's index names findings its triage files do not hold -- the PR #5043 shape).
+git init -q --bare "$ADV_ORIGIN"
+git init -q -b main "$ADV_REPO"
+git -C "$ADV_REPO" config user.email t@example.invalid
+git -C "$ADV_REPO" config user.name t
+git -C "$ADV_REPO" remote add origin "$ADV_ORIGIN"
+echo base >"${ADV_REPO}/f.txt"; git -C "$ADV_REPO" add f.txt; git -C "$ADV_REPO" commit -q -m base
+git -C "$ADV_REPO" push -q origin main
+echo fix >>"${ADV_REPO}/f.txt"; git -C "$ADV_REPO" commit -q -am fix
+ADV_HEAD="$(git -C "$ADV_REPO" rev-parse HEAD)"
+git -C "$ADV_REPO" push -q origin "HEAD:refs/pull/77/head"
+mkdir -p "${ADV_BASE}/sweep-a/triage/stories"
+cat >"${ADV_BASE}/sweep-a/triage/stories/index.json" <<'JSON'
+{"900": {"item_id": "PVTI_adv", "sweep_id": "sweep-a", "slug": "s", "findings": ["F-missing"]}}
+JSON
+cat >"${ADV_BIN}/gh" <<STUB
+#!/usr/bin/env bash
+printf '{"headRefOid":"${ADV_HEAD}","headRefName":"feature/story-900-x","baseRefName":"main","body":""}'
+STUB
+chmod +x "${ADV_BIN}/gh"
+write_win_shim "$ADV_BIN" gh
+
+ADV_RUN_DIR="${ADV_BASE}/sweep-a/adversarial/pr-77/adv-pr77-${ADV_HEAD:0:12}"
+adv_check() {
+  env -u CFGMS_AUTONOMOUS PATH="${ADV_BIN}:$PATH" CFGMS_TEST_REPO_ROOT="$ADV_REPO" CFGMS_SECURITY_REVIEW_BASE="$ADV_BASE" \
+    "$CLI" adversarial-review 77 --item PVTI_adv --check 2>&1
+}
+adv_verb() {
+  local flag="$1"; shift
+  env -u CFGMS_AUTONOMOUS PATH="${ADV_BIN}:$PATH" CFGMS_TEST_REPO_ROOT="$ADV_REPO" CFGMS_SECURITY_REVIEW_BASE="$ADV_BASE" "$@" \
+    "$CLI" adversarial-review 77 --item PVTI_adv "$flag" 2>&1
+}
+# Wait for the background run to store a result and drop its lock.
+adv_wait() {
+  local i
+  for i in $(seq 1 150); do
+    [[ -f "${ADV_RUN_DIR}/result.json" && ! -f "${ADV_RUN_DIR}/.running" ]] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+adv_reset() { chmod -R u+w "${ADV_BASE}/sweep-a/adversarial" 2>/dev/null || true; rm -rf "${ADV_BASE}/sweep-a/adversarial"; }
+adv_last() { printf '%s\n' "$1" | tail -n 1; }
+
+# MAX_ATTEMPTS=1: the failing run is stored and the next --check reports it.
+adv_reset
+out="$(CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS=1 adv_check)"
+check_eq "first --check starts a run: last line is pending" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:pending"
+check_contains "first --check prints the attempt line" "$out" "ADVERSARIAL_REVIEW_ATTEMPT:1/1"
+if adv_wait; then ok "background run stored a result.json"; else bad "background run stored a result.json" "timed out"; fi
+check_eq "stored result is error:prepare with stage and attempt" \
+  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["status"], d["stage"], d["attempt"])' "${ADV_RUN_DIR}/result.json")" "error:prepare prepare 1"
+out="$(CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS=1 adv_check)"
+check_eq "MAX_ATTEMPTS=1: next --check prints error:prepare, not pending" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:error:prepare"
+check_eq "MAX_ATTEMPTS=1: no further run was started" "$(cat "${ADV_RUN_DIR}/attempts")" "1"
+
+# --release clears an error head, and a later --check agrees.
+out="$(adv_verb --release)"
+check_eq "--release on an error head prints pass:released" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:pass:released"
+out="$(CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS=1 adv_check)"
+check_eq "--check after --release prints pass:released" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:pass:released"
+
+# Autonomous --release is refused for an error head and for a held head.
+rm -f "${ADV_RUN_DIR}/released.json"
+rc=0; out="$(adv_verb --release CFGMS_AUTONOMOUS=true)" || rc=$?
+check_eq "autonomous --release on an error head exits non-zero" "$([[ $rc -ne 0 ]] && echo yes || echo no)" "yes"
+check_eq "autonomous --release on an error head writes no released.json" "$([[ -e "${ADV_RUN_DIR}/released.json" ]] && echo yes || echo no)" "no"
+echo '{"status": "hold:2"}' >"${ADV_RUN_DIR}/result.json"
+rc=0; out="$(adv_verb --release CFGMS_AUTONOMOUS=true)" || rc=$?
+check_eq "autonomous --release on a held head exits non-zero" "$([[ $rc -ne 0 ]] && echo yes || echo no)" "yes"
+check_eq "autonomous --release on a held head writes no released.json" "$([[ -e "${ADV_RUN_DIR}/released.json" ]] && echo yes || echo no)" "no"
+
+# Default maximum: exactly 3 runs, then the stored error stays.
+adv_reset
+starts=0
+for i in 1 2 3 4 5; do
+  out="$(adv_check)"
+  if [[ "$out" == *"ADVERSARIAL_REVIEW_ATTEMPT:"* ]]; then
+    starts=$((starts + 1))
+    check_contains "run ${starts} prints ADVERSARIAL_REVIEW_ATTEMPT:${starts}/3" "$out" "ADVERSARIAL_REVIEW_ATTEMPT:${starts}/3"
+    check_eq "run ${starts} leaves the status line last" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:pending"
+    adv_wait || bad "run ${starts} stored a result" "timed out"
+  fi
+done
+check_eq "repeated --check on an always-failing head starts exactly 3 runs" "$starts" "3"
+check_eq "after the maximum, --check prints the stored error" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:error:prepare"
+check_eq "attempt counter stays at the maximum" "$(cat "${ADV_RUN_DIR}/attempts")" "3"
+# Timestamped to the second, so two moves inside one second share a name.
+check_eq "earlier error results were kept under result.error.*" "$([[ -e "$(ls "${ADV_RUN_DIR}"/result.error.*.json 2>/dev/null | head -n 1)" ]] && echo yes || echo no)" "yes"
+
+# A run that died without a result (lock names a dead PID) counts as an attempt.
+adv_reset
+mkdir -p "$ADV_RUN_DIR"
+echo 3 >"${ADV_RUN_DIR}/attempts"
+echo 2147483646 >"${ADV_RUN_DIR}/.running"
+out="$(adv_check)"
+check_eq "dead run at the maximum: error:attempts_exhausted is printed" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:error:attempts_exhausted"
+check_eq "error:attempts_exhausted is stored" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "${ADV_RUN_DIR}/result.json")" "error:attempts_exhausted"
+out="$(adv_check)"
+check_eq "error:attempts_exhausted stays the answer" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:error:attempts_exhausted"
+
+# A corrupt result.json is reported, not retried, and never a traceback.
+adv_reset
+mkdir -p "$ADV_RUN_DIR"
+printf '{not json' >"${ADV_RUN_DIR}/result.json"
+out="$(adv_check)"
+check_eq "corrupt result.json: last line is error:result_unreadable" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:error:result_unreadable"
+check_not_contains "corrupt result.json: no traceback" "$out" "Traceback"
+
+# An invalid maximum is rejected.
+rc=0; out="$(CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS=0 adv_check)" || rc=$?
+check_contains "MAX_ATTEMPTS must be a positive integer" "$out" "CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS must be a positive integer"
+
+# The old unbounded move is gone: result.error.* is written only in the bounded step.
+check_eq "result.error. is written in exactly one place" "$(grep -c 'result\.error\.' "$CLI")" "1"
+chmod -R u+w "$ADV_TMP" 2>/dev/null || true; rm -rf "$ADV_TMP"
+
+echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"
 if [[ $fail -gt 0 ]]; then

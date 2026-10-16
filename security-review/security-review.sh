@@ -107,7 +107,13 @@ Commands:
                        <base>/<sweep-id>/adversarial/pr-<N>/ and are never posted anywhere.
                        Last line: ADVERSARIAL_REVIEW:pass | hold:<n> | error:<reason> |
                        pending | not_applicable. --check never waits (review-pr uses it);
-                       --release clears a hold for the current head after the founder read it.
+                       each run it starts prints ADVERSARIAL_REVIEW_ATTEMPT:<n>/<max> before
+                       the final line. A head gets CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS
+                       (default 3) runs; after that a stored error stays the answer, and a run
+                       that died without a result ends as error:attempts_exhausted. A result
+                       file that cannot be read is error:result_unreadable. --release clears a
+                       hold or an error for the current head after the founder read it, and
+                       refuses when CFGMS_AUTONOMOUS=true.
 
 CFGMS_SECURITY_REVIEW_LANES (required) is a comma-separated list of harness:model
 pairs, e.g. "claude:claude-sonnet-5" (full id; the pinned CLI rejects short
@@ -1252,8 +1258,11 @@ PYEOF
 #              union them.
 #   --check    never waits: print the stored result for this head, `pending`
 #              while a run is in progress, or start one in the background and
-#              print `pending`. This is what review-pr calls.
-#   --release  the founder read a `hold` result and clears it for this head.
+#              print `pending`. This is what review-pr calls. Runs per head
+#              are bounded by CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS:
+#              an error result is retried only while attempts remain.
+#   --release  the founder read a `hold` or `error:*` result and clears it for
+#              this head. Refused for an autonomous agent.
 cmd_adversarial_review() {
   local pr="" item="" mode="run"
   while [[ $# -gt 0 ]]; do
@@ -1275,6 +1284,8 @@ cmd_adversarial_review() {
   model="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL:-$default_model}"
   local adv_entrypoint="${CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR:-$SECURITY_REVIEW_DIR/lanes}/${adv_harness}_lane.py"
   [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS must be a positive integer" >&2; exit 1; }
+  local max_attempts="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS:-3}"
+  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS must be a positive integer" >&2; exit 1; }
 
   local base pr_json head base_ref story
   base="$(resolve_base_dir)" || { echo "ADVERSARIAL_REVIEW:error:base_dir"; return 0; }
@@ -1310,15 +1321,42 @@ print(m.group(1) if m else "")')"
   local run_dir="${pr_dir}/adv-pr${pr}-${head:0:12}"
   local result="${run_dir}/result.json" released="${run_dir}/released.json" lock="${run_dir}/.running"
 
+  local attempts_file="${run_dir}/attempts"
+
   _adv_stored_status() {
     if [[ -f "$released" ]]; then echo "ADVERSARIAL_REVIEW:pass:released"; return 0; fi
-    python3 -c 'import json,sys; print("ADVERSARIAL_REVIEW:" + json.load(open(sys.argv[1]))["status"])' "$result"
+    python3 -c '
+import json, sys
+try:
+    status = json.load(open(sys.argv[1]))["status"]
+    if not isinstance(status, str) or not status:
+        raise ValueError("status")
+except Exception:
+    status = "error:result_unreadable"
+print("ADVERSARIAL_REVIEW:" + status)' "$result"
   }
-  # Only pass and hold are final for a head. An error result is kept for
-  # diagnosis under a timestamped name and the head is reviewed again.
-  if [[ -f "$result" ]] && [[ "$(_adv_stored_status)" == ADVERSARIAL_REVIEW:error:* ]]; then
-    mv "$result" "${run_dir}/result.error.$(date +%Y%m%dT%H%M%S).json"
-  fi
+  # The runs --check has started for this head. A missing counter is zero; an
+  # unreadable one counts as spent so a damaged counter cannot lift the bound.
+  _adv_attempts() {
+    local n
+    n="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n="$max_attempts"
+    echo "$n"
+  }
+  # Store an error result atomically: a temp file in the run dir, then rename.
+  _adv_write_error() {
+    local stage="$1" tmp
+    mkdir -p "$run_dir"
+    tmp="$(mktemp "${run_dir}/.result.XXXXXX")" || return 1
+    python3 -c 'import json,sys; json.dump({"status": "error:" + sys.argv[1], "stage": sys.argv[1], "attempt": int(sys.argv[2])}, open(sys.argv[3], "w"))' \
+      "$stage" "$(_adv_attempts)" "$tmp" && mv -f "$tmp" "$result" || { rm -f "$tmp"; return 1; }
+  }
+  # Pre-collect failure of the background run: store it so the next --check
+  # sees an error rather than a missing result.
+  _adv_fail() {
+    _adv_write_error "$1" || echo "ERROR: could not store adversarial result for stage $1" >&2
+    echo "ADVERSARIAL_REVIEW:error:$1"
+  }
   # A run in progress owns the lock; the background run started by --check
   # finds its own PID there.
   _adv_running() {
@@ -1327,17 +1365,43 @@ print(m.group(1) if m else "")')"
 
   case "$mode" in
     release)
+      if [[ "${CFGMS_AUTONOMOUS:-}" == "true" ]]; then
+        echo "ERROR: adversarial-review --release is refused for an autonomous agent; the founder clears a hold or an error" >&2
+        exit 1
+      fi
       [[ -f "$result" ]] || { echo "ERROR: no adversarial result for PR #${pr} at head ${head}" >&2; exit 1; }
       python3 -c 'import json,sys,datetime; json.dump({"released_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "head": sys.argv[2]}, open(sys.argv[1], "w"))' "$released" "$head"
       echo "ADVERSARIAL_REVIEW:pass:released"
       return 0
       ;;
     check)
-      if [[ -f "$result" ]]; then _adv_stored_status; return 0; fi
-      if _adv_running; then echo "ADVERSARIAL_REVIEW:pending"; return 0; fi
+      local stored attempts
       mkdir -p "$run_dir"
+      attempts="$(_adv_attempts)"
+      if [[ -f "$released" ]]; then _adv_stored_status; return 0; fi
+      if [[ -f "$result" ]]; then
+        stored="$(_adv_stored_status)"
+        # Only pass and hold are final for a head. An error is kept for
+        # diagnosis under a timestamped name and retried while attempts remain.
+        if [[ "$stored" == ADVERSARIAL_REVIEW:error:* && "$stored" != "ADVERSARIAL_REVIEW:error:result_unreadable" ]] \
+          && (( attempts < max_attempts )); then
+          mv "$result" "${run_dir}/result.error.$(date +%Y%m%dT%H%M%S).json"
+        else
+          echo "$stored"
+          return 0
+        fi
+      fi
+      if _adv_running; then echo "ADVERSARIAL_REVIEW:pending"; return 0; fi
+      if (( attempts >= max_attempts )); then
+        _adv_write_error attempts_exhausted || { echo "ADVERSARIAL_REVIEW:error:attempts_exhausted"; return 0; }
+        _adv_stored_status
+        return 0
+      fi
+      attempts=$((attempts + 1))
+      echo "$attempts" >"$attempts_file"
       nohup "$0" adversarial-review "$pr" --item "$item" >"${pr_dir}/run-${head:0:12}.log" 2>&1 &
       echo "$!" >"$lock"
+      echo "ADVERSARIAL_REVIEW_ATTEMPT:${attempts}/${max_attempts}"
       echo "ADVERSARIAL_REVIEW:pending"
       return 0
       ;;
@@ -1351,23 +1415,23 @@ print(m.group(1) if m else "")')"
   trap 'rm -f "'"$lock"'"' EXIT
 
   git -C "$REPO_ROOT" fetch --quiet origin "pull/${pr}/head" "${base_ref}" \
-    || { echo "ADVERSARIAL_REVIEW:error:fetch"; return 0; }
+    || { _adv_fail fetch; return 0; }
   [[ "$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD)" == "$head" ]] \
-    || { echo "ADVERSARIAL_REVIEW:error:head_moved"; return 0; }
+    || { _adv_fail head_moved; return 0; }
   git -C "$REPO_ROOT" diff "origin/${base_ref}...${head}" >"${run_dir}/pr.diff" \
-    || { echo "ADVERSARIAL_REVIEW:error:diff"; return 0; }
+    || { _adv_fail diff; return 0; }
   git -C "$REPO_ROOT" diff --name-only --diff-filter=d "origin/${base_ref}...${head}" >"${run_dir}/changed-files.txt"
 
   if [[ ! -d "${run_dir}/snapshot" ]]; then
     python3 "${SECURITY_REVIEW_DIR}/snapshot.py" create "$head" "$REPO_ROOT" "${run_dir}/snapshot" >/dev/null \
-      || { echo "ADVERSARIAL_REVIEW:error:snapshot"; return 0; }
+      || { _adv_fail snapshot; return 0; }
   fi
   python3 "${SECURITY_REVIEW_DIR}/snapshot.py" verify "${run_dir}/snapshot" "$head" "$REPO_ROOT" >/dev/null \
-    || { echo "ADVERSARIAL_REVIEW:error:snapshot_verify"; return 0; }
+    || { _adv_fail snapshot_verify; return 0; }
   python3 "${SECURITY_REVIEW_DIR}/adversarial.py" prepare --base "$base" --item "$item" --pr "$pr" \
     --head "$head" --run-dir "$run_dir" --diff-file "${run_dir}/pr.diff" \
     --changed-files-file "${run_dir}/changed-files.txt" >/dev/null \
-    || { echo "ADVERSARIAL_REVIEW:error:prepare"; return 0; }
+    || { _adv_fail prepare; return 0; }
 
   # Ollama Pro allows 3 concurrent requests and each run is one agent loop, so
   # at most 3 run at once.

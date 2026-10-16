@@ -801,7 +801,7 @@ _review_refusal_hint() {
     adversarial_review_hold)
       echo "the adversarial review found open paths; the story is Blocked. The founder reads the private result under the sweep's adversarial/ dir and clears it with 'security-review.sh adversarial-review <PR> --release', or the PR gets fixed." ;;
     adversarial_review_error)
-      echo "the adversarial review could not produce a result (see the run log under the sweep's adversarial/pr-<N>/). It retries on the next review-pr; persistent errors need the founder." ;;
+      echo "the adversarial review could not produce a result (see the run log under the sweep's adversarial/pr-<N>/). Each head gets a bounded number of attempts (CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS, default 3), retried on later review-pr calls; once they are used up the error stays, and the founder clears the head with 'security-review.sh adversarial-review <PR> --release'." ;;
     already_in_flight)
       echo "a review container for this PR is still running — another review is genuinely in progress. Check /isoagents; no action needed." ;;
     container_exists)
