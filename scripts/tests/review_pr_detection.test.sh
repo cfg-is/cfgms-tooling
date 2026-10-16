@@ -363,7 +363,18 @@ case "$1" in
   *)  exit 0 ;;
 esac
 STUB
-chmod +x "$CONFLICT_STUB_DIR/gh"
+# Stub docker too. review-pr's same-host container probe (`docker ps -a ... |
+# head -1`) runs under `set -euo pipefail`, so on a host without docker the
+# CLI exits 127 with no output before reaching anything after the probe — the
+# adversarial gate below never ran there, and the not_refused cases above passed
+# only because empty output contains no "merge_conflicts". An empty `docker ps`
+# means "no existing review container", which is the state every case here
+# assumes; the result must not depend on the real host's docker or containers.
+cat > "$CONFLICT_STUB_DIR/docker" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$CONFLICT_STUB_DIR/gh" "$CONFLICT_STUB_DIR/docker"
 
 assert_review_refusal() {
   local description="$1" merge_state="$2" expected="$3"
