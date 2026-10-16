@@ -456,7 +456,16 @@ cat > "$ADV_ROOT/pipeline-helper.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "helper $*" >> "$ADV_CALLS"
 STUB
-chmod +x "$ADV_ROOT/scripts/project-queue.sh" "$ADV_ROOT/adversarial.sh" "$ADV_ROOT/pipeline-helper.sh"
+# review-pr's same-host container check (`docker ps -a ... | head -1`) runs
+# before the gate under `set -o pipefail`, so on a host without docker the CLI
+# exits 127 there and the gate is never reached. Stub docker as "no existing
+# container" so these cases do not depend on the host having docker installed.
+mkdir -p "$ADV_ROOT/bin"
+cat > "$ADV_ROOT/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$ADV_ROOT/scripts/project-queue.sh" "$ADV_ROOT/adversarial.sh" "$ADV_ROOT/pipeline-helper.sh" "$ADV_ROOT/bin/docker"
 printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' \
   > "$ADV_ROOT/meta.json"
 
