@@ -132,7 +132,13 @@ for pr in json.loads(raw):
 
 # ---------------------------------------------------------------- ticks
 
-emit() { printf 'EVENT %s\n' "$*"; }
+# emit — one stdout line per event. A failed write means the reader (the
+# Monitor) is gone, so leave through the normal exit path and let the EXIT trap
+# release watch.pid. cmd_watch ignores SIGPIPE so the failure is seen as a
+# status here instead of killing the shell first.
+emit() {
+  printf 'EVENT %s\n' "$*" 2>/dev/null || exit 0
+}
 
 # Local-only probes. Runs every FAST_INTERVAL.
 fast_tick() {
@@ -270,6 +276,35 @@ release_pidfile() {
   fi
 }
 
+# ---------------------------------------------------------------- orphan check
+
+# live_ppid — the parent PID the kernel reports now. bash's $PPID is fixed at
+# startup and does not follow a re-parenting.
+live_ppid() {
+  local stat
+  if [[ -r "/proc/$$/stat" ]]; then
+    stat="$(cat "/proc/$$/stat" 2>/dev/null || true)"
+    stat="${stat##*) }"      # drop "pid (comm) "; the rest is "state ppid ..."
+    stat="${stat#* }"
+    printf '%s\n' "${stat%% *}"
+  else
+    ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ' || true
+  fi
+}
+
+# host_gone — true when the process that started this watcher is gone: the
+# recorded parent no longer exists, or the watcher was re-parented to PID 1
+# although it was not started by PID 1.
+host_gone() {
+  if [[ "${watch_parent}" =~ ^[0-9]+$ ]] && ! pid_alive "${watch_parent}"; then
+    return 0
+  fi
+  if [[ "${watch_parent}" != "1" && "$(live_ppid)" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------- loop
 
 cmd_watch() {
@@ -279,6 +314,9 @@ cmd_watch() {
   # its job, reported `EVENT stop`, and then died dirty, leaving the pid file it
   # was trying to remove. Measured on the first real drained shutdown.
   pidfile="${STATE_DIR}/watch.pid"
+  # Same scoping reason: host_gone reads it on every tick.
+  watch_parent="${PPID}"
+  trap '' PIPE
   local now
   mkdir -p "${STATE_DIR}"
   claim_pidfile || return 1
@@ -350,6 +388,11 @@ cmd_watch() {
   local last_slow="${now}" streak
   while true; do
     sleep "${FAST_INTERVAL}"
+    # The hosting process is gone, so nothing reads stdout. Exit through the
+    # normal path so the EXIT trap releases watch.pid (issue #5098).
+    if host_gone; then
+      return 0
+    fi
     now="$(date +%s)"
 
     streak="$(sget drained_streak)"

@@ -469,6 +469,107 @@ else
   printf '  n/a   EPERM guard: needs Linux /proc and a non-root user to reach EPERM\n'
 fi
 
+# --- the watcher ends with its host or its reader (issue #5098) -------------
+# The harness Monitor that hosts the watcher is not always able to end it: the
+# orphan keeps watch.pid and the next arm fails with "already running". Two
+# defences, both tested here.
+orphan_env() {
+  export PIPELINE_WATCH_DRAINED_LIMIT=99 \
+    PIPELINE_WATCH_FAST=1 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+    PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+    PIPELINE_WATCH_BOARD_CMD="echo 0" \
+    PIPELINE_WATCH_PRS_CMD="printf ''"
+}
+# proc_gone <pid> — true when the process is absent or only a zombie (an
+# un-reaped orphan still answers `kill -0`).
+proc_gone() {
+  local st
+  [[ -d "/proc/$1" ]] || { kill -0 "$1" 2>/dev/null && return 1 || return 0; }
+  st="$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null || true)"
+  [[ -z "${st}" || "${st}" == "Z" ]]
+}
+# wait_gone <pid> <seconds> — poll in 0.2s steps.
+wait_gone() {
+  local i
+  for ((i = 0; i < $2 * 5; i++)); do
+    proc_gone "$1" && return 0
+    sleep 0.2
+  done
+  return 1
+}
+wait_pidfile() {
+  local i
+  for ((i = 0; i < 50; i++)); do
+    [[ -s "${PO_CACHE_DIR}/watch/watch.pid" ]] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+# Defence 2: kill the wrapper shell that is the watcher's direct parent.
+bash "${WATCH}" reset >/dev/null
+(
+  orphan_env
+  export PIPELINE_WATCH_SHA_CMD="printf 'sha-orphan\n'"
+  bash -c "bash '${WATCH}' watch > '${TMP}/orphan_out' 2>&1 & wait" &
+  echo $! > "${TMP}/wrapper_pid"
+  wait_pidfile
+  sleep 1
+)
+wrapper_pid="$(cat "${TMP}/wrapper_pid")"
+orphan_pid="$(cat "${PO_CACHE_DIR}/watch/watch.pid" 2>/dev/null || true)"
+check_eq "orphan test: the watcher's parent is the wrapper shell" \
+  "$(awk '{print $4}' "/proc/${orphan_pid}/stat" 2>/dev/null || echo none)" "${wrapper_pid}"
+kill -9 "${wrapper_pid}" 2>/dev/null || true
+rc=0; wait_gone "${orphan_pid}" 3 || rc=$?
+check_eq "defence 2: the watcher exits within 3s of its parent being killed" "${rc}" "0"
+check_eq "defence 2: watch.pid is removed" \
+  "$([[ -e "${PO_CACHE_DIR}/watch/watch.pid" ]] && echo present || echo absent)" "absent"
+rc=0
+out="$(orphan_env; PIPELINE_WATCH_SHA_CMD="printf 'sha-orphan\n'" \
+       timeout 3 bash "${WATCH}" watch 2>&1)" || rc=$?
+check_not_contains "a watch after the orphan exit does not print already running" "${out}" "already running"
+check_eq "and that watch stays up" "${rc}" "124"
+
+# Defence 1: the reader of stdout goes away; the next emitted event fails.
+bash "${WATCH}" reset >/dev/null
+(
+  orphan_env
+  # A new SHA every tick: each tick emits `merged`, so a write is attempted
+  # right after the reader (head, which stops after the startup line) is gone.
+  export PIPELINE_WATCH_SHA_CMD='date +%s%N'
+  # SIGPIPE ignored on entry, so only the write status can end the watcher;
+  # without that the test would pass on SIGPIPE killing it, which proves nothing.
+  trap '' PIPE
+  bash "${WATCH}" watch 2>/dev/null | head -n 1 > "${TMP}/reader_out"
+) &
+reader_host=$!
+wait_pidfile
+pipe_pid="$(cat "${PO_CACHE_DIR}/watch/watch.pid" 2>/dev/null || true)"
+rc=0; wait_gone "${pipe_pid}" 6 || rc=$?
+check_eq "defence 1: the watcher exits when a write to stdout fails" "${rc}" "0"
+check_eq "defence 1: watch.pid is removed" \
+  "$([[ -e "${PO_CACHE_DIR}/watch/watch.pid" ]] && echo present || echo absent)" "absent"
+kill "${pipe_pid}" 2>/dev/null || true   # only reached alive when the check failed
+wait "${reader_host}" 2>/dev/null || true
+
+# Healthy: live host and live reader, several ticks, still running.
+bash "${WATCH}" reset >/dev/null
+(
+  orphan_env
+  export PIPELINE_WATCH_SHA_CMD="printf 'sha-healthy\n'"
+  exec bash "${WATCH}" watch > "${TMP}/healthy_out" 2>&1
+) &
+healthy_host=$!
+wait_pidfile
+healthy_pid="$(cat "${PO_CACHE_DIR}/watch/watch.pid" 2>/dev/null || true)"
+sleep 4
+rc=0; proc_gone "${healthy_pid}" || rc=$?
+check_eq "a healthy watcher survives several ticks" "${rc}" "1"
+check_eq "and still holds watch.pid" "$(cat "${PO_CACHE_DIR}/watch/watch.pid" 2>/dev/null || true)" "${healthy_pid}"
+kill "${healthy_host}" 2>/dev/null || true
+wait "${healthy_host}" 2>/dev/null || true
+
 echo "--------------------------------------"
 printf 'ran %d, failed %d\n' "${ran}" "${fail}"
 [[ "${fail}" -eq 0 ]] || exit 1
