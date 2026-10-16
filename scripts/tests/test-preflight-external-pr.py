@@ -27,10 +27,14 @@ def _load_preflight():
     return m
 
 
+HEAD_A = "a" * 40
+HEAD_B = "b" * 40
+
+
 def _make_raw_pr(number=999, head_ref="feature/story-999-agent", author_login="someuser",
                  is_draft=False, labels=None, timeline_items=None, comments=None,
                  status_rollup=None, body="", mergeable="MERGEABLE", merge_state="CLEAN",
-                 latest_commit_date=None):
+                 latest_commit_date=None, head_oid=HEAD_A, approvals=None):
     """Build a minimal PR node as returned by gh_graphql_pipeline_overview (prs list)."""
     return {
         "number": number,
@@ -47,6 +51,8 @@ def _make_raw_pr(number=999, head_ref="feature/story-999-agent", author_login="s
         "comments": comments if comments is not None else [],
         "statusCheckRollup": status_rollup if status_rollup is not None else [],
         "latest_commit_date": latest_commit_date,
+        "head_oid": head_oid,
+        "approvals": approvals if approvals is not None else [],
     }
 
 
@@ -205,25 +211,58 @@ class TestBuildPrSummaries(unittest.TestCase):
         self.assertIsNone(summaries[0]["story_number"])
         self.assertTrue(summaries[0]["is_external"])
 
-    def test_human_reviewed_ok_by_push_sets_released(self):
-        """AC5: human-reviewed:ok applied by push+ collaborator → is_released=True."""
-        self._set_perm_map({
-            "external-user": "read",
-            "maintainer": "push",
-        })
+    def _released_pr(self, head_oid=HEAD_A, approvals=None):
         timeline = [
             {"label": {"name": "human-reviewed:ok"}, "actor": {"login": "maintainer"},
              "createdAt": "2026-06-01T00:00:00Z"},
         ]
-        prs = [_make_raw_pr(
+        return _make_raw_pr(
             number=999,
             author_login="external-user",
             labels=[{"name": "human-reviewed:ok"}],
             timeline_items=timeline,
-        )]
+            head_oid=head_oid,
+            approvals=approvals,
+        )
+
+    def test_human_reviewed_ok_by_push_sets_released(self):
+        """AC5: human-reviewed:ok applied by push+ collaborator who approved the head -> released."""
+        self._set_perm_map({"external-user": "read", "maintainer": "push"})
+        prs = [self._released_pr(approvals=[{"login": "maintainer", "oid": HEAD_A}])]
         summaries = self.pf._build_pr_summaries(prs)
         self.assertTrue(summaries[0]["is_external"])
         self.assertTrue(summaries[0]["is_released"])
+
+    def test_backdated_normal_push_after_release_does_not_release(self):
+        """A normal (non-force) push after the release moves the head to an
+        unapproved SHA. No timestamp is consulted, so a backdated committer
+        date cannot keep the release alive."""
+        self._set_perm_map({"external-user": "read", "maintainer": "push"})
+        pr = self._released_pr(head_oid=HEAD_B,
+                               approvals=[{"login": "maintainer", "oid": HEAD_A}])
+        pr["latest_commit_date"] = "2020-01-01T00:00:00Z"  # backdated committer date
+        summaries = self.pf._build_pr_summaries([pr])
+        self.assertTrue(summaries[0]["is_external"])
+        self.assertFalse(summaries[0]["is_released"])
+
+    def test_label_without_head_approval_does_not_release(self):
+        """Label alone, with no APPROVED review on the head, is not a release."""
+        self._set_perm_map({"external-user": "read", "maintainer": "push"})
+        self.assertFalse(self.pf._build_pr_summaries([self._released_pr()])[0]["is_released"])
+
+    def test_head_approval_by_other_login_does_not_release(self):
+        """The approval must come from the actor who applied the release label."""
+        self._set_perm_map({"external-user": "read", "maintainer": "push", "other": "read"})
+        prs = [self._released_pr(approvals=[{"login": "other", "oid": HEAD_A}])]
+        self.assertFalse(self.pf._build_pr_summaries(prs)[0]["is_released"])
+
+    def test_release_with_unknown_head_oid_fails_closed(self):
+        """Missing or malformed head SHA -> not released."""
+        self._set_perm_map({"external-user": "read", "maintainer": "push"})
+        for head in ("", "not-a-sha"):
+            prs = [self._released_pr(head_oid=head,
+                                     approvals=[{"login": "maintainer", "oid": head}])]
+            self.assertFalse(self.pf._build_pr_summaries(prs)[0]["is_released"], head)
 
     def test_human_reviewed_ok_by_triage_does_not_release(self):
         """AC5: triage actor applying human-reviewed:ok does NOT release an external PR."""
