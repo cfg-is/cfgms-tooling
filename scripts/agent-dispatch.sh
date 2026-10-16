@@ -3564,7 +3564,9 @@ PYEOF
     # preserved for diagnosis and refuses; a cleanly-exited one is reaped here
     # and we proceed (see _classify_review_container_state for why).
     # (Same-host fast path; the cross-host interlock is the pr-<N> lease below.)
-    existing_state=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.State}}" 2>/dev/null | head -1)
+    # `|| true`: with no docker binary the pipeline exits 127 under pipefail and
+    # set -e would kill review-pr silently; absent docker means no container.
+    existing_state=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.State}}" 2>/dev/null | head -1 || true)
     if [[ -n "$existing_state" ]]; then
       existing_exit=$(docker inspect "$container_name" --format '{{.State.ExitCode}}' 2>/dev/null || echo "")
       case "$(_classify_review_container_state "$existing_state" "$existing_exit")" in
@@ -3976,7 +3978,7 @@ PROMPT_EOF
     # no-op for a lane whose container had already exited. An exited
     # container is reaped here and the launch proceeds; a genuinely still-
     # running one is refused exactly as before.
-    existing_state=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.State}}" 2>/dev/null | head -1)
+    existing_state=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.State}}" 2>/dev/null | head -1 || true)
     if [[ -n "$existing_state" ]]; then
       if _container_safe_to_reap "$existing_state"; then
         docker rm -f "$container_name" >/dev/null 2>&1 || true
