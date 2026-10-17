@@ -165,7 +165,8 @@ run_entrypoint() {
     # finding 2).
     local mode="$1"
     echo "nameserver 127.0.0.1" > "${WORK_HOME}/resolv.conf"
-    timeout 20 env HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+    timeout 20 env -u CLAUDE_CODE_OAUTH_TOKEN HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+      ${HARNESS_OAUTH_TOKEN:+CLAUDE_CODE_OAUTH_TOKEN="$HARNESS_OAUTH_TOKEN"} \
       CFGMS_SECURITY_REVIEW_HARNESS="${STUB_HARNESS:-}" \
       CFGMS_TEST_LANE_SCRIPT_PATH="${WORK_HOME}/lane_stub.py" \
       CFGMS_TEST_RESOLV_CONF_PATH="${WORK_HOME}/resolv.conf" \
@@ -327,7 +328,8 @@ run_plan_entrypoint() {
     echo "nameserver 127.0.0.1" > "${WORK_HOME}/resolv.conf"
     mkdir -p "${WORK_HOME}/.claude"
     touch "${WORK_HOME}/.claude/.credentials.json"
-    timeout 20 env HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+    timeout 20 env -u CLAUDE_CODE_OAUTH_TOKEN HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+      ${HARNESS_OAUTH_TOKEN:+CLAUDE_CODE_OAUTH_TOKEN="$HARNESS_OAUTH_TOKEN"} \
       CFGMS_TEST_PROMPT_FILE_PATH="$prompt_file" \
       CFGMS_TEST_PLAN_RESULT_PATH="$result_file" \
       CFGMS_TEST_RESOLV_CONF_PATH="${WORK_HOME}/resolv.conf" \
@@ -435,9 +437,13 @@ run_plan_entrypoint_harness() {
     # run_plan_entrypoint_harness <prompt_file> <result_file> <harness> <model>
     # Deliberately does NOT create ~/.claude/.credentials.json -- a non-claude
     # planner must not depend on it. Callers that need it create it themselves.
+    # The caller's login state is not inherited: agent containers export
+    # CLAUDE_CODE_OAUTH_TOKEN, which would skip the credentials-file check.
+    # A case that needs token mode sets HARNESS_OAUTH_TOKEN instead.
     local prompt_file="$1" result_file="$2" harness="$3" model="${4:-}"
     echo "nameserver 127.0.0.1" > "${WORK_HOME}/resolv.conf"
-    timeout 20 env HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+    timeout 20 env -u CLAUDE_CODE_OAUTH_TOKEN HOME="$WORK_HOME" PATH="${BIN_DIR}:${FAKEBIN}:${PATH}" \
+      ${HARNESS_OAUTH_TOKEN:+CLAUDE_CODE_OAUTH_TOKEN="$HARNESS_OAUTH_TOKEN"} \
       CFGMS_TEST_PROMPT_FILE_PATH="$prompt_file" \
       CFGMS_TEST_PLAN_RESULT_PATH="$result_file" \
       CFGMS_TEST_RESOLV_CONF_PATH="${WORK_HOME}/resolv.conf" \
@@ -633,7 +639,7 @@ assert_eq "$(cat "${WORK_HOME}/claude-invoked" 2>/dev/null || true)" "claude-was
 # Issue #4854: token mode needs no credentials file.
 rm -f "${WORK_HOME}/.claude/.credentials.json" "${WORK_HOME}/claude-invoked"
 set +e
-out=$(CLAUDE_CODE_OAUTH_TOKEN="test-token-not-real" run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "claude" "claude-fable-5-1" 2>&1)
+out=$(HARNESS_OAUTH_TOKEN="test-token-not-real" run_plan_entrypoint_harness "$PROMPT_FILE" "$RESULT_FILE" "claude" "claude-fable-5-1" 2>&1)
 rc=$?
 set -e
 assert_eq "$rc" "0" "claude planner in token mode without a credentials file: exits 0"
