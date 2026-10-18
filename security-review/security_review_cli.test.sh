@@ -2577,7 +2577,7 @@ cat >"${ADV_BASE}/sweep-a/triage/stories/index.json" <<'JSON'
 JSON
 cat >"${ADV_BIN}/gh" <<STUB
 #!/usr/bin/env bash
-printf '{"headRefOid":"${ADV_HEAD}","headRefName":"feature/story-900-x","baseRefName":"main","body":""}'
+printf '{"headRefOid":"%s","headRefName":"feature/story-900-x","baseRefName":"main","body":""}' "\${ADV_GH_HEAD:-${ADV_HEAD}}"
 STUB
 chmod +x "${ADV_BIN}/gh"
 write_win_shim "$ADV_BIN" gh
@@ -2676,6 +2676,137 @@ check_contains "MAX_ATTEMPTS must be a positive integer" "$out" "CFGMS_SECURITY_
 
 # The old unbounded move is gone: result.error.* is written only in the bounded step.
 check_eq "result.error. is written in exactly one place" "$(grep -c 'result\.error\.' "$CLI")" "1"
+
+echo ""
+echo "== adversarial-review: re-review, base-only reuse, block-at (Issue #5100) =="
+# A stub dispatcher records each launch, so the run count and "no launch" are observable.
+mkdir -p "${ADV_REPO}/.claude/scripts"
+ADV_LAUNCHES="${ADV_TMP}/launches.log"
+cat >"${ADV_REPO}/.claude/scripts/agent-dispatch.sh" <<STUB
+#!/usr/bin/env bash
+mode=""
+while [[ \$# -gt 0 ]]; do [[ "\$1" == "--mode" ]] && mode="\$2"; shift; done
+echo "\$mode" >>"${ADV_LAUNCHES}"
+echo "LAUNCHED_INVESTIGATOR:\${mode}:stub-cid"
+STUB
+chmod +x "${ADV_REPO}/.claude/scripts/agent-dispatch.sh"
+mkdir -p "${ADV_BASE}/sweep-b/triage/stories"
+cat >"${ADV_BASE}/sweep-b/triage/stories/index.json" <<'JSON'
+{"901": {"item_id": "PVTI_adv2", "sweep_id": "sweep-b", "slug": "relay", "findings": []}}
+JSON
+echo "The relay outlives the admin session." >"${ADV_BASE}/sweep-b/triage/stories/901-relay.md"
+ADV2_PR_DIR="${ADV_BASE}/sweep-b/adversarial/pr-77"
+ADV2_RUN_DIR="${ADV2_PR_DIR}/adv-pr77-${ADV_HEAD:0:12}"
+adv2() {
+  local flag="$1"; shift
+  env -u CFGMS_AUTONOMOUS PATH="${ADV_BIN}:$PATH" CFGMS_TEST_REPO_ROOT="$ADV_REPO" CFGMS_SECURITY_REVIEW_BASE="$ADV_BASE" "$@" \
+    "$CLI" adversarial-review 77 --item PVTI_adv2 $flag 2>&1
+}
+adv2_reset() { chmod -R u+w "${ADV_BASE}/sweep-b/adversarial" 2>/dev/null || true; rm -rf "${ADV_BASE}/sweep-b/adversarial"; : >"$ADV_LAUNCHES"; }
+adv2_wait() { local i; for i in $(seq 1 150); do [[ -f "${ADV2_RUN_DIR}/result.json" && ! -f "${ADV2_RUN_DIR}/.running" ]] && return 0; sleep 0.2; done; return 1; }
+adv2_seed() { # <head> <fingerprint> <status> [findings-json]
+  local d="${ADV2_PR_DIR}/adv-pr77-${1:0:12}"
+  mkdir -p "$d"
+  python3 -c 'import json,sys; json.dump({"status": sys.argv[1], "findings": json.loads(sys.argv[2])}, open(sys.argv[3], "w"))' "$3" "${4:-[]}" "${d}/result.json"
+  python3 "${SECURITY_REVIEW_DIR_FOR_TEST}/adversarial.py" fingerprint-record --pr-dir "$ADV2_PR_DIR" --head "$1" --fingerprint "$2"
+}
+SECURITY_REVIEW_DIR_FOR_TEST="${REPO_ROOT}/.claude/skills/security-review"
+ADV_OLD="1111111111111111111111111111111111111111"
+launches() { grep -c . "$ADV_LAUNCHES" || true; }
+adv2_index_fp() { # <head>: the fingerprint the CLI recorded for that head
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get("fingerprint", ""))' \
+    "${ADV2_PR_DIR}/index.json" "$1" 2>/dev/null || true
+}
+# The fingerprint is whatever the CLI records for ADV_HEAD, not a formula copied here.
+adv2_reset
+adv2 --check >/dev/null
+adv2_wait || bad "fingerprint probe stored a result" "timed out"
+ADV_FP="$(adv2_index_fp "$ADV_HEAD")"
+check_eq "fingerprint is a SHA-256 of the diff bytes" "$([[ "$ADV_FP" =~ ^[0-9a-f]{64}$ ]] && echo yes || echo no)" "yes"
+
+# First review of a PR runs the full count (default 3).
+adv2_reset
+out="$(adv2 "" )"
+check_eq "first review launches 3 runs" "$(launches)" "3"
+check_eq "first review records mode full" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "${ADV2_RUN_DIR}/result.json")" "full"
+
+# After a held head with a different fingerprint: 1 run, earlier findings in the plan.
+adv2_reset
+adv2_seed "$ADV_OLD" "different-fp" "hold:1" '[{"hypothesis_id":"h1","severity":"high","file":"pkg/relay.go","line":12,"symbol":"Relay","evidence":"outlives revoke"}]'
+out="$(adv2 "")"
+check_eq "re-review after a hold launches 1 run" "$(launches)" "1"
+check_eq "re-review records mode and earlier head" \
+  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["mode"], d["earlier_head"])' "${ADV2_RUN_DIR}/result.json")" "rereview ${ADV_OLD}"
+check_contains "re-review plan carries the earlier finding" "$(cat "${ADV2_RUN_DIR}/plan/step-001.json")" "pkg/relay.go:12"
+adv2_reset
+adv2_seed "$ADV_OLD" "different-fp" "hold:1" '[]'
+out="$(adv2 "" CFGMS_SECURITY_REVIEW_ADVERSARIAL_RERUNS=2)"
+check_eq "RERUNS=2 launches 2 runs" "$(launches)" "2"
+
+# Same PR-own diff fingerprint: the earlier result is reused and nothing launches.
+adv2_reset
+adv2_seed "$ADV_OLD" "$ADV_FP" "pass"
+out="$(adv2 --check)"
+check_contains "rebase-only head: reuse is shown in --check" "$out" "ADVERSARIAL_REVIEW_REUSED:${ADV_OLD:0:12}"
+check_eq "rebase-only head: reused status is the last line" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:pass"
+check_eq "rebase-only head: no run was launched" "$(launches)" "0"
+check_eq "rebase-only head: carry-over is recorded in the run dir" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["carried_over"]["from_head"])' "${ADV2_RUN_DIR}/result.json")" "$ADV_OLD"
+
+# A release carries over only on an exact fingerprint match.
+adv2_reset
+adv2_seed "$ADV_OLD" "$ADV_FP" "hold:2"
+echo '{}' >"${ADV2_PR_DIR}/adv-pr77-${ADV_OLD:0:12}/released.json"
+out="$(adv2 --check)"
+check_eq "matching fingerprint carries a release over" "$(adv_last "$out")" "ADVERSARIAL_REVIEW:pass:released"
+adv2_reset
+adv2_seed "$ADV_OLD" "other-fp" "hold:2"
+echo '{}' >"${ADV2_PR_DIR}/adv-pr77-${ADV_OLD:0:12}/released.json"
+out="$(adv2 --check)"
+check_not_contains "changed hunks: no release carries over" "$out" "pass:released"
+adv2_wait
+
+# A changed hunk (different fingerprint) still triggers a review.
+adv2_reset
+adv2_seed "$ADV_OLD" "other-fp" "pass"
+out="$(adv2 --check)"
+check_not_contains "changed hunk: no reuse" "$out" "ADVERSARIAL_REVIEW_REUSED"
+check_contains "changed hunk: a review is started" "$out" "ADVERSARIAL_REVIEW_ATTEMPT:1/3"
+adv2_wait
+check_eq "changed hunk: runs were launched" "$([[ "$(launches)" -ge 1 ]] && echo yes || echo no)" "yes"
+
+# A whitespace-only change is a different change: `git patch-id --stable` gives
+# both heads the same id, and the earlier head's pass must not carry over.
+ADV_WS_TMP="${ADV_TMP}/ws-worktree"
+git -C "$ADV_REPO" worktree add -q --detach "$ADV_WS_TMP" origin/main
+printf 'f ix\n' >>"${ADV_WS_TMP}/f.txt"
+git -C "$ADV_WS_TMP" commit -q -am "fix with a space"
+ADV_WS_HEAD="$(git -C "$ADV_WS_TMP" rev-parse HEAD)"
+git -C "$ADV_REPO" worktree remove --force "$ADV_WS_TMP"
+ws_pid() { git -C "$ADV_REPO" diff "$(git -C "$ADV_REPO" merge-base origin/main "$1")" "$1" | git patch-id --stable | awk '{print $1}'; }
+check_eq "premise: patch-id --stable collapses the whitespace-only difference" "$(ws_pid "$ADV_WS_HEAD")" "$(ws_pid "$ADV_HEAD")"
+adv2_reset
+git -C "$ADV_REPO" push -q -f origin "${ADV_WS_HEAD}:refs/pull/77/head"
+ADV_WS_RUN_DIR="${ADV2_PR_DIR}/adv-pr77-${ADV_WS_HEAD:0:12}"
+ADV_GH_HEAD="$ADV_WS_HEAD" adv2 --check >/dev/null
+for _ in $(seq 1 150); do [[ -f "${ADV_WS_RUN_DIR}/result.json" && ! -f "${ADV_WS_RUN_DIR}/.running" ]] && break; sleep 0.2; done
+ws_fp="$(adv2_index_fp "$ADV_WS_HEAD")"
+check_eq "whitespace variant: a fingerprint was recorded" "$([[ -n "$ws_fp" ]] && echo yes || echo no)" "yes"
+check_not_contains "whitespace variant: fingerprint differs from the original" "$ws_fp" "$ADV_FP"
+python3 -c 'import json,sys; json.dump({"status": "pass", "findings": []}, open(sys.argv[1], "w"))' "${ADV_WS_RUN_DIR}/result.json"
+echo '{}' >"${ADV_WS_RUN_DIR}/released.json"
+git -C "$ADV_REPO" push -q -f origin "${ADV_HEAD}:refs/pull/77/head"
+: >"$ADV_LAUNCHES"
+out="$(adv2 --check)"
+check_not_contains "whitespace-only change: the earlier pass is not reused" "$out" "ADVERSARIAL_REVIEW_REUSED"
+check_not_contains "whitespace-only change: the earlier release is not carried over" "$out" "pass:released"
+check_contains "whitespace-only change: a review is started" "$out" "ADVERSARIAL_REVIEW_ATTEMPT:1/3"
+adv2_wait
+
+# The block-at setting rejects any other value.
+rc=0; out="$(adv2 --check CFGMS_SECURITY_REVIEW_ADVERSARIAL_BLOCK_AT=low)" || rc=$?
+check_contains "BLOCK_AT other than high+residual|medium is an error" "$out" "CFGMS_SECURITY_REVIEW_ADVERSARIAL_BLOCK_AT must be"
+check_eq "invalid BLOCK_AT exits non-zero" "$([[ $rc -ne 0 ]] && echo yes || echo no)" "yes"
 chmod -R u+w "$ADV_TMP" 2>/dev/null || true; rm -rf "$ADV_TMP"
 
 echo ""

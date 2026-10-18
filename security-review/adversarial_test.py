@@ -195,5 +195,121 @@ class CollectTest(unittest.TestCase):
             self.assertEqual(json.load(fh)["status"], "pass")
 
 
+class RelationAndBlockingTest(unittest.TestCase):
+    """Issue #5100: relation is derived from the hypothesis id; the block rule
+    holds on high/critical, or a medium residual/regression."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.run_dir = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        _write(os.path.join(self.run_dir, "plan", "step-001.json"),
+               {"hypotheses": [{"id": "h1"}, {"id": "h-variant"}, {"id": "h-regression"}]})
+
+    def _collect(self, finding, **kw):
+        _write(os.path.join(self.run_dir, "lanes", "adv-1", "step-001.findings.json"),
+               {"step_id": "step-001", "findings": [dict({"file": "a.go", "symbol": "F", "cwe": "CWE-20"}, **finding)]})
+        return adversarial.collect(self.run_dir, 1, **kw)
+
+    def test_medium_variant_passes_and_is_deferred(self):
+        r = self._collect({"severity": "medium", "hypothesis_id": "h-variant"})
+        self.assertEqual(r["status"], "pass")
+        self.assertEqual(len(r["deferred"]), 1)
+        self.assertEqual(r["findings"][0]["relation"], "variant")
+
+    def test_medium_residual_holds(self):
+        r = self._collect({"severity": "medium", "hypothesis_id": "h1"})
+        self.assertEqual(r["status"], "hold:1")
+        self.assertEqual(r["deferred"], [])
+
+    def test_medium_regression_holds(self):
+        r = self._collect({"severity": "medium", "hypothesis_id": "h-regression"})
+        self.assertEqual(r["status"], "hold:1")
+
+    def test_high_variant_holds(self):
+        self.assertEqual(self._collect({"severity": "high", "hypothesis_id": "h-variant"})["status"], "hold:1")
+
+    def test_missing_or_unknown_hypothesis_holds_as_residual(self):
+        r = self._collect({"severity": "medium"})
+        self.assertEqual((r["status"], r["findings"][0]["relation"]), ("hold:1", "residual"))
+        r = self._collect({"severity": "medium", "hypothesis_id": "h99"})
+        self.assertEqual((r["status"], r["findings"][0]["relation"]), ("hold:1", "residual"))
+
+    def test_medium_block_at_holds_a_variant(self):
+        r = self._collect({"severity": "medium", "hypothesis_id": "h-variant"}, block_at="medium")
+        self.assertEqual(r["status"], "hold:1")
+
+    def test_unknown_block_at_is_an_error(self):
+        with self.assertRaises(ValueError):
+            self._collect({"severity": "low"}, block_at="low")
+
+    def test_duplicate_keeps_stricter_relation_and_higher_severity(self):
+        base = {"file": "a.go", "symbol": "F", "cwe": "CWE-20"}
+        _write(os.path.join(self.run_dir, "lanes", "adv-1", "step-001.findings.json"), {"findings": [
+            dict(base, severity="medium", hypothesis_id="h-variant")]})
+        _write(os.path.join(self.run_dir, "lanes", "adv-2", "step-001.findings.json"), {"findings": [
+            dict(base, severity="medium", hypothesis_id="h1")]})
+        r = adversarial.collect(self.run_dir, 2)
+        self.assertEqual(len(r["findings"]), 1)
+        self.assertEqual(r["findings"][0]["relation"], "residual")
+        self.assertEqual(r["status"], "hold:1")
+
+    def test_result_records_mode_and_earlier_head(self):
+        r = self._collect({"severity": "low"}, mode="rereview", earlier_head="e" * 40)
+        self.assertEqual((r["mode"], r["earlier_head"]), ("rereview", "e" * 40))
+
+
+class RereviewAndReuseTest(SweepFixture):
+    def test_rereview_plan_carries_the_earlier_findings(self):
+        detail = adversarial.load_finding_detail(self.sweep, ["F0007"])
+        prior = [{"hypothesis_id": "h1", "severity": "high", "file": "pkg/x.go", "line": 9,
+                  "symbol": "Sink", "vuln_class": "link following", "evidence": "still reads symlinks"}]
+        step = adversarial.build_step(sweep_id="s", head_sha="b" * 40, pr="1", story="03", detail=detail,
+                                      changed_files=[], diff="", prior_findings=prior, earlier_head="a" * 40)
+        self.assertIn("FOCUSED RE-REVIEW", step["description"])
+        self.assertIn("pkg/x.go:9", step["description"])
+        self.assertIn("still reads symlinks", step["description"])
+        self.assertEqual(schema.validate_plan_step(step), [])
+        first = adversarial.build_step(sweep_id="s", head_sha="b" * 40, pr="1", story="03", detail=detail,
+                                       changed_files=[], diff="")
+        self.assertNotIn("FOCUSED RE-REVIEW", first["description"])
+
+    def _store(self, pr_dir, head, fp, status, released=False):
+        adversarial.record_fingerprint(pr_dir, head, fp)
+        run = os.path.join(pr_dir, f"adv-pr1-{head[:12]}")
+        _write(os.path.join(run, "result.json"), {"status": status, "findings": []})
+        if released:
+            _write(os.path.join(run, "released.json"), {})
+
+    def test_same_fingerprint_reuses_result_and_release(self):
+        pr_dir = os.path.join(self.sweep, "adversarial", "pr-1")
+        self._store(pr_dir, "a" * 40, "fp1", "hold:1", released=True)
+        run = os.path.join(pr_dir, "adv-pr1-" + "b" * 12)
+        reuse = adversarial.find_reusable(pr_dir, "1", "b" * 40, "fp1")
+        adversarial.apply_reuse(run, reuse, "fp1")
+        with open(os.path.join(run, "result.json")) as fh:
+            result = json.load(fh)
+        self.assertEqual(result["status"], "hold:1")
+        self.assertEqual(result["carried_over"]["from_head"], "a" * 40)
+        self.assertTrue(os.path.exists(os.path.join(run, "released.json")))
+
+    def test_changed_fingerprint_or_error_result_is_not_reused(self):
+        pr_dir = os.path.join(self.sweep, "adversarial", "pr-1")
+        self._store(pr_dir, "a" * 40, "fp1", "pass")
+        self._store(pr_dir, "c" * 40, "fp3", "error:prepare")
+        self.assertIsNone(adversarial.find_reusable(pr_dir, "1", "b" * 40, "fp2"))
+        self.assertIsNone(adversarial.find_reusable(pr_dir, "1", "b" * 40, "fp3"))
+        self.assertIsNone(adversarial.find_reusable(pr_dir, "1", "b" * 40, ""))
+
+    def test_rereview_source_is_an_earlier_held_head_only(self):
+        pr_dir = os.path.join(self.sweep, "adversarial", "pr-1")
+        self.assertIsNone(adversarial.find_rereview_source(pr_dir, "1", "b" * 40))
+        self._store(pr_dir, "a" * 40, "fp1", "pass")
+        self.assertIsNone(adversarial.find_rereview_source(pr_dir, "1", "b" * 40))
+        self._store(pr_dir, "c" * 40, "fp2", "hold:2")
+        self.assertEqual(adversarial.find_rereview_source(pr_dir, "1", "b" * 40)["head"], "c" * 40)
+        self.assertIsNone(adversarial.find_rereview_source(pr_dir, "1", "c" * 40))
+
+
 if __name__ == "__main__":
     unittest.main()

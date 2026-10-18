@@ -350,8 +350,8 @@ A story whose listed IDs are all missing from the triage files is an error, not 
   `CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL` (default `glm-5.3:cloud`), at most 3 at once, and
   unions them. One run is not enough: two runs of the same prompt shared about 28% of their
   findings when measured;
-- prints `ADVERSARIAL_REVIEW:pass` only when every run completed with nothing at medium or above,
-  `hold:<n>` otherwise, and `error:<reason>` when any run produced no result. A failure before
+- prints `ADVERSARIAL_REVIEW:pass` only when every run completed with no blocking finding (see
+  "What blocks" below), `hold:<n>` otherwise, and `error:<reason>` when any run produced no result. A failure before
   the runs start (`fetch`, `head_moved`, `diff`, `snapshot`, `snapshot_verify`, `prepare`) is
   stored as `result.json` too, so it is never reported as `pending`;
 - bounds the re-runs: `--check` starts at most `CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS`
@@ -359,6 +359,39 @@ A story whose listed IDs are all missing from the triage files is an error, not 
   `pending` line. Once the attempts are used, a stored `error:*` stays the answer, and a run that
   died without a result ends as `error:attempts_exhausted`. A `result.json` that cannot be read is
   `error:result_unreadable`.
+
+**Focused re-review after a hold.** The first review of a PR runs
+`CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS` runs. When an earlier head of the same PR has a stored
+`hold`, the next head runs `CFGMS_SECURITY_REVIEW_ADVERSARIAL_RERUNS` runs (default 1). Its plan
+step lists the earlier findings (id, severity, title, location, evidence) and asks the
+investigator to confirm each is closed and to check the new diff for regressions. `result.json`
+records `mode: rereview` and `earlier_head` (`mode: full` otherwise).
+
+**No re-review when only the base changed.** Before a run starts, the verb fingerprints the PR's
+own change (SHA-256 of the exact bytes of `git diff --no-ext-diff --no-textconv --binary
+--full-index merge-base..head`, whitespace included) and records it in
+`<sweep>/adversarial/pr-<N>/index.json` (head -> fingerprint). If an earlier head with the same
+fingerprint has a stored `pass`, `pass:released` or `hold`, that result is copied to the new head
+with `carried_over` (`from_head`, `fingerprint`) in `result.json`, and a release carries over
+only on that exact match. No run starts; `--check` prints
+`ADVERSARIAL_REVIEW_REUSED:<earlier-head12>` before the status line. Any change to the PR's own
+hunks gives a different fingerprint and is reviewed, including a whitespace-only change. A
+rebase over an upstream edit to a file the PR also touches changes the diff's line numbers and
+blob ids, so it is reviewed again too. A fingerprint that cannot be computed, or an empty diff,
+never matches.
+
+**What blocks.** `collect` sets a `relation` on every finding from the hypothesis it came from:
+`h-variant` -> `variant`, `h-regression` -> `regression`, every other id (the original weaknesses,
+an absent or unknown id) -> `residual`. `unrelated` is accepted but nothing derives it. When
+findings de-duplicate, the stricter relation (`residual` > `regression` > `variant` >
+`unrelated`) and higher severity are kept. `CFGMS_SECURITY_REVIEW_ADVERSARIAL_BLOCK_AT` sets the rule:
+
+- `high+residual` (default): hold on a high or critical finding, or a medium whose relation is
+  `residual` or `regression`. Other medium findings do not hold; `result.json` lists them under
+  `deferred` for filing as follow-up drafts.
+- `medium`: any medium or above holds.
+
+Any other value is an error.
 
 Results stay under `<sweep>/adversarial/pr-<N>/adv-pr<N>-<head12>/` and are keyed by the PR head.
 They are never posted. `agent-dispatch.sh review-pr` runs the verb with `--check` (never waits:

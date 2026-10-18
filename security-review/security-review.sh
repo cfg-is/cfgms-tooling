@@ -101,7 +101,7 @@ Commands:
                        triage/stories/index.json; otherwise prints
                        ADVERSARIAL_REVIEW:not_applicable. Builds a prompt from the private
                        finding detail plus the PR diff, runs
-                       CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS (default 3) agent-loop runs (harness: adversarial.py)
+                       CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS (default 3; RERUNS, default 1, after a held head) agent-loop runs (harness: adversarial.py)
                        of CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL (default: adversarial.py)
                        against a snapshot of the PR head, and unions them. Results stay under
                        <base>/<sweep-id>/adversarial/pr-<N>/ and are never posted anywhere.
@@ -1250,8 +1250,10 @@ PYEOF
 #
 # Adversarial review of a security-fix PR (Issue #5025); adversarial.py owns
 # the private prompt and the verdict. Results live only under
-# <base>/<sweep-id>/adversarial/pr-<N>/<head-sha>/ and are keyed by the PR head,
-# so a head that has a result is never reviewed twice. The last stdout line is
+# <base>/<sweep-id>/adversarial/pr-<N>/adv-pr<N>-<head12>/ and are keyed by the
+# PR head, so a head that has a result is never reviewed twice. A head whose
+# PR-own diff fingerprint matches a reviewed head reuses its result (Issue
+# #5100); a head after a held head gets a 1-run focused re-review. The last stdout line is
 # always one ADVERSARIAL_REVIEW:<status> line.
 #
 #   (default)  run now: snapshot the PR head, launch N agent-loop runs, wait,
@@ -1284,6 +1286,13 @@ cmd_adversarial_review() {
   model="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_MODEL:-$default_model}"
   local adv_entrypoint="${CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR:-$SECURITY_REVIEW_DIR/lanes}/${adv_harness}_lane.py"
   [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_RUNS must be a positive integer" >&2; exit 1; }
+  local reruns="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_RERUNS:-1}"
+  [[ "$reruns" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_RERUNS must be a positive integer" >&2; exit 1; }
+  local block_at="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_BLOCK_AT:-high+residual}"
+  case "$block_at" in
+    high+residual|medium) ;;
+    *) echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_BLOCK_AT must be high+residual or medium, got: ${block_at}" >&2; exit 1 ;;
+  esac
   local max_attempts="${CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS:-3}"
   [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CFGMS_SECURITY_REVIEW_ADVERSARIAL_MAX_ATTEMPTS must be a positive integer" >&2; exit 1; }
 
@@ -1363,6 +1372,39 @@ print("ADVERSARIAL_REVIEW:" + status)' "$result"
     [[ -f "$lock" ]] && [[ "$(cat "$lock")" != "$$" ]] && kill -0 "$(cat "$lock")" 2>/dev/null
   }
 
+  # Fingerprint of the PR's own change (merge-base..head), so a rebase that
+  # leaves the PR's diff byte-identical gives the same value. It is the SHA-256
+  # of the exact diff bytes: whitespace is kept (an indentation or in-string
+  # space change can change behaviour, and `git patch-id --stable` drops it),
+  # external diff drivers and textconv are off so neither can hide a change,
+  # and --binary carries binary content. Empty when it cannot be computed or
+  # the diff is empty; an empty fingerprint never matches.
+  _adv_fingerprint() {
+    git -C "$REPO_ROOT" fetch --quiet origin "pull/${pr}/head" "${base_ref}" >/dev/null 2>&1 || return 0
+    [[ "$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD 2>/dev/null)" == "$head" ]] || return 0
+    local mb diff_file
+    mb="$(git -C "$REPO_ROOT" merge-base "origin/${base_ref}" "$head" 2>/dev/null)" || return 0
+    diff_file="$(mktemp)" || return 0
+    if git -C "$REPO_ROOT" -c core.quotePath=false diff --no-ext-diff --no-textconv --no-color \
+         --binary --full-index "$mb" "$head" >"$diff_file" 2>/dev/null && [[ -s "$diff_file" ]]; then
+      python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$diff_file"
+    fi
+    rm -f "$diff_file"
+  }
+  # Carry an earlier head's pass, pass:released or hold over to this head when
+  # the fingerprint matches exactly. Returns 0 when the result was reused.
+  _adv_try_reuse() {
+    local fp from
+    fp="$(_adv_fingerprint)"
+    [[ -n "$fp" ]] || return 1
+    python3 "${SECURITY_REVIEW_DIR}/adversarial.py" fingerprint-record --pr-dir "$pr_dir" --head "$head" --fingerprint "$fp" || return 1
+    from="$(python3 "${SECURITY_REVIEW_DIR}/adversarial.py" reuse --pr-dir "$pr_dir" --pr "$pr" --head "$head" \
+      --fingerprint "$fp" --run-dir "$run_dir")" || return 1
+    [[ -n "$from" ]] || return 1
+    echo "ADVERSARIAL_REVIEW_REUSED:${from:0:12}"
+    return 0
+  }
+
   case "$mode" in
     release)
       if [[ "${CFGMS_AUTONOMOUS:-}" == "true" ]]; then
@@ -1397,6 +1439,7 @@ print("ADVERSARIAL_REVIEW:" + status)' "$result"
         _adv_stored_status
         return 0
       fi
+      if _adv_try_reuse; then _adv_stored_status; return 0; fi
       attempts=$((attempts + 1))
       echo "$attempts" >"$attempts_file"
       nohup "$0" adversarial-review "$pr" --item "$item" >"${pr_dir}/run-${head:0:12}.log" 2>&1 &
@@ -1414,6 +1457,8 @@ print("ADVERSARIAL_REVIEW:" + status)' "$result"
   echo "$$" >"$lock"
   trap 'rm -f "'"$lock"'"' EXIT
 
+  if _adv_try_reuse; then _adv_stored_status; return 0; fi
+
   git -C "$REPO_ROOT" fetch --quiet origin "pull/${pr}/head" "${base_ref}" \
     || { _adv_fail fetch; return 0; }
   [[ "$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD)" == "$head" ]] \
@@ -1428,9 +1473,19 @@ print("ADVERSARIAL_REVIEW:" + status)' "$result"
   fi
   python3 "${SECURITY_REVIEW_DIR}/snapshot.py" verify "${run_dir}/snapshot" "$head" "$REPO_ROOT" >/dev/null \
     || { _adv_fail snapshot_verify; return 0; }
+  # An earlier head of this PR held: a focused re-review of 1 run carries its
+  # findings. The first review of a PR keeps the full run count.
+  local review_mode="full" earlier_head="" earlier_result="" rr
+  rr="$(python3 "${SECURITY_REVIEW_DIR}/adversarial.py" rereview-source --pr-dir "$pr_dir" --pr "$pr" --head "$head")" || rr=""
+  if [[ -n "$rr" ]]; then
+    IFS=$'\t' read -r earlier_head earlier_result <<<"$rr"
+    review_mode="rereview"
+    runs="$reruns"
+  fi
   python3 "${SECURITY_REVIEW_DIR}/adversarial.py" prepare --base "$base" --item "$item" --pr "$pr" \
     --head "$head" --run-dir "$run_dir" --diff-file "${run_dir}/pr.diff" \
-    --changed-files-file "${run_dir}/changed-files.txt" >/dev/null \
+    --changed-files-file "${run_dir}/changed-files.txt" \
+    ${earlier_result:+--prior-result "$earlier_result" --earlier-head "$earlier_head"} >/dev/null \
     || { _adv_fail prepare; return 0; }
 
   # Ollama Pro allows 3 concurrent requests and each run is one agent loop, so
@@ -1455,7 +1510,8 @@ print("ADVERSARIAL_REVIEW:" + status)' "$result"
 
   python3 -c 'import json,sys; json.dump({"pr": sys.argv[1], "head": sys.argv[2], "model": sys.argv[3], "runs": int(sys.argv[4])}, open(sys.argv[5], "w"))' \
     "$pr" "$head" "$model" "$runs" "${run_dir}/run-meta.json"
-  python3 "${SECURITY_REVIEW_DIR}/adversarial.py" collect --run-dir "$run_dir" --runs "$runs"
+  python3 "${SECURITY_REVIEW_DIR}/adversarial.py" collect --run-dir "$run_dir" --runs "$runs" \
+    --block-at "$block_at" --mode "$review_mode" ${earlier_head:+--earlier-head "$earlier_head"}
 }
 
 main() {
