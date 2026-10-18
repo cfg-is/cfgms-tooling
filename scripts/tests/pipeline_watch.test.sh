@@ -570,6 +570,47 @@ check_eq "and still holds watch.pid" "$(cat "${PO_CACHE_DIR}/watch/watch.pid" 2>
 kill "${healthy_host}" 2>/dev/null || true
 wait "${healthy_host}" 2>/dev/null || true
 
+# --- merge-queue removal ------------------------------------------------------
+# Queue checks run on a gh-readonly-queue ref, so the PR head's rollup stays
+# green and checks_red never fires. The queue set is the only signal.
+bash "${WATCH}" reset >/dev/null
+qslow() { PIPELINE_WATCH_BOARD_CMD="${TMP}/board.sh" \
+          PIPELINE_WATCH_PRS_CMD="printf ''" \
+          PIPELINE_WATCH_QUEUE_CMD="printf '%b' '$1'" \
+          bash "${WATCH}" tick-slow 2>&1; }
+out="$(qslow '7\tqueued\n8\tqueued\n9\topen\n')"
+check_eq "first slow tick seeds the queue set silently" "${out}" ""
+out="$(qslow '7\tqueued\n8\topen\n')"
+check_contains "a PR that left the queue still open emits queue_removed" "${out}" "EVENT queue_removed pr=8 reason=left_queue"
+check_not_contains "a PR still queued emits nothing" "${out}" "pr=7"
+out="$(qslow '8\topen\n')"
+check_not_contains "a PR that merged (no longer open) is not a removal" "${out}" "pr=7"
+out="$(qslow '8\topen\n')"
+check_not_contains "a removal is reported once" "${out}" "queue_removed"
+
+# --- resume gap names the PRs whose check state changed -----------------------
+bash "${WATCH}" reset >/dev/null
+gapwatch() { PIPELINE_WATCH_DRAINED_LIMIT=99 \
+       PIPELINE_WATCH_FAST=1 PIPELINE_WATCH_SLOW=9999 PIPELINE_WATCH_FULL=9999 \
+       PIPELINE_WATCH_SHA_CMD="printf 'sha-h1\n'" \
+       PIPELINE_WATCH_CONTAINERS_CMD="printf ''" \
+       PIPELINE_WATCH_BOARD_CMD="echo 0" \
+       PIPELINE_WATCH_PRS_CMD="printf '%b' '$1'" \
+       PIPELINE_WATCH_QUEUE_CMD="printf '%b' '$2'" \
+       timeout 3 bash "${WATCH}" watch 2>&1 || true; }
+out="$(gapwatch '5125\tpending\n5127\tpending\n5130\tpending\n5131\tpending\n' '5131\tqueued\n')"
+check_contains "cold start" "${out}" "reason=startup"
+out="$(gapwatch '5125\tsuccess\n5127\tsuccess\n5130\tfailure\n5131\tpending\n' '5131\topen\n')"
+check_contains "resume lists green and red PRs" "${out}" "EVENT full_cycle reason=resume_gap prs_green=5125,5127 prs_red=5130"
+check_not_contains "resume does not replay checks_green" "${out}" "EVENT checks_green"
+check_not_contains "resume does not replay checks_red" "${out}" "EVENT checks_red"
+check_contains "resume reports a queue removal from the gap" "${out}" "EVENT queue_removed pr=5131 reason=left_queue"
+bash "${WATCH}" reset >/dev/null
+gapwatch '5125\tpending\n' '' >/dev/null
+out="$(gapwatch '5125\tsuccess\n' '')"
+check_contains "an empty prs_red list is omitted" "${out}" "reason=resume_gap prs_green=5125"
+check_not_contains "an empty prs_red list is omitted (no key)" "${out}" "prs_red"
+
 echo "--------------------------------------"
 printf 'ran %d, failed %d\n' "${ran}" "${fail}"
 [[ "${fail}" -eq 0 ]] || exit 1

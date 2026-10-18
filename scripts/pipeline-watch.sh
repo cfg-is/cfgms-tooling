@@ -130,6 +130,28 @@ for pr in json.loads(raw):
 ' 2>/dev/null || true
 }
 
+# Prints "<pr_number><TAB>queued|open" per open PR against develop, drafts
+# included. "queued" means the PR is in the merge queue now. Merge-queue checks
+# run on a gh-readonly-queue ref, so a queue failure never shows up in the PR
+# head's rollup that probe_prs tracks; this is the only view of a removal. A
+# merged PR is not open and is not listed, so it cannot look like a removal.
+probe_queue() {
+  if [[ -n "${PIPELINE_WATCH_QUEUE_CMD:-}" ]]; then
+    eval "${PIPELINE_WATCH_QUEUE_CMD}" || true
+    return
+  fi
+  gh pr list --repo cfg-is/cfgms --state open --base develop --limit 100 \
+    --json number,isInMergeQueue 2>/dev/null \
+    | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    sys.exit(0)
+for pr in json.loads(raw):
+    print("%s\t%s" % (pr["number"], "queued" if pr.get("isInMergeQueue") else "open"))
+' 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------- ticks
 
 # emit — one stdout line per event. A failed write means the reader (the
@@ -178,6 +200,31 @@ fast_tick() {
   sset stalled "${stalled}"
 }
 
+# queue_tick — emit `queue_removed` for a PR that was in the merge queue last
+# tick and is still open but no longer queued. The first call only seeds the set.
+queue_tick() {
+  local first_run=0 rows queued="" num state prev
+  [[ -f "${STATE_DIR}/queue_set" ]] || first_run=1
+  prev="$(sget queue_set)"
+  rows="$(probe_queue)"
+  while IFS=$'\t' read -r num state; do
+    [[ -n "${num:-}" && "${state:-}" == "queued" ]] && queued+="${num} "
+  done < <(printf '%s\n' "${rows}")
+  if (( ! first_run )); then
+    while IFS=$'\t' read -r num state; do
+      [[ -n "${num:-}" && "${state:-}" == "open" ]] || continue
+      if [[ " ${prev} " == *" ${num} "* ]]; then
+        emit "queue_removed pr=${num} reason=left_queue"
+      fi
+    done < <(printf '%s\n' "${rows}")
+  fi
+  # An unreadable probe (no rows at all) keeps the previous set rather than
+  # forgetting every queued PR.
+  if [[ -n "${rows}" || ${first_run} -eq 1 ]]; then
+    sset queue_set "${queued}"
+  fi
+}
+
 # GitHub probes. Runs every SLOW_INTERVAL.
 slow_tick() {
   local status count prev num state prev_states cur_states line
@@ -199,6 +246,7 @@ slow_tick() {
   [[ -f "${STATE_DIR}/pr_states" ]] || first_run=1
   prev_states="$(sget pr_states)"
   cur_states="$(probe_prs)"
+  queue_tick
   if (( first_run )); then
     sset pr_states "${cur_states}"
     return 0
@@ -382,7 +430,15 @@ cmd_watch() {
   elif [[ -n "${baseline}" ]]; then
     # Resume that found the world already moved. One cycle covers the gap.
     sset last_full "${now}"
-    emit "full_cycle reason=resume_gap"
+    local prs_green prs_red gap_line="full_cycle reason=resume_gap"
+    prs_green="$(printf '%s\n' "${baseline}" | sed -n 's/^EVENT checks_green pr=\([0-9]*\)$/\1/p' | paste -sd, -)"
+    prs_red="$(printf '%s\n' "${baseline}" | sed -n 's/^EVENT checks_red pr=\([0-9]*\)$/\1/p' | paste -sd, -)"
+    [[ -z "${prs_green}" ]] || gap_line+=" prs_green=${prs_green}"
+    [[ -z "${prs_red}" ]] || gap_line+=" prs_red=${prs_red}"
+    emit "${gap_line}"
+    # A queue removal during the gap is consumed by the baseline like any
+    # other edge; name it here so it is reported once, not lost.
+    printf '%s\n' "${baseline}" | grep '^EVENT queue_removed ' || true
   fi
 
   local last_slow="${now}" streak
@@ -446,7 +502,7 @@ cmd_record_cycle() {
 
 cmd_state() {
   local f
-  for f in develop_sha containers stalled board_Ready board_Fix board_Failed drained_streak last_full; do
+  for f in develop_sha containers stalled queue_set board_Ready board_Fix board_Failed drained_streak last_full; do
     printf '%s=%s\n' "${f}" "$(sget "${f}" | tr '\n' ' ')"
   done
 }
