@@ -890,7 +890,13 @@ except Exception: print('')" 2>/dev/null || echo "")
     pr="${1:?PR number required}"
     container="cfg-agent-pr-fix-${pr}"
     # External-author gate (Issue #1786): refuse before touching any PR content.
-    if ! "$DISPATCH" check-pr-author "$pr"; then
+    # Read the head once and bind the trust check and the clone to it (Issue #5401).
+    head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "DISPATCH_FIX_REFUSED:${pr}:head_unknown"
+      exit 3
+    fi
+    if ! "$DISPATCH" check-pr-author "$pr" "$head_sha"; then
       echo "DISPATCH_FIX_REFUSED:${pr}:external_author"
       exit 3
     fi
@@ -908,7 +914,7 @@ except Exception: print('')" 2>/dev/null || echo "")
     docker rm -f "$container" >/dev/null 2>&1 || true
     # Remove any stale worktree directory
     rm -rf "${WORKTREE_BASE}/pr-fix-${pr}" 2>/dev/null || true
-    "$DISPATCH" create-clone-pr "$pr" | tail -1
+    "$DISPATCH" create-clone-pr --expected-head "$head_sha" "$pr" | tail -1
     CFGMS_LEASE_KEY="pr-${pr}" "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/pr-fix-${pr}" --fix-pr "$pr" | tail -1
     trap - ERR
     echo "DISPATCHED_FIX:$pr"
@@ -922,7 +928,13 @@ except Exception: print('')" 2>/dev/null || echo "")
     # clone/fetch/checkout/launch). Uses #1786's permission-level helper
     # (push/maintain/admin). The interim authorAssociation check was replaced
     # once #1786 landed; this subcommand-level assertion stays regardless.
-    if ! "$DISPATCH" check-pr-author "$pr"; then
+    # Read the head once and bind the trust check and the clone to it (Issue #5401).
+    head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "RESOLVE_CONFLICT_REFUSED:${pr}:head_unknown"
+      exit 3
+    fi
+    if ! "$DISPATCH" check-pr-author "$pr" "$head_sha"; then
       echo "RESOLVE_CONFLICT_REFUSED:${pr}:external_author"
       exit 3
     fi
@@ -939,7 +951,7 @@ except Exception: print('')" 2>/dev/null || echo "")
     docker rm -f "$container" >/dev/null 2>&1 || true
     # Remove any stale worktree directory (separate namespace from pr-fix-<PR>)
     rm -rf "${WORKTREE_BASE}/resolve-conflict-${pr}" 2>/dev/null || true
-    "$DISPATCH" create-clone-pr --dest-prefix "resolve-conflict-" "$pr" | tail -1
+    "$DISPATCH" create-clone-pr --dest-prefix "resolve-conflict-" --expected-head "$head_sha" "$pr" | tail -1
     CFGMS_LEASE_KEY="pr-${pr}" "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/resolve-conflict-${pr}" --resolve-conflict "$pr" | tail -1
     trap - ERR
     echo "DISPATCHED_RESOLVE_CONFLICT:${pr}"

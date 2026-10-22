@@ -790,6 +790,10 @@ _review_refusal_hint() {
   case "$reason" in
     pr_not_found)
       echo "PR does not exist, or the API lookup failed." ;;
+    head_unknown)
+      echo "the PR head SHA could not be read; the release check cannot be bound to a commit." ;;
+    head_moved)
+      echo "the PR head changed after the trust check; retry so the release is re-checked against the new head." ;;
     pr_state_*)
       echo "PR is not OPEN (closed or merged) — nothing to review." ;;
     fork_branch_*)
@@ -1219,13 +1223,19 @@ _post_quarantine_comment() {
 #   genuine external PR.
 _branch_author_gate() {
   local branch="$1"
-  local pr_meta pr_num pr_author trust
+  local pr_meta pr_num pr_author pr_head trust
   pr_meta=$(gh pr list --repo cfg-is/cfgms --head "$branch" --state open \
-    --json number,author --jq '.[0] // empty' 2>/dev/null || echo "")
+    --json number,author,headRefOid --jq '.[0] // empty' 2>/dev/null || echo "")
   [[ -n "$pr_meta" ]] || { echo "internal"; return 0; }
   pr_num=$(echo "$pr_meta" | jq -r '.number')
   pr_author=$(echo "$pr_meta" | jq -r '.author.login // empty')
-  trust=$(_check_author_permission "$pr_author" "$pr_num" "")
+  pr_head=$(echo "$pr_meta" | jq -r '.headRefOid // empty')
+  # An empty head would leave the release unbound to a commit (Issue #5401).
+  if [[ ! "$pr_head" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "external:${pr_num}:${pr_author}:head_unknown"
+    return 0
+  fi
+  trust=$(_check_author_permission "$pr_author" "$pr_num" "" "$pr_head")
   if [[ "$trust" != "internal" ]]; then
     echo "external:${pr_num}:${pr_author}:${trust}"
   else
@@ -2547,10 +2557,14 @@ case "$cmd" in
     # land the clone in a distinct namespace (e.g. "resolve-conflict-" for the
     # resolve-conflict agent so it never collides with a simultaneous fix-pr
     # container on the same PR).
+    # Optional --expected-head <SHA> binds the clone to the commit the caller
+    # already judged (Issue #5401).
     dest_prefix="pr-fix-"
+    expected_head_flag=""
     while [[ $# -gt 0 && "$1" == --* ]]; do
       case "$1" in
         --dest-prefix) dest_prefix="${2:?--dest-prefix requires a value}"; shift 2 ;;
+        --expected-head) expected_head_flag="${2:?--expected-head requires a value}"; shift 2 ;;
         *) echo "Unknown flag for create-clone-pr: $1"; exit 1 ;;
       esac
     done
@@ -2560,7 +2574,7 @@ case "$cmd" in
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
     # Fetch all PR metadata in one call (author gate + branch + body).
-    pr_meta_fix=$(gh pr view "$pr_num" --json headRefName,baseRefName,body,labels,author 2>/dev/null) || {
+    pr_meta_fix=$(gh pr view "$pr_num" --json headRefName,headRefOid,baseRefName,body,labels,author 2>/dev/null) || {
       echo "ERROR: Failed to get metadata for PR #${pr_num}"
       exit 1
     }
@@ -2568,15 +2582,28 @@ case "$cmd" in
     pr_body=$(echo "$pr_meta_fix" | jq -r '.body // ""')
     pr_labels_fix=$(echo "$pr_meta_fix" | jq -r '.labels[].name')
     pr_author_login=$(echo "$pr_meta_fix" | jq -r '.author.login // empty')
+    pr_head_fix=$(echo "$pr_meta_fix" | jq -r '.headRefOid // empty')
 
     if [[ -z "$pr_branch" ]]; then
       echo "ERROR: Failed to get branch for PR #${pr_num}"
       exit 1
     fi
 
+    # Bind every check below to one head SHA (Issue #5401). An empty or
+    # malformed head must never reach the trust check, where it would leave
+    # the release unbound to the commit this clone checks out.
+    if [[ ! "$pr_head_fix" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "FIX_REFUSED:${pr_num}:head_unknown"
+      exit 3
+    fi
+    if [[ -n "$expected_head_flag" && "$expected_head_flag" != "$pr_head_fix" ]]; then
+      echo "FIX_REFUSED:${pr_num}:head_moved"
+      exit 3
+    fi
+
 
     # External-author gate (Issue #1786): check trust BEFORE git clone/fetch of PR content.
-    author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels_fix")
+    author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels_fix" "$pr_head_fix")
     if [[ "$author_trust" != "internal" ]]; then
       _post_quarantine_comment "$pr_num" "$pr_author_login"
       echo "FIX_REFUSED:${pr_num}:external_author_${pr_author_login}:${author_trust}"
@@ -2612,6 +2639,13 @@ case "$cmd" in
     sync_to_remote_develop
     git fetch origin "$pr_branch"
     git checkout "$pr_branch"
+    if [[ "$(git rev-parse HEAD)" != "$pr_head_fix" ]]; then
+      cd "$REPO_ROOT"
+      rm -rf "$dest"
+      trap - ERR
+      echo "FIX_REFUSED:${pr_num}:head_moved"
+      exit 3
+    fi
     trap - ERR
 
     echo "CLONE_OK:${dest_prefix}${pr_num}:${pr_branch}:issue=${issue_num:-none}"
@@ -3540,7 +3574,7 @@ PYEOF
 
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
-      --json state,headRefName,body,labels,headRepositoryOwner,author,mergeStateStatus 2>/dev/null) || {
+      --json state,headRefName,headRefOid,body,labels,headRepositoryOwner,author,mergeStateStatus 2>/dev/null) || {
       _emit_review_refused "$pr_num" "pr_not_found"
     }
     gate_credentials_for_launch
@@ -3563,6 +3597,7 @@ PYEOF
     pr_body=$(echo "$pr_meta" | jq -r '.body // ""')
     pr_labels=$(echo "$pr_meta" | jq -r '.labels[].name')
     pr_author_login=$(echo "$pr_meta" | jq -r '.author.login // empty')
+    pr_head_review=$(echo "$pr_meta" | jq -r '.headRefOid // empty')
 
     if [[ "$state" != "OPEN" ]]; then
       _emit_review_refused "$pr_num" "pr_state_${state}"
@@ -3573,7 +3608,12 @@ PYEOF
 
     # External-author gate (Issue #1786): check trust BEFORE any git fetch/checkout.
     # Fail-closed: null/empty author or any API error → external.
-    author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels")
+    # The head is captured once (Issue #5401) and bound to the release check
+    # and to the clone below; an empty head would leave the release unbound.
+    if [[ ! "$pr_head_review" =~ ^[0-9a-f]{40}$ ]]; then
+      _emit_review_refused "$pr_num" "head_unknown"
+    fi
+    author_trust=$(_check_author_permission "$pr_author_login" "$pr_num" "$pr_labels" "$pr_head_review")
     if [[ "$author_trust" != "internal" ]]; then
       _post_quarantine_comment "$pr_num" "$pr_author_login"
       _emit_review_refused "$pr_num" "external_author_${pr_author_login}:${author_trust}"
@@ -3777,6 +3817,12 @@ for i in items:
     sync_to_remote_develop
     git fetch --quiet origin "$pr_branch"
     git checkout --quiet "$pr_branch"
+    if [[ "$(git rev-parse HEAD)" != "$pr_head_review" ]]; then
+      cd "$REPO_ROOT"
+      rm -rf "$clone_dir"
+      trap - ERR
+      _emit_review_refused "$pr_num" "head_moved"
+    fi
     cd "$REPO_ROOT"
     trap - ERR
 
@@ -5006,7 +5052,7 @@ PY
     # Calls _check_author_permission with the supplied args and prints result.
     # Test hooks: CFGMS_TEST_COLLAB_PERM, CFGMS_TEST_ACTOR_LOGIN, CFGMS_TEST_ACTOR_PERM.
     [[ $# -ge 1 ]] || { echo "_test-check-author requires <login> [<pr_num>] [<pr_labels>]"; exit 1; }
-    _check_author_permission "${1}" "${2:-}" "${3:-}"
+    _check_author_permission "${1}" "${2:-}" "${3:-}" "${4:-}"
     ;;
 
   _test-resolve-pr)

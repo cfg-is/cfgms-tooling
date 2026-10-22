@@ -110,6 +110,18 @@ esac
 MOCK_EOF
 chmod +x "$MOCK"
 
+# gh stub: dispatch-fix reads the PR head once (Issue #5401). GH_HEAD overrides it.
+GH_BIN="$TMP/ghbin"; mkdir -p "$GH_BIN"
+cat > "$GH_BIN/gh" <<'GH_EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *headRefOid*) printf '%s\n' "${GH_HEAD-1111111111111111111111111111111111111111}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+GH_EOF
+chmod +x "$GH_BIN/gh"
+export PATH="$GH_BIN:$PATH"
+
 rc=0
 out="$(CFGMS_TEST_DISPATCH="$MOCK" \
        CFGMS_TEST_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh" \
@@ -129,6 +141,13 @@ out="$(CFGMS_TEST_DISPATCH="$MOCK" \
        bash "$PO_ACT" dispatch-fix 4242 2>&1)" || true
 check_not_contains "bypass -> no DEFERRED" "$out" "DISPATCH_FIX_DEFERRED"
 check_contains "bypass -> advanced past gate to clone step" "$out" "MOCK_UNEXPECTED:create-clone-pr"
+
+# T6: an unreadable PR head is refused before the capacity gate (Issue #5401).
+out="$(GH_HEAD="" CFGMS_TEST_DISPATCH="$MOCK" \
+       CFGMS_TEST_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh" \
+       CFGMS_TEST_WORKTREE_BASE="$TMP/wt" \
+       bash "$PO_ACT" dispatch-fix 4242 2>&1)" || true
+check_contains "empty head -> DISPATCH_FIX_REFUSED head_unknown" "$out" "DISPATCH_FIX_REFUSED:4242:head_unknown"
 
 echo ""
 if [[ "$fail" -eq 0 ]]; then printf 'capacity.test.sh: PASS (%d checks)\n' "$ran"; exit 0

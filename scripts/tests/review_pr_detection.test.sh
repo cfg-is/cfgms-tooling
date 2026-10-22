@@ -428,7 +428,7 @@ assert_review_refusal() {
   ran=$((ran + 1))
   local fixture actual
   fixture="${CONFLICT_STUB_DIR}/meta-${merge_state}.json"
-  printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"%s"}' \
+  printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"1111111111111111111111111111111111111111","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"%s"}' \
     "$merge_state" > "$fixture"
   # Stub the credential gate. It runs BEFORE the conflict guard, so on a host
   # with no ~/.claude/.credentials.json -- every CI runner -- review-pr returns
@@ -525,7 +525,7 @@ cat > "$ADV_ROOT/bin/docker" <<'STUB'
 exit 0
 STUB
 chmod +x "$ADV_ROOT/scripts/project-queue.sh" "$ADV_ROOT/adversarial.sh" "$ADV_ROOT/pipeline-helper.sh" "$ADV_ROOT/bin/docker"
-printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' \
+printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"1111111111111111111111111111111111111111","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' \
   > "$ADV_ROOT/meta.json"
 
 run_adv_review() {
@@ -609,7 +609,7 @@ STUB
 chmod +x "$PR_ROOT/bin/docker"
 
 run_prompt_launch() {  # run_prompt_launch <branch> <label>
-  printf '{"state":"OPEN","headRefName":"%s","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' "$1" > "$PR_ROOT/meta.json"
+  printf '{"state":"OPEN","headRefName":"%s","headRefOid":"%s","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' "$1" "$(git -C "$PR_ROOT/origin" rev-parse "$1")" > "$PR_ROOT/meta.json"
   rm -f "$PR_ROOT/prompt.md" "$PR_ROOT/docker-args.txt"
   PR_ROOT="$PR_ROOT" GH_FIXTURE="$PR_ROOT/meta.json" \
     PATH="$PR_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$PR_ROOT/home" \
@@ -633,6 +633,107 @@ for kind in story:feature/story-4242-agent item:feature/item-PVTI_prompt-agent; 
 done
 run_prompt_launch feature/story-4242-agent story
 assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
+
+echo
+echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"
+
+# Real CLIs end to end. The gh stub answers by args: a headRefOid-only --jq
+# query (po-act) returns $B_HEAD_NOW; `pr view` returns the $B_FIXTURE JSON;
+# `pr list` returns $B_LIST; collaborator lookups return read (external).
+# The release hooks say maintainer "maint" approved SHA A only. docker records
+# any `run`, so "starts no container" is a file-existence check.
+BH_ROOT=$(mktemp -d)
+trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR" "$ADV_ROOT" "$PR_ROOT" "$BH_ROOT"' EXIT
+mkdir -p "$BH_ROOT/bin" "$BH_ROOT/home" "$BH_ROOT/wt"
+cat > "$BH_ROOT/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  "pr list"*) printf '%s' "$B_LIST"; exit 0 ;;
+  "pr view"*"--jq"*) printf '%s\n' "$B_HEAD_NOW"; exit 0 ;;
+  "pr view"*) cat "$B_FIXTURE"; exit 0 ;;
+  *collaborators*permission*) echo "${B_PERM:-read}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+cat > "$BH_ROOT/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == run ]] && echo run >> "$BH_ROOT/docker-run.log"
+exit 0
+STUB
+chmod +x "$BH_ROOT/bin/gh" "$BH_ROOT/bin/docker"
+SHA_A="$REL_SHA_A"; SHA_B="$REL_SHA_B"
+SHA_C=cccccccccccccccccccccccccccccccccccccccc
+
+# Throwaway origin whose PR branch tip is the SHA the clone will find.
+git init -q -b develop "$BH_ROOT/origin"
+git -C "$BH_ROOT/origin" config user.email t@example.com
+git -C "$BH_ROOT/origin" config user.name t
+git -C "$BH_ROOT/origin" commit -q --allow-empty -m init
+git -C "$BH_ROOT/origin" branch feature/story-4242-agent
+BR_TIP=$(git -C "$BH_ROOT/origin" rev-parse feature/story-4242-agent)
+git clone -q "$BH_ROOT/origin" "$BH_ROOT/repo"
+seed_trusted_sources "$BH_ROOT/repo"
+cp "$ADV_ROOT/scripts/project-queue.sh" "$BH_ROOT/repo/scripts/project-queue.sh"
+
+# bh_run <author> <head-in-fixture> <live-head> <approved-sha> <cmd...>
+bh_run() {
+  local author="$1" fixture_head="$2" live="$3" approved="$4"; shift 4
+  printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"%s","body":"Fixes #4242","baseRefName":"develop","labels":[{"name":"human-reviewed:ok"}],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"%s"},"mergeStateStatus":"CLEAN"}' \
+    "$fixture_head" "$author" > "$BH_ROOT/pr.json"
+  rm -f "$BH_ROOT/docker-run.log"; rm -rf "$BH_ROOT/wt"/*
+  ADV_CALLS=/dev/null BH_ROOT="$BH_ROOT" B_FIXTURE="$BH_ROOT/pr.json" B_HEAD_NOW="$live" \
+    B_LIST="${B_LIST:-}" PATH="$BH_ROOT/bin:$PATH" HOME="$BH_ROOT/home" \
+    CFGMS_TEST_HEAD_OID="$live" CFGMS_TEST_APPROVALS="maint ${approved}" \
+    CFGMS_TEST_ACTOR_LOGIN=maint CFGMS_TEST_ACTOR_PERM=push \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" CFGMS_TEST_REPO_ROOT="$BH_ROOT/repo" \
+    CFGMS_TEST_WORKTREE_BASE="$BH_ROOT/wt" CFGMS_ADVERSARIAL_REVIEW_GATE=off \
+    CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
+    CFGMS_AGENT_CAPACITY_GATE=off "$@" 2>&1 || true
+}
+no_container() { [[ ! -e "$BH_ROOT/docker-run.log" ]]; }
+
+# review-pr: stale release (approved A, head now B) refused; at A it passes the gate.
+out=$(bh_run ext-user "$SHA_B" "$SHA_B" "$SHA_A" "$DISPATCH" review-pr 4242)
+assert_adv "review-pr: release for an older head → external_author" '[[ "$out" == *"REVIEW_REFUSED:4242:external_author_ext-user"* ]] && no_container'
+out=$(bh_run ext-user "$SHA_A" "$SHA_A" "$SHA_A" "$DISPATCH" review-pr 4242)
+assert_adv "review-pr: release covering the head → not refused at the gate" '[[ "$out" != *"external_author"* && "$out" != *"head_unknown"* ]]'
+out=$(bh_run jrdnr "" "$SHA_A" "$SHA_A" "$DISPATCH" review-pr 4242)
+assert_adv "review-pr: empty headRefOid → head_unknown, no container" '[[ "$out" == *"REVIEW_REFUSED:4242:head_unknown"* ]] && no_container'
+out=$(bh_run jrdnr "not-a-sha" "$SHA_A" "$SHA_A" "$DISPATCH" review-pr 4242)
+assert_adv "review-pr: non-40-hex headRefOid → head_unknown" '[[ "$out" == *"REVIEW_REFUSED:4242:head_unknown"* ]] && no_container'
+# Head moved between the trust check and the clone: the fixture says C, the branch is at its real tip.
+out=$(bh_run jrdnr "$SHA_C" "$SHA_C" "$SHA_C" "$DISPATCH" review-pr 4242)
+assert_adv "review-pr: head moved before clone → head_moved, no container" '[[ "$out" == *"REVIEW_REFUSED:4242:head_moved"* ]] && no_container'
+out=$(bh_run jrdnr "$BR_TIP" "$BR_TIP" "$BR_TIP" "$DISPATCH" review-pr 4242)
+assert_adv "review-pr: head matches the clone → no head refusal" '[[ "$out" != *"head_moved"* && "$out" != *"head_unknown"* ]]'
+
+# Fix launch (create-clone-pr).
+out=$(bh_run ext-user "$SHA_B" "$SHA_B" "$SHA_A" "$DISPATCH" create-clone-pr 4242)
+assert_adv "fix launch: release for an older head → external_author" '[[ "$out" == *"FIX_REFUSED:4242:external_author_ext-user"* ]]'
+out=$(bh_run jrdnr "" "$SHA_A" "$SHA_A" "$DISPATCH" create-clone-pr 4242)
+assert_adv "fix launch: empty headRefOid → head_unknown, no clone" '[[ "$out" == *"FIX_REFUSED:4242:head_unknown"* && ! -d "$BH_ROOT/wt/pr-fix-4242" ]]'
+out=$(bh_run jrdnr "$SHA_C" "$SHA_C" "$SHA_C" "$DISPATCH" create-clone-pr 4242)
+assert_adv "fix launch: head moved before clone → head_moved, clone removed" '[[ "$out" == *"FIX_REFUSED:4242:head_moved"* && ! -d "$BH_ROOT/wt/pr-fix-4242" ]]'
+out=$(bh_run jrdnr "$BR_TIP" "$BR_TIP" "$BR_TIP" "$DISPATCH" create-clone-pr --expected-head "$SHA_C" 4242)
+assert_adv "fix launch: --expected-head differing from the live head → head_moved" '[[ "$out" == *"FIX_REFUSED:4242:head_moved"* && ! -d "$BH_ROOT/wt/pr-fix-4242" ]]'
+out=$(bh_run jrdnr "$BR_TIP" "$BR_TIP" "$BR_TIP" "$DISPATCH" create-clone-pr --expected-head "$BR_TIP" 4242)
+assert_adv "fix launch: head matches → CLONE_OK" '[[ "$out" == *"CLONE_OK:pr-fix-4242"* ]]'
+
+# Branch gate (create-clone-branch resolves the open PR for the branch).
+B_LIST=$(printf '{"number":4242,"author":{"login":"ext-user"},"headRefOid":""}')
+out=$(bh_run ext-user "$SHA_A" "$SHA_A" "$SHA_A" "$DISPATCH" create-clone-branch feature/story-4242-agent)
+assert_adv "branch gate: empty headRefOid → head_unknown, no clone" '[[ "$out" == *"BRANCH_REFUSED:feature/story-4242-agent:external_author_ext-user:head_unknown"* && ! -d "$BH_ROOT/wt/feature-story-4242-agent" ]]'
+B_LIST=$(printf '{"number":4242,"author":{"login":"ext-user"},"headRefOid":"%s"}' "$SHA_B")
+out=$(bh_run ext-user "$SHA_B" "$SHA_B" "$SHA_A" "$DISPATCH" create-clone-branch feature/story-4242-agent)
+assert_adv "branch gate: release for an older head → refused" '[[ "$out" == *"BRANCH_REFUSED:feature/story-4242-agent:external_author_ext-user:external:read"* ]]'
+unset B_LIST
+
+# dispatch-fix: refused for an external PR whose release covers an older head.
+out=$(bh_run ext-user "$SHA_B" "$SHA_B" "$SHA_A" bash "$SCRIPT_DIR/../po-act.sh" dispatch-fix 4242)
+assert_adv "dispatch-fix: release for an older head → external_author" '[[ "$out" == *"DISPATCH_FIX_REFUSED:4242:external_author"* ]] && no_container'
+out=$(bh_run ext-user "" "" "$SHA_A" bash "$SCRIPT_DIR/../po-act.sh" dispatch-fix 4242)
+assert_adv "dispatch-fix: unreadable head → head_unknown" '[[ "$out" == *"DISPATCH_FIX_REFUSED:4242:head_unknown"* ]] && no_container'
 
 echo
 echo "ran ${ran} assertions; failures: ${fail}"

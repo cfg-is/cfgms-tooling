@@ -128,7 +128,7 @@ STUB
 case "$1" in add-issue) echo '{"item_id":"PVTI_t","linked_issue":4242}' ;; *) echo '[]' ;; esac
 STUB
   chmod +x "$1/bin/docker" "$1/scripts/project-queue.sh"
-  printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' > "$1/meta.json"
+  printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"1111111111111111111111111111111111111111","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' > "$1/meta.json"
 }
 GH_FIX="$TMP/gh-fixture"
 mkdir -p "$GH_FIX"

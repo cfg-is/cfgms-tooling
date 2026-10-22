@@ -79,19 +79,19 @@ assert_gate "branch with no open PR → internal" \
   "feature/story-9001-agent" "internal" "internal"
 
 # Open PR exists, author is a trusted push+ collaborator.
-printf '{"number":501,"author":{"login":"trusted-dev"}}' \
+printf '{"number":501,"author":{"login":"trusted-dev"},"headRefOid":"1111111111111111111111111111111111111111"}' \
   > "${GH_FIXTURE_DIR}/feature_pr_9002.json"
 assert_gate "branch with open PR, trusted author → internal" \
   "feature/pr-9002" "internal" "internal"
 
 # Open PR exists, author fails the trust check → external, refused.
-printf '{"number":502,"author":{"login":"rando"}}' \
+printf '{"number":502,"author":{"login":"rando"},"headRefOid":"1111111111111111111111111111111111111111"}' \
   > "${GH_FIXTURE_DIR}/feature_pr_9003.json"
 assert_gate "branch with open PR, untrusted author → external, refused" \
   "feature/pr-9003" "external" "external:502:rando:external"
 
 # Open PR exists, author is null/empty (fail-closed default) → external.
-printf '{"number":503,"author":{"login":""}}' \
+printf '{"number":503,"author":{"login":""},"headRefOid":"1111111111111111111111111111111111111111"}' \
   > "${GH_FIXTURE_DIR}/feature_pr_9004.json"
 assert_gate "branch with open PR, null author fails closed → external" \
   "feature/pr-9004" "external" "external:503::external"

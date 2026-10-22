@@ -73,6 +73,30 @@ TMPWT="$(mktemp -d)"
 trap 'rm -rf "$TMPWT"' EXIT
 
 # ---------------------------------------------------------------------------
+# Stub gh on PATH. po-act.sh reads the PR head (headRefOid) before every
+# dispatch (Issue #5401), so the tests need a deterministic head. GH_HEAD is the
+# PR's live head; GH_FIXTURE is the author/labels JSON for `gh pr view`.
+# ---------------------------------------------------------------------------
+GH_BIN="$TMPWT/ghbin"
+mkdir -p "$GH_BIN"
+cat > "$GH_BIN/gh" <<'GH_EOF'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *headRefOid*) printf '%s\n' "${GH_HEAD-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"; exit 0 ;;
+  *collaborators*permission*) echo "${GH_PERM:-read}"; exit 0 ;;
+  "pr view"*) cat "${GH_FIXTURE:?}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+GH_EOF
+chmod +x "$GH_BIN/gh"
+export PATH="$GH_BIN:$PATH"
+SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export GH_FIXTURE="$TMPWT/pr.json"
+printf '{"author":{"login":"ext-user"},"labels":[{"name":"human-reviewed:ok"}]}' > "$GH_FIXTURE"
+
+# ---------------------------------------------------------------------------
 # Build a mock dispatch script that records calls and fakes success.
 # Accepts two modes controlled by MOCK_AUTHOR_GATE:
 #   "trusted"  — check-pr-author exits 0 (AUTHOR_TRUSTED)
@@ -100,6 +124,7 @@ case "$cmd" in
     while [[ $# -gt 0 && "$1" == --* ]]; do
       case "$1" in
         --dest-prefix) dest_prefix="$2"; shift 2 ;;
+        --expected-head) shift 2 ;;
         *) shift ;;
       esac
     done
@@ -172,6 +197,52 @@ check_contains "AC6a: clone uses resolve-conflict- prefix"  "$out" "CLONE_OK:res
 check_contains "AC6a: container name is resolve-conflict"   "$out" "LAUNCHED:cfg-agent-resolve-conflict-1234"
 
 # ---------------------------------------------------------------------------
+# Issue #5401 — the release check is bound to the head the agent acts on.
+# The mock delegates check-pr-author to the real agent-dispatch.sh so the real
+# release logic judges the head; clone/launch stay mocked and record argv.
+# ---------------------------------------------------------------------------
+echo ""
+echo "resolve_conflict.test.sh — #5401: release bound to head"
+echo "--------------------------------------------------------"
+
+REAL_DISPATCH="${SCRIPT_DIR}/../agent-dispatch.sh"
+MOCK_BOUND="${TMPWT}/mock_dispatch_bound.sh"
+cat > "$MOCK_BOUND" <<MOCK_BOUND_EOF
+#!/usr/bin/env bash
+cmd="\${1:-}"; shift || true
+case "\$cmd" in
+  check-pr-author) exec "$REAL_DISPATCH" check-pr-author "\$@" ;;
+  create-clone-pr) echo "create-clone-pr \$*" >> "$TMPWT/calls.log"; echo "CLONE_OK:x:y"; exit 0 ;;
+  launch-generic)  echo "LAUNCHED:\${1:-}:mock"; exit 0 ;;
+  *) echo "MOCK_UNEXPECTED_CALL:\$cmd" >&2; exit 1 ;;
+esac
+MOCK_BOUND_EOF
+chmod +x "$MOCK_BOUND"
+
+# run_bound leaves the exit code in $TMPWT/rc (the call runs in a subshell).
+# Release granted at SHA A: maintainer "maint" labelled and approved A.
+run_bound() {  # run_bound <live-head> -> output; rc in $bound_rc
+  : > "$TMPWT/calls.log"
+  GH_HEAD="$1" CFGMS_TEST_HEAD_OID="$1" CFGMS_TEST_APPROVALS="maint ${SHA_A}"     CFGMS_TEST_COLLAB_PERM=read CFGMS_TEST_ACTOR_LOGIN=maint CFGMS_TEST_ACTOR_PERM=push     CFGMS_TEST_WORKTREE_BASE="$TMPWT" CFGMS_TEST_DISPATCH="$MOCK_BOUND"     bash "$PO_ACT" resolve-conflict 4321 2>&1 && echo 0 > "$TMPWT/rc" || echo $? > "$TMPWT/rc"
+}
+
+out=$(run_bound "$SHA_B"); rc=$(cat "$TMPWT/rc")
+check_contains "#5401: head moved past the release → refused external_author"   "$out" "RESOLVE_CONFLICT_REFUSED:4321:external_author"
+check "#5401: stale release exits 3" "$rc" "3"
+check_not_contains "#5401: stale release launches nothing" "$out" "LAUNCHED"
+
+out=$(run_bound "$SHA_A"); rc=$(cat "$TMPWT/rc")
+check_contains "#5401: head equals the released head → admitted" \
+  "$out" "DISPATCHED_RESOLVE_CONFLICT:4321"
+check_contains "#5401: clone bound to the checked head via --expected-head" \
+  "$(cat "$TMPWT/calls.log")" "--expected-head ${SHA_A}"
+
+out=$(GH_HEAD="" CFGMS_TEST_WORKTREE_BASE="$TMPWT" CFGMS_TEST_DISPATCH="$MOCK_BOUND" \
+      bash "$PO_ACT" resolve-conflict 4321 2>&1) || true
+check_contains "#5401: unreadable head fails closed with head_unknown" \
+  "$out" "RESOLVE_CONFLICT_REFUSED:4321:head_unknown"
+
+# ---------------------------------------------------------------------------
 # Error paths — launch failure and missing argument guard
 # ---------------------------------------------------------------------------
 echo ""
@@ -196,6 +267,7 @@ case "$cmd" in
     while [[ $# -gt 0 && "$1" == --* ]]; do
       case "$1" in
         --dest-prefix) dest_prefix="$2"; shift 2 ;;
+        --expected-head) shift 2 ;;
         *) shift ;;
       esac
     done
