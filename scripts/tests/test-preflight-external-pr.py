@@ -689,6 +689,37 @@ class TestWaitVerdictReviewRecommendations(unittest.TestCase):
         self.assertEqual(recs[0]["action"], "skip")
         self.assertIn("fail", recs[0]["reason"].lower())
 
+    # --- enqueue_merge must name the gated command, never a raw merge (Issue #5389) ---
+    def test_enqueue_reason_uses_po_act_enqueue_with_story(self):
+        recs = self.pf.compute_review_recommendations(
+            [self._make_summary(pr_num=101, story_num=42, has_review=True, verdict="pass")], set())
+        self.assertEqual(recs[0]["action"], "enqueue_merge")
+        self.assertIn("po-act.sh enqueue", recs[0]["reason"])
+        self.assertIn("./.claude/scripts/po-act.sh enqueue 101 42", recs[0]["reason"])
+        self.assertNotIn("gh pr merge", recs[0]["reason"])
+
+    def test_enqueue_reason_without_story_omits_story_arg(self):
+        recs = self.pf.compute_review_recommendations(
+            [self._make_summary(pr_num=101, story_num=None, has_review=True, verdict="pass")], set())
+        self.assertEqual(recs[0]["action"], "enqueue_merge")
+        self.assertIn("./.claude/scripts/po-act.sh enqueue 101`", recs[0]["reason"])
+        self.assertNotIn("gh pr merge", recs[0]["reason"])
+
+    def test_external_unreleased_pass_green_never_enqueues(self):
+        s = self._make_summary(pr_num=202, story_num=None, has_review=True, verdict="pass")
+        s["is_external"] = True
+        recs = self.pf.compute_review_recommendations([s], set())
+        self.assertNotIn("enqueue_merge", [r["action"] for r in recs])
+
+    def test_external_released_pass_green_enqueues_storyless(self):
+        s = self._make_summary(pr_num=202, story_num=None, has_review=True, verdict="pass")
+        s["is_external"] = True
+        s["is_released"] = True
+        recs = self.pf.compute_review_recommendations([s], set())
+        self.assertEqual(recs[0]["action"], "enqueue_merge")
+        self.assertIn("./.claude/scripts/po-act.sh enqueue 202`", recs[0]["reason"])
+        self.assertNotIn("gh pr merge", recs[0]["reason"])
+
 
 class TestMergeQueueStateRecommendations(unittest.TestCase):
     """Issue #2589: preflight consumes merge-queue state — eviction escalation

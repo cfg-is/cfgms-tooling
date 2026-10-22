@@ -1873,7 +1873,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
               before any other action makes sense. Always takes precedence
               when mergeStateStatus is DIRTY (conflicts) or BEHIND (base advanced).
     - enqueue_merge: review armed + green + mergeable but neither in queue nor
-              auto-merge-enabled — manual `gh pr merge --squash` to enqueue.
+              auto-merge-enabled — enqueue via `po-act.sh enqueue` (the gated path).
     - skip: in-flight (in queue, auto-merge armed, OR has active fix-agent
               container — fix-agent and rebase-pr.sh would race on the same
               branch); leave alone.
@@ -2171,11 +2171,14 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 and not pr.get("auto_merge_enabled")
                 and not in_queue
             ):
+                enqueue_cmd = f"./.claude/scripts/po-act.sh enqueue {pr['pr']}"
+                if pr["story_number"] is not None:
+                    enqueue_cmd += f" {pr['story_number']}"
                 recs.append({
                     "pr": pr["pr"],
                     "story": pr["story_number"],
                     "action": "enqueue_merge",
-                    "reason": "reviewed + CI green + mergeable but not in merge queue — run `gh pr merge <N> --squash`",
+                    "reason": f"reviewed + CI green + mergeable but not in merge queue — run `{enqueue_cmd}`",
                 })
             elif (
                 ms == "BLOCKED"

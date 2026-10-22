@@ -65,6 +65,15 @@ else
   printf '  ok    lane bullet has no raw gh pr merge\n'
 fi
 
+# po.md's recommendations table must have an enqueue_merge row that routes to
+# po-act.sh enqueue and forbids a raw gh pr merge (Issue #5389).
+row="$(grep -F '| `enqueue_merge` |' "$POMD" || true)"
+if [[ -n "$row" && "$row" == *'po-act.sh enqueue'* && "$row" == *'never a raw `gh pr merge`'* ]]; then
+  printf '  ok    enqueue_merge row names po-act.sh enqueue and forbids raw gh pr merge\n'
+else
+  printf '  FAIL  enqueue_merge row missing or does not forbid raw gh pr merge\n'; fail=$((fail + 1))
+fi
+
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'GHEOF'
