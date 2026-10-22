@@ -5,6 +5,10 @@
 set -euo pipefail
 
 REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+# Fixed root, outside /workspace, where the review container mounts the harness
+# copy of the merge-gate scripts (Issue #5386). Mirrors the repo layout so the
+# scripts' $(dirname "$0")/../.. resolution lands on it unchanged.
+TRUSTED_ROOT="/opt/cfgms-trusted"
 WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktrees}"
 
 # Reuse ac_resolve_agent_model (Issue #3030) to predict the model a dispatched
@@ -3541,6 +3545,17 @@ PYEOF
     }
     gate_credentials_for_launch
     gate_image_staleness_for_launch
+    # Trusted gate sources (Issue #5386). The merge gate must run a copy the PR
+    # cannot change, so the review container gets the harness checkout's
+    # scripts and agent definition read-only under TRUSTED_ROOT. Check each on
+    # the host first: docker would create a missing bind-mount source as an
+    # empty directory and the gate would then run from nothing.
+    for trusted_src in ".claude/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
+      if [[ ! -r "${REPO_ROOT}/${trusted_src}" ]]; then
+        _emit_review_refused "$pr_num" "trusted_source_missing_${trusted_src//\//_}"
+      fi
+    done
+
     state=$(echo "$pr_meta" | jq -r '.state')
     merge_state=$(echo "$pr_meta" | jq -r '.mergeStateStatus // empty' | tr '[:lower:]' '[:upper:]')
     pr_branch=$(echo "$pr_meta" | jq -r '.headRefName')
@@ -3774,10 +3789,14 @@ You are operating as the Acceptance Reviewer agent for CFGMS.
 
 Your assignment: pr:${pr_num} story:0 --project-item ${item_id}
 
-Read \`.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
+Read \`${TRUSTED_ROOT}/.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
 workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
+
+Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/scripts\`
+(the harness copy), never from a path under /workspace: the PR under review can
+edit the copies in its own checkout.
 
 When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
@@ -3800,15 +3819,19 @@ You are operating as the Acceptance Reviewer agent for CFGMS.
 
 Your assignment: pr:${pr_num} story:${story_num} --project-item ${item_id}
 
-Read \`.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
+Read \`${TRUSTED_ROOT}/.claude/agents/acceptance-reviewer.md\` and execute its full Phase 1-5
 workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
+Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/scripts\`
+(the harness copy), never from a path under /workspace: the PR under review can
+edit the copies in its own checkout.
+
 When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
-- **PASS (zero findings)**: enqueue with \`./.claude/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
+- **PASS (zero findings)**: enqueue with \`${TRUSTED_ROOT}/.claude/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
   mark story Done with \`./scripts/project-queue.sh update-field ${item_id} status Done\`,
   then run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
   release the dev agent's container/worktree.
@@ -3861,6 +3884,9 @@ PROMPT_EOF
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
+      -v "${REPO_ROOT}/.claude/scripts:${TRUSTED_ROOT}/.claude/scripts:ro" \
+      -v "${REPO_ROOT}/scripts:${TRUSTED_ROOT}/scripts:ro" \
+      -v "${REPO_ROOT}/.claude/agents/acceptance-reviewer.md:${TRUSTED_ROOT}/.claude/agents/acceptance-reviewer.md:ro" \
       -v "${REPO_ROOT}/.devcontainer/agent-context.sh:/usr/local/bin/agent-context.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \

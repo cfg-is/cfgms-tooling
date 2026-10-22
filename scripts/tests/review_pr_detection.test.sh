@@ -22,6 +22,13 @@ DISPATCH="${SCRIPT_DIR}/../agent-dispatch.sh"
 fail=0
 ran=0
 
+# review-pr refuses a launch when the trusted gate sources are absent
+# (Issue #5386); seed them into a stub repo root.
+seed_trusted_sources() {
+  mkdir -p "$1/.claude/scripts" "$1/.claude/agents" "$1/scripts"
+  : > "$1/.claude/agents/acceptance-reviewer.md"
+}
+
 assert_resolves() {
   local description="$1"
   local branch="$2"
@@ -386,6 +393,7 @@ echo "--- review-pr: conflict guard (mergeStateStatus) ---"
 # End-to-end through the real CLI: the stub answers both gh calls the guard sits
 # behind (the PR view, then the author-permission check) by branching on args.
 CONFLICT_STUB_DIR=$(mktemp -d)
+seed_trusted_sources "$CONFLICT_STUB_DIR"
 trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR"' EXIT
 cat > "$CONFLICT_STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -477,6 +485,7 @@ echo "--- review-pr: adversarial security-review gate (Issue #5025) ---"
 # their calls. The gate sits after item resolution and before the capacity
 # gate, so a refusal here means no lease was taken and nothing was launched.
 ADV_ROOT=$(mktemp -d)
+seed_trusted_sources "$ADV_ROOT"
 trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR" "$ADV_ROOT"' EXIT
 mkdir -p "$ADV_ROOT/scripts" "$ADV_ROOT/home" "$ADV_ROOT/bin"
 # The container conflict gate runs `docker ps -a` before the adversarial gate.
@@ -567,6 +576,63 @@ for verdict in "ADVERSARIAL_REVIEW:pass" "ADVERSARIAL_REVIEW:pass:released" "ADV
   out=$(run_adv_review pass "$verdict")
   assert_adv "$verdict → gate passes and review continues to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-pass.log" && [[ "$out" != *adversarial* ]]'
 done
+
+
+echo
+echo "--- review-pr: prompts use the trusted gate path (Issue #5386) ---"
+
+# Full launch against a real throwaway git origin; the docker stub records its
+# argv and copies the generated prompt out of the mounted workspace.
+PR_ROOT=$(mktemp -d)
+trap 'rm -rf "$STALE_STUB_DIR" "$CONFLICT_STUB_DIR" "$ADV_ROOT" "$PR_ROOT"' EXIT
+mkdir -p "$PR_ROOT/bin" "$PR_ROOT/home"
+git init -q -b develop "$PR_ROOT/origin"
+git -C "$PR_ROOT/origin" config user.email t@example.com
+git -C "$PR_ROOT/origin" config user.name t
+git -C "$PR_ROOT/origin" commit -q --allow-empty -m init
+git -C "$PR_ROOT/origin" branch feature/story-4242-agent
+git -C "$PR_ROOT/origin" branch feature/item-PVTI_prompt-agent
+git clone -q "$PR_ROOT/origin" "$PR_ROOT/repo"
+seed_trusted_sources "$PR_ROOT/repo"
+cp "$ADV_ROOT/scripts/project-queue.sh" "$PR_ROOT/repo/scripts/project-queue.sh"
+cat > "$PR_ROOT/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == run ]]; then
+  printf '%s\n' "$@" > "$PR_ROOT/docker-args.txt"
+  for a in "$@"; do
+    [[ "$a" == *:/workspace ]] && cp "${a%:/workspace}/.acceptance-review-prompt.md" "$PR_ROOT/prompt.md"
+  done
+  echo fakecontainerid
+fi
+exit 0
+STUB
+chmod +x "$PR_ROOT/bin/docker"
+
+run_prompt_launch() {  # run_prompt_launch <branch> <label>
+  printf '{"state":"OPEN","headRefName":"%s","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' "$1" > "$PR_ROOT/meta.json"
+  rm -f "$PR_ROOT/prompt.md" "$PR_ROOT/docker-args.txt"
+  PR_ROOT="$PR_ROOT" GH_FIXTURE="$PR_ROOT/meta.json" \
+    PATH="$PR_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$PR_ROOT/home" \
+    CFGMS_TEST_COLLAB_PERM=admin CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+    CFGMS_TEST_REPO_ROOT="$PR_ROOT/repo" CFGMS_ADVERSARIAL_REVIEW_GATE=off \
+    CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
+    CFGMS_AGENT_CAPACITY_GATE=off \
+    "$DISPATCH" review-pr 4242 >"$PR_ROOT/launch-$2.out" 2>&1 || true
+}
+
+for kind in story:feature/story-4242-agent item:feature/item-PVTI_prompt-agent; do
+  label="${kind%%:*}"; branch="${kind#*:}"
+  run_prompt_launch "$branch" "$label"
+  assert_adv "$label prompt written" '[[ -s "$PR_ROOT/prompt.md" ]]'
+  assert_adv "$label prompt names the trusted scripts root" 'grep -qF "/opt/cfgms-trusted/.claude/scripts" "$PR_ROOT/prompt.md"'
+  assert_adv "$label prompt reads the agent definition from the trusted path" 'grep -qF "Read \`/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md\`" "$PR_ROOT/prompt.md"'
+  assert_adv "$label prompt has no relative po-act enqueue" '! grep -qF "./.claude/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
+  assert_adv "$label prompt has no relative agent definition read" '! grep -E "(^|[^/])\.claude/agents/acceptance-reviewer\.md" "$PR_ROOT/prompt.md" | grep -qv "/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md"'
+  assert_adv "$label docker run mounts the three trusted sources read-only" \
+    'grep -qF "$PR_ROOT/repo/.claude/scripts:/opt/cfgms-trusted/.claude/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/scripts:/opt/cfgms-trusted/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/.claude/agents/acceptance-reviewer.md:/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md:ro" "$PR_ROOT/docker-args.txt"'
+done
+run_prompt_launch feature/story-4242-agent story
+assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
 
 echo
 echo "ran ${ran} assertions; failures: ${fail}"
