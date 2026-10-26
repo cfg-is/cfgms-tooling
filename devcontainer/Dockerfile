@@ -134,7 +134,7 @@ RUN bash /tmp/install-go-analyzers.sh \
 # .github/workflows/dependency-pin-check.yml, .github/workflows/golangci-lint.yml,
 # windows-setup.ps1 and the Makefile's GOLANGCI_LINT_VERSION (the `lint` target
 # rebuilds the linter itself when the one on PATH predates a toolchain bump).
-RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 \
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 \
     && golangci-lint --version
 
 # Trivy — v0.69.4-v0.69.6 are compromised (CVE-2026-33634); v0.75.0 is the
