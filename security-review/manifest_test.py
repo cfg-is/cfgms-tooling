@@ -5,12 +5,14 @@ Run: python3 .claude/skills/security-review/manifest_test.py
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -220,6 +222,14 @@ def test_create_sweep_creates_directory_skeleton():
             )
 
 
+class _FrozenDatetime(datetime.datetime):
+    """datetime whose now() is fixed, so the minute-resolution sweep id is stable."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 1, 1, 12, 0, 59, tzinfo=tz)
+
+
 def test_create_sweep_is_idempotent():
     # REQUIRED TEST: calling create_sweep twice against the same sweep id does
     # not overwrite an existing manifest.json and does not error on
@@ -227,7 +237,16 @@ def test_create_sweep_is_idempotent():
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as base:
         init_real_git_repo(repo)
         env = {"CFGMS_SECURITY_REVIEW_BASE": base}
-        with mock.patch.dict(os.environ, platform_test_support.minimal_env(env), clear=True):
+        # The sweep id embeds a minute-resolution UTC timestamp, so two real
+        # calls that straddle a minute rollover legitimately resolve different
+        # ids. This test asserts idempotency against the SAME sweep id, so the
+        # clock is pinned for both calls rather than racing the wall clock.
+        frozen_clock = types.SimpleNamespace(
+            datetime=_FrozenDatetime, timezone=datetime.timezone
+        )
+        with mock.patch.dict(
+            os.environ, platform_test_support.minimal_env(env), clear=True
+        ), mock.patch.object(manifest, "datetime", frozen_clock):
             sweep_dir = manifest.create_sweep("HEAD", lanes=TEST_LANES, repo_root=repo)
 
             manifest_path = os.path.join(sweep_dir, "manifest.json")
