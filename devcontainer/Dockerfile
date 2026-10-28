@@ -419,10 +419,10 @@ ENV TRIVY_CACHE_DIR=/home/agent/.cache/trivy
 ENV GOMODCACHE=/home/agent/go/pkg/mod
 ENV GOFLAGS=-modcacherw
 
-# === Serena MCP server (semantic code navigation for PO/dev sessions) ===
-# Everything is fetched at BUILD time (unrestricted network) and baked into the
-# image. At RUNTIME serena resolves entirely from the warmed uv cache with
-# UV_OFFLINE=1, so NO pypi/astral egress is added to the container firewall.
+# === uv (Python package installer) ===
+# Used at BUILD time by the security-review scanner toolchain below to build
+# the hash-pinned semgrep virtualenv. Nothing uses uv at RUNTIME, so no
+# pypi/astral egress is added to the container firewall.
 #
 # uv/uvx — pinned release binary + SHA-256 (same supply-chain pattern as trivy).
 # Per-architecture checksums from <artifact>.tar.gz.sha256 release asset at
@@ -445,20 +445,6 @@ RUN set -eu; \
     install -m 0755 "/tmp/uv-${UV_TRIPLE}/uvx" /usr/local/bin/uvx; \
     rm -rf /tmp/uv.tgz "/tmp/uv-${UV_TRIPLE}"
 
-# gopls — serena's Go language server (pinned), on the shared PATH.
-RUN go install golang.org/x/tools/gopls@v0.22.0 \
-    && install -m 0755 "$(go env GOPATH)/bin/gopls" /usr/local/bin/gopls
-
-# Install serena (pinned v1.6.1) as a self-contained tool for the agent user.
-# This bakes serena + all its Python deps into the image (~/.local/share/uv +
-# the `serena` launcher on ~/.local/bin), so at runtime serena starts directly
-# from the binary with no uvx git re-resolution and no pypi/astral egress.
-# setup-env.sh repoints the project .mcp.json at this binary.
-ENV UV_CACHE_DIR=/home/agent/.cache/uv
-RUN install -d -o agent -g agent /home/agent/.cache/uv /home/agent/.local \
-    && su agent -c 'set -e; export UV_CACHE_DIR=/home/agent/.cache/uv; \
-         uv tool install --from git+https://github.com/oraios/serena@v1.7.0 serena-agent' \
-    && chown -R agent:agent /home/agent/.cache/uv /home/agent/.local
 # Defense-in-depth: keep any stray uv invocation offline behind the firewall.
 ENV UV_OFFLINE=1
 
