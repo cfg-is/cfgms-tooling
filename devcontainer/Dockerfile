@@ -168,7 +168,7 @@ RUN set -eu; \
       arm64) NANCY_ARCH='linux-arm64' ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v2.1.0/nancy-v2.1.0-${NANCY_ARCH}" \
+    curl -L "https://github.com/sonatype-nexus-community/nancy/releases/download/v2.1.1/nancy-v2.1.1-${NANCY_ARCH}" \
        -o "$GOPATH/bin/nancy" \
     && chmod +x "$GOPATH/bin/nancy"
 
