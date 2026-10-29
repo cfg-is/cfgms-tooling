@@ -7,11 +7,13 @@
 // Each function below plants exactly one finding a specific tool in the Go
 // profile must recover; `lanes/scan_fixtures_test.py` asserts that it does,
 // so an emptied profile or a broken rule fails the test instead of passing
-// silently. No suppression comments -- a `#nosec` here would defeat the test.
+// silently. The gosec findings carry rule-specific `#nosec` annotations so the repo-wide
+// gate stays green; the scanner profile runs gosec with `-nosec`, which
+// ignores them, so the planted findings are still recovered.
 package planted
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- deliberately planted weak-crypto fixture; scan profile runs gosec with -nosec.
 	"fmt"
 	"log/slog"
 	"strings"
@@ -21,7 +23,7 @@ import (
 // the upstream semgrep taint rule go.lang.security.audit.md5-used-as-password
 // (an md5 digest flowing into a function whose name contains "password").
 func HashPassword(password string) string {
-	sum := md5.Sum([]byte(password))
+	sum := md5.Sum([]byte(password)) // #nosec G401 -- deliberately planted weak-crypto fixture.
 	storePassword(sum)
 	return fmt.Sprintf("%x", sum)
 }
