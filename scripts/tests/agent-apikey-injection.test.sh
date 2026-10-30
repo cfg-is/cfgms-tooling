@@ -43,7 +43,7 @@ check() {
 check_contains() {
   local desc="$1" haystack="$2" needle="$3"
   ran=$((ran + 1))
-  if echo "$haystack" | grep -qF "$needle"; then
+  if grep -qF -- "$needle" <<<"$haystack"; then
     printf '  ok    %s\n' "$desc"
   else
     fail=$((fail + 1))
@@ -54,7 +54,7 @@ check_contains() {
 check_not_contains() {
   local desc="$1" haystack="$2" needle="$3"
   ran=$((ran + 1))
-  if ! echo "$haystack" | grep -qF "$needle"; then
+  if ! grep -qF -- "$needle" <<<"$haystack"; then
     printf '  ok    %s\n' "$desc"
   else
     fail=$((fail + 1))
