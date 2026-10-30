@@ -140,16 +140,43 @@ probe_queue() {
     eval "${PIPELINE_WATCH_QUEUE_CMD}" || true
     return
   fi
-  gh pr list --repo cfg-is/cfgms --state open --base develop --limit 100 \
-    --json number,isInMergeQueue 2>/dev/null \
-    | python3 -c '
-import json, sys
-raw = sys.stdin.read().strip()
-if not raw:
-    sys.exit(0)
-for pr in json.loads(raw):
-    print("%s\t%s" % (pr["number"], "queued" if pr.get("isInMergeQueue") else "open"))
-' 2>/dev/null || true
+  # `gh pr list --json` has no merge-queue field, so ask GraphQL for the queue
+  # entries and the open PR list together. A failed call prints nothing and the
+  # caller keeps its previous set.
+  gh api graphql -f query='query {
+    repository(owner: "cfg-is", name: "cfgms") {
+      mergeQueue(branch: "develop") { entries(first: 100) { nodes { pullRequest { number } } } }
+      pullRequests(states: OPEN, baseRefName: "develop", first: 100) { nodes { number } }
+    }
+  }' --jq '
+    .data.repository as $r
+    | [$r.mergeQueue.entries.nodes[]?.pullRequest.number] as $q
+    | $r.pullRequests.nodes[]
+    | "\(.number)\t\(if (.number as $n | $q | index($n)) != null then "queued" else "open" end)"
+  ' 2>/dev/null || true
+}
+
+# Prints the GitHub reason (lower-cased, e.g. failed_checks) of the PR's latest
+# RemovedFromMergeQueueEvent, or nothing when it cannot be read.
+probe_removal_reason() {
+  if [[ -n "${PIPELINE_WATCH_REASON_CMD:-}" ]]; then
+    eval "${PIPELINE_WATCH_REASON_CMD}" "$1" || true
+    return
+  fi
+  gh api graphql -F num="$1" -f query='query($num: Int!) {
+    repository(owner: "cfg-is", name: "cfgms") {
+      pullRequest(number: $num) { timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { reason } } } }
+    }
+  }' --jq '.data.repository.pullRequest.timelineItems.nodes[0].reason // empty | ascii_downcase' 2>/dev/null || true
+}
+
+# Prints MERGED / CLOSED / OPEN for a PR, or nothing when unreadable.
+probe_pr_state() {
+  if [[ -n "${PIPELINE_WATCH_PRSTATE_CMD:-}" ]]; then
+    eval "${PIPELINE_WATCH_PRSTATE_CMD}" "$1" || true
+    return
+  fi
+  gh pr view "$1" --repo cfg-is/cfgms --json state --jq .state 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- ticks
@@ -203,20 +230,28 @@ fast_tick() {
 # queue_tick — emit `queue_removed` for a PR that was in the merge queue last
 # tick and is still open but no longer queued. The first call only seeds the set.
 queue_tick() {
-  local first_run=0 rows queued="" num state prev
+  local first_run=0 rows queued="" num state prev reason seen=" "
   [[ -f "${STATE_DIR}/queue_set" ]] || first_run=1
   prev="$(sget queue_set)"
   rows="$(probe_queue)"
   while IFS=$'\t' read -r num state; do
-    [[ -n "${num:-}" && "${state:-}" == "queued" ]] && queued+="${num} "
+    [[ "${num:-}" =~ ^[0-9]+$ ]] || continue
+    seen+="${num} "
+    [[ "${state:-}" == "queued" ]] && queued+="${num} "
   done < <(printf '%s\n' "${rows}")
-  if (( ! first_run )); then
-    while IFS=$'\t' read -r num state; do
-      [[ -n "${num:-}" && "${state:-}" == "open" ]] || continue
-      if [[ " ${prev} " == *" ${num} "* ]]; then
-        emit "queue_removed pr=${num} reason=left_queue"
+  if (( ! first_run )) && [[ -n "${rows}" ]]; then
+    for num in ${prev}; do
+      [[ "${num}" =~ ^[0-9]+$ ]] || continue
+      [[ " ${queued} " != *" ${num} "* ]] || continue
+      # Still open and unqueued: removed. Gone from the open list: merged
+      # (silent) or closed (a removal that also closed the PR).
+      if [[ "${seen}" != *" ${num} "* && "$(probe_pr_state "${num}")" != "CLOSED" ]]; then
+        continue
       fi
-    done < <(printf '%s\n' "${rows}")
+      reason="$(probe_removal_reason "${num}" | head -n 1)"
+      [[ "${reason}" =~ ^[a-z_]+$ ]] || reason=""
+      emit "queue_removed pr=${num} reason=${reason:-left_queue}"
+    done
   fi
   # An unreadable probe (no rows at all) keeps the previous set rather than
   # forgetting every queued PR.
@@ -330,6 +365,10 @@ release_pidfile() {
 # startup and does not follow a re-parenting.
 live_ppid() {
   local stat
+  if [[ -n "${PIPELINE_WATCH_LIVE_PPID_CMD:-}" ]]; then
+    eval "${PIPELINE_WATCH_LIVE_PPID_CMD}"
+    return
+  fi
   if [[ -r "/proc/$$/stat" ]]; then
     stat="$(cat "/proc/$$/stat" 2>/dev/null || true)"
     stat="${stat##*) }"      # drop "pid (comm) "; the rest is "state ppid ..."
@@ -347,7 +386,7 @@ host_gone() {
   if [[ "${watch_parent}" =~ ^[0-9]+$ ]] && ! pid_alive "${watch_parent}"; then
     return 0
   fi
-  if [[ "${watch_parent}" != "1" && "$(live_ppid)" == "1" ]]; then
+  if [[ "$(live_ppid)" == "1" ]]; then
     return 0
   fi
   return 1
@@ -438,7 +477,10 @@ cmd_watch() {
     emit "${gap_line}"
     # A queue removal during the gap is consumed by the baseline like any
     # other edge; name it here so it is reported once, not lost.
-    printf '%s\n' "${baseline}" | grep '^EVENT queue_removed ' || true
+    local qline
+    while IFS= read -r qline; do
+      emit "${qline#EVENT }"
+    done < <(printf '%s\n' "${baseline}" | grep '^EVENT queue_removed ' || true)
   fi
 
   local last_slow="${now}" streak

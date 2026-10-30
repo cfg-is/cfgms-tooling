@@ -531,6 +531,22 @@ out="$(orphan_env; PIPELINE_WATCH_SHA_CMD="printf 'sha-orphan\n'" \
 check_not_contains "a watch after the orphan exit does not print already running" "${out}" "already running"
 check_eq "and that watch stays up" "${rc}" "124"
 
+# Defence 3: the parent is PID 1 at a tick (not a change of parent).
+bash "${WATCH}" reset >/dev/null
+(
+  orphan_env
+  export PIPELINE_WATCH_SHA_CMD="printf 'sha-p1\n'" PIPELINE_WATCH_LIVE_PPID_CMD="echo 1"
+  bash "${WATCH}" watch > "${TMP}/p1_out" 2>&1 &
+  echo $! > "${TMP}/p1_pid"
+  wait_pidfile
+)
+p1_pid="$(cat "${TMP}/p1_pid")"
+rc=0; wait_gone "${p1_pid}" 3 || rc=$?
+check_eq "defence 3: the watcher exits within two fast ticks when its parent is PID 1" "${rc}" "0"
+check_eq "defence 3: watch.pid is removed" \
+  "$([[ -e "${PO_CACHE_DIR}/watch/watch.pid" ]] && echo present || echo absent)" "absent"
+kill "${p1_pid}" 2>/dev/null || true
+
 # Defence 1: the reader of stdout goes away; the next emitted event fails.
 bash "${WATCH}" reset >/dev/null
 (
@@ -577,6 +593,8 @@ bash "${WATCH}" reset >/dev/null
 qslow() { PIPELINE_WATCH_BOARD_CMD="${TMP}/board.sh" \
           PIPELINE_WATCH_PRS_CMD="printf ''" \
           PIPELINE_WATCH_QUEUE_CMD="printf '%b' '$1'" \
+          PIPELINE_WATCH_REASON_CMD="printf ''; : " \
+          PIPELINE_WATCH_PRSTATE_CMD="echo MERGED; : " \
           bash "${WATCH}" tick-slow 2>&1; }
 out="$(qslow '7\tqueued\n8\tqueued\n9\topen\n')"
 check_eq "first slow tick seeds the queue set silently" "${out}" ""
@@ -588,6 +606,25 @@ check_not_contains "a PR that merged (no longer open) is not a removal" "${out}"
 out="$(qslow '8\topen\n')"
 check_not_contains "a removal is reported once" "${out}" "queue_removed"
 
+# GitHub's reason is reported, and a removal that also closed the PR counts.
+bash "${WATCH}" reset >/dev/null
+qreason() { PIPELINE_WATCH_BOARD_CMD="${TMP}/board.sh" PIPELINE_WATCH_PRS_CMD="printf ''" \
+            PIPELINE_WATCH_QUEUE_CMD="printf '%b' '$1'" \
+            PIPELINE_WATCH_REASON_CMD="echo failed_checks; : " \
+            PIPELINE_WATCH_PRSTATE_CMD="$2; : " \
+            bash "${WATCH}" tick-slow 2>&1; }
+qreason '21\tqueued\n22\tqueued\n23\tqueued\n' 'echo MERGED' >/dev/null
+out="$(qreason '21\topen\n22\tqueued\n' 'echo MERGED')"
+check_eq "exactly one queue_removed line, with the GitHub reason" "${out}" "EVENT queue_removed pr=21 reason=failed_checks"
+bash "${WATCH}" reset >/dev/null
+qreason '31\tqueued\n32\topen\n' 'echo CLOSED' >/dev/null
+out="$(qreason '32\topen\n' 'echo CLOSED')"
+check_eq "a removed-and-closed PR emits queue_removed" "${out}" "EVENT queue_removed pr=31 reason=failed_checks"
+bash "${WATCH}" reset >/dev/null
+qreason '41\tqueued\n42\topen\n' 'echo MERGED' >/dev/null
+out="$(qreason '42\topen\n' 'echo MERGED')"
+check_eq "a merged PR gone from the open list is silent" "${out}" ""
+
 # --- resume gap names the PRs whose check state changed -----------------------
 bash "${WATCH}" reset >/dev/null
 gapwatch() { PIPELINE_WATCH_DRAINED_LIMIT=99 \
@@ -597,6 +634,8 @@ gapwatch() { PIPELINE_WATCH_DRAINED_LIMIT=99 \
        PIPELINE_WATCH_BOARD_CMD="echo 0" \
        PIPELINE_WATCH_PRS_CMD="printf '%b' '$1'" \
        PIPELINE_WATCH_QUEUE_CMD="printf '%b' '$2'" \
+       PIPELINE_WATCH_REASON_CMD="printf ''; : " \
+       PIPELINE_WATCH_PRSTATE_CMD="echo MERGED; : " \
        timeout 3 bash "${WATCH}" watch 2>&1 || true; }
 out="$(gapwatch '5125\tpending\n5127\tpending\n5130\tpending\n5131\tpending\n' '5131\tqueued\n')"
 check_contains "cold start" "${out}" "reason=startup"
