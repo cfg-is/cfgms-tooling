@@ -99,7 +99,7 @@ if command -v flock >/dev/null 2>&1; then
   )
   read -r fail ran < "$TMP/counts"
 else
-  mkdir "$TMP/rebuild.lock.d"
+  : > "$TMP/rebuild.lock.held"
   out="$(run_prune 0.95)"; log="$(cat "$TMP/docker.log")"
   check_contains "held rebuild lock skips" "$out" "DOCKER_PRUNED:skipped=build_in_progress"
   check_not_contains "held rebuild lock: no prune invoked" "$log" "prune"

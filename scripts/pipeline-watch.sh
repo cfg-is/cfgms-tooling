@@ -28,6 +28,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=lib/atomic-lock.sh
+source "${SCRIPT_DIR}/lib/atomic-lock.sh"
 
 FAST_INTERVAL="${PIPELINE_WATCH_FAST:-60}"
 SLOW_INTERVAL="${PIPELINE_WATCH_SLOW:-300}"
@@ -317,18 +319,19 @@ pid_alive() {
 # claim_pidfile — the single-instance guard. Reading the pid file, checking it
 # and writing it must be ONE step: done separately, two starts racing from cold
 # state both read "nobody running", both write, and both emit a startup cycle
-# (issue #4137). A lock directory serialises the three: mkdir is atomic on every
-# filesystem bash runs on, and flock is not shipped with Git Bash.
+# (issue #4137). A lock file serialises the three: atomic_lock_try (bash O_EXCL
+# creation) is atomic on every filesystem, unlike the mkdir binary under
+# uutils coreutils; flock is not shipped with Git Bash.
 claim_pidfile() {
-  local lockdir="${STATE_DIR}/watch.lock.d" waited=0 existing rc=0
-  until mkdir "${lockdir}" 2>/dev/null; do
+  local lockdir="${STATE_DIR}/watch.lock" waited=0 existing rc=0
+  until atomic_lock_try "${lockdir}"; do
     waited=$((waited + 1))
     if (( waited > 50 )); then
       # The critical section below takes milliseconds, so a lock older than a
       # minute belongs to a start that died inside it. Reclaim it instead of
       # locking the host out until someone deletes it by hand.
       if [[ -n "$(find "${lockdir}" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
-        rmdir "${lockdir}" 2>/dev/null || true
+        rm -f "${lockdir}" 2>/dev/null || true
         waited=0
         continue
       fi
@@ -346,7 +349,7 @@ claim_pidfile() {
     # reclaimed here.
     printf '%s\n' "$$" > "${pidfile}"
   fi
-  rmdir "${lockdir}" 2>/dev/null || true
+  rm -f "${lockdir}" 2>/dev/null || true
   return "${rc}"
 }
 

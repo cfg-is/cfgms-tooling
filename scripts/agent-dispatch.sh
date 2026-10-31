@@ -26,6 +26,11 @@ if [[ -f "${_agent_dispatch_self_root}/.devcontainer/agent-context.sh" ]]; then
   source "${_agent_dispatch_self_root}/.devcontainer/agent-context.sh"
 fi
 
+# Atomic lock helper (Issue #5708). Resolved from this file's own location, not
+# $0 or cwd, because tests and the dispatcher source this script.
+# shellcheck source=lib/atomic-lock.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/atomic-lock.sh"
+
 # Base directory for per-agent API key tmpfs files.
 # Override CFGMS_TEST_CRED_BASE in hermetic tests.
 AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
@@ -153,7 +158,8 @@ AGENT_LEDGER_FILE="${AGENT_LEDGER_DIR}/ledger.jsonl"
 # this host's Git-Bash/MSYS usr/bin; its "command not found" (exit 127) was
 # being swallowed identically to lock contention by a bare `|| exit 0`, so
 # every guarded write silently never happened (Issue #3686) — falls back to an
-# mkdir-based spinlock, atomic on every filesystem bash runs on. Either way:
+# O_EXCL lock-file spinlock (atomic_lock_try; the mkdir binary is not atomic
+# under uutils coreutils, Issue #5708). Either way:
 # best-effort, matching every caller's existing contract that a lock-guarded
 # write must never block or fail the caller beyond the timeout.
 _cfgms_locked_do() {
@@ -164,14 +170,14 @@ _cfgms_locked_do() {
       "$body_fn"
     ) 200>>"$lockfile" 2>/dev/null || true
   else
-    local lockdir="${lockfile}.d" waited=0 max_waits=$((timeout * 5))
-    while ! mkdir "$lockdir" 2>/dev/null; do
+    local heldfile="${lockfile}.held" waited=0 max_waits=$((timeout * 5))
+    while ! atomic_lock_try "$heldfile"; do
       waited=$((waited + 1))
       [[ $waited -gt $max_waits ]] && return 0
       sleep 0.2
     done
     "$body_fn" 2>/dev/null || true
-    rmdir "$lockdir" 2>/dev/null || true
+    rm -f "$heldfile" 2>/dev/null || true
   fi
 }
 
@@ -1552,24 +1558,24 @@ _image_rebuild_proc_start() {
   return 0
 }
 
-# _image_rebuild_write_holder <lockdir> — records this process's identity
-# (pid, host, start time) into a just-acquired fallback lock directory. Called
-# once, immediately after the mkdir that wins the lock, so the window where
-# the lock directory exists without a holder record is as small as possible.
+# _image_rebuild_write_holder <lockfile> — records this process's identity
+# (pid, host, start time) into a just-acquired fallback lock file. Called
+# once, immediately after the atomic_lock_try that wins the lock, so the window
+# where the lock file exists without a holder record is as small as possible.
 #
 # Records $BASHPID, not $$: the gate calls _image_rebuild inside a command
 # substitution, so $$ names the dispatch script while $BASHPID names the
-# subshell that actually runs the build and removes the directory. A dead
+# subshell that actually runs the build and removes the lock file. A dead
 # holder is exactly that subshell being gone.
 _image_rebuild_write_holder() {
-  local lockdir="$1"
+  local lockfile="$1"
   _image_rebuild_hostname
   _image_rebuild_proc_start "$BASHPID"
   {
     printf 'pid=%s\n' "$BASHPID"
     printf 'host=%s\n' "$_IMAGE_REBUILD_HOSTNAME"
     printf 'start=%s\n' "$_IMAGE_REBUILD_PROC_START"
-  } >"${lockdir}/holder" 2>/dev/null || true
+  } >|"$lockfile" 2>/dev/null || true
 }
 
 # _image_rebuild_read_holder <holder_file> — parses a holder record into
@@ -1607,19 +1613,19 @@ _image_rebuild_read_holder() {
   [[ "$_IMAGE_REBUILD_HOLDER_PID" =~ ^[0-9]+$ ]]
 }
 
-# _image_rebuild_lock_stale <lockdir> — true if <lockdir>'s recorded holder is
+# _image_rebuild_lock_stale <lockfile> — true if <lockfile>'s recorded holder is
 # provably no longer running it, so a waiter may reclaim it instead of
 # spinning out the full budget (Issue #4419: a holder that dies mid-build --
 # OOM-killed docker build, kill -9, host reboot -- never removes the
-# directory, and nothing else did either). Fails closed at every ambiguous
+# lock file, and nothing else did either). Fails closed at every ambiguous
 # step -- no holder record yet, a record from a different host, or a start
 # time that can't be compared -- by reporting "not stale": a wrongly reclaimed
 # live lock breaks the one guarantee this lock exists for (two concurrent
 # docker builds), while a wrongly retained dead lock only costs the waiter the
 # bounded spin budget.
 _image_rebuild_lock_stale() {
-  local lockdir="$1"
-  _image_rebuild_read_holder "${lockdir}/holder" || return 1
+  local lockfile="$1"
+  _image_rebuild_read_holder "$lockfile" || return 1
 
   _image_rebuild_hostname
   [[ "$_IMAGE_REBUILD_HOLDER_HOST" == "$_IMAGE_REBUILD_HOSTNAME" ]] || return 1
@@ -1632,58 +1638,58 @@ _image_rebuild_lock_stale() {
      && "$recorded_start" != "$_IMAGE_REBUILD_PROC_START" ]]
 }
 
-# _image_rebuild_reclaim <lockdir> — take a lock directory away from a holder
+# _image_rebuild_reclaim <lockfile> — take a lock file away from a holder
 # that is provably dead. Returns 0 only when this process now holds a freshly
-# created <lockdir> (holder record written); non-zero means keep waiting.
+# created <lockfile> (holder record written); non-zero means keep waiting.
 #
-# Removing and re-creating the directory has to be one indivisible step. Two
-# waiters that independently judge the same directory stale otherwise
+# Removing and re-creating the file has to be one indivisible step. Two
+# waiters that independently judge the same lock stale otherwise
 # interleave as remove / create / remove / create and BOTH end up believing
 # they hold the lock — the concurrent `docker build` this lock exists to
 # prevent, and a likelier interleaving than it looks, since waiters spin in
-# lockstep on the same 0.2s cadence. A nested lock directory
-# (<lockdir>.reclaim, held for the handful of syscalls below and nothing else)
+# lockstep on the same 0.2s cadence. A nested lock file
+# (<lockfile>.reclaim, held for the handful of syscalls below and nothing else)
 # admits one reclaimer at a time, and re-checking liveness inside it means a
 # waiter that queued behind the reclaimer sees the new, live holder and goes
 # back to waiting instead of deleting it.
 _image_rebuild_reclaim() {
-  local lockdir="$1" reclaim="${lockdir}.reclaim"
-  _image_rebuild_lock_stale "$lockdir" || return 1
+  local lockfile="$1" reclaim="${lockfile}.reclaim"
+  _image_rebuild_lock_stale "$lockfile" || return 1
 
-  if ! mkdir "$reclaim" 2>/dev/null; then
+  if ! atomic_lock_try "$reclaim"; then
     # Either another waiter is mid-reclaim (leave it to them), or a previous
     # reclaimer died holding this directory. The same liveness check that
     # recovers the main lock recovers this one, so that one dead reclaimer
     # cannot disable stale-lock recovery on the host until someone deletes the
     # directory by hand.
     _image_rebuild_lock_stale "$reclaim" || return 1
-    rm -rf "$reclaim" 2>/dev/null || true
-    mkdir "$reclaim" 2>/dev/null || return 1
+    rm -f "$reclaim" 2>/dev/null || true
+    atomic_lock_try "$reclaim" || return 1
   fi
   _image_rebuild_write_holder "$reclaim"
 
   local held=1
-  if _image_rebuild_lock_stale "$lockdir"; then
-    rm -rf "$lockdir" 2>/dev/null || true
-    if mkdir "$lockdir" 2>/dev/null; then
-      _image_rebuild_write_holder "$lockdir"
+  if _image_rebuild_lock_stale "$lockfile"; then
+    rm -f "$lockfile" 2>/dev/null || true
+    if atomic_lock_try "$lockfile"; then
+      _image_rebuild_write_holder "$lockfile"
       held=0
     fi
   fi
-  rm -rf "$reclaim" 2>/dev/null || true
+  rm -f "$reclaim" 2>/dev/null || true
   return $held
 }
 
 # _image_rebuild <checkout_hash> — serializes _image_rebuild__body so two
 # concurrent launches never build at the same time. Prefers flock (the kernel
 # releases an FD lock when its holder dies, so a crash can't strand it); falls
-# back to the same mkdir spinlock _cfgms_locked_do uses when flock is absent.
+# back to the same O_EXCL lock-file spinlock _cfgms_locked_do uses when flock is absent.
 # Unlike _cfgms_locked_do this is NOT best-effort — a rebuild that is silently
 # skipped under lock contention would let the caller launch on the stale image
 # it was trying to replace, so a lock timeout is itself a rebuild failure. On
-# the mkdir fallback specifically, a dead holder's directory is never removed
-# by the kernel, so every waiter checks holder liveness each time mkdir loses
-# the race and reclaims the directory (_image_rebuild_reclaim) instead of
+# the fallback specifically, a dead holder's lock file is never removed
+# by the kernel, so every waiter checks holder liveness each time the acquire
+# loses the race and reclaims the file (_image_rebuild_reclaim) instead of
 # spinning out the budget against a lock nobody is going to release.
 _image_rebuild() {
   local checkout_hash="$1"
@@ -1695,11 +1701,11 @@ _image_rebuild() {
       _image_rebuild__body "$checkout_hash"
     ) 200>"$IMAGE_REBUILD_LOCK"
   else
-    local lockdir="${IMAGE_REBUILD_LOCK}.d" waited=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-      # Reclaim hands back a lock directory this process now holds, so there is
-      # nothing left to race for — break out rather than re-entering mkdir.
-      if _image_rebuild_reclaim "$lockdir"; then
+    local lockfile="${IMAGE_REBUILD_LOCK}.held" waited=0
+    while ! atomic_lock_try "$lockfile"; do
+      # Reclaim hands back a lock file this process now holds, so there is
+      # nothing left to race for — break out rather than re-acquiring.
+      if _image_rebuild_reclaim "$lockfile"; then
         break
       fi
       waited=$((waited + 1))
@@ -1709,10 +1715,10 @@ _image_rebuild() {
       fi
       sleep 0.2
     done
-    _image_rebuild_write_holder "$lockdir"
+    _image_rebuild_write_holder "$lockfile"
     local rc=0
     _image_rebuild__body "$checkout_hash" || rc=$?
-    rm -rf "$lockdir" 2>/dev/null || true
+    rm -f "$lockfile" 2>/dev/null || true
     return $rc
   fi
 }
@@ -1857,14 +1863,14 @@ _docker_prune_reclaim() {
       _docker_prune_body "$image_age" "$cache_age"
     ) 200>"$IMAGE_REBUILD_LOCK"
   else
-    local lockdir="${IMAGE_REBUILD_LOCK}.d"
-    if ! mkdir "$lockdir" 2>/dev/null; then
+    local lockfile="${IMAGE_REBUILD_LOCK}.held"
+    if ! atomic_lock_try "$lockfile"; then
       echo "DOCKER_PRUNED:skipped=build_in_progress"
       return 0
     fi
-    _image_rebuild_write_holder "$lockdir"
+    _image_rebuild_write_holder "$lockfile"
     _docker_prune_body "$image_age" "$cache_age" || true
-    rm -rf "$lockdir" 2>/dev/null || true
+    rm -f "$lockfile" 2>/dev/null || true
   fi
 }
 
