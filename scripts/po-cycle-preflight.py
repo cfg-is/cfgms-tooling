@@ -2871,8 +2871,7 @@ def main():
 
     draft_dep_states = {}
     if draft_dep_ids:
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "..", "..", "scripts", "project-queue.sh")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "project-queue.sh")
         for item_id in sorted(draft_dep_ids):
             try:
                 res = subprocess.run(

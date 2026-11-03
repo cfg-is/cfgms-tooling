@@ -7,7 +7,7 @@ set -euo pipefail
 REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 # Fixed root, outside /workspace, where the review container mounts the harness
 # copy of the merge-gate scripts (Issue #5386). Mirrors the repo layout so the
-# scripts' $(dirname "$0")/../.. resolution lands on it unchanged.
+# scripts' $(dirname "$0")/../../.. resolution lands on it unchanged.
 TRUSTED_ROOT="/opt/cfgms-trusted"
 WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktrees}"
 
