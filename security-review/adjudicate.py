@@ -87,9 +87,9 @@ def default_lane_entrypoint() -> str:
 
 def default_dispatch_script(repo_root: str | None = None) -> str:
     if repo_root:
-        return os.path.join(repo_root, ".claude", "scripts", "agent-dispatch.sh")
+        return os.path.join(repo_root, ".claude", "tooling", "scripts", "agent-dispatch.sh")
     return str(
-        Path(__file__).resolve().parents[3] / ".claude" / "scripts" / "agent-dispatch.sh"
+        Path(__file__).resolve().parents[3] / ".claude" / "tooling" / "scripts" / "agent-dispatch.sh"
     )
 
 

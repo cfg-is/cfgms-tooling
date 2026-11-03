@@ -760,7 +760,7 @@ def default_dispatch_script(repo_root: str | None = None) -> str:
             "cannot determine the repository root to locate agent-dispatch.sh "
             "(`git rev-parse --show-toplevel` failed); pass --repo-root explicitly"
         )
-    return os.path.join(root, ".claude", "scripts", "agent-dispatch.sh")
+    return os.path.join(root, ".claude", "tooling", "scripts", "agent-dispatch.sh")
 
 
 def _materialize_lane_bundle(top_bundle_dir: str, lane_sweep_dir: str) -> str:

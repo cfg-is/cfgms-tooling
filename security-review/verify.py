@@ -135,7 +135,7 @@ def _materialize_verification_snapshot(top_snapshot_dir: str, sub_dir: str) -> s
 
 def default_dispatch_script(repo_root: "str | None" = None) -> str:
     root = repo_root or str(Path(__file__).resolve().parents[3])
-    return os.path.join(root, ".claude", "scripts", "agent-dispatch.sh")
+    return os.path.join(root, ".claude", "tooling", "scripts", "agent-dispatch.sh")
 
 
 def build_verification_input(sweep_id: str, commit_sha: str, findings: list) -> dict:
