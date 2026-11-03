@@ -12,9 +12,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
-POACT="${REPO_ROOT}/.claude/scripts/po-act.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DISPATCH="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
+POACT="${REPO_ROOT}/.claude/tooling/scripts/po-act.sh"
 
 for f in "$DISPATCH" "$POACT"; do
   [[ -f "$f" ]] || { printf 'FAIL: expected file not found: %s\n' "$f" >&2; exit 1; }

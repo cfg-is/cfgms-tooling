@@ -5,7 +5,7 @@
 #
 # All body/comment content is passed via file paths to avoid quoting issues.
 #
-# Usage: ./scripts/pipeline-helper.sh <command> [args...]
+# Usage: ./.claude/tooling/scripts/pipeline-helper.sh <command> [args...]
 set -euo pipefail
 
 REPO="cfg-is/cfgms"
@@ -93,7 +93,7 @@ case "$cmd" in
     # the entry point create-story delegates to.
     vbody="${1:?Usage: validate-story-body <body_file> [epic_num]}"
     vepic="${2:-}"
-    VPREFLIGHT="$(cd "$(dirname "$0")/.." && pwd)/.claude/scripts/po-cycle-preflight.py"
+    VPREFLIGHT="$(cd "$(dirname "$0")" && pwd)/po-cycle-preflight.py"
     if [ ! -f "$vbody" ]; then
       echo "ERROR: Body file not found: $vbody" >&2
       exit 1
@@ -170,8 +170,8 @@ VALIDATE_EOF
       exit 1
     fi
 
-    PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
-    PREFLIGHT="$(cd "$(dirname "$0")/.." && pwd)/.claude/scripts/po-cycle-preflight.py"
+    PROJECT_QUEUE="$(cd "$(dirname "$0")" && pwd)/project-queue.sh"
+    PREFLIGHT="$(cd "$(dirname "$0")" && pwd)/po-cycle-preflight.py"
 
     # cap:* capability tags (descriptive, multi-valued) name the product capability
     # that CONSUMES this story — see docs/product/roadmap.md. For a --defer draft
@@ -489,7 +489,7 @@ SPLICE_EOF
       esac
     done
 
-    PROJECT_QUEUE="$(cd "$(dirname "$0")/.." && pwd)/scripts/project-queue.sh"
+    PROJECT_QUEUE="$(cd "$(dirname "$0")" && pwd)/project-queue.sh"
     mat_json=$(bash "$PROJECT_QUEUE" materialize "$item_id")
     issue_num=$(echo "$mat_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['issue_num'])")
 

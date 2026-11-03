@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the unified SQLite usage store (usage_db.py).
 
-Run: python3 -m unittest discover -s .claude/metrics/tests -t .
+Run: python3 -m unittest discover -s .claude/tooling/metrics/tests -t .
 
 Covers: schema creation, idempotent re-ingest (no duplicate rows on repeat
 runs), incremental skip of unchanged files, dev-agent container tagging and

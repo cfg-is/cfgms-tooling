@@ -6,7 +6,7 @@
 # label), and the INFO:claude_code_version line health-check reports from
 # that label.
 #
-# Claude Code is the one tool in .devcontainer/Dockerfile that is NOT
+# Claude Code is the one tool in .claude/tooling/devcontainer/Dockerfile that is NOT
 # version-pinned — it installs npm's `stable` dist-tag at build time — so the
 # image label is the only record of which release an image actually shipped.
 # That makes two properties load-bearing and both are covered here:
@@ -27,9 +27,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DISPATCH="${REPO_ROOT_REAL}/.claude/scripts/agent-dispatch.sh"
-DOCKERFILE="${REPO_ROOT_REAL}/.devcontainer/Dockerfile"
+REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DISPATCH="${REPO_ROOT_REAL}/.claude/tooling/scripts/agent-dispatch.sh"
+DOCKERFILE="${REPO_ROOT_REAL}/.claude/tooling/devcontainer/Dockerfile"
 AGENT_SETUP_MD="${REPO_ROOT_REAL}/.claude/commands/agent-setup.md"
 
 [[ -f "$DISPATCH" ]] || { printf 'FAIL: agent-dispatch.sh not found at %s\n' "$DISPATCH" >&2; exit 1; }
@@ -63,16 +63,16 @@ if bash -n "$DISPATCH" 2>/dev/null; then ok "agent-dispatch.sh parses"; else bad
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
-# Fixture checkout: a disposable git repo with a .devcontainer tree, so
+# Fixture checkout: a disposable git repo with a .claude/tooling/devcontainer tree, so
 # nothing here depends on (or touches) the real repo.
 FIXTURE_REPO="${SANDBOX}/fixture-repo"
-mkdir -p "${FIXTURE_REPO}/.devcontainer"
-echo "FROM scratch" > "${FIXTURE_REPO}/.devcontainer/Dockerfile"
+mkdir -p "${FIXTURE_REPO}/.claude/tooling/devcontainer"
+echo "FROM scratch" > "${FIXTURE_REPO}/.claude/tooling/devcontainer/Dockerfile"
 GIT=(git -c init.defaultBranch=main -c user.email=test@test.local -c user.name=test)
 "${GIT[@]}" -C "$FIXTURE_REPO" init -q
-"${GIT[@]}" -C "$FIXTURE_REPO" add .devcontainer
+"${GIT[@]}" -C "$FIXTURE_REPO" add .claude/tooling/devcontainer
 "${GIT[@]}" -C "$FIXTURE_REPO" commit -q -m fixture
-CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.devcontainer)"
+CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.claude/tooling/devcontainer)"
 [[ -n "$CHECKOUT_HASH" ]] || { printf 'FAIL: could not compute fixture checkout hash\n' >&2; exit 1; }
 
 export CFGMS_TEST_REPO_ROOT="$FIXTURE_REPO"
@@ -325,7 +325,7 @@ check_contains "health-check (no label): reports 'unknown', not an empty value" 
   "INFO:claude_code_version:unknown"
 # Informational only: an unlabelled image is reported, not warned about — the
 # label is a traceability record, and its absence is not a staleness signal
-# (WARN:image_inputs_stale already covers a stale .devcontainer tree).
+# (WARN:image_inputs_stale already covers a stale .claude/tooling/devcontainer tree).
 check_not_contains "health-check (no label): does not warn on a missing label" "$hc2_out" \
   "WARN:claude_code_version"
 

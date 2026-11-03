@@ -11,7 +11,7 @@ real temp directory -- never a mocked filesystem -- because the whole point
 of `read_refusal_attempts()` is that it works from what a prior process
 actually wrote to disk, not from any in-memory value.
 
-Run: python3 .claude/skills/security-review/lanes/harness_runner_test.py
+Run: python3 .claude/tooling/security-review/lanes/harness_runner_test.py
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import platform_test_support  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-HARNESS_RUNNER_PATH = REPO_ROOT / ".claude/skills/security-review/lanes/harness_runner.py"
+HARNESS_RUNNER_PATH = REPO_ROOT / ".claude/tooling/security-review/lanes/harness_runner.py"
 SKILL_MD_PATH = REPO_ROOT / ".claude/skills/security-review/SKILL.md"
 
 FAILURES: list[str] = []
@@ -1023,9 +1023,9 @@ def test_written_envelope_round_trips_through_schema_validate():
 # architecture doc from disk -- never a copy baked into the test -- so a drift
 # between code, document and docs fails here, not silently.
 
-METHODOLOGY_MD_PATH = REPO_ROOT / ".claude/skills/security-review/docs/methodology.md"
-ARCHITECTURE_MD_PATH = REPO_ROOT / ".claude/skills/security-review/docs/harness-architecture.md"
-SECURITY_REVIEW_DIR = REPO_ROOT / ".claude/skills/security-review"
+METHODOLOGY_MD_PATH = REPO_ROOT / ".claude/tooling/security-review/docs/methodology.md"
+ARCHITECTURE_MD_PATH = REPO_ROOT / ".claude/tooling/security-review/docs/harness-architecture.md"
+SECURITY_REVIEW_DIR = REPO_ROOT / ".claude/tooling/security-review"
 PROMPT_CONSTANT_NAMES = ("SYSTEM_PROMPT", "OUTPUT_SCHEMA_DESCRIPTION", "METHODOLOGY_CORE", "METHODOLOGY_ANCHORS")
 
 
@@ -1070,7 +1070,7 @@ def _raises_methodology_error(fn) -> bool:
 
 
 def test_methodology_document_exists_and_loads_with_two_anchors_per_level():
-    check(METHODOLOGY_MD_PATH.is_file(), ".claude/skills/security-review/docs/methodology.md exists")
+    check(METHODOLOGY_MD_PATH.is_file(), ".claude/tooling/security-review/docs/methodology.md exists")
     check(
         harness_runner.methodology_path() == METHODOLOGY_MD_PATH,
         "harness_runner.methodology_path() resolves to the in-repo document",
@@ -1148,7 +1148,7 @@ def test_always_inlined_core_is_under_the_declared_ceiling_and_is_not_the_whole_
         "METHODOLOGY_CORE_MAX_CHARS" in architecture
         and f"{harness_runner.METHODOLOGY_CORE_MAX_CHARS:,}" in architecture
         and f"{harness_runner.ANCHOR_MAX_CHARS:,}" in architecture,
-        ".claude/skills/security-review/docs/harness-architecture.md records the declared ceilings",
+        ".claude/tooling/security-review/docs/harness-architecture.md records the declared ceilings",
     )
 
 
@@ -1357,7 +1357,7 @@ def test_prompt_constants_are_defined_in_exactly_one_module():
                         definers[element.id].append(py.relative_to(REPO_ROOT).as_posix())
     for name, files in definers.items():
         check(
-            files == [".claude/skills/security-review/lanes/harness_runner.py"],
+            files == [".claude/tooling/security-review/lanes/harness_runner.py"],
             f"{name} is assigned in exactly one module (harness_runner.py)",
             str(files),
         )
@@ -1422,8 +1422,8 @@ def test_every_lane_builds_its_prompt_from_shared_preamble():
 
 def test_skill_md_points_at_the_methodology():
     check(
-        ".claude/skills/security-review/docs/methodology.md" in SKILL_MD_PATH.read_text(encoding="utf-8"),
-        "SKILL.md points an operator at .claude/skills/security-review/docs/methodology.md",
+        ".claude/tooling/security-review/docs/methodology.md" in SKILL_MD_PATH.read_text(encoding="utf-8"),
+        "SKILL.md points an operator at .claude/tooling/security-review/docs/methodology.md",
     )
 
 

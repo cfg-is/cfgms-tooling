@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for .devcontainer/dnsmasq-allowlist.conf (Issue #3905).
+# Tests for .claude/tooling/devcontainer/dnsmasq-allowlist.conf (Issue #3905).
 #
 # Starts a throwaway dnsmasq instance directly against the real allowlist
 # file on an unprivileged port and drives it with `dig` — the same binary
@@ -13,7 +13,7 @@
 # verified empirically against this exact dnsmasq build. "REFUSED" is this
 # suite's fail-closed assertion for that reason.
 #
-# Run: bash .devcontainer/dnsmasq-allowlist_test.sh
+# Run: bash .claude/tooling/devcontainer/dnsmasq-allowlist_test.sh
 set -euo pipefail
 
 # Resolve the real tools this suite drives. dnsmasq is commonly in /usr/sbin,

@@ -17,8 +17,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DISPATCH="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
 
 [[ -f "$DISPATCH" ]] || { printf 'FAIL: not found: %s\n' "$DISPATCH" >&2; exit 1; }
 

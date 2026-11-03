@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coverage tests for atomic_write.py.
 
-Run: python3 .claude/skills/security-review/atomic_write_test.py
+Run: python3 .claude/tooling/security-review/atomic_write_test.py
 """
 from __future__ import annotations
 

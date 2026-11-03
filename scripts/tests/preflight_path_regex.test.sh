@@ -98,7 +98,7 @@ assert_paths "backtick .tsx"  '- `web/src/x.tsx` — edit'     "web/src/x.tsx"
 # ── New extensions from Issue #1861 ──
 assert_paths "backtick .ps1"  '- `scripts/install.ps1` — new' "scripts/install.ps1"
 assert_paths "backtick .wxs"  '- `build/windows/x.wxs` — edit' "build/windows/x.wxs"
-assert_paths "backtick .py"   '- `.claude/scripts/po.py` — edit' ".claude/scripts/po.py"
+assert_paths "backtick .py"   '- `.claude/tooling/scripts/po.py` — edit' ".claude/tooling/scripts/po.py"
 
 # ── Special-case files: Makefile + Dockerfile variants ──
 assert_paths "backtick Makefile"           '- `Makefile` — add target'             "Makefile"

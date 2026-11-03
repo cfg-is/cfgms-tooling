@@ -8,7 +8,7 @@ AC1: The open-PR query only returns PRs based on develop, so a release PR
 AC2: ci_summary() scores a PR with no reported checks as pending, not green.
      A PR to a branch without CI would otherwise look green and be enqueued.
 
-Run: python3 .claude/scripts/tests/test-preflight-release-branch.py
+Run: python3 .claude/tooling/scripts/tests/test-preflight-release-branch.py
 """
 import importlib.util
 import os

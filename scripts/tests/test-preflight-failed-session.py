@@ -4,7 +4,7 @@ Tests: wip_session_failed detector matches the entrypoint draft-PR format
 (Issue #3806).
 
 The detector in po-cycle-preflight.py must recognize the draft PRs the
-container entrypoint (.devcontainer/entrypoint.sh) actually emits, so a
+container entrypoint (.claude/tooling/devcontainer/entrypoint.sh) actually emits, so a
 session-truncated WIP draft gets routed to `resume_failed_session`
 (dispatch-fix resume) instead of `spawn_acceptance_reviewer` (a review of
 unfinished work).
@@ -19,7 +19,7 @@ AC4: Negative cases — non-draft PRs and unrelated human draft PRs are not
 AC5: PR #3794-shaped regression: draft, current-format title/body ->
      action=resume_failed_session, not spawn_acceptance_reviewer.
 
-Run: python3 .claude/scripts/tests/test-preflight-failed-session.py
+Run: python3 .claude/tooling/scripts/tests/test-preflight-failed-session.py
 """
 import importlib.util
 import os
@@ -201,10 +201,10 @@ class TestPR3794RegressionRouting(unittest.TestCase):
 class TestEmitterContractFixtures(unittest.TestCase):
     """Contract test: embeds the emitter's exact title/body formats as
     fixtures with provenance, so a future wording change to
-    .devcontainer/entrypoint.sh:117-118 fails this test loudly instead of
+    .claude/tooling/devcontainer/entrypoint.sh:117-118 fails this test loudly instead of
     silently misrouting production drafts.
 
-    Provenance — .devcontainer/entrypoint.sh:117-118 (as of Issue #3806):
+    Provenance — .claude/tooling/devcontainer/entrypoint.sh:117-118 (as of Issue #3806):
         gh pr create --base develop --draft \\
             --title "WIP: ${CURRENT_BRANCH} (agent produced no PR)" \\
             --body "Agent session ended with exit code ${EXIT_CODE} and no

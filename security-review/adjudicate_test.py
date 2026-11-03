@@ -8,7 +8,7 @@ Hand-rolled, stdlib only, matching every sibling `*_test.py`. The dispatch
 script is a stub that logs its argv (matching `planner_test.py`'s own
 precedent); nothing here runs docker or a model.
 
-Run: python3 .claude/skills/security-review/adjudicate_test.py
+Run: python3 .claude/tooling/security-review/adjudicate_test.py
 """
 from __future__ import annotations
 

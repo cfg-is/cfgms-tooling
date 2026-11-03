@@ -19,7 +19,7 @@ to that process is a control).
 
 **`codex exec` has a built-in one** -- confirmed against the Codex CLI
 actually installed for this story (`@openai/codex@0.153.4`, pinned in
-`.devcontainer/Dockerfile`): `codex exec --output-last-message <FILE>`
+`.claude/tooling/devcontainer/Dockerfile`): `codex exec --output-last-message <FILE>`
 writes the harness's final turn message to `<FILE>` itself, from the
 *outer*, unsandboxed `codex` process -- not from a tool call the model makes.
 Combined with `--sandbox read-only` (Codex's own sandbox policy for any
@@ -92,7 +92,7 @@ def _bootstrap_harness_imports() -> None:
     # `harness_runner`, `scan_profiles` (the scanner allowlist), `schema`,
     # `resume`, ... -- must come from the TRUSTED harness mount
     # (`agent-dispatch.sh launch-investigator` bind-mounts the host's own
-    # `.claude/skills/security-review` read-only at
+    # `.claude/tooling/security-review` read-only at
     # `/opt/cfgms-harness/security-review` and exports its path in
     # `CFGMS_SECURITY_REVIEW_HARNESS_DIR`), never from the audited snapshot at
     # `/workspace`: the snapshot is the code under review, and a reviewed commit
@@ -103,10 +103,10 @@ def _bootstrap_harness_imports() -> None:
     lane_candidates.append(Path(trusted_harness) / "lanes")
     harness_candidates.append(Path(trusted_harness))
     if env_repo_root:
-        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
-        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
-    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
-    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+        lane_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review")
+    lane_candidates.append(Path("/workspace/.claude/tooling/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/tooling/security-review"))
 
     for candidate in lane_candidates:
         if (candidate / "terminal_state.py").is_file():

@@ -27,8 +27,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-POACT="${REPO_ROOT_REAL}/.claude/scripts/po-act.sh"
+REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+POACT="${REPO_ROOT_REAL}/.claude/tooling/scripts/po-act.sh"
 MOCK_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh"
 
 for f in "$POACT" "$MOCK_PIPELINE_HELPER"; do
@@ -70,13 +70,13 @@ SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 FIXTURE_REPO="${SANDBOX}/fixture-repo"
-mkdir -p "${FIXTURE_REPO}/.devcontainer"
-echo "FROM scratch" > "${FIXTURE_REPO}/.devcontainer/Dockerfile"
+mkdir -p "${FIXTURE_REPO}/.claude/tooling/devcontainer"
+echo "FROM scratch" > "${FIXTURE_REPO}/.claude/tooling/devcontainer/Dockerfile"
 GIT=(git -c init.defaultBranch=main -c user.email=test@test.local -c user.name=test)
 "${GIT[@]}" -C "$FIXTURE_REPO" init -q
-"${GIT[@]}" -C "$FIXTURE_REPO" add .devcontainer
+"${GIT[@]}" -C "$FIXTURE_REPO" add .claude/tooling/devcontainer
 "${GIT[@]}" -C "$FIXTURE_REPO" commit -q -m fixture
-CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.devcontainer)"
+CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.claude/tooling/devcontainer)"
 [[ -n "$CHECKOUT_HASH" ]] || { printf 'FAIL: could not compute fixture checkout hash\n' >&2; exit 1; }
 
 WORKTREE_BASE="${SANDBOX}/worktrees"

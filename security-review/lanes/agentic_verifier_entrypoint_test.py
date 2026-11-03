@@ -9,7 +9,7 @@ The cases that matter are the unhappy ones. A stage that dies without writing
 leaves the report unable to tell "did not run" from "found nothing", which is
 the single failure this whole harness is built to prevent.
 
-Run: python3 .claude/skills/security-review/lanes/agentic_verifier_entrypoint_test.py
+Run: python3 .claude/tooling/security-review/lanes/agentic_verifier_entrypoint_test.py
 """
 from __future__ import annotations
 

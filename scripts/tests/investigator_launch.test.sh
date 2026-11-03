@@ -18,9 +18,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
-ENTRYPOINT="${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DISPATCH="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
+ENTRYPOINT="${REPO_ROOT}/.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh"
 AGENT_PROFILE="${REPO_ROOT}/.claude/agents/investigator.md"
 
 for f in "$DISPATCH" "$ENTRYPOINT" "$AGENT_PROFILE"; do
@@ -683,7 +683,7 @@ echo "== REQUIRED TEST — the image pre-creates /home/agent/.codex as agent-own
 echo "   mirroring .claude/.ollama, so the auth.json bind mount above lands in an"
 echo "   already-writable directory instead of a root:root one Docker would"
 echo "   create on demand (Issue #4004) =="
-dockerfile_src="$(cat "${REPO_ROOT}/.devcontainer/Dockerfile")"
+dockerfile_src="$(cat "${REPO_ROOT}/.claude/tooling/devcontainer/Dockerfile")"
 check_contains "Dockerfile creates /home/agent/.codex" "$dockerfile_src" \
   "mkdir -p /home/agent/.codex"
 check_contains "Dockerfile chowns /home/agent/.codex to agent:agent" "$dockerfile_src" \
@@ -1051,7 +1051,7 @@ mkdir -p "$TRAVERSAL_TARGET"
 # Relative traversal from <sweep>/lanes/ back up to the sandbox and into a
 # directory that stands in for an arbitrary host path (a real $HOME, say).
 rel_escape="../../../../$(basename "$SANDBOX")/traversal-target"
-for bad_mode in ".." "." "../.." "lanes/../../.." "a/b" "/etc" "$rel_escape" ".hidden"; do
+for bad_mode in ".." "." "../.." "lanes/../../../.." "a/b" "/etc" "$rel_escape" ".hidden"; do
   : > "$DOCKER_CALL_LOG"
   set +e
   trav_out=$(PATH="${FAKEBIN}:${PATH}" \
@@ -1402,17 +1402,17 @@ echo "   non-test .py under the mounted trusted harness tree), sensitive to"
 echo "   the mounted inputs and insensitive to everything else =="
 
 HARNESS_ID_REPO="${SANDBOX}/harness-id-repo"
-mkdir -p "${HARNESS_ID_REPO}/.devcontainer/scripts" "${HARNESS_ID_REPO}/.claude/skills/security-review" "${HARNESS_ID_REPO}/.claude/agents"
-ENTRYPOINT_FIXTURE="${HARNESS_ID_REPO}/.devcontainer/scripts/investigator-entrypoint.sh"
-SIBLING_FIXTURE="${HARNESS_ID_REPO}/.claude/skills/security-review/schema.py"
+mkdir -p "${HARNESS_ID_REPO}/.claude/tooling/devcontainer/scripts" "${HARNESS_ID_REPO}/.claude/tooling/security-review" "${HARNESS_ID_REPO}/.claude/agents"
+ENTRYPOINT_FIXTURE="${HARNESS_ID_REPO}/.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh"
+SIBLING_FIXTURE="${HARNESS_ID_REPO}/.claude/tooling/security-review/schema.py"
 # Plan mode's own agent-profile mount (Issue #4003) requires this file to
 # exist under CFGMS_TEST_REPO_ROOT for every plan-mode call below, exactly as
 # it requires investigator-entrypoint.sh to exist -- a missing one is now a
 # hard failure, same as a missing entrypoint would be.
 AGENT_PROFILE_FIXTURE="${HARNESS_ID_REPO}/.claude/agents/investigator.md"
 printf 'investigator agent profile v1\n' > "$AGENT_PROFILE_FIXTURE"
-mkdir -p "${HARNESS_ID_REPO}/.claude/skills/security-review/docs"
-printf 'methodology v1\n' > "${HARNESS_ID_REPO}/.claude/skills/security-review/docs/methodology.md"
+mkdir -p "${HARNESS_ID_REPO}/.claude/tooling/security-review/docs"
+printf 'methodology v1\n' > "${HARNESS_ID_REPO}/.claude/tooling/security-review/docs/methodology.md"
 LANE_ENTRYPOINT_A="${SANDBOX}/lane-entrypoint-a.py"
 LANE_ENTRYPOINT_B="${SANDBOX}/lane-entrypoint-b.py"
 printf 'lane entrypoint content A\n' > "$LANE_ENTRYPOINT_A"
@@ -1564,7 +1564,7 @@ fi
 
 echo ""
 echo "== REQUIRED TEST (Issue #3982) — the whole trusted harness tree"
-echo "   .claude/skills/security-review/ is now bind-mounted read-only at"
+echo "   .claude/tooling/security-review/ is now bind-mounted read-only at"
 echo "   /opt/cfgms-harness/security-review for a lane, so changing a sibling"
 echo "   .py module between two calls MUST change the recorded hash (it is"
 echo "   mounted, executed code), while a *_test.py sibling (never executed by a"
@@ -1579,7 +1579,7 @@ if [[ -n "$hash_sibling_before" && -n "$hash_sibling_after" && "$hash_sibling_be
 else
   bad "changing a mounted sibling harness module changes the recorded hash" "before=${hash_sibling_before} after=${hash_sibling_after}"
 fi
-SIBLING_TEST_FIXTURE="${HARNESS_ID_REPO}/.claude/skills/security-review/schema_test.py"
+SIBLING_TEST_FIXTURE="${HARNESS_ID_REPO}/.claude/tooling/security-review/schema_test.py"
 printf 'test v1\n' > "$SIBLING_TEST_FIXTURE"
 hash_testfile_before="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
 printf 'test v2 CHANGED\n' > "$SIBLING_TEST_FIXTURE"
@@ -1590,12 +1590,12 @@ else
   bad "changing a *_test.py sibling does NOT change the recorded hash" "before=${hash_testfile_before} after=${hash_testfile_after}"
 fi
 check_contains "lane launch bind-mounts the trusted harness tree read-only at /opt/cfgms-harness/security-review" \
-  "$(cat "$DOCKER_CALL_LOG")" "${HARNESS_ID_REPO}/.claude/skills/security-review:/opt/cfgms-harness/security-review:ro"
+  "$(cat "$DOCKER_CALL_LOG")" "${HARNESS_ID_REPO}/.claude/tooling/security-review:/opt/cfgms-harness/security-review:ro"
 check_contains "lane launch exports CFGMS_SECURITY_REVIEW_HARNESS_DIR" \
   "$(cat "$DOCKER_CALL_LOG")" "CFGMS_SECURITY_REVIEW_HARNESS_DIR=/opt/cfgms-harness/security-review"
 check_contains "lane launch bind-mounts the trusted methodology beside the harness" \
-  "$(cat "$DOCKER_CALL_LOG")" "${HARNESS_ID_REPO}/.claude/skills/security-review/docs:/opt/cfgms-harness/docs/security-review:ro"
-printf 'methodology v2 CHANGED\n' > "${HARNESS_ID_REPO}/.claude/skills/security-review/docs/methodology.md"
+  "$(cat "$DOCKER_CALL_LOG")" "${HARNESS_ID_REPO}/.claude/tooling/security-review/docs:/opt/cfgms-harness/docs/security-review:ro"
+printf 'methodology v2 CHANGED\n' > "${HARNESS_ID_REPO}/.claude/tooling/security-review/docs/methodology.md"
 hash_method_after="$(run_hid_launch hid-lane "$LANE_ENTRYPOINT_A")"
 if [[ -n "$hash_sibling_after" && -n "$hash_method_after" && "$hash_sibling_after" != "$hash_method_after" ]]; then
   ok "changing the mounted methodology changes the recorded hash"

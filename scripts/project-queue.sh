@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PIPELINE_YAML="${SCRIPT_DIR}/../.claude/pipeline.yaml"
+PIPELINE_YAML="${SCRIPT_DIR}/../../pipeline.yaml"
 REPO_OWNER="cfg-is"
 REPO_NAME="cfgms"
 

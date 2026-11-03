@@ -27,7 +27,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 # shellcheck source=lib/atomic-lock.sh
 source "${SCRIPT_DIR}/lib/atomic-lock.sh"
 
@@ -93,7 +93,7 @@ probe_board() {
     eval "${PIPELINE_WATCH_BOARD_CMD} \"\${status}\"" || true
     return
   fi
-  "${REPO_ROOT}/scripts/project-queue.sh" list-by-status "${status}" 2>/dev/null \
+  "${REPO_ROOT}/.claude/tooling/scripts/project-queue.sh" list-by-status "${status}" 2>/dev/null \
     | grep -m1 '^\[' \
     | python3 -c 'import json,sys; d=sys.stdin.read().strip(); print(len(json.loads(d)) if d else 0)' \
     2>/dev/null || printf '\n'

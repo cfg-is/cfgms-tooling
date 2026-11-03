@@ -2,7 +2,7 @@
 """Coverage tests for roster.py: CFGMS_SECURITY_REVIEW_LANES parsing (Issue
 #3932, epic #3927's contract C5).
 
-Run: python3 .claude/skills/security-review/roster_test.py
+Run: python3 .claude/tooling/security-review/roster_test.py
 """
 from __future__ import annotations
 

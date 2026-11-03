@@ -7,7 +7,7 @@ the mechanical half of the allowlist: a registry entry that names an
 unlisted executable, carries a shell metacharacter, points semgrep at a
 registry/URL config, or drops its bounds must fail here before it can merge.
 
-Run: python3 .claude/skills/security-review/lanes/scan_profiles_test.py
+Run: python3 .claude/tooling/security-review/lanes/scan_profiles_test.py
 """
 from __future__ import annotations
 

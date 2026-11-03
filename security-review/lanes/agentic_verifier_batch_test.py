@@ -9,7 +9,7 @@ The cases that matter here are the ones where a batch goes half-right: a model
 that answers four findings of five, answers one twice, or invents a finding
 number. Those must neither discard good verdicts nor accept bad ones.
 
-Run: python3 .claude/skills/security-review/lanes/agentic_verifier_batch_test.py
+Run: python3 .claude/tooling/security-review/lanes/agentic_verifier_batch_test.py
 """
 from __future__ import annotations
 

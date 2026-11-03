@@ -26,7 +26,7 @@ makes this test fail: the whole point of running the real script against a
 real subprocess and then really consolidating is that there is no seam left
 for a stub to paper over.
 
-Run: python3 .claude/skills/security-review/lanes/claude_lane_integration_test.py
+Run: python3 .claude/tooling/security-review/lanes/claude_lane_integration_test.py
 """
 from __future__ import annotations
 

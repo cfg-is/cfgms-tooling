@@ -5,7 +5,7 @@ Hand-rolled, stdlib only, exit 0 on all-pass. `launch()` is exercised against a
 stub dispatch script that records its own argv, so the argument the whole story
 turns on -- which snapshot gets mounted -- is asserted rather than assumed.
 
-Run: python3 .claude/skills/security-review/verify_test.py
+Run: python3 .claude/tooling/security-review/verify_test.py
 """
 from __future__ import annotations
 

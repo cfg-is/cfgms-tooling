@@ -6,7 +6,7 @@ Hand-rolled (no unittest, no third-party test runner), matching the
 `planner_test.py` / `metadata_test.py` convention: stdlib only, exit 0 on
 all-pass, run directly by `scripts/test-scripts.sh`.
 
-Run: python3 .claude/skills/security-review/partition_test.py
+Run: python3 .claude/tooling/security-review/partition_test.py
 """
 from __future__ import annotations
 

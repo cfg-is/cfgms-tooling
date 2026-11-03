@@ -8,7 +8,7 @@ unexpected in-repo path.
 `resolve_base_dir()` reads `CFGMS_SECURITY_REVIEW_BASE`, defaulting to
 `${HOME}/.cache/cfgms-security-review` only when the env var is genuinely
 unset -- matching the `CFGMS_AGENT_SESSIONS_BASE` / `CFGMS_AGENT_LEDGER_DIR`
-precedent (`.claude/scripts/agent-dispatch.sh`). If resolution produces a path
+precedent (`.claude/tooling/scripts/agent-dispatch.sh`). If resolution produces a path
 that is empty, equal to `.`, lands inside the repository root (or any
 ancestor-inclusive subpath of it), or cannot be created/written, it raises
 `BaseDirError` -- callers exit non-zero and write nothing. There is

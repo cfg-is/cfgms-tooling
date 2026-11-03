@@ -2,7 +2,7 @@
 """Regression corpus: load entries, and score a sweep's findings against them
 (Issue #4059).
 
-`.claude/skills/security-review/docs/regression-corpus.md` is the public index -- ids,
+`.claude/tooling/security-review/docs/regression-corpus.md` is the public index -- ids,
 commits, classes. Entry detail lives outside the repository, under
 `<base>/corpus/<id>.json`, because an entry describes a defect that is still
 present at the commit it names.
@@ -39,7 +39,7 @@ import json
 import os
 import re
 
-INDEX_RELATIVE_PATH = ".claude/skills/security-review/docs/regression-corpus.md"
+INDEX_RELATIVE_PATH = ".claude/tooling/security-review/docs/regression-corpus.md"
 CORPUS_SUBDIR = "corpus"
 
 _ROW_RE = re.compile(

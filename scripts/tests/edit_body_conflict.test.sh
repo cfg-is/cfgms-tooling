@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic test for edit-body's optimistic-concurrency check in
-# scripts/pipeline-helper.sh (Issue #4433).
+# .claude/tooling/scripts/pipeline-helper.sh (Issue #4433).
 #
 # Before this story, edit-body replaced an issue body unconditionally: two
 # sessions that both read a body, both revised it, and both wrote it produced
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HELPER="${SCRIPT_DIR}/../../../scripts/pipeline-helper.sh"
+HELPER="${SCRIPT_DIR}/../pipeline-helper.sh"
 [[ -f "$HELPER" ]] || { printf 'FAIL: pipeline-helper.sh not found at %s\n' "$HELPER" >&2; exit 1; }
 
 fail=0; ran=0

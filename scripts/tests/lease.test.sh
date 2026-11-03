@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hermetic tests for the distributed-lease primitive in scripts/pipeline-helper.sh
+# Hermetic tests for the distributed-lease primitive in .claude/tooling/scripts/pipeline-helper.sh
 # (multi-host /po cron coordination). A fake `gh` on PATH simulates the GitHub
 # git-refs REST API with an on-disk ref/commit store, so the real lease logic
 # (atomic create, contention, TTL reclaim, release, status) is exercised without
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HELPER="${SCRIPT_DIR}/../../../scripts/pipeline-helper.sh"
+HELPER="${SCRIPT_DIR}/../pipeline-helper.sh"
 [[ -f "$HELPER" ]] || { printf 'FAIL: pipeline-helper.sh not found at %s\n' "$HELPER" >&2; exit 1; }
 
 fail=0; ran=0

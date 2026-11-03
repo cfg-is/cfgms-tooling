@@ -50,7 +50,7 @@
 #
 # Exit codes: 0 = success (with or without findings), 2 = usage error.
 #
-# Usage: scripts/pr-security-findings.sh <PR_NUM>
+# Usage: .claude/tooling/scripts/pr-security-findings.sh <PR_NUM>
 
 set -euo pipefail
 

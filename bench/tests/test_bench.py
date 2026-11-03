@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the benchmark harness.
 
-Run: python3 .claude/bench/tests/test_bench.py
+Run: python3 .claude/tooling/bench/tests/test_bench.py
 
 The harness exists to decide whether a model change was an improvement, so its
 own scoring has to be trustworthy. The tests that matter most are the ones

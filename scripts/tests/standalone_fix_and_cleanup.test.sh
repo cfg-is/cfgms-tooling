@@ -12,7 +12,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HELPER="${SCRIPT_DIR}/../../../scripts/pipeline-helper.sh"
+HELPER="${SCRIPT_DIR}/../pipeline-helper.sh"
 DISPATCH="${SCRIPT_DIR}/../agent-dispatch.sh"
 
 for f in "${HELPER}" "${DISPATCH}"; do

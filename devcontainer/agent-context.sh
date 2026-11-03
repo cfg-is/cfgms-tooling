@@ -8,7 +8,7 @@
 # All render_* functions accept JSON on their first arg and print markdown to
 # stdout. All fetch_* functions print JSON to stdout; callers capture via $().
 #
-# This file is sourced by .devcontainer/entrypoint.sh. Do not `exit` from here.
+# This file is sourced by .claude/tooling/devcontainer/entrypoint.sh. Do not `exit` from here.
 
 # ----------------------------------------------------------------------------
 # Fetch helpers
@@ -525,7 +525,7 @@ EOF
 # gate judging it. Dev and fix agents consume untrusted issue/PR text, so branch
 # content is never a trusted input to harness configuration (same rule as the
 # token reporter, Issue #3041). The image bakes this file
-# (.devcontainer/Dockerfile) and every dispatch path bind-mounts the harness
+# (.claude/tooling/devcontainer/Dockerfile) and every dispatch path bind-mounts the harness
 # checkout's copy over it read-only, so routing edits need no image rebuild.
 #
 # CFGMS_MODEL_ROUTING_FILE is the host operator's escape hatch (used by the

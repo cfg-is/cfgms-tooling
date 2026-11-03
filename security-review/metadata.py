@@ -473,7 +473,7 @@ TIER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("business", ("features/*", "internal/*", "pkg/*")),
     ("docs", ("docs/*", "*.md", "LICENSE", "LICENSE.*", "examples/*")),
     ("tooling", (
-        ".github/*", ".devcontainer/*", ".claude/*", ".serena/*", "scripts/*", "build/*",
+        ".github/*", ".claude/tooling/devcontainer/*", ".claude/*", ".serena/*", "scripts/*", "build/*",
         "*.sh", "*.ps1", "Makefile", "Dockerfile*", "docker-compose*.yml", "buf.yaml", "buf.*.yaml",
     )),
     ("config", (

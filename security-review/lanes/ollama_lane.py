@@ -74,7 +74,7 @@ to a local `ollama serve` daemon; reaching Ollama Cloud without one signed in
 returns the same exit-0/401 shape described above regardless of `OLLAMA_HOST`
 (a daemon is the thing that actually signs a Cloud request with the
 `ollama signin` keypair). Starting and health-checking that daemon is
-`.devcontainer/scripts/investigator-entrypoint.sh`'s job, once, before this
+`.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh`'s job, once, before this
 script's `main()` ever runs -- this module assumes a ready daemon exactly as
 every other lane assumes a ready, authenticated CLI.
 
@@ -129,7 +129,7 @@ def _bootstrap_harness_imports() -> None:
     # `harness_runner`, `scan_profiles` (the scanner allowlist), `schema`,
     # `resume`, ... -- must come from the TRUSTED harness mount
     # (`agent-dispatch.sh launch-investigator` bind-mounts the host's own
-    # `.claude/skills/security-review` read-only at
+    # `.claude/tooling/security-review` read-only at
     # `/opt/cfgms-harness/security-review` and exports its path in
     # `CFGMS_SECURITY_REVIEW_HARNESS_DIR`), never from the audited snapshot at
     # `/workspace`: the snapshot is the code under review, and a reviewed commit
@@ -140,10 +140,10 @@ def _bootstrap_harness_imports() -> None:
     lane_candidates.append(Path(trusted_harness) / "lanes")
     harness_candidates.append(Path(trusted_harness))
     if env_repo_root:
-        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
-        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
-    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
-    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+        lane_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review")
+    lane_candidates.append(Path("/workspace/.claude/tooling/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/tooling/security-review"))
 
     for candidate in lane_candidates:
         if (candidate / "terminal_state.py").is_file():

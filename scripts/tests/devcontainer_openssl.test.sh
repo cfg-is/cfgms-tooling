@@ -3,19 +3,19 @@
 #
 # go-tpm's tpm2/transport/simulator wraps go-tpm-tools/simulator, which links
 # -lcrypto, so the cgo TPM simulator tests of #4976 cannot build without
-# libssl-dev in the runtime stage of .devcontainer/Dockerfile.
+# libssl-dev in the runtime stage of .claude/tooling/devcontainer/Dockerfile.
 #
 # Static part (always runs, no docker): libssl-dev is in the runtime stage's
 # apt-get install list, not only in the builder stage.
 # Live part (opt-in): when CFGMS_AGENT_IMAGE_UNDER_TEST names a built image and
 # docker is available, the header and pkg-config entry exist inside it.
 #
-# Run: bash .claude/scripts/tests/devcontainer_openssl.test.sh
+# Run: bash .claude/tooling/scripts/tests/devcontainer_openssl.test.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DOCKERFILE="${DOCKERFILE_UNDER_TEST:-${REPO_ROOT_REAL}/.devcontainer/Dockerfile}"
+REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DOCKERFILE="${DOCKERFILE_UNDER_TEST:-${REPO_ROOT_REAL}/.claude/tooling/devcontainer/Dockerfile}"
 
 fail=0; ran=0
 ok()  { ran=$((ran + 1)); printf '  ok    %s\n' "$1"; }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hermetic tests for the image build-inputs staleness gate (Issue #4388).
 #
-# Nothing rebuilt cfg-agent:latest when .devcontainer/ changed on develop, and
+# Nothing rebuilt cfg-agent:latest when .claude/tooling/devcontainer/ changed on develop, and
 # some of the scripts that image runs (review-entrypoint.sh, agent-context.sh,
 # setup-env.sh, investigator-entrypoint.sh) are bind-mounted fresh from the
 # checkout at every launch. PR #4378 changed the entrypoint contract; the
@@ -22,8 +22,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DISPATCH="${REPO_ROOT_REAL}/.claude/scripts/agent-dispatch.sh"
+REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DISPATCH="${REPO_ROOT_REAL}/.claude/tooling/scripts/agent-dispatch.sh"
 AGENT_SETUP_MD="${REPO_ROOT_REAL}/.claude/commands/agent-setup.md"
 
 [[ -f "$DISPATCH" ]] || { printf 'FAIL: agent-dispatch.sh not found at %s\n' "$DISPATCH" >&2; exit 1; }
@@ -56,20 +56,20 @@ if bash -n "$DISPATCH" 2>/dev/null; then ok "agent-dispatch.sh parses"; else bad
 
 # ---------------------------------------------------------------------------
 # Fixture: a disposable git repo standing in for the checkout, with a
-# .devcontainer tree whose HEAD tree hash is the "checkout hash" the gate
+# .claude/tooling/devcontainer tree whose HEAD tree hash is the "checkout hash" the gate
 # computes.
 # ---------------------------------------------------------------------------
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 FIXTURE_REPO="${SANDBOX}/fixture-repo"
-mkdir -p "${FIXTURE_REPO}/.devcontainer"
-echo "FROM scratch" > "${FIXTURE_REPO}/.devcontainer/Dockerfile"
+mkdir -p "${FIXTURE_REPO}/.claude/tooling/devcontainer"
+echo "FROM scratch" > "${FIXTURE_REPO}/.claude/tooling/devcontainer/Dockerfile"
 GIT=(git -c init.defaultBranch=main -c user.email=test@test.local -c user.name=test)
 "${GIT[@]}" -C "$FIXTURE_REPO" init -q
-"${GIT[@]}" -C "$FIXTURE_REPO" add .devcontainer
+"${GIT[@]}" -C "$FIXTURE_REPO" add .claude/tooling/devcontainer
 "${GIT[@]}" -C "$FIXTURE_REPO" commit -q -m fixture
-CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.devcontainer)"
+CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.claude/tooling/devcontainer)"
 [[ -n "$CHECKOUT_HASH" ]] || { printf 'FAIL: could not compute fixture checkout hash\n' >&2; exit 1; }
 
 export CFGMS_TEST_REPO_ROOT="$FIXTURE_REPO"
@@ -644,7 +644,7 @@ fi
 # at po-act.sh:41) rather than calling agent-dispatch.sh launch, so it had no
 # test anywhere that would catch a missing gate on that path -- which is
 # exactly how it shipped ungated. This section scans every script under
-# .claude/scripts/ (not just agent-dispatch.sh) so the same gap can't reopen
+# .claude/tooling/scripts/ (not just agent-dispatch.sh) so the same gap can't reopen
 # in a different file next time.
 #
 # A "launch" is a `docker run` invocation shaped like the ones that actually
@@ -665,7 +665,7 @@ fi
 # both agent-dispatch.sh and po-act.sh use for their subcommand dispatch). A
 # script with no case statement at all (refresh-agent-creds.sh) is one single
 # branch spanning the whole file.
-printf '\n== structural: every agent-container docker run under .claude/scripts/ is gated ==\n'
+printf '\n== structural: every agent-container docker run under .claude/tooling/scripts/ is gated ==\n'
 
 # refresh-agent-creds.sh:34 (`exec docker run --rm -it ...`) is a human-run,
 # TTY-requiring credential refresh -- operator-invoked, not autonomous dev-
@@ -723,7 +723,7 @@ while IFS= read -r -d '' script; do
         "no gate_image_staleness_for_launch call found earlier in the same case branch"
     fi
   done
-done < <(find "${REPO_ROOT_REAL}/.claude/scripts" -maxdepth 1 -name '*.sh' -print0)
+done < <(find "${REPO_ROOT_REAL}/.claude/tooling/scripts" -maxdepth 1 -name '*.sh' -print0)
 
 echo ""
 echo "-----------------------------------------"

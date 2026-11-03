@@ -14,11 +14,11 @@
 #
 # Every case here exits before any GitHub call, so this suite creates nothing.
 #
-# Run: bash .claude/scripts/tests/create_story_validation.test.sh
+# Run: bash .claude/tooling/scripts/tests/create_story_validation.test.sh
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-HELPER="$REPO_ROOT/scripts/pipeline-helper.sh"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+HELPER="$REPO_ROOT/.claude/tooling/scripts/pipeline-helper.sh"
 DRAFT_ID="PVTI_lADOCrV4cc4BX5ezzg2MYzs"
 PASS=0; FAIL=0; TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

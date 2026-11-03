@@ -10,7 +10,7 @@ no docker -- every fixture is a real git repository created under
 `tempfile.TemporaryDirectory()`, so this suite runs unmodified on a plain
 git/tar-equipped CI runner.
 
-Run: python3 .claude/skills/security-review/snapshot_test.py
+Run: python3 .claude/tooling/security-review/snapshot_test.py
 """
 from __future__ import annotations
 

@@ -54,26 +54,26 @@ source "$(dirname "$0")/agent-dispatch.sh"
 
 WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-}"
 if [[ -z "$WORKTREE_BASE" ]]; then
-  WORKTREE_BASE="$(cd "$(dirname "$0")/../.." && pwd)/../worktrees"
+  WORKTREE_BASE="$(cd "$(dirname "$0")/../../.." && pwd)/../worktrees"
   WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
 fi
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
 # CFGMS_TEST_PROJECT_QUEUE: same test-hook shape as CFGMS_TEST_DISPATCH /
 # CFGMS_TEST_PIPELINE_HELPER -- lets hermetic tests stand in for the real
 # script (gh-backed, no test hooks of its own) rather than hitting GitHub.
-PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh}"
-PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/pipeline-helper.sh}"
+PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../../.." && pwd)/.claude/tooling/scripts/project-queue.sh}"
+PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-$(cd "$(dirname "$0")/../../.." && pwd)/.claude/tooling/scripts/pipeline-helper.sh}"
 
 # Trusted-gate mode (Issue #5386). When this script runs from the harness copy
 # mounted in the review container, every helper must resolve under that root.
 # A missing one refuses the gate; nothing falls back to the PR checkout in
 # /workspace. CFGMS_TRUSTED_ROOT exists so a test can reproduce the layout.
-_po_root="$(cd "$(dirname "$0")/../.." && pwd)"
+_po_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 if [[ "$_po_root" == "${CFGMS_TRUSTED_ROOT:-/opt/cfgms-trusted}" ]]; then
-  DISPATCH="${_po_root}/.claude/scripts/agent-dispatch.sh"
-  PREFLIGHT="${_po_root}/.claude/scripts/po-cycle-preflight.py"
-  PROJECT_QUEUE="${_po_root}/scripts/project-queue.sh"
-  PIPELINE_HELPER="${_po_root}/scripts/pipeline-helper.sh"
+  DISPATCH="${_po_root}/.claude/tooling/scripts/agent-dispatch.sh"
+  PREFLIGHT="${_po_root}/.claude/tooling/scripts/po-cycle-preflight.py"
+  PROJECT_QUEUE="${_po_root}/.claude/tooling/scripts/project-queue.sh"
+  PIPELINE_HELPER="${_po_root}/.claude/tooling/scripts/pipeline-helper.sh"
   for _po_helper in "$DISPATCH" "$PREFLIGHT" "$PROJECT_QUEUE" "$PIPELINE_HELPER"; do
     if [[ ! -r "$_po_helper" ]]; then
       echo "TRUSTED_GATE_REFUSED:helper_missing_$(basename "$_po_helper")"
@@ -659,7 +659,7 @@ fi
 case "$cmd" in
   dispatch)
     arg="${1:?story number or item_id required}"
-    PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/project-queue.sh}"
+    PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../../.." && pwd)/.claude/tooling/scripts/project-queue.sh}"
 
     # Resource admission gate (before any lease/materialize/clone). Defer if the
     # host has no room for another agent container — RAM/disk 90%, CPU 75%.
@@ -812,7 +812,7 @@ except Exception: print('')" 2>/dev/null || echo "")
     # docker-run launch site gates immediately before its `docker run`; this
     # inlined dispatch path (see the "Inlined from agent-dispatch.sh launch"
     # comment above) was the one that didn't, so dev-agent dispatch kept
-    # running on images built from stale .devcontainer inputs.
+    # running on images built from stale .claude/tooling/devcontainer inputs.
     gate_image_staleness_for_launch
 
     agent_token_args
@@ -1153,7 +1153,7 @@ EOF
     # never creates a merge commit. Must run BEFORE preflight as its own
     # process — never inside preflight, since the script must not rewrite
     # itself mid-run.
-    repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+    repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
     branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     if [ "$branch" != "develop" ]; then
       echo "SYNC_SKIP:on branch ${branch:-unknown} (not develop)"
@@ -1323,7 +1323,7 @@ with open(path, "w") as f:
     json.dump(manifest, f, indent=2)
 PYEOF
 
-    TOKEN_REPORT="${REPO_ROOT}/.claude/metrics/token_report.py"
+    TOKEN_REPORT="${REPO_ROOT}/.claude/tooling/metrics/token_report.py"
     if [[ -f "$TOKEN_REPORT" ]]; then
       # CFGMS_TEST_TRANSCRIPTS_DIR lets a hermetic test point correlation at a
       # fixture corpus instead of the real ~/.claude/projects.
@@ -1373,7 +1373,7 @@ PYEOF
     # Documented one-line command (Issue #3053 AC6): average cost per cycle
     # step across the last N completed cycles, with each step's work/no-op
     # split and the nested agent roles those cycles spawned.
-    #   ./.claude/scripts/po-act.sh cycle-report [N]
+    #   ./.claude/tooling/scripts/po-act.sh cycle-report [N]
     n="${1:-10}"
     if [[ ! -d "$CYCLE_DIR" ]]; then
       echo "No cycles recorded yet at ${CYCLE_DIR}"
@@ -1441,7 +1441,7 @@ PYEOF
     ;;
 
   _test-mq-failed-runs)
-    # Hidden test hook for .claude/scripts/tests/diagnose_merge_group.test.sh.
+    # Hidden test hook for .claude/tooling/scripts/tests/diagnose_merge_group.test.sh.
     # Not user-facing; feeds stdin straight to _mq_failed_runs_for_pr so the
     # branch-matching and conclusion-filtering can be driven from fixture JSON.
     # Safe: no gh, no docker, no writes.

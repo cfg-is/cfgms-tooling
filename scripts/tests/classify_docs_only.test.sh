@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 CLASSIFY="${REPO_ROOT}/.github/scripts/classify-docs-only.sh"
 
 fail=0; ran=0
@@ -24,8 +24,8 @@ trap 'rm -rf "$TMP"' EXIT
 # file that reads docs/deploy/unit.service, a doc nothing reads, and a
 # reference to a path that does not exist.
 FIX="$TMP/repo"
-mkdir -p "$FIX/.claude/scripts" "$FIX/docs/deploy" "$FIX/pkg/a" "$FIX/.claude/skills/x"
-printf 'CORE = open("docs/read-by-code.md").read()\n# see docs/ghost.md\n' > "$FIX/.claude/scripts/harness.py"
+mkdir -p "$FIX/.claude/tooling/scripts" "$FIX/docs/deploy" "$FIX/pkg/a" "$FIX/.claude/skills/x"
+printf 'CORE = open("docs/read-by-code.md").read()\n# see docs/ghost.md\n' > "$FIX/.claude/tooling/scripts/harness.py"
 printf 'package a\nconst p = "docs/deploy/unit.service"\nconst s = ".claude/skills/x/SKILL.md"\n' > "$FIX/pkg/a/a_test.go"
 echo "core" > "$FIX/docs/read-by-code.md"
 echo "unit" > "$FIX/docs/deploy/unit.service"
@@ -42,9 +42,9 @@ echo ""
 echo "classify-docs-only.sh"
 
 # AC3: the real repo, the exact file that broke develop in PR #4201 (moved to
-# .claude/skills/security-review/docs/methodology.md by Issue #4299).
+# .claude/tooling/security-review/docs/methodology.md by Issue #4299).
 check_last_line "real repo: methodology.md alone is code (PR #4201 regression)" \
-  "$(classify "$REPO_ROOT" .claude/skills/security-review/docs/methodology.md)" "code=true"
+  "$(classify "$REPO_ROOT" .claude/tooling/security-review/docs/methodology.md)" "code=true"
 
 check_last_line "a doc no code reads is docs-only" \
   "$(classify "$FIX" docs/unread.md README.md)" "code=false"

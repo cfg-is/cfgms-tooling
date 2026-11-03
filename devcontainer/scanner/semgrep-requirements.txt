@@ -1,5 +1,5 @@
 # semgrep and its full transitive dependency closure, pinned by version AND
-# sha256 for `uv pip install --require-hashes` in .devcontainer/Dockerfile.
+# sha256 for `uv pip install --require-hashes` in .claude/tooling/devcontainer/Dockerfile.
 # Generated 2026-10-27 from PyPI for CPython 3.13 (hashes for every published
 # distribution of each pinned version, as listed by the index).
 # Regenerate: list every pin as name==version in an input file, then

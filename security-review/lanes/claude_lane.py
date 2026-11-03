@@ -95,12 +95,12 @@ def _bootstrap_harness_imports() -> None:
     got this right, per finding 2's own text -- this module reuses that pattern
     rather than the `__file__`-relative one `anthropic.py`/`ollama.py` used):
     (1) run from a checkout, where this file lives at
-    `.claude/skills/security-review/lanes/claude_lane.py` and its siblings sit
+    `.claude/tooling/security-review/lanes/claude_lane.py` and its siblings sit
     one directory up (`schema.py` etc.) or beside it (`terminal_state.py`,
     `harness_runner.py`); (2) run inside the investigator container, where only
     this single file is bind-mounted (at
     `/usr/local/bin/investigator-lane-entrypoint.py` -- see
-    `.devcontainer/scripts/investigator-entrypoint.sh`), so `__file__` resolves
+    `.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh`), so `__file__` resolves
     to a path with no siblings at all, but the *whole* repository is separately
     bind-mounted read-only at `/workspace`
     (`agent-dispatch.sh launch-investigator`), which does have them.
@@ -121,7 +121,7 @@ def _bootstrap_harness_imports() -> None:
     # `harness_runner`, `scan_profiles` (the scanner allowlist), `schema`,
     # `resume`, ... -- must come from the TRUSTED harness mount
     # (`agent-dispatch.sh launch-investigator` bind-mounts the host's own
-    # `.claude/skills/security-review` read-only at
+    # `.claude/tooling/security-review` read-only at
     # `/opt/cfgms-harness/security-review` and exports its path in
     # `CFGMS_SECURITY_REVIEW_HARNESS_DIR`), never from the audited snapshot at
     # `/workspace`: the snapshot is the code under review, and a reviewed commit
@@ -132,10 +132,10 @@ def _bootstrap_harness_imports() -> None:
     lane_candidates.append(Path(trusted_harness) / "lanes")
     harness_candidates.append(Path(trusted_harness))
     if env_repo_root:
-        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
-        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
-    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
-    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+        lane_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review")
+    lane_candidates.append(Path("/workspace/.claude/tooling/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/tooling/security-review"))
 
     for candidate in lane_candidates:
         if (candidate / "terminal_state.py").is_file():

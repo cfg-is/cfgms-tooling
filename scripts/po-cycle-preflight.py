@@ -153,7 +153,7 @@ AGENT_BRANCH_RE = re.compile(r"^feature/(?:story-\d+|item-[A-Za-z0-9]+)-agent$")
 # never got going). Both a body prefix and a title-suffix form are accepted
 # because either alone is sufficient evidence of a truncated session.
 #
-# CURRENT emitter (.devcontainer/entrypoint.sh:117-118, `gh pr create --draft`):
+# CURRENT emitter (.claude/tooling/devcontainer/entrypoint.sh:117-118, `gh pr create --draft`):
 #   title: "WIP: <branch> (agent produced no PR)"
 #   body:  "Agent session ended with exit code <N> and no pull request: ..."
 #
@@ -866,7 +866,7 @@ def _pq_script_path():
     override = os.environ.get("CFGMS_TEST_PROJECT_QUEUE")
     if override:
         return override
-    return str(Path(__file__).resolve().parent.parent.parent / "scripts" / "project-queue.sh")
+    return str(Path(__file__).resolve().parent / "project-queue.sh")
 
 
 def _pipeline_helper_path():
@@ -874,7 +874,7 @@ def _pipeline_helper_path():
     override = os.environ.get("CFGMS_TEST_PIPELINE_HELPER")
     if override:
         return override
-    return str(Path(__file__).resolve().parent.parent.parent / "scripts" / "pipeline-helper.sh")
+    return str(Path(__file__).resolve().parent / "pipeline-helper.sh")
 
 
 def live_story_lease_item_ids():
@@ -1110,7 +1110,7 @@ def code_health_check():
         "checks": {},
     }
 
-    repo_root = Path(__file__).resolve().parent.parent.parent
+    repo_root = Path(__file__).resolve().parents[3]
     if not (repo_root / ".git").exists():
         result["skipped"] = True
         result["skipped_reason"] = "no .git in expected repo root"
@@ -1923,7 +1923,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "resume_failed_session",
-                "reason": "WIP draft PR from session truncation (token reauth/limit) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>` to resume; the fix-pr agent will mark the PR ready when it finishes",
+                "reason": "WIP draft PR from session truncation (token reauth/limit) — run `./.claude/tooling/scripts/po-act.sh dispatch-fix <PR>` to resume; the fix-pr agent will mark the PR ready when it finishes",
             })
             continue
 
@@ -1997,7 +1997,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "rebase",
-                "reason": "mergeStateStatus=DIRTY (conflicts with develop) — run `./.claude/scripts/rebase-pr.sh <PR>`; if it returns REBASE_CONFLICT, escalate to resolve-conflict",
+                "reason": "mergeStateStatus=DIRTY (conflicts with develop) — run `./.claude/tooling/scripts/rebase-pr.sh <PR>`; if it returns REBASE_CONFLICT, escalate to resolve-conflict",
             })
             continue
         if not in_queue and ms == "BEHIND" and pr.get("auto_merge_enabled"):
@@ -2008,7 +2008,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "rebase",
-                "reason": "mergeStateStatus=BEHIND with auto-merge armed but not in queue — preemptive rebase via `./.claude/scripts/rebase-pr.sh <PR>`",
+                "reason": "mergeStateStatus=BEHIND with auto-merge armed but not in queue — preemptive rebase via `./.claude/tooling/scripts/rebase-pr.sh <PR>`",
             })
             continue
 
@@ -2171,7 +2171,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 and not pr.get("auto_merge_enabled")
                 and not in_queue
             ):
-                enqueue_cmd = f"./.claude/scripts/po-act.sh enqueue {pr['pr']}"
+                enqueue_cmd = f"./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']}"
                 if pr["story_number"] is not None:
                     enqueue_cmd += f" {pr['story_number']}"
                 recs.append({
@@ -2201,7 +2201,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                     "pr": pr["pr"],
                     "story": pr["story_number"],
                     "action": "rebase",
-                    "reason": "reviewed + auto-merge armed but mergeStateStatus=BLOCKED with CI not red — likely missing required-check status (workflow drift between PR branch and current develop required set). Preemptive rebase via `./.claude/scripts/rebase-pr.sh <PR>` triggers fresh CI with the current check set; auto-merge completes when checks report green.",
+                    "reason": "reviewed + auto-merge armed but mergeStateStatus=BLOCKED with CI not red — likely missing required-check status (workflow drift between PR branch and current develop required set). Preemptive rebase via `./.claude/tooling/scripts/rebase-pr.sh <PR>` triggers fresh CI with the current check set; auto-merge completes when checks report green.",
                 })
             else:
                 reason = "acceptance review comment already present"
@@ -2260,7 +2260,7 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
 
     Each Fix story should have a corresponding open PR that needs the fix-pr
     agent to address review findings or CI failures. The PO calls
-    `./.claude/scripts/po-act.sh dispatch-fix <PR>` for each `dispatch_fix` rec.
+    `./.claude/tooling/scripts/po-act.sh dispatch-fix <PR>` for each `dispatch_fix` rec.
 
     Action vocabulary:
     - dispatch_fix: a fix is genuinely needed — open PR with CI red/pending and
@@ -2297,7 +2297,7 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
                 "story": story_num,
                 "pr": None,
                 "action": "no_open_pr",
-                "reason": "story has Fix status but no open PR — stale status; investigate and update via `./scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
+                "reason": "story has Fix status but no open PR — stale status; investigate and update via `./.claude/tooling/scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
             })
             continue
         pr_num = pr["pr"]
@@ -2353,7 +2353,7 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
                     "story": story_num,
                     "pr": pr_num,
                     "action": "dispatch_fix",
-                    "reason": f"review FAIL not resolved (fix_landed={fix_landed}, CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
+                    "reason": f"review FAIL not resolved (fix_landed={fix_landed}, CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/tooling/scripts/po-act.sh dispatch-fix <PR>`",
                 })
             continue
         # CI-driven Fix (no review FAIL): green CI genuinely means the fix
@@ -2364,14 +2364,14 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
                 "story": story_num,
                 "pr": pr_num,
                 "action": "clear_stale_status",
-                "reason": "Fix status but CI green, no review FAIL, no merge-state blockers — fix already succeeded; update status via `./scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
+                "reason": "Fix status but CI green, no review FAIL, no merge-state blockers — fix already succeeded; update status via `./.claude/tooling/scripts/project-queue.sh update-field <ITEM_ID> status Ready`",
             })
             continue
         recs.append({
             "story": story_num,
             "pr": pr_num,
             "action": "dispatch_fix",
-            "reason": f"Fix-status story with open PR (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/scripts/po-act.sh dispatch-fix <PR>`",
+            "reason": f"Fix-status story with open PR (CI={overall}, mergeStateStatus={ms or 'UNKNOWN'}) — run `./.claude/tooling/scripts/po-act.sh dispatch-fix <PR>`",
         })
     return recs
 

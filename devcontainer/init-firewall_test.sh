@@ -37,7 +37,7 @@
 #      prove existing agent containers resolve the Claude domains and
 #      nothing else.
 #
-# Run: bash .devcontainer/init-firewall_test.sh
+# Run: bash .claude/tooling/devcontainer/init-firewall_test.sh
 set -euo pipefail
 
 # Resolve the real tools this suite drives. dnsmasq is commonly in /usr/sbin,

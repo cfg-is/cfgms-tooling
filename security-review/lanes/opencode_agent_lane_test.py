@@ -8,7 +8,7 @@ is this lane's own behaviour: the prompt it builds, the two-turn answer
 protocol, what it writes for the shared loop, and that the shared loop turns
 its output into the same envelopes every other lane produces.
 
-Run: python3 .claude/skills/security-review/lanes/opencode_agent_lane_test.py
+Run: python3 .claude/tooling/security-review/lanes/opencode_agent_lane_test.py
 """
 from __future__ import annotations
 

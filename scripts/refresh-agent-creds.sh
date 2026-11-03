@@ -2,7 +2,7 @@
 # Refresh Claude Code OAuth credentials for agent dispatch containers.
 # Run this script directly in a terminal (requires TTY for interactive login).
 #
-# Usage: ./.claude/scripts/refresh-agent-creds.sh
+# Usage: ./.claude/tooling/scripts/refresh-agent-creds.sh
 #
 # The login runs on exactly the CLI version the image ships -- recorded in
 # the `cfgms.claude_code_version` label on cfg-agent:latest (Issue #4473:

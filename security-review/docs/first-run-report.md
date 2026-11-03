@@ -41,11 +41,11 @@ All commands run from the repo root on the feature branch at the commit above.
 | `go build ./...` + `go test -short` (non-race smoke, modules/integration/e2e excluded) | PASS |
 | `./scripts/test-scripts.sh` | 285 passed, 0 failed, exit 0 |
 | `security-review` Python suites inside it | 21 suites, all "All checks passed" (the issue text said 17; four were added since) |
-| `.claude/scripts/tests/investigator_launch.test.sh` | PASS, 264 checks, exit 0 |
-| `.claude/scripts/tests/security_review_cli.test.sh`, run 1 / 2 / 3 | PASS 253 checks, exit 0, all three runs |
-| `.devcontainer/investigator-entrypoint_test.sh` | 11/11 passed, exit 0 |
-| `bash .devcontainer/init-firewall_test.sh` (baseline) | exit 1: `ERROR: dnsmasq did not become ready on port 15354` |
-| `.devcontainer/dnsmasq-allowlist_test.sh` (baseline) | exit 1: `ERROR: dnsmasq did not become ready on port 15353` |
+| `.claude/tooling/scripts/tests/investigator_launch.test.sh` | PASS, 264 checks, exit 0 |
+| `.claude/tooling/scripts/tests/security_review_cli.test.sh`, run 1 / 2 / 3 | PASS 253 checks, exit 0, all three runs |
+| `.claude/tooling/devcontainer/investigator-entrypoint_test.sh` | 11/11 passed, exit 0 |
+| `bash .claude/tooling/devcontainer/init-firewall_test.sh` (baseline) | exit 1: `ERROR: dnsmasq did not become ready on port 15354` |
+| `.claude/tooling/devcontainer/dnsmasq-allowlist_test.sh` (baseline) | exit 1: `ERROR: dnsmasq did not become ready on port 15353` |
 
 **`develop` baseline for the two known-failing suites.** Both fail on this bare host
 exactly as the issue recorded. The branch had no changes at that point, so this run's
@@ -299,7 +299,7 @@ started and immediately found nothing to do, which is correct but indistinguisha
 - `.claude/skills/security-review/SKILL.md`: roster and adjudicator examples use full claude
   model ids and a codex model the subscription accepts; the ollama sign-in paragraph
   describes the service-managed host case and the "key present but not signed in" outcome.
-- `.claude/skills/security-review/docs/harness-architecture.md`: the same model-id examples; the ollama
+- `.claude/tooling/security-review/docs/harness-architecture.md`: the same model-id examples; the ollama
   credential gate section says existence is the only host-side check and what an
   unconnected key produces.
 

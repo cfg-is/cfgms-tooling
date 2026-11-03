@@ -12,7 +12,7 @@
 # reported as "external:<pr>:<author>:<trust>" so the caller quarantines and
 # refuses instead of ever cloning it.
 #
-# Run: bash .claude/scripts/tests/branch_author_gate.test.sh
+# Run: bash .claude/tooling/scripts/tests/branch_author_gate.test.sh
 
 set -euo pipefail
 

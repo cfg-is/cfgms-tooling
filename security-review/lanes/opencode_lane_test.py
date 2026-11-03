@@ -14,7 +14,7 @@ imported `opencode_lane` module, called twice with two different model ids,
 produces two independently-tracked results with no code difference between
 them.
 
-Run: python3 .claude/skills/security-review/lanes/opencode_lane_test.py
+Run: python3 .claude/tooling/security-review/lanes/opencode_lane_test.py
 """
 from __future__ import annotations
 
@@ -874,7 +874,7 @@ def test_import_isolation_single_file_layout() -> None:
     `/workspace` path.
     """
     repo_root = str(Path(__file__).resolve().parents[4])
-    if not os.path.isfile(os.path.join(repo_root, ".claude/skills/security-review/schema.py")):
+    if not os.path.isfile(os.path.join(repo_root, ".claude/tooling/security-review/schema.py")):
         check(False, "import isolation: repo checkout available for this test", repo_root)
         return
 

@@ -2,7 +2,7 @@
 """Tests for corpus_run.py (Issue #4259). A real temporary git repository
 supplies the pinned commits, so `plan` exercises the real snapshot code.
 
-Run: python3 .claude/skills/security-review/corpus_run_test.py
+Run: python3 .claude/tooling/security-review/corpus_run_test.py
 """
 from __future__ import annotations
 

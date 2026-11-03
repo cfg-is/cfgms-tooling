@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coverage tests for resume.py: the four-terminal-state resume scanner.
 
-Run: python3 .claude/skills/security-review/resume_test.py
+Run: python3 .claude/tooling/security-review/resume_test.py
 """
 from __future__ import annotations
 

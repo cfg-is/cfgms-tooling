@@ -30,8 +30,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/agent-context.sh"
 # resolve to /usr/local/scripts/... — which doesn't exist; entrypoint.sh lives
 # at /usr/local/bin/ with no sibling scripts/ dir. Test harness overrides via
 # CFGMS_TEST_PROJECT_QUEUE to point at the host repo.
-PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-/workspace/scripts/project-queue.sh}"
-PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-/workspace/scripts/pipeline-helper.sh}"
+PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-/workspace/.claude/tooling/scripts/project-queue.sh}"
+PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-/workspace/.claude/tooling/scripts/pipeline-helper.sh}"
 
 # Distributed-lease release (multi-host cron coordination). The launching host
 # passed CFGMS_LEASE_KEY (story-<item> for dev, pr-<N> for fix/resolve) and is
@@ -541,7 +541,7 @@ becomes a locked `internal` issue only when it is dispatched.
 # Returns CREATED_DRAFT:<item_id>. Usually the epic your current story belongs to
 # is the right parent. The draft starts in Draft status (Tech Lead validates it
 # before it becomes Ready/dispatchable).
-./scripts/pipeline-helper.sh create-story <PARENT_EPIC_NUM> "<scope>: <title>" /path/to/body.md
+./.claude/tooling/scripts/pipeline-helper.sh create-story <PARENT_EPIC_NUM> "<scope>: <title>" /path/to/body.md
 ```
 
 If create-story fails, fix it before moving on — a half-filed item is worse than

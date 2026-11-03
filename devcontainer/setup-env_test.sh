@@ -21,7 +21,7 @@
 # to a temp dir so the agent-level setup that follows a PASSING gate cannot
 # touch the real home directory.
 #
-# Run: bash .devcontainer/setup-env_test.sh
+# Run: bash .claude/tooling/devcontainer/setup-env_test.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

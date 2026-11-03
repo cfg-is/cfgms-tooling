@@ -12,9 +12,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DISPATCH="${REPO_ROOT_REAL}/.claude/scripts/agent-dispatch.sh"
-DOCKERFILE="${REPO_ROOT_REAL}/.devcontainer/Dockerfile"
+REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DISPATCH="${REPO_ROOT_REAL}/.claude/tooling/scripts/agent-dispatch.sh"
+DOCKERFILE="${REPO_ROOT_REAL}/.claude/tooling/devcontainer/Dockerfile"
 AGENT_SETUP_MD="${REPO_ROOT_REAL}/.claude/commands/agent-setup.md"
 
 [[ -f "$DISPATCH" ]] || { printf 'FAIL: agent-dispatch.sh not found at %s\n' "$DISPATCH" >&2; exit 1; }
@@ -40,13 +40,13 @@ SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 FIXTURE_REPO="${SANDBOX}/fixture-repo"
-mkdir -p "${FIXTURE_REPO}/.devcontainer"
-echo "FROM scratch" > "${FIXTURE_REPO}/.devcontainer/Dockerfile"
+mkdir -p "${FIXTURE_REPO}/.claude/tooling/devcontainer"
+echo "FROM scratch" > "${FIXTURE_REPO}/.claude/tooling/devcontainer/Dockerfile"
 GIT=(git -c init.defaultBranch=main -c user.email=test@test.local -c user.name=test)
 "${GIT[@]}" -C "$FIXTURE_REPO" init -q
-"${GIT[@]}" -C "$FIXTURE_REPO" add .devcontainer
+"${GIT[@]}" -C "$FIXTURE_REPO" add .claude/tooling/devcontainer
 "${GIT[@]}" -C "$FIXTURE_REPO" commit -q -m fixture
-CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.devcontainer)"
+CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.claude/tooling/devcontainer)"
 
 export CFGMS_TEST_REPO_ROOT="$FIXTURE_REPO"
 export CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees"

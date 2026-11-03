@@ -7,7 +7,7 @@ one structural check that touches a real sibling module
 (`resolve_harness_call`) proves the lane reuses each finder lane's own
 harness call rather than carrying a second copy.
 
-Run: python3 .claude/skills/security-review/lanes/adjudicator_test.py
+Run: python3 .claude/tooling/security-review/lanes/adjudicator_test.py
 """
 from __future__ import annotations
 

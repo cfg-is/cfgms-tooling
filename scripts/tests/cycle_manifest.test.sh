@@ -13,9 +13,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-POACT="${REPO_ROOT}/.claude/scripts/po-act.sh"
-TOKEN_REPORT="${REPO_ROOT}/.claude/metrics/token_report.py"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+POACT="${REPO_ROOT}/.claude/tooling/scripts/po-act.sh"
+TOKEN_REPORT="${REPO_ROOT}/.claude/tooling/metrics/token_report.py"
 
 for f in "$POACT" "$TOKEN_REPORT"; do
   [[ -f "$f" ]] || { printf 'FAIL: expected file not found: %s\n' "$f" >&2; exit 1; }
@@ -73,7 +73,7 @@ printf '\n== no cycle open: a subcommand call is a silent no-op ==\n'
 # hermetic (sandboxed PO_CACHE_DIR, ledger dir, CFGMS_TEST_REPO_ROOT); the gh
 # dependency was the one hole. Stub it so the assertion measures what it claims:
 # a subcommand with no cycle open runs normally and creates no manifest.
-# (Issue #3459 -- found when .claude/scripts/tests/ was first wired into `make test`.)
+# (Issue #3459 -- found when .claude/tooling/scripts/tests/ was first wired into `make test`.)
 GH_STUB_DIR="${SANDBOX}/ghstub"
 mkdir -p "$GH_STUB_DIR"
 cat > "$GH_STUB_DIR/gh" <<'GHSTUB'

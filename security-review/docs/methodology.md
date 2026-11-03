@@ -19,7 +19,7 @@ Two audiences read it:
 ## How this document reaches a finder lane
 
 The document is split into two kinds of content, marked with HTML comments that
-`.claude/skills/security-review/lanes/harness_runner.py` parses:
+`.claude/tooling/security-review/lanes/harness_runner.py` parses:
 
 - **The compact core**, between the `methodology-core:begin` and `methodology-core:end`
   HTML comments. It is inlined into every step prompt of every lane,
@@ -42,9 +42,9 @@ There is one copy of this text, here. `harness_runner.py` holds the only loading
 and the only constants (`METHODOLOGY_CORE`, `METHODOLOGY_ANCHORS`), and every lane's
 `build_prompt` calls `harness_runner.shared_preamble(step)` rather than assembling its
 own. A test fails if a second definition appears anywhere under
-`.claude/skills/security-review/`. The choices behind this shape, and the alternatives
+`.claude/tooling/security-review/`. The choices behind this shape, and the alternatives
 that were rejected, are recorded in
-[`.claude/skills/security-review/docs/harness-architecture.md`](harness-architecture.md)
+[`.claude/tooling/security-review/docs/harness-architecture.md`](harness-architecture.md)
 under *Review methodology: compact core and per-step anchors*.
 
 ### Editing rules
@@ -373,7 +373,7 @@ names it. This is prompt guidance, not a schema rule: `schema.validate_plan_step
 not reject a step for lacking one, since forcing a model to invent an absence claim it
 does not believe produces noise, not signal.
 
-The enforced copy of this text lives in `.claude/skills/security-review/planner.py`'s
+The enforced copy of this text lives in `.claude/tooling/security-review/planner.py`'s
 `build_prompt()`, which is what the planner model actually reads; this section is the
 same definition for the reader auditing or reviewing it.
 

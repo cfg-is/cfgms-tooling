@@ -2,14 +2,14 @@
 # Provides isolated environment for headless Claude Code agent sessions.
 # Pre-caches Go modules and Trivy DB to minimize per-agent startup time.
 #
-# Build: docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
+# Build: docker build -t cfg-agent:latest -f .claude/tooling/devcontainer/Dockerfile .
 #   (resolves Claude Code's current `stable` npm release; the documented
 #   agent-setup.md / agent-dispatch.sh build paths additionally pass
 #   --build-arg CLAUDE_CODE_VERSION_OVERRIDE=<resolved version> and
 #   --label cfgms.claude_code_version=<resolved version>, and likewise
 #   CODEX_CLI_VERSION_OVERRIDE / cfgms.codex_version, so a bare build
 #   above still installs current Claude Code and Codex but skips the labels)
-# Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .devcontainer/Dockerfile .
+# Rebuild weekly to refresh Trivy DB: docker build --no-cache -t cfg-agent:latest -f .claude/tooling/devcontainer/Dockerfile .
 
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
 # and .git history are never baked into the final image's layers.
@@ -213,7 +213,7 @@ RUN ( set -eu; \
 # The resolved version is stamped as the `cfgms.claude_code_version` image
 # label by the `docker build --build-arg CLAUDE_CODE_VERSION_OVERRIDE=...
 # --label cfgms.claude_code_version=...` invocation in
-# .claude/commands/agent-setup.md and .claude/scripts/agent-dispatch.sh (the
+# .claude/commands/agent-setup.md and .claude/tooling/scripts/agent-dispatch.sh (the
 # same place that already stamps `cfgms.build_inputs_hash`), so any run can
 # still be traced to an exact Claude Code version even though none is pinned
 # in this file. `agent-dispatch.sh health-check` prints it.
@@ -237,7 +237,7 @@ RUN set -eu; \
 # (holding back a bad release, reproducing a past build); empty (the default)
 # resolves `latest` fresh at build time. The resolved version is stamped as
 # the `cfgms.codex_version` image label by the build invocations in
-# .claude/commands/agent-setup.md and .claude/scripts/agent-dispatch.sh, and
+# .claude/commands/agent-setup.md and .claude/tooling/scripts/agent-dispatch.sh, and
 # `agent-dispatch.sh health-check` prints the installed codex version.
 # This is the second subscription agent harness the security review harness
 # dispatches (Issue #3935, epic #3927) — `codex_lane.py` invokes this binary
@@ -385,23 +385,23 @@ COPY --from=cfg-builder /usr/local/bin/cfg /usr/local/bin/cfg
 # one real cross-harness bleed in the single-investigator-image model: every
 # container previously resolved every provider's domain regardless of which
 # one it authenticated to.
-COPY .devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
-COPY .devcontainer/scripts/setup-env.sh /usr/local/bin/setup-env.sh
-COPY .devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY .devcontainer/agent-context.sh /usr/local/bin/agent-context.sh
-COPY .devcontainer/dnsmasq-allowlist-base.conf /etc/dnsmasq-allowlist-base.conf
-COPY .devcontainer/dnsmasq-allowlist.d/ /etc/dnsmasq-allowlist.d/
+COPY .claude/tooling/devcontainer/init-firewall.sh /usr/local/bin/init-firewall.sh
+COPY .claude/tooling/devcontainer/scripts/setup-env.sh /usr/local/bin/setup-env.sh
+COPY .claude/tooling/devcontainer/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY .claude/tooling/devcontainer/agent-context.sh /usr/local/bin/agent-context.sh
+COPY .claude/tooling/devcontainer/dnsmasq-allowlist-base.conf /etc/dnsmasq-allowlist-base.conf
+COPY .claude/tooling/devcontainer/dnsmasq-allowlist.d/ /etc/dnsmasq-allowlist.d/
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/local/bin/entrypoint.sh
 
 # Token reporter (Issue #3028/#3041) — baked into the harness so accounting is a
 # property of the image, never of the branch under dispatch/review. A PR branch
 # that predates this reporter (or edits/deletes it) must not disable its own
-# telemetry. The review dispatch path additionally bind-mounts .claude/metrics
+# telemetry. The review dispatch path additionally bind-mounts .claude/tooling/metrics
 # fresh from the host at runtime (see agent-dispatch.sh review-pr), the same
 # no-rebuild-required pattern already used for review-entrypoint.sh; this bake
 # covers the entrypoint.sh dev/fix/branch paths, which only pick up script
 # changes on image rebuild anyway.
-COPY .claude/metrics/token_report.py .claude/metrics/pricing.json /usr/local/share/cfgms-metrics/
+COPY .claude/tooling/metrics/token_report.py .claude/tooling/metrics/pricing.json /usr/local/share/cfgms-metrics/
 
 # Per-segment model routing (Issue #3030) — same rule as the reporter above:
 # baked into the harness so the model an agent runs on is a property of the
@@ -455,32 +455,32 @@ ENV UV_OFFLINE=1
 # with `--no-config-lookup --config /opt/cfgms-scanner/eslint.config.js`
 # against these node_modules (never the audited project's), semgrep reads
 # only the rule files installed here, and every argv is a constant from
-# .claude/skills/security-review/lanes/scan_profiles.py. rg, gosec and
+# .claude/tooling/security-review/lanes/scan_profiles.py. rg, gosec and
 # staticcheck are already installed above and are NOT reinstalled.
 #
 # All three pins below are intentionally NOT tracked by
 # dependency-pin-check.yml (same status as the Ollama CLI pin above): its
 # freshness checks are hand-written per tool and adding them is outside
-# this story. Refresh: bump the versions in .devcontainer/scanner/, regenerate
+# this story. Refresh: bump the versions in .claude/tooling/devcontainer/scanner/, regenerate
 # the lockfile / hashed requirements as their headers describe, rebuild.
 #
-# ESLint + plugins: exact versions from .devcontainer/scanner/package.json,
+# ESLint + plugins: exact versions from .claude/tooling/devcontainer/scanner/package.json,
 # integrity-pinned by its package-lock.json (`npm ci` refuses a mismatch);
 # `--ignore-scripts` so no dependency lifecycle script runs at build.
-COPY .devcontainer/scanner/package.json .devcontainer/scanner/package-lock.json /opt/cfgms-scanner/
+COPY .claude/tooling/devcontainer/scanner/package.json .claude/tooling/devcontainer/scanner/package-lock.json /opt/cfgms-scanner/
 WORKDIR /opt/cfgms-scanner
 RUN npm ci --ignore-scripts --no-audit --no-fund \
     && test -f /opt/cfgms-scanner/node_modules/eslint/bin/eslint.js
 WORKDIR /
-COPY .devcontainer/scanner/eslint.config.js /opt/cfgms-scanner/eslint.config.js
+COPY .claude/tooling/devcontainer/scanner/eslint.config.js /opt/cfgms-scanner/eslint.config.js
 
-# semgrep: hash-pinned wheel closure (.devcontainer/scanner/semgrep-requirements.txt,
+# semgrep: hash-pinned wheel closure (.claude/tooling/devcontainer/scanner/semgrep-requirements.txt,
 # `--require-hashes` rejects any artifact whose sha256 is not listed) into a
 # private virtualenv on the system Python. Network is needed only here, at
 # build time; the runner sets SEMGREP_SEND_METRICS=off and every profile
 # passes --metrics=off --disable-version-check, so nothing phones home later.
 ARG SEMGREP_VERSION=1.179.0
-COPY .devcontainer/scanner/semgrep-requirements.txt /opt/cfgms-scanner/semgrep-requirements.txt
+COPY .claude/tooling/devcontainer/scanner/semgrep-requirements.txt /opt/cfgms-scanner/semgrep-requirements.txt
 RUN grep -q "^semgrep==${SEMGREP_VERSION} " /opt/cfgms-scanner/semgrep-requirements.txt \
     && UV_OFFLINE=0 uv venv --python /usr/bin/python3 /opt/cfgms-scanner/venv \
     && UV_OFFLINE=0 uv pip install --python /opt/cfgms-scanner/venv/bin/python \
@@ -491,12 +491,12 @@ RUN grep -q "^semgrep==${SEMGREP_VERSION} " /opt/cfgms-scanner/semgrep-requireme
 # at the commit pinned in semgrep/upstream/SOURCE and verified file-by-file
 # against the sha256 recorded there (fetch-semgrep-rules.sh fails the build on
 # any mismatch); the CFGMS project rules are copied from the repository.
-COPY .devcontainer/scanner/semgrep/upstream/SOURCE /tmp/semgrep-upstream-SOURCE
-COPY .devcontainer/scanner/fetch-semgrep-rules.sh /usr/local/bin/fetch-semgrep-rules.sh
+COPY .claude/tooling/devcontainer/scanner/semgrep/upstream/SOURCE /tmp/semgrep-upstream-SOURCE
+COPY .claude/tooling/devcontainer/scanner/fetch-semgrep-rules.sh /usr/local/bin/fetch-semgrep-rules.sh
 RUN chmod 0755 /usr/local/bin/fetch-semgrep-rules.sh \
     && /usr/local/bin/fetch-semgrep-rules.sh /tmp/semgrep-upstream-SOURCE /opt/cfgms-scanner/semgrep/upstream \
     && rm -f /tmp/semgrep-upstream-SOURCE
-COPY .devcontainer/scanner/semgrep/cfgms/ /opt/cfgms-scanner/semgrep/cfgms/
+COPY .claude/tooling/devcontainer/scanner/semgrep/cfgms/ /opt/cfgms-scanner/semgrep/cfgms/
 # Validate every rule file parses at build time, offline, so a broken rule
 # fails the build rather than silently producing an empty scan later.
 RUN SEMGREP_SEND_METRICS=off /opt/cfgms-scanner/venv/bin/semgrep --validate --metrics=off --disable-version-check \

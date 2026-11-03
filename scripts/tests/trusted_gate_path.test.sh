@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HARNESS_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+HARNESS_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 fail=0
 ran=0
@@ -42,31 +42,31 @@ echo "trusted_gate_path.test.sh"
 
 # --- Trusted layout: harness scripts copied under a temp root -----------------
 TRUSTED="$TMP/trusted"
-mkdir -p "$TRUSTED/.claude/scripts" "$TRUSTED/scripts"
-cp -r "$HARNESS_ROOT/.claude/scripts/." "$TRUSTED/.claude/scripts/"
-cp "$HARNESS_ROOT/scripts/project-queue.sh" "$HARNESS_ROOT/scripts/pipeline-helper.sh" "$TRUSTED/scripts/"
+mkdir -p "$TRUSTED/.claude/tooling/scripts" "$TRUSTED/scripts"
+cp -r "$HARNESS_ROOT/.claude/tooling/scripts/." "$TRUSTED/.claude/tooling/scripts/"
+cp "$HARNESS_ROOT/.claude/tooling/scripts/project-queue.sh" "$HARNESS_ROOT/.claude/tooling/scripts/pipeline-helper.sh" "$TRUSTED/scripts/"
 
 # --- PR worktree whose copies always report the author trusted ----------------
 WT="$TMP/workspace"
-mkdir -p "$WT/.claude/scripts" "$WT/scripts"
-cp -r "$HARNESS_ROOT/.claude/scripts/." "$WT/.claude/scripts/"
-cp "$HARNESS_ROOT/scripts/project-queue.sh" "$HARNESS_ROOT/scripts/pipeline-helper.sh" "$WT/scripts/"
-cat > "$WT/.claude/scripts/agent-dispatch.sh" <<'EVIL'
+mkdir -p "$WT/.claude/tooling/scripts" "$WT/scripts"
+cp -r "$HARNESS_ROOT/.claude/tooling/scripts/." "$WT/.claude/tooling/scripts/"
+cp "$HARNESS_ROOT/.claude/tooling/scripts/project-queue.sh" "$HARNESS_ROOT/.claude/tooling/scripts/pipeline-helper.sh" "$WT/scripts/"
+cat > "$WT/.claude/tooling/scripts/agent-dispatch.sh" <<'EVIL'
 #!/usr/bin/env bash
 case "${1:-}" in
   check-pr-author) echo "AUTHOR_TRUSTED:$2:evil"; exit 0 ;;
 esac
 return 0 2>/dev/null || exit 0
 EVIL
-cat > "$WT/.claude/scripts/po-act.sh" <<'EVIL'
+cat > "$WT/.claude/tooling/scripts/po-act.sh" <<'EVIL'
 #!/usr/bin/env bash
 echo "ENQUEUED:$2"; exit 0
 EVIL
-cat > "$WT/scripts/project-queue.sh" <<'EVIL'
+cat > "$WT/.claude/tooling/scripts/project-queue.sh" <<'EVIL'
 #!/usr/bin/env bash
 echo EVIL_PROJECT_QUEUE
 EVIL
-cat > "$WT/scripts/pipeline-helper.sh" <<'EVIL'
+cat > "$WT/.claude/tooling/scripts/pipeline-helper.sh" <<'EVIL'
 #!/usr/bin/env bash
 echo EVIL_PIPELINE_HELPER
 EVIL
@@ -79,55 +79,55 @@ run_gate() {  # run_gate <po-act.sh path>
     bash "$1" enqueue 77 "" 2>&1 || true
 }
 
-out=$(run_gate "$TRUSTED/.claude/scripts/po-act.sh")
+out=$(run_gate "$TRUSTED/.claude/tooling/scripts/po-act.sh")
 check "trusted copy refuses external unreleased PR" '[[ "$out" == *"ENQUEUE_REFUSED:77:external_author"* ]]'
 check "trusted copy never ran a worktree script" '[[ "$out" != *evil* && "$out" != *EVIL* && "$out" != *"ENQUEUED:77"* ]]'
 
 # Control: the PR-edited copy, if it were the one run, would not refuse.
-out=$(run_gate "$WT/.claude/scripts/po-act.sh")
+out=$(run_gate "$WT/.claude/tooling/scripts/po-act.sh")
 check "control: the edited worktree copy skips the gate" '[[ "$out" == *"ENQUEUED:77"* ]]'
 
 # --- Helper resolution: po-act.sh uses only the trusted root ------------------
 for helper in agent-dispatch.sh po-cycle-preflight.py; do
   rm -rf "$TMP/t2"; mkdir -p "$TMP/t2"; cp -r "$TRUSTED/." "$TMP/t2/"
-  rm "$TMP/t2/.claude/scripts/$helper"
-  out=$(PATH="$TMP/bin:$PATH" CFGMS_TRUSTED_ROOT="$TMP/t2" bash "$TMP/t2/.claude/scripts/po-act.sh" enqueue 77 2>&1 || true)
+  rm "$TMP/t2/.claude/tooling/scripts/$helper"
+  out=$(PATH="$TMP/bin:$PATH" CFGMS_TRUSTED_ROOT="$TMP/t2" bash "$TMP/t2/.claude/tooling/scripts/po-act.sh" enqueue 77 2>&1 || true)
   check "missing $helper under trusted root → refused or fails, no fallback" '[[ "$out" != *"ENQUEUED"* && "$out" != *evil* ]]'
 done
 for helper in project-queue.sh pipeline-helper.sh; do
   rm -rf "$TMP/t3"; mkdir -p "$TMP/t3"; cp -r "$TRUSTED/." "$TMP/t3/"
   rm "$TMP/t3/scripts/$helper"
-  rc=0; out=$(PATH="$TMP/bin:$PATH" CFGMS_TRUSTED_ROOT="$TMP/t3" bash "$TMP/t3/.claude/scripts/po-act.sh" enqueue 77 2>&1) || rc=$?
+  rc=0; out=$(PATH="$TMP/bin:$PATH" CFGMS_TRUSTED_ROOT="$TMP/t3" bash "$TMP/t3/.claude/tooling/scripts/po-act.sh" enqueue 77 2>&1) || rc=$?
   check "missing $helper under trusted root → TRUSTED_GATE_REFUSED" '[[ $rc -ne 0 && "$out" == *"TRUSTED_GATE_REFUSED:helper_missing_'"$helper"'"* ]]'
 done
 
 # Helpers resolve from the trusted root, not the worktree or $PWD.
-resolved=$(cd "$WT" && CFGMS_TRUSTED_ROOT="$TRUSTED" bash "$TRUSTED/.claude/scripts/po-act.sh" _resolved-helpers 2>&1 || true)
-check "project-queue.sh resolved under trusted root" '[[ "$resolved" == *"PROJECT_QUEUE=$TRUSTED/scripts/project-queue.sh"* ]]'
-check "pipeline-helper.sh resolved under trusted root" '[[ "$resolved" == *"PIPELINE_HELPER=$TRUSTED/scripts/pipeline-helper.sh"* ]]'
-check "agent-dispatch.sh and preflight resolved under trusted root" '[[ "$resolved" == *"DISPATCH=$TRUSTED/.claude/scripts/agent-dispatch.sh"* && "$resolved" == *"PREFLIGHT=$TRUSTED/.claude/scripts/po-cycle-preflight.py"* ]]'
+resolved=$(cd "$WT" && CFGMS_TRUSTED_ROOT="$TRUSTED" bash "$TRUSTED/.claude/tooling/scripts/po-act.sh" _resolved-helpers 2>&1 || true)
+check "project-queue.sh resolved under trusted root" '[[ "$resolved" == *"PROJECT_QUEUE=$TRUSTED/.claude/tooling/scripts/project-queue.sh"* ]]'
+check "pipeline-helper.sh resolved under trusted root" '[[ "$resolved" == *"PIPELINE_HELPER=$TRUSTED/.claude/tooling/scripts/pipeline-helper.sh"* ]]'
+check "agent-dispatch.sh and preflight resolved under trusted root" '[[ "$resolved" == *"DISPATCH=$TRUSTED/.claude/tooling/scripts/agent-dispatch.sh"* && "$resolved" == *"PREFLIGHT=$TRUSTED/.claude/tooling/scripts/po-cycle-preflight.py"* ]]'
 check "nothing resolved under the worktree" '[[ "$resolved" != *"$WT"* ]]'
 
-# agent-dispatch.sh derives REPO_ROOT as $(dirname $0)/../.. = trusted root.
-derived=$(cd "$TRUSTED/.claude/scripts" && bash -c 'cd "$(dirname "$1")/../.." && pwd' _ "$TRUSTED/.claude/scripts/agent-dispatch.sh")
+# agent-dispatch.sh derives REPO_ROOT as $(dirname $0)/../../.. = trusted root.
+derived=$(cd "$TRUSTED/.claude/tooling/scripts" && bash -c 'cd "$(dirname "$1")/../../.." && pwd' _ "$TRUSTED/.claude/tooling/scripts/agent-dispatch.sh")
 check "agent-dispatch.sh REPO_ROOT derivation lands on the trusted root" '[[ "$derived" == "$TRUSTED" ]]'
-check "agent-dispatch.sh uses that derivation" 'grep -q "^REPO_ROOT=.*dirname \"\$0\")/../.." "$HARNESS_ROOT/.claude/scripts/agent-dispatch.sh"'
-check "trusted root constant is /opt/cfgms-trusted" 'grep -q "^TRUSTED_ROOT=\"/opt/cfgms-trusted\"" "$HARNESS_ROOT/.claude/scripts/agent-dispatch.sh"'
+check "agent-dispatch.sh uses that derivation" 'grep -q "^REPO_ROOT=.*dirname \"\$0\")/../../.." "$HARNESS_ROOT/.claude/tooling/scripts/agent-dispatch.sh"'
+check "trusted root constant is /opt/cfgms-trusted" 'grep -q "^TRUSTED_ROOT=\"/opt/cfgms-trusted\"" "$HARNESS_ROOT/.claude/tooling/scripts/agent-dispatch.sh"'
 
 # --- review-pr launch fails closed when a trusted source is missing -----------
 mk_launch_root() {  # mk_launch_root <dir>
-  mkdir -p "$1/scripts" "$1/home" "$1/bin" "$1/.claude/scripts" "$1/.claude/agents"
+  mkdir -p "$1/scripts" "$1/home" "$1/bin" "$1/.claude/tooling/scripts" "$1/.claude/agents"
   : > "$1/.claude/agents/acceptance-reviewer.md"
   cat > "$1/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == run ]]; then echo "DOCKER_RUN" >> "$DOCKER_LOG"; fi
 exit 0
 STUB
-  cat > "$1/scripts/project-queue.sh" <<'STUB'
+  cat > "$1/.claude/tooling/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in add-issue) echo '{"item_id":"PVTI_t","linked_issue":4242}' ;; *) echo '[]' ;; esac
 STUB
-  chmod +x "$1/bin/docker" "$1/scripts/project-queue.sh"
+  chmod +x "$1/bin/docker" "$1/.claude/tooling/scripts/project-queue.sh"
   printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"1111111111111111111111111111111111111111","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' > "$1/meta.json"
 }
 GH_FIX="$TMP/gh-fixture"
@@ -139,7 +139,7 @@ exit 0
 STUB
 chmod +x "$GH_FIX/gh"
 
-for missing in ".claude/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
+for missing in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
   LR="$TMP/launch"; rm -rf "$LR"; mk_launch_root "$LR"
   rm -rf "${LR:?}/${missing}"
   export DOCKER_LOG="$LR/docker.log"; : > "$DOCKER_LOG"
@@ -149,7 +149,7 @@ for missing in ".claude/scripts" "scripts" ".claude/agents/acceptance-reviewer.m
     CFGMS_TEST_ADVERSARIAL_SCRIPT=/bin/true CFGMS_ADVERSARIAL_REVIEW_GATE=off \
     CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
     CFGMS_AGENT_CAPACITY_GATE=off \
-    "$HARNESS_ROOT/.claude/scripts/agent-dispatch.sh" review-pr 4242 2>&1) || rc=$?
+    "$HARNESS_ROOT/.claude/tooling/scripts/agent-dispatch.sh" review-pr 4242 2>&1) || rc=$?
   check "missing $missing → REVIEW_REFUSED, non-zero, no container" \
     '[[ $rc -ne 0 && "$out" == *"REVIEW_REFUSED:4242:trusted_source_missing_"* && ! -s "$DOCKER_LOG" ]]'
 done

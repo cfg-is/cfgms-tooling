@@ -248,7 +248,7 @@ CODE_TIERS = frozenset({"entrypoint", "security", "dataaccess", "business", "pre
 
 # G-3's high-risk population (Issue #3980): the two tiers a compromised
 # controller admin or an attacker landing a commit can do the most damage
-# through -- see .claude/skills/security-review/docs/harness-architecture.md's threat model.
+# through -- see .claude/tooling/security-review/docs/harness-architecture.md's threat model.
 HIGH_RISK_TIERS = frozenset({"entrypoint", "security"})
 
 

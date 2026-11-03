@@ -2,7 +2,7 @@
 """Coverage tests for agentic_verifier.py.
 
 Hand-rolled, stdlib only, exit 0 on all-pass -- the convention every other
-suite under .claude/skills/security-review/ follows.
+suite under .claude/tooling/security-review/ follows.
 
 The state machine is driven through a fake `run`, so every failure this module
 was built to survive is reproduced here from the REAL measured shapes rather
@@ -10,7 +10,7 @@ than imagined ones: the 44-minute grep loop that answered nothing, the
 answer-shaped object that is not an answer, and the exit-0 silence that three
 separate defects in this harness have already hidden behind.
 
-Run: python3 .claude/skills/security-review/lanes/agentic_verifier_test.py
+Run: python3 .claude/tooling/security-review/lanes/agentic_verifier_test.py
 """
 from __future__ import annotations
 

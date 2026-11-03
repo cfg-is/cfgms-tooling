@@ -34,7 +34,7 @@ Three shapes are validated here:
 
 - A **step envelope** (`validate_step_envelope`): the record a lane writes per
   step regardless of outcome (SEC3900 finding B7). `state` resolves to one of
-  the four terminal states (see .claude/skills/security-review/docs/harness-architecture.md);
+  the four terminal states (see .claude/tooling/security-review/docs/harness-architecture.md);
   `state == "complete"` additionally requires a `findings` array (which may be
   empty — a genuinely clean step is a valid, distinct case from
   `refused`/`failed`), and every other state requires a non-empty
@@ -156,7 +156,7 @@ SEVERITY_VALUES = frozenset({"low", "medium", "high", "critical"})
 CONFIDENCE_VALUES = frozenset({"low", "medium", "high"})
 
 # The closed CWE identifier list Issue #3981's methodology document defines
-# under "Vulnerability classes in scope" (`.claude/skills/security-review/docs/methodology.md`,
+# under "Vulnerability classes in scope" (`.claude/tooling/security-review/docs/methodology.md`,
 # inside the always-inlined `methodology-core` section) -- kept here as a
 # literal set, rather than parsed from that document at import, so this
 # module stays dependency-free of the doc's location/parsing (that is

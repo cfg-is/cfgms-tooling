@@ -64,10 +64,10 @@ def _bootstrap_harness_imports() -> None:
     lane_candidates.append(Path(trusted) / "lanes")
     harness_candidates.append(Path(trusted))
     if env_repo_root:
-        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
-        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
-    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
-    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+        lane_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review")
+    lane_candidates.append(Path("/workspace/.claude/tooling/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/tooling/security-review"))
     for candidate in lane_candidates:
         if (candidate / "terminal_state.py").is_file():
             if str(candidate) not in sys.path:

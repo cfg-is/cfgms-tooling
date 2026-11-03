@@ -6,7 +6,7 @@
 #
 # Reads the review prompt from /workspace/.acceptance-review-prompt.md
 # (written by the host) and runs `claude -p` against it. Mirrors the
-# credential-validation flow from .devcontainer/entrypoint.sh so a stale
+# credential-validation flow from .claude/tooling/devcontainer/entrypoint.sh so a stale
 # OAuth token refreshes itself before the review starts.
 #
 # The Acceptance Reviewer agent definition (.claude/agents/acceptance-reviewer.md)
@@ -29,7 +29,7 @@ fi
 
 # Helper library for prompt context assembly, incl. ac_resolve_agent_model
 # (Issue #3030). Layout differs between the source tree (this script lives
-# under .devcontainer/scripts/, agent-context.sh under .devcontainer/) and the
+# under .claude/tooling/devcontainer/scripts/, agent-context.sh under .claude/tooling/devcontainer/) and the
 # container (both flattened as siblings under /usr/local/bin/ — see Dockerfile
 # COPY + the runtime -v mount in agent-dispatch.sh) — try the flattened path
 # first since that's the hot path in production.
@@ -48,8 +48,8 @@ PROMPT_FILE="/workspace/.acceptance-review-prompt.md"
 # FAIL, or merge on PASS). TTL reclaim is the backstop if this container dies.
 release_cfgms_lease() {
   [ -n "${CFGMS_LEASE_KEY:-}" ] || return 0
-  [ -f /workspace/scripts/pipeline-helper.sh ] || return 0
-  bash /workspace/scripts/pipeline-helper.sh lease-release "$CFGMS_LEASE_KEY" >/dev/null 2>&1 || true
+  [ -f /workspace/.claude/tooling/scripts/pipeline-helper.sh ] || return 0
+  bash /workspace/.claude/tooling/scripts/pipeline-helper.sh lease-release "$CFGMS_LEASE_KEY" >/dev/null 2>&1 || true
 }
 trap release_cfgms_lease EXIT
 
@@ -109,7 +109,7 @@ fi
 PR_NUM=$(grep -oP 'pr:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 STORY_NUM=$(grep -oP 'story:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 ITEM_ID=$(grep -oP -- '--project-item \K\S+' "$PROMPT_FILE" | head -1 || echo "")
-PROJECT_QUEUE="/workspace/scripts/project-queue.sh"
+PROJECT_QUEUE="/workspace/.claude/tooling/scripts/project-queue.sh"
 # Model/effort resolved from .claude/model-routing.yaml (Issue #3030) —
 # see ac_resolve_agent_model in agent-context.sh.
 mapfile -t RESOLVED_MODEL < <(ac_resolve_agent_model "acceptance-review")
@@ -160,7 +160,7 @@ RESULT_EOF
 # The reporter resolves from the harness, never from /workspace (the PR branch
 # under review) — a branch that predates, edits, or deletes the reporter must
 # not be able to disable its own accounting. agent-dispatch.sh review-pr
-# bind-mounts .claude/metrics from the host at runtime, the same no-rebuild
+# bind-mounts .claude/tooling/metrics from the host at runtime, the same no-rebuild
 # pattern already used for this script and setup-env.sh; entrypoint.sh's own
 # copy is baked into the image (see Dockerfile) as a fallback path. A failure
 # to record usage must be loud (stdout WARN + an explicit usage_error marker

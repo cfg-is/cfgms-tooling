@@ -4,7 +4,7 @@ contract C5).
 
 `CFGMS_SECURITY_REVIEW_LANES` is a comma-separated list of `harness:model`
 pairs -- a fan-out, not a fallback chain: every entry runs at every step
-(see .claude/skills/security-review/docs/harness-architecture.md, C5). This module turns
+(see .claude/tooling/security-review/docs/harness-architecture.md, C5). This module turns
 that string into a list of `Lane` tuples that `security-review.sh` loops
 over to call `agent-dispatch.sh launch-investigator --harness <h> --model
 <m> ...` once per entry (Issue #3932's `dispatch_roster_lanes`).

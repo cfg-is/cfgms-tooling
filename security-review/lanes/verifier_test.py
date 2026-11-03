@@ -6,7 +6,7 @@ files written to a real temp directory and a real stubbed harness call -- never
 a mocked filesystem -- because the properties under test are what the stage
 reads, what it emits, and what it refuses to emit.
 
-Run: python3 .claude/skills/security-review/lanes/verifier_test.py
+Run: python3 .claude/tooling/security-review/lanes/verifier_test.py
 """
 from __future__ import annotations
 

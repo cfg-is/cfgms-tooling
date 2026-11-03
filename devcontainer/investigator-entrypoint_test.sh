@@ -31,7 +31,7 @@
 # investigator-entrypoint.sh's CFGMS_TEST_LANE_SCRIPT_PATH override to point
 # it at a stub script this suite controls instead.
 #
-# Run: bash .devcontainer/investigator-entrypoint_test.sh
+# Run: bash .claude/tooling/devcontainer/investigator-entrypoint_test.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

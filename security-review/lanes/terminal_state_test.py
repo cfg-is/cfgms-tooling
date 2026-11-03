@@ -11,7 +11,7 @@ temp directory -- never a mocked filesystem or a stubbed classifier
 dependency -- because the whole point of this module is that state is
 derived from the artifact actually on disk.
 
-Run: python3 .claude/skills/security-review/lanes/terminal_state_test.py
+Run: python3 .claude/tooling/security-review/lanes/terminal_state_test.py
 """
 from __future__ import annotations
 

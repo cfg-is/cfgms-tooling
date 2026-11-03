@@ -27,7 +27,7 @@ draft item id (`PVTI_...`) alongside `#NNNN`, and treat an unmaterialized draft
 dependency as an OPEN dependency. It fails closed, and it does not change what
 `--defer` means.
 
-Run: python3 .claude/scripts/tests/test-preflight-draft-deps.py
+Run: python3 .claude/tooling/scripts/tests/test-preflight-draft-deps.py
 """
 import importlib.util
 import os

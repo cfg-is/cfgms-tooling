@@ -13,7 +13,7 @@ shared prompt/schema/refusal-retry library (`harness_runner.py`, Issue
 #3931's C4) and the shared terminal-state classifier (`terminal_state.py`,
 Issue #3928's C3), and reads/enriches plan steps identically. It differs in
 exactly two places, both forced by the real, installed OpenCode CLI
-(`opencode-ai@1.18.29`, pinned in `.devcontainer/Dockerfile` -- confirmed by
+(`opencode-ai@1.18.29`, pinned in `.claude/tooling/devcontainer/Dockerfile` -- confirmed by
 installing and running it, not assumed from documentation, which for this
 CLI is unreliable: several search-indexed "OpenCode docs" mirrors describe
 flags this version's own `--help` does not have):
@@ -126,7 +126,7 @@ def _bootstrap_harness_imports() -> None:
     # `harness_runner`, `scan_profiles` (the scanner allowlist), `schema`,
     # `resume`, ... -- must come from the TRUSTED harness mount
     # (`agent-dispatch.sh launch-investigator` bind-mounts the host's own
-    # `.claude/skills/security-review` read-only at
+    # `.claude/tooling/security-review` read-only at
     # `/opt/cfgms-harness/security-review` and exports its path in
     # `CFGMS_SECURITY_REVIEW_HARNESS_DIR`), never from the audited snapshot at
     # `/workspace`: the snapshot is the code under review, and a reviewed commit
@@ -137,10 +137,10 @@ def _bootstrap_harness_imports() -> None:
     lane_candidates.append(Path(trusted_harness) / "lanes")
     harness_candidates.append(Path(trusted_harness))
     if env_repo_root:
-        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
-        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
-    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
-    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+        lane_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review")
+    lane_candidates.append(Path("/workspace/.claude/tooling/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/tooling/security-review"))
 
     for candidate in lane_candidates:
         if (candidate / "terminal_state.py").is_file():

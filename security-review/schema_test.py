@@ -7,7 +7,7 @@ Hand-rolled (no unittest, no third-party test runner) matching the existing
 only, exit 0 on all-pass, non-zero otherwise, run directly by
 `scripts/test-scripts.sh`.
 
-Run: python3 .claude/skills/security-review/schema_test.py
+Run: python3 .claude/tooling/security-review/schema_test.py
 """
 from __future__ import annotations
 
@@ -256,7 +256,7 @@ def test_cwe_and_line_are_required_finding_fields():
 
 def test_cwe_values_match_the_methodology_document():
     # Drift guard: schema.CWE_VALUES is a literal copy of the closed
-    # identifier list .claude/skills/security-review/docs/methodology.md (#3981)
+    # identifier list .claude/tooling/security-review/docs/methodology.md (#3981)
     # defines, not parsed from it at import (that document-parsing concern
     # belongs to lanes/harness_runner.py, for prompt assembly). Read the live
     # document here so an edit to either side without the other fails this test.
@@ -273,12 +273,12 @@ def test_cwe_values_match_the_methodology_document():
     check(
         missing == [],
         "schema.CWE_VALUES: every identifier also appears in "
-        ".claude/skills/security-review/docs/methodology.md",
+        ".claude/tooling/security-review/docs/methodology.md",
         str(missing),
     )
     check(
         "other: <short label>" in text,
-        ".claude/skills/security-review/docs/methodology.md still documents the "
+        ".claude/tooling/security-review/docs/methodology.md still documents the "
         "'other' escape normalize_cwe accepts",
     )
 

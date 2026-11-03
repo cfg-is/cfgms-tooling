@@ -11,7 +11,7 @@ or partially parked -- and produces two files under `<sweep_dir>/report/`:
 
 - `consolidated.json` -- machine-readable findings, de-duplicated on
   `file` + `symbol` + normalised `cwe` (never a line number, per
-  .claude/skills/security-review/docs/harness-architecture.md; never the free-text
+  .claude/tooling/security-review/docs/harness-architecture.md; never the free-text
   `vuln_class`, per Issue #4134 -- two lanes describing one defect in
   different registers are the same defect, and keying on prose made them two),
   each annotated with exactly the lanes that independently reported it and the
@@ -893,7 +893,7 @@ _IDENTIFIER_PREFIX_RE = re.compile(
 # A bare number with no `CWE` at all, which is still not a heading.
 _BARE_IDENTIFIER_RE = re.compile(r"^\s*\d+\s*$")
 # `other: <short label>` is the vocabulary's escape hatch, which
-# `.claude/skills/security-review/docs/methodology.md` calls "allowed and expected" -- so a
+# `.claude/tooling/security-review/docs/methodology.md` calls "allowed and expected" -- so a
 # lane using it is behaving correctly, and it must not produce
 # "### other: foo (other: foo)", the exact duplication this helper exists to
 # prevent. The label is the tail; `other:` is the marker, not prose.
@@ -2004,7 +2004,7 @@ def _sweep_complete(report: dict) -> bool:
       coverage, so both fold into this one check.
     - any lane's coverage row shows `parked > 0` or `refused > 0` -- a
       rate-limited or model-refused step "never got far enough to have read
-      anything meaningful" (.claude/skills/security-review/docs/harness-architecture.md),
+      anything meaningful" (.claude/tooling/security-review/docs/harness-architecture.md),
       exactly like `failed`. Without these two, a sweep in which every step
       was parked or refused -- zero code actually read -- would render as a
       clean full sweep, which is the fail-open framing this check exists to

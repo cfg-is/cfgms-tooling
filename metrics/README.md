@@ -10,25 +10,25 @@ Part of epic #3026 (pipeline cost engineering); this directory is story #3027.
 
 ```bash
 # Where does the money go?
-.claude/metrics/token_report.py --composition
+.claude/tooling/metrics/token_report.py --composition
 
 # Spend by model, by pipeline segment, by day
-.claude/metrics/token_report.py --group-by model
-.claude/metrics/token_report.py --group-by segment --top 20
-.claude/metrics/token_report.py --group-by day --since 7
+.claude/tooling/metrics/token_report.py --group-by model
+.claude/tooling/metrics/token_report.py --group-by segment --top 20
+.claude/tooling/metrics/token_report.py --group-by day --since 7
 
 # Main loop vs subagents vs workflow agents
-.claude/metrics/token_report.py --group-by agent
+.claude/tooling/metrics/token_report.py --group-by agent
 
 # Which review lens (or Tech Lead, BA, fix round...) actually costs what
-.claude/metrics/token_report.py --group-by role
+.claude/tooling/metrics/token_report.py --group-by role
 
 # One record per API call, for downstream tooling and benchmarks
-.claude/metrics/token_report.py --format jsonl --out facts.jsonl
+.claude/tooling/metrics/token_report.py --format jsonl --out facts.jsonl
 
 # What did delivered work actually cost -- per story, dev vs fix vs review
-.claude/metrics/token_report.py --story-report
-.claude/metrics/token_report.py --story-report --format jsonl --out stories.jsonl
+.claude/tooling/metrics/token_report.py --story-report
+.claude/tooling/metrics/token_report.py --story-report --format jsonl --out stories.jsonl
 ```
 
 Group keys: `model`, `segment`, `session`, `day`, `skill`, `agent`, `project`,
@@ -68,7 +68,7 @@ Prices live in `pricing.json`, not in code. A model absent from that table is
 reported as `UNPRICED`: its tokens are counted and its dollars are **not**
 guessed, and the row is flagged with `*`.
 
-Run the tests with `python3 .claude/metrics/tests/test_token_report.py`.
+Run the tests with `python3 .claude/tooling/metrics/tests/test_token_report.py`.
 
 ## Three things that make naive versions of this tool wrong
 
@@ -158,7 +158,7 @@ stamps its own token totals into `agent-result.json` on exit. To report on
 dispatched agents, point the reporter at that root:
 
 ```bash
-.claude/metrics/token_report.py \
+.claude/tooling/metrics/token_report.py \
   --projects-dir ~/.cache/cfgms-agent-sessions/cfg-agent-1234 \
   --format totals
 ```
@@ -172,12 +172,12 @@ the container lifecycle, because a transcript is meant to outlive its container.
 ### Dev-agent telemetry needs an image rebuild
 
 The agent image bakes in `setup-env.sh` and `entrypoint.sh`
-(`.devcontainer/Dockerfile` lines 169-170), and `launch-generic` does **not**
+(`.claude/tooling/devcontainer/Dockerfile` lines 169-170), and `launch-generic` does **not**
 bind-mount either. So dev and fix agents only produce telemetry once the image
 is rebuilt:
 
 ```bash
-docker build -t cfg-agent:latest -f .devcontainer/Dockerfile .
+docker build -t cfg-agent:latest -f .claude/tooling/devcontainer/Dockerfile .
 ```
 
 | container | scripts come from | rebuild needed |

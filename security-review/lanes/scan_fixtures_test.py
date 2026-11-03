@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Planted-fixture coverage tests for the shipped scanner profiles (Issue
 #3982): each profile must RECOVER a known finding from
-`.claude/skills/security-review/fixtures/scan/`, run through the real shared
+`.claude/tooling/security-review/fixtures/scan/`, run through the real shared
 runner with the real registry against the real tools.
 
 Where a tool is not installed (a host without the cfg-agent image's
@@ -11,7 +11,7 @@ that is *missing* (the profile no longer names the tool, or the language was
 dropped) FAILS: that is the "must fail if any profile is emptied" guarantee.
 Inside the container every tool is present and every case runs for real.
 
-Run: python3 .claude/skills/security-review/lanes/scan_fixtures_test.py
+Run: python3 .claude/tooling/security-review/lanes/scan_fixtures_test.py
 Optional: CFGMS_SCANNER_HOME=<dir> to point at a non-default scanner home.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ import harness_runner  # noqa: E402
 import scan_profiles  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-FIXTURES = ".claude/skills/security-review/fixtures/scan"
+FIXTURES = ".claude/tooling/security-review/fixtures/scan"
 
 FAILURES: list[str] = []
 SKIPS: list[str] = []

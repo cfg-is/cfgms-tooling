@@ -22,7 +22,7 @@ constants, never a second copy of them.
 
 ## Review methodology: compact core and per-step anchors (Issue #3981)
 
-`.claude/skills/security-review/docs/methodology.md` is the single copy of the review
+`.claude/tooling/security-review/docs/methodology.md` is the single copy of the review
 methodology every lane is held to -- threat model, the closed CWE shortlist
 plus its `other:` escape, attacker tiers, the four severity definitions, and
 worked CFGMS examples ("anchors") calibrating each level. This module loads
@@ -232,7 +232,7 @@ OUTPUT_SCHEMA_DESCRIPTION = _build_output_schema_description()
 
 # --- Review methodology: compact core and per-step anchors (Issue #3981) ----
 #
-# `.claude/skills/security-review/docs/methodology.md` is the one copy of the review
+# `.claude/tooling/security-review/docs/methodology.md` is the one copy of the review
 # methodology every lane is held to. This module loads that document once,
 # at import, and is the only place its text becomes a prompt constant -- the
 # same C4 single-sourcing contract `SYSTEM_PROMPT` and
@@ -255,10 +255,10 @@ OUTPUT_SCHEMA_DESCRIPTION = _build_output_schema_description()
 # cannot start with the methodology silently dropped from its prompts.
 
 SEVERITY_LEVELS = ("critical", "high", "medium", "low")
-METHODOLOGY_RELATIVE_PATH = ".claude/skills/security-review/docs/methodology.md"
+METHODOLOGY_RELATIVE_PATH = ".claude/tooling/security-review/docs/methodology.md"
 # The investigator container's trusted-harness mount keeps its pre-relocation
 # internal layout (`agent-dispatch.sh launch-investigator` bind-mounts the
-# host's .claude/skills/security-review/docs at the fixed container path
+# host's .claude/tooling/security-review/docs at the fixed container path
 # /opt/cfgms-harness/docs/security-review -- see CLAUDE.md's Out of Scope on
 # container-internal mount paths), so it is resolved with its own relative
 # path rather than METHODOLOGY_RELATIVE_PATH above.
@@ -289,16 +289,16 @@ class MethodologyError(ValueError):
 
 
 def methodology_path() -> Path:
-    """Locate `.claude/skills/security-review/docs/methodology.md`: under
+    """Locate `.claude/tooling/security-review/docs/methodology.md`: under
     `CFGMS_SECURITY_REVIEW_REPO_ROOT` when set (the same override every
     lane's import bootstrap honours), else four directories above this file
     -- the repository root both in a checkout and in the investigator
     container, where the whole repository is bind-mounted at `/workspace`
     and this module is imported from
-    `/workspace/.claude/skills/security-review/lanes/`."""
+    `/workspace/.claude/tooling/security-review/lanes/`."""
     # Issue #3982: the methodology is review POLICY, so inside the investigator
     # container it comes from the trusted harness mount (`launch-investigator`
-    # bind-mounts the host's .claude/skills/security-review/docs at
+    # bind-mounts the host's .claude/tooling/security-review/docs at
     # /opt/cfgms-harness/docs/security-review beside the harness tree), never
     # from the audited snapshot. An explicit CFGMS_SECURITY_REVIEW_METHODOLOGY
     # file path wins; then the trusted mount; then the checkout/test roots.

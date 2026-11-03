@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 POMD="${REPO_ROOT}/.claude/agents/po.md"
 
 [[ -f "$POMD" ]] || { printf 'FAIL: po.md not found at %s\n' "$POMD" >&2; exit 1; }
@@ -104,7 +104,7 @@ run_enqueue() {  # run_enqueue <released_head_oid> <approvals> <actor_perm>
   PATH="$TMP/bin:$PATH" GH_LOG="$TMP/gh.log" HEAD_SHA_FILE="$TMP/head_sha" \
     CFGMS_TEST_COLLAB_PERM=read CFGMS_TEST_ACTOR_LOGIN=maint CFGMS_TEST_ACTOR_PERM="$3" \
     CFGMS_TEST_HEAD_OID="$1" CFGMS_TEST_APPROVALS="$2" \
-    bash "${REPO_ROOT}/.claude/scripts/po-act.sh" enqueue 9999 2>&1 || true
+    bash "${REPO_ROOT}/.claude/tooling/scripts/po-act.sh" enqueue 9999 2>&1 || true
 }
 merged() { grep -q '^pr merge' "$TMP/gh.log" && echo merged || echo not_merged; }
 

@@ -109,7 +109,7 @@ else
   ok "mount never lands inside ~/.claude (parent stays agent-owned)"
 fi
 
-setup_src="$(cat "${SCRIPT_DIR}/../../../.devcontainer/scripts/setup-env.sh")"
+setup_src="$(cat "${SCRIPT_DIR}/../../devcontainer/scripts/setup-env.sh")"
 check_contains "setup-env symlinks projects at the mount" "$setup_src" \
   'ln -sfn /agent-sessions ~/.claude/projects'
 check_contains "symlink is guarded on the mount existing" "$setup_src" \
@@ -224,8 +224,8 @@ check_contains "prune is retention-driven, not container-driven" "$dispatch_src"
 
 printf '\n== container-side accounting ==\n'
 
-for entry in "${SCRIPT_DIR}/../../../.devcontainer/entrypoint.sh" \
-             "${SCRIPT_DIR}/../../../.devcontainer/scripts/review-entrypoint.sh"; do
+for entry in "${SCRIPT_DIR}/../../devcontainer/entrypoint.sh" \
+             "${SCRIPT_DIR}/../../devcontainer/scripts/review-entrypoint.sh"; do
   name="$(basename "$entry")"
   src="$(cat "$entry")"
   check_contains "${name} records usage into the manifest" "$src" '"usage"'
@@ -236,7 +236,7 @@ for entry in "${SCRIPT_DIR}/../../../.devcontainer/entrypoint.sh" \
 
   # Regression guard for #3041: the reporter must resolve from the harness,
   # never from the PR checkout under /workspace -- a branch that lacks, edits,
-  # or deletes .claude/metrics must not be able to disable its own accounting.
+  # or deletes .claude/tooling/metrics must not be able to disable its own accounting.
   if grep -qE 'TOKEN_REPORT="/workspace' "$entry"; then
     bad "${name} reporter never resolved from /workspace" "found a /workspace-rooted TOKEN_REPORT assignment"
   else
@@ -253,13 +253,13 @@ done
 
 printf '\n== harness-baked reporter (image + Dockerfile) ==\n'
 
-DOCKERFILE="${SCRIPT_DIR}/../../../.devcontainer/Dockerfile"
-DOCKERIGNORE="${SCRIPT_DIR}/../../../.dockerignore"
+DOCKERFILE="${SCRIPT_DIR}/../../devcontainer/Dockerfile"
+DOCKERIGNORE="${SCRIPT_DIR}/../../../../.dockerignore"
 dockerfile_src="$(cat "$DOCKERFILE")"
 check_contains "Dockerfile bakes token_report.py into the harness path" "$dockerfile_src" \
   '/usr/local/share/cfgms-metrics/'
 check_contains "Dockerfile bakes pricing.json alongside it" "$dockerfile_src" \
-  '.claude/metrics/pricing.json'
+  '.claude/tooling/metrics/pricing.json'
 
 # The bake COPYs out of .claude, which .dockerignore excludes wholesale for
 # every image in the repo. Without a per-file negation BuildKit warns
@@ -304,12 +304,12 @@ printf '\n== harness reporter mount (all accounting dispatch paths) ==\n'
 
 check_contains "harness mount targets the image's baked reporter path" "$dispatch_src" \
   'AGENT_METRICS_MOUNT="/usr/local/share/cfgms-metrics"'
-check_contains "dispatch bind-mounts .claude/metrics from the harness checkout" "$dispatch_src" \
-  '-v "${REPO_ROOT}/.claude/metrics:${AGENT_METRICS_MOUNT}:ro"'
+check_contains "dispatch bind-mounts .claude/tooling/metrics from the harness checkout" "$dispatch_src" \
+  '-v "${REPO_ROOT}/.claude/tooling/metrics:${AGENT_METRICS_MOUNT}:ro"'
 # An absent source must fall through to the baked copy: Docker would otherwise
 # create an empty host dir and shadow a working reporter with nothing.
 check_contains "mount is skipped when the harness copy is absent" "$dispatch_src" \
-  'if [ -d "${REPO_ROOT}/.claude/metrics" ]; then'
+  'if [ -d "${REPO_ROOT}/.claude/tooling/metrics" ]; then'
 
 # Baking alone leaves the control inoperative until someone rebuilds a ~10GB
 # image, so every container that runs an accounting entrypoint must also carry

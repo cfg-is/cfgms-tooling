@@ -10,7 +10,7 @@ launches is the only thing in the pipeline that reads source, so "bash is
 denied" and "each worker gets its own session store" must fail loudly if a
 future edit relaxes them, rather than being true only in the docstring.
 
-Run: python3 .claude/skills/security-review/lanes/agentic_verifier_runner_test.py
+Run: python3 .claude/tooling/security-review/lanes/agentic_verifier_runner_test.py
 """
 from __future__ import annotations
 

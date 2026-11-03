@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coverage tests for manifest.py: sweep id + manifest + directory skeleton.
 
-Run: python3 .claude/skills/security-review/manifest_test.py
+Run: python3 .claude/tooling/security-review/manifest_test.py
 """
 from __future__ import annotations
 

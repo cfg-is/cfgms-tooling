@@ -18,7 +18,7 @@ host:
   writes exactly one envelope, `adjudication.json`.
 
 **What it asks the model.** For every finding: apply the severity rubric
-(`.claude/skills/security-review/docs/methodology.md`, the same document every finder lane
+(`.claude/tooling/security-review/docs/methodology.md`, the same document every finder lane
 is held to -- delivered whole here: the core and every worked example, since
 there is no per-step subject to select anchors by) to the lanes' own reports
 and return one severity with a written rationale. For every cross-step
@@ -105,10 +105,10 @@ def _bootstrap_harness_imports() -> None:
     lane_candidates.append(Path(trusted_harness) / "lanes")
     harness_candidates.append(Path(trusted_harness))
     if env_repo_root:
-        lane_candidates.append(Path(env_repo_root) / ".claude/skills/security-review/lanes")
-        harness_candidates.append(Path(env_repo_root) / ".claude/skills/security-review")
-    lane_candidates.append(Path("/workspace/.claude/skills/security-review/lanes"))
-    harness_candidates.append(Path("/workspace/.claude/skills/security-review"))
+        lane_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review/lanes")
+        harness_candidates.append(Path(env_repo_root) / ".claude/tooling/security-review")
+    lane_candidates.append(Path("/workspace/.claude/tooling/security-review/lanes"))
+    harness_candidates.append(Path("/workspace/.claude/tooling/security-review"))
     for candidate in lane_candidates:
         if (candidate / "terminal_state.py").is_file():
             candidate_str = str(candidate)

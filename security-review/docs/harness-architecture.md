@@ -11,9 +11,9 @@ rules independently.
 
 ## Implementation
 
-Python 3 standard library plus bash, matching the existing `.claude/scripts/` convention —
+Python 3 standard library plus bash, matching the existing `.claude/tooling/scripts/` convention —
 no third-party pip dependencies (no `jsonschema`, nothing). The shared, dependency-free
-primitives live in `.claude/skills/security-review/`:
+primitives live in `.claude/tooling/security-review/`:
 
 | Module | Responsibility |
 |---|---|
@@ -33,11 +33,11 @@ primitives live in `.claude/skills/security-review/`:
 | `metadata.py` | `collect`/`render_payload` — the flat, metadata-only repository summary (paths, package dirs, route registrar paths, `web/src/` top-level directory names), kept as an independently tested unit but no longer called by the planner path; `write_bundle` (Issue #3978) — the auditable bundle directory that is the planner's only input as of Issue #3979 — see [The auditable planner bundle](#the-auditable-planner-bundle-issue-3978) below |
 | `snapshot.py` | `create_snapshot`/`verify_snapshot` — the immutable, byte-verified snapshot every LANE investigator container mounts at `/workspace` (Issue #3951/#3952); the PLAN-mode container mounts the bundle instead as of Issue #3979 — see [Immutable snapshot](#immutable-snapshot) below |
 | `planner.py` | `prepare`/`launch`/`finalize` — writes the auditable bundle (`metadata.write_bundle()`) and assembles the planner prompt around its `01-tree.tsv` file inventory, launches the plan-mode investigator container (mounting the bundle, never the snapshot, at `/workspace` — Issue #3979), and validates its `plan/step-NNN.json` output; `launch(..., planners=...)`/`finalize_multi_planner`/`merge_steps_by_scope` add the `CFGMS_SECURITY_REVIEW_PLANNERS` multi-planner path (C6, Issue #3937) — see [Multi-planner plan merge](#multi-planner-plan-merge-c6-issue-3937) below |
-| `security-review.sh` | The operator-facing `launch`/`status`/`resume` CLI (Issue #3910) — see [Sweep orchestration CLI](#sweep-orchestration-cli-launchstatusresume) below. Lives in `.claude/scripts/`, one level up from this directory, alongside `agent-dispatch.sh` |
+| `security-review.sh` | The operator-facing `launch`/`status`/`resume` CLI (Issue #3910) — see [Sweep orchestration CLI](#sweep-orchestration-cli-launchstatusresume) below. Lives in `.claude/tooling/scripts/`, one level up from this directory, alongside `agent-dispatch.sh` |
 
 This directory's name contains a hyphen, so it is never imported with a plain
 `import security-review` statement. A module that needs a sibling imports it the way
-`.claude/metrics/usage_db.py` imports `token_report.py`:
+`.claude/tooling/metrics/usage_db.py` imports `token_report.py`:
 `sys.path.insert(0, str(Path(__file__).resolve().parent))` followed by a plain `import <module>`.
 
 ## Artifact layout
@@ -45,7 +45,7 @@ This directory's name contains a hyphen, so it is never imported with a plain
 All sweep state lives outside the repository, under a base directory resolved by
 `basedir.py::resolve_base_dir()` (default `${HOME}/.cache/cfgms-security-review`, matching the
 `CFGMS_AGENT_SESSIONS_BASE` / `CFGMS_AGENT_LEDGER_DIR` precedent in
-`.claude/scripts/agent-dispatch.sh`). Nothing under this tree is ever committed.
+`.claude/tooling/scripts/agent-dispatch.sh`). Nothing under this tree is ever committed.
 
 ```
 ~/.cache/cfgms-security-review/
@@ -302,13 +302,13 @@ summary on its envelope's `scans` field; it never executes anything itself.
   `eslint-plugin-react` and the CFGMS HTML-sink bans from `web/eslint.config.js`, and
   `semgrep`. Shell/PowerShell/Python: `rg` over the CLAUDE.md banned runtime-composition
   patterns. Semgrep is in scope because its unique value is *project* rules no stock scanner
-  carries (`.devcontainer/scanner/semgrep/cfgms/`: raw `err` in a structured log call, an
+  carries (`.claude/tooling/devcontainer/scanner/semgrep/cfgms/`: raw `err` in a structured log call, an
   unannotated `IsRaftLeader()`/`IsLeader()`, `exec.Command("sh", "-c", ...)`, the HTML sinks
   and `eval`/`new Function`). *Rejected:* `eslint-plugin-security` alone (it is Node security,
   not browser sink coverage); deferring semgrep to a follow-up story (drags the epic out).
 - **Decision 1b — network-using scanners: excluded, no exceptions.** `govulncheck` and
   `npm audit` call `vuln.go.dev` and the npm registry by design; admitting either means a new
-  domain in `.devcontainer/dnsmasq-allowlist.d/`, widening the egress of a credential-bearing
+  domain in `.claude/tooling/devcontainer/dnsmasq-allowlist.d/`, widening the egress of a credential-bearing
   container, for dependency-CVE data `nancy` and `trivy` already produce on every PR.
   *Rejected:* adding those domains. *Future:* import same-commit CI scan results with
   provenance and freshness, so dependency coverage reaches the model without a network call.
@@ -327,10 +327,10 @@ entrypoint file was always bind-mounted from the host, but until this story its 
 (`harness_runner`, `scan_profiles`, `schema`, `resume`, `terminal_state`) resolved from
 `/workspace` — the audited snapshot, i.e. the code under review. A reviewed commit could have
 replaced the registry or run code on import beside the lane credential. `launch-investigator`
-now bind-mounts the host's own `.claude/skills/security-review` read-only at
+now bind-mounts the host's own `.claude/tooling/security-review` read-only at
 `/opt/cfgms-harness/security-review` for every lane launch (never in plan mode), exports
 `CFGMS_SECURITY_REVIEW_HARNESS_DIR`, and each lane's import bootstrap consults that path ahead of
-any `/workspace` fallback. The review methodology is policy too, so `.claude/skills/security-review/docs` is mounted beside it at
+any `/workspace` fallback. The review methodology is policy too, so `.claude/tooling/security-review/docs` is mounted beside it at
 `/opt/cfgms-harness/docs/security-review` and `methodology_path()` resolves there first (an
 explicit `CFGMS_SECURITY_REVIEW_METHODOLOGY` path wins; the checkout root is the fallback for
 tests). Every non-test `.py` in the harness tree plus `methodology.md` is hashed into
@@ -385,7 +385,7 @@ only path confinement stops it.
 snapshot. eslint runs as `node /opt/cfgms-scanner/node_modules/eslint/bin/eslint.js
 --no-config-lookup --config /opt/cfgms-scanner/eslint.config.js --no-inline-config`; a flat
 config is executable JavaScript, so the audited project's `eslint.config.js` must never load.
-The scanner's own `node_modules` come from `.devcontainer/scanner/package-lock.json` (`npm ci
+The scanner's own `node_modules` come from `.claude/tooling/devcontainer/scanner/package-lock.json` (`npm ci
 --ignore-scripts` at build), not from `web/`; the audited project's dependencies are never
 installed at scan time. Go tools typecheck the snapshot but never run it (`CGO_ENABLED=0`; no
 `go generate`/`go run` in any profile); they run from the nearest enclosing `go.mod` so a nested
@@ -460,7 +460,7 @@ clean code.
 
 **Coverage is proven, not asserted.** `lanes/scan_fixtures_test.py` runs the real registry
 through the real runner against planted fixtures under
-`.claude/skills/security-review/fixtures/scan/` (their own Go module in a dot-directory, so the
+`.claude/tooling/security-review/fixtures/scan/` (their own Go module in a dot-directory, so the
 root `./...` never compiles them, and excluded from CodeQL via `paths-ignore`): gosec must report
 `G401`, staticcheck `SA4017`, upstream semgrep `md5-used-as-password` and
 `react-dangerouslysetinnerhtml`, the CFGMS rules `cfgms-raw-error-in-structured-log`,
@@ -469,10 +469,10 @@ root `./...` never compiles them, and excluded from CodeQL via `paths-ignore`): 
 (the profile was emptied); a tool absent from the host prints `[SKIP]` with the reason — never
 `[PASS]` — and runs for real inside `cfg-agent:latest`.
 
-**Image supply chain.** `.devcontainer/Dockerfile` installs the scanner home in one block:
+**Image supply chain.** `.claude/tooling/devcontainer/Dockerfile` installs the scanner home in one block:
 eslint and plugins from the scanner lockfile (integrity-pinned; `--ignore-scripts`); semgrep
 `1.179.0` via `uv pip install --require-hashes` from
-`.devcontainer/scanner/semgrep-requirements.txt` (the full wheel closure, sha256 per artifact for
+`.claude/tooling/devcontainer/scanner/semgrep-requirements.txt` (the full wheel closure, sha256 per artifact for
 both `x86_64` and `aarch64`) into a private virtualenv; the curated upstream Go and TS/React
 security rules fetched at the commit pinned in `semgrep/upstream/SOURCE` and verified file by
 file against the sha256 recorded there (`fetch-semgrep-rules.sh` fails the build on any
@@ -481,12 +481,12 @@ the Semgrep Rules License); the CFGMS rules copied from the repository; and `sem
 over every rule set so a broken rule fails the build. `ruleset_version()` hashes `SOURCE`, the
 CFGMS rules and the eslint config into the cache key, so a rule change invalidates cached
 results. These pins are not tracked by `dependency-pin-check.yml` (same status as the Ollama CLI
-pin); refresh by bumping the versions in `.devcontainer/scanner/` and regenerating the lockfile
+pin); refresh by bumping the versions in `.claude/tooling/devcontainer/scanner/` and regenerating the lockfile
 and hashed requirements as their headers describe.
 
 ### Review methodology: compact core and per-step anchors (Issue #3981)
 
-**Where it lives.** `.claude/skills/security-review/docs/methodology.md` is the single copy of the review
+**Where it lives.** `.claude/tooling/security-review/docs/methodology.md` is the single copy of the review
 methodology every finder lane is held to: the CFGMS threat model restated for a reviewer, the
 closed vulnerability-class shortlist (CWE identifiers plus an explicit `other: <label>` escape),
 the attacker tiers, the four severity level definitions, and worked CFGMS examples ("anchors")
@@ -649,7 +649,7 @@ Every lane emits the same shape (`schema.py::validate_finding`):
 
 Fifteen fields are required; `end_line` is the sole optional field (sixteen total). `severity`
 and `confidence` are validated against their enum; `cwe` (Issue #3983) is validated and
-normalised against the closed CWE identifier list `.claude/skills/security-review/docs/methodology.md` (#3981)
+normalised against the closed CWE identifier list `.claude/tooling/security-review/docs/methodology.md` (#3981)
 defines, or its `other: <label>` escape, by `schema.normalize_cwe` — case and minor formatting
 variation (`cwe-295`, `CWE-295: ...`) normalise to the same canonical value, never pass through as
 distinct ones; `line` must be a positive integer, and `end_line`, when present, must be an integer
@@ -998,7 +998,7 @@ harness lane (and any future harness lane) actually runs behind today.
 
 ## Investigator launch primitive
 
-`.claude/scripts/agent-dispatch.sh launch-investigator` (Issue #3903) is the sole way any
+`.claude/tooling/scripts/agent-dispatch.sh launch-investigator` (Issue #3903) is the sole way any
 lab-side code runs against this harness's sweep tree. It launches a headless container that is
 technically — not just behaviorally — prevented from writing to the repository, branching,
 committing, pushing, or opening a PR or issue. The full contract, mount boundary, and
@@ -1006,15 +1006,15 @@ credential-delivery mechanics are documented at the files themselves rather than
 
 | Concern | Where it's implemented |
 |---|---|
-| Launch subcommand, mount boundary (`:ro` workspace, per-lane/plan writable output only), `--disallowedTools`, `--cap-add NET_ADMIN`, session/ledger wiring | `.claude/scripts/agent-dispatch.sh` (`launch-investigator` case arm) |
-| In-container mode dispatch (`plan` execs `claude -p`; a lane id execs that lane's own script) and the egress-firewall init that precedes both | `.devcontainer/scripts/investigator-entrypoint.sh` |
-| Default-deny egress: iptables `OUTPUT` policy `DROP`, HTTPS-only, dnsmasq domain allowlist, `resolv.conf` pinned to `127.0.0.1` | `.devcontainer/init-firewall.sh`, allowlist in `.devcontainer/dnsmasq-allowlist-base.conf` + `.devcontainer/dnsmasq-allowlist.d/` |
+| Launch subcommand, mount boundary (`:ro` workspace, per-lane/plan writable output only), `--disallowedTools`, `--cap-add NET_ADMIN`, session/ledger wiring | `.claude/tooling/scripts/agent-dispatch.sh` (`launch-investigator` case arm) |
+| In-container mode dispatch (`plan` execs `claude -p`; a lane id execs that lane's own script) and the egress-firewall init that precedes both | `.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh` |
+| Default-deny egress: iptables `OUTPUT` policy `DROP`, HTTPS-only, dnsmasq domain allowlist, `resolv.conf` pinned to `127.0.0.1` | `.claude/tooling/devcontainer/init-firewall.sh`, allowlist in `.claude/tooling/devcontainer/dnsmasq-allowlist-base.conf` + `.claude/tooling/devcontainer/dnsmasq-allowlist.d/` |
 | The read-only/report-only behavioral contract for whichever mode runs `claude` inside the container | `.claude/agents/investigator.md` |
-| Plan-mode-only mount of that same file at `/home/agent/.claude/agents/investigator.md:ro`, so `claude --agent investigator` resolves it (Issue #4003) | `.claude/scripts/agent-dispatch.sh` (`launch-investigator` case arm, plan branch) |
-| Streaming each container's log to `<--sweep-dir>/container-logs/<mode>.log` for its lifetime, so the event stream outlives the container (Issue #4132) — under whichever directory that launch was given, which is a sub-sweep dir for the verifier, the adjudicator and each multi-planner | `.claude/scripts/agent-dispatch.sh` (`start_investigator_log_capture`) |
-| Harness-session credential mount (the only credential path — see `--harness`/`--model` below) | `.claude/scripts/agent-dispatch.sh` (`launch-investigator` case arm) |
-| Structural and functional test coverage | `.claude/scripts/tests/investigator_launch.test.sh` |
-| Per-harness egress fragment selection test coverage | `.devcontainer/init-firewall_test.sh` |
+| Plan-mode-only mount of that same file at `/home/agent/.claude/agents/investigator.md:ro`, so `claude --agent investigator` resolves it (Issue #4003) | `.claude/tooling/scripts/agent-dispatch.sh` (`launch-investigator` case arm, plan branch) |
+| Streaming each container's log to `<--sweep-dir>/container-logs/<mode>.log` for its lifetime, so the event stream outlives the container (Issue #4132) — under whichever directory that launch was given, which is a sub-sweep dir for the verifier, the adjudicator and each multi-planner | `.claude/tooling/scripts/agent-dispatch.sh` (`start_investigator_log_capture`) |
+| Harness-session credential mount (the only credential path — see `--harness`/`--model` below) | `.claude/tooling/scripts/agent-dispatch.sh` (`launch-investigator` case arm) |
+| Structural and functional test coverage | `.claude/tooling/scripts/tests/investigator_launch.test.sh` |
+| Per-harness egress fragment selection test coverage | `.claude/tooling/devcontainer/init-firewall_test.sh` |
 
 This story assumes a sweep directory already exists (story S2/#3902 owns creating that tree) and
 fails closed if it does not — it never creates the sweep tree itself.
@@ -1226,16 +1226,16 @@ surfaces as a container that exits immediately, not as one that runs with open e
 founder chose one investigator image with the harness selected at launch, rather than an image
 per harness — credential and tool separation are already per-launch (`--harness`/`--model`,
 above), so that choice is sound on its own. Before Issue #3932, the egress allowlist was not
-per-launch: `.devcontainer/init-firewall.sh` started dnsmasq from a single baked
+per-launch: `.claude/tooling/devcontainer/init-firewall.sh` started dnsmasq from a single baked
 `/etc/dnsmasq-allowlist.conf` covering every provider, so any container — regardless of which
 harness or lane it was — could resolve every provider's domain. That was the one real
 cross-harness bleed the single-image model had, and splitting the allowlist is what closed it:
 
-- `.devcontainer/dnsmasq-allowlist-base.conf` — everything that is not a model provider (GitHub,
+- `.claude/tooling/devcontainer/dnsmasq-allowlist-base.conf` — everything that is not a model provider (GitHub,
   the Go toolchain, package registries, the security scanners). Issues #3935/#3936 add no domain
   here — a base entry is reachable by every lane regardless of harness, which would undo the
   separation this whole mechanism exists to provide.
-- `.devcontainer/dnsmasq-allowlist.d/<harness>.conf` — one fragment per harness. `claude.conf`
+- `.claude/tooling/devcontainer/dnsmasq-allowlist.d/<harness>.conf` — one fragment per harness. `claude.conf`
   holds only what the Claude Code harness itself needs (`anthropic.com`, `claude.ai`,
   `claude.com`, `sentry.io`) and is selected both when `--harness claude` sets
   `CFGMS_SECURITY_REVIEW_HARNESS=claude` **and** when no harness value is supplied at all —
@@ -1285,7 +1285,7 @@ cross-harness bleed the single-image model had, and splitting the allowlist is w
   harness with no fragment at all — aborts the container before dnsmasq ever starts: fail closed,
   never a fallback to loading every fragment, which would silently reopen the bleed this mechanism
   exists to close.
-- `.devcontainer/dnsmasq-allowlist.conf` (the original single combined file, pre-#3932) is no
+- `.claude/tooling/devcontainer/dnsmasq-allowlist.conf` (the original single combined file, pre-#3932) is no
   longer baked into the image — kept only, unbaked, as the fixed regression fixture
   `dnsmasq-allowlist_test.sh` still exercises directly. Its domain set matches
   `dnsmasq-allowlist-base.conf` + `dnsmasq-allowlist.d/claude.conf` exactly; Issues
@@ -1390,7 +1390,7 @@ one argument at 128 KiB) fails to launch, and the step is recorded failed rather
 
 ## The Claude harness lane
 
-`.claude/skills/security-review/lanes/claude_lane.py` (Issue #3933, epic #3927's switchover
+`.claude/tooling/security-review/lanes/claude_lane.py` (Issue #3933, epic #3927's switchover
 cutover) is the first — and, as of this story, only — lane built on the architectural correction
 the epic makes: a lane authenticates as a subscription agent harness's own session, never a REST
 API key. It replaces the three REST lanes this same story deletes (`anthropic.py`, `openai.py`,
@@ -1457,7 +1457,7 @@ to paper over, since every step in the chain is a real subprocess run, not an in
 
 ## The Codex harness lane
 
-`.claude/skills/security-review/lanes/codex_lane.py` (Issue #3935) is the second lane on the
+`.claude/tooling/security-review/lanes/codex_lane.py` (Issue #3935) is the second lane on the
 architectural correction the epic makes, landed on top of `claude_lane.py` — proving, for the
 first time, that adding a harness to the roster is additive: no change to `security-review.sh`'s
 dispatch loop, `roster.py`'s parsing, or `investigator-entrypoint.sh`'s mode dispatch, all of
@@ -1477,7 +1477,7 @@ invokes the `codex` binary (resolved on `PATH`) as a subprocess.
 credential itself — inside `$CODEX_HOME` during initialization, and fails every step closed with
 `Permission denied (os error 13)` before any network call if it cannot. A bind mount only creates
 the *file* at the mount point; if the parent directory doesn't already exist in the image, Docker
-creates it as `root:root 755` to hold it. `.devcontainer/Dockerfile` pre-creates
+creates it as `root:root 755` to hold it. `.claude/tooling/devcontainer/Dockerfile` pre-creates
 `/home/agent/.codex` (`chown agent:agent`) for this reason, mirroring `~/.claude` and `~/.ollama`,
 whose directories exist in the image for the same reason and are why the analogous `claude`/
 `ollama` credential mounts don't hit this (Issue #4004).
@@ -1529,7 +1529,7 @@ the real, confirmed flag names (`exec`, `--model`, `--sandbox read-only`,
 
 ## The OpenCode harness lane
 
-`.claude/skills/security-review/lanes/opencode_lane.py` (Issue #3936) is the third lane on the
+`.claude/tooling/security-review/lanes/opencode_lane.py` (Issue #3936) is the third lane on the
 architectural correction the epic makes, landed on top of `codex_lane.py`. It is also the harness
 epic #3927's C5 roster example configures TWICE with different models
 (`opencode:<qwen-id>,opencode:<glm-id>`), so this lane proves the narrower half of "adding to the
@@ -1625,11 +1625,11 @@ distinct model ids with no per-model branch.
 
 ## The Ollama harness lane
 
-`.claude/skills/security-review/lanes/ollama_lane.py` (Issue #3976, epic #3975) is the fourth
+`.claude/tooling/security-review/lanes/ollama_lane.py` (Issue #3976, epic #3975) is the fourth
 lane on the architectural correction the epic makes, landed on top of `opencode_lane.py`. It is
 the first lane whose harness needs a background daemon running inside the investigator container,
 and the first that parses findings from stdout rather than from a written file — both forced by
-what the real, installed CLI (`ollama` v0.33.3, pinned in `.devcontainer/Dockerfile`'s `ARG
+what the real, installed CLI (`ollama` v0.33.3, pinned in `.claude/tooling/devcontainer/Dockerfile`'s `ARG
 OLLAMA_CLI_VERSION`) actually is: a plain stdin/stdout text completion client with no tool loop at
 all, not an agentic harness like the other three.
 
@@ -1783,7 +1783,7 @@ with no dependence on wrapping ever having been disabled by the terminal; and tw
 fixtures — one where thinking text leaks ahead of a real answer despite `--hidethinking`, asserted
 still extracted (defense in depth, not trust in the flag), and one where stdout is thinking text
 and nothing else, asserted `failed`, never `refused` or `complete`.
-`.devcontainer/investigator-entrypoint_test.sh` is the first test file for
+`.claude/tooling/devcontainer/investigator-entrypoint_test.sh` is the first test file for
 `investigator-entrypoint.sh` at all, covering the daemon-start/poll/fail-closed behavior with a
 stub `ollama serve`/`ollama list` pair: the lane script runs once the daemon reports ready, never
 runs if it does not, and is unaffected (no daemon start attempted) for every non-ollama harness.
@@ -1966,7 +1966,7 @@ the default: multi-planner is a **benchmarking mode**, not the normal path (Issu
 that story, every planner — one or many — is handed the same harness-computed step partition
 (`partition.py::partition()`, deterministic over the bundle's `01-tree.tsv`, `06-config-surface.tsv`,
 and `07-authz-store-surface.tsv` — the last added by Issue #4060; the scenario axis is the one
-exception, taking its steps from `.claude/skills/security-review/docs/threat-scenarios.md` instead, Issue #4059)
+exception, taking its steps from `.claude/tooling/security-review/docs/threat-scenarios.md` instead, Issue #4059)
 and asked only for hypotheses; the partition is the harness's own decision, never the model's. When
 more than one planner is listed, each plans independently over the same assigned steps and the
 resulting proposals merge by `scope`: one step per distinct scope (now identical by construction
@@ -1979,7 +1979,7 @@ first's, never a different partition to compare against.
 
 **Which harnesses can plan (Issue #4041).** `claude` and `codex` only, out of the four wired for
 finder lanes. The roster parser accepts any `harness:model` pair, but the plan-mode entrypoint
-(`.devcontainer/scripts/investigator-entrypoint.sh`) dispatches on
+(`.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh`) dispatches on
 `CFGMS_SECURITY_REVIEW_HARNESS` and fails closed, naming the harness and the wired set, for
 anything else — it never falls back to `claude`, which before this story it did implicitly: the
 branch always exec'd `claude` and always pre-checked `~/.claude/.credentials.json`, so a
@@ -2026,7 +2026,7 @@ those controls, never in place of them. Do not carry this value to a lane — a 
 source checkout, and its read-only sandbox works there precisely because a lane never writes.
 
 **The scenario axis (Issue #4059).** A third partition axis, after directory and boundary: one step
-per entry in `.claude/skills/security-review/docs/threat-scenarios.md`. A planner reasoning bottom-up from a file
+per entry in `.claude/tooling/security-review/docs/threat-scenarios.md`. A planner reasoning bottom-up from a file
 inventory produces bottom-up guesses -- shown `pkg/session/token.go` it proposes weak token entropy,
 and never proposes that one fleet action might reach every endpoint, because nothing in a file tree
 suggests that question. The catalogue supplies the questions; this axis gives each one a step.
@@ -2062,7 +2062,7 @@ idea which risk assembled it. An unknown id degrades to no block rather than rai
 resuming a sweep whose plan predates a catalogue edit still runs; the planner is where a missing
 catalogue fails closed.
 
-**The regression corpus (Issue #4059).** `.claude/skills/security-review/docs/regression-corpus.md` pins defects
+**The regression corpus (Issue #4059).** `.claude/tooling/security-review/docs/regression-corpus.md` pins defects
 this repository has had to commits where they are still present, so "model A beats model B" and "this
 change made it worse" are answerable with a number. `corpus.py` scores on file plus the
 consolidated `vuln_class`, which **since Issue #4134 is the normalised `cwe`**, not the free-text
@@ -2324,7 +2324,7 @@ paths=None)` writes a directory of artifacts instead of the flat in-memory paylo
 extractor's second output, not a replacement for the first: `collect()`/`render_payload()` are
 kept, unchanged, as their own independently tested unit — but as of Issue #3979 nothing in the
 planner path calls them anymore (`grep -n render_payload
-.claude/skills/security-review/planner.py` returns nothing). `prepare()` now writes the bundle
+.claude/tooling/security-review/planner.py` returns nothing). `prepare()` now writes the bundle
 via this function and `build_prompt()` renders the prompt from the bundle's own `01-tree.tsv`
 instead of the flat payload — see [Step plan generation (metadata-only
 planner)](#step-plan-generation-metadata-only-planner) above for the consuming side, and `--scope-file`
@@ -2428,7 +2428,7 @@ listed every file. The first end-to-end run (Issue #3985) hit this directly: the
 (`claude-opus-5`, the legacy default) produced about one step per minute over 3283 inventory files,
 so a sweep meant to cover three packages still paid the full-repository planning cost, and the plan
 had to be pruned by hand (deleting step files) before lanes dispatched — a workaround
-`.claude/skills/security-review/docs/first-run-report.md` records as "the coverage denominator is the pruned
+`.claude/tooling/security-review/docs/first-run-report.md` records as "the coverage denominator is the pruned
 plan, not the repository." A bounded sweep needed to be a first-class operation, not a full plan an
 operator edits after the fact.
 
@@ -2505,7 +2505,7 @@ against `*/<pattern>` — **never by reading a file body.**
 | 7 | `presentational` | `web/src/*` |
 | 8 | `business` | `features/*`, `internal/*`, `pkg/*` |
 | 9 | `docs` | `docs/*`, `*.md`, `LICENSE`, `LICENSE.*`, `examples/*` |
-| 10 | `tooling` | `.github/*`, `.devcontainer/*`, `.claude/*`, `.serena/*`, `scripts/*`, `build/*`, `*.sh`, `*.ps1`, `Makefile`, `Dockerfile*`, `docker-compose*.yml`, `buf.yaml`, `buf.*.yaml` |
+| 10 | `tooling` | `.github/*`, `.claude/tooling/devcontainer/*`, `.claude/*`, `.serena/*`, `scripts/*`, `build/*`, `*.sh`, `*.ps1`, `Makefile`, `Dockerfile*`, `docker-compose*.yml`, `buf.yaml`, `buf.*.yaml` |
 | 11 | `config` | `*.yaml`, `*.yml`, `*.json`, `*.toml`, `*.cfg`, `*.conf`, `*.tsv`, `*.jsonl`, `*.txt`, `templates/*`, `web/*`, `go.mod`, `CODEOWNERS`, `*.example`, `*ignore`, `*.baseline`, `.gitattributes`, `.nvmrc`, `staticcheck.conf`, `*.wxs`, `*.xml`, `*.html`, `*.js`, `postinstall` |
 
 The closed tier set (`metadata.CLOSED_TIER_SET`) is therefore `entrypoint`, `security`,
@@ -3808,7 +3808,7 @@ secret — it is a host-only tool, matching the epic's locked "runtime: existing
 system" decision, invoked interactively today and by a future scheduling wrapper later (a
 separate, explicitly out-of-scope follow-up) — never by CI.
 
-**Testing.** `.claude/scripts/tests/security_review_cli.test.sh` follows
+**Testing.** `.claude/tooling/scripts/tests/security_review_cli.test.sh` follows
 `investigator_launch.test.sh`'s own precedent for testing code that calls `agent-dispatch.sh
 launch-investigator`: a stub `docker` binary renders the real, unmodified `launch-investigator`
 call (real argument parsing, real mount construction) and then, in place of a real container,
@@ -3857,7 +3857,7 @@ planner-side counterpart of this same roster shape — which model(s) *build* th
 which model(s) *review* it — and is optional: see [Multi-planner plan merge
 (C6)](#multi-planner-plan-merge-c6-issue-3937).
 
-**`.claude/skills/security-review/roster.py`** is the pure-function parser: `parse_roster()`
+**`.claude/tooling/security-review/roster.py`** is the pure-function parser: `parse_roster()`
 turns the env var's value into a list of `(harness, model, lane_dir_name)` tuples —
 `lane_dir_name` is `<harness>-<model>`, matching C5's "lane directories are named for the pair, so
 provenance is structural" rule, and is validated against the same strict lane-id shape

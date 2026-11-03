@@ -6,7 +6,7 @@
 #
 # This is a thin CLI. It adds no classification, schema, or credential logic
 # of its own -- it only calls each dependency's existing entry point, in
-# sequence, exactly as documented in .claude/skills/security-review/docs/harness-architecture.md:
+# sequence, exactly as documented in .claude/tooling/security-review/docs/harness-architecture.md:
 #   - manifest.py (#3902)   -- create_sweep(), given the roster-derived lane list
 #   - planner.py (#3906)    -- prepare()/launch()/finalize()
 #   - agent-dispatch.sh launch-investigator (#3903) -- dispatches each roster
@@ -57,10 +57,10 @@ if [[ -z "$REPO_ROOT" ]]; then
   exit 1
 fi
 
-# agent-dispatch.sh stays under .claude/scripts/ -- this script no longer
+# agent-dispatch.sh stays under .claude/tooling/scripts/ -- this script no longer
 # shares a directory with it after the security-review skill relocation, so
 # it must be resolved relative to REPO_ROOT rather than SCRIPT_DIR.
-AGENT_DISPATCH_SCRIPT="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
+AGENT_DISPATCH_SCRIPT="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
 
 usage() {
   cat <<'EOF'
@@ -118,7 +118,7 @@ Commands:
 CFGMS_SECURITY_REVIEW_LANES (required) is a comma-separated list of harness:model
 pairs, e.g. "claude:claude-sonnet-5" (full id; the pinned CLI rejects short
 forms like "sonnet-5") -- see roster.py and
-.claude/skills/security-review/docs/harness-architecture.md. To see which model ids the
+.claude/tooling/security-review/docs/harness-architecture.md. To see which model ids the
 pinned `claude` CLI actually recognizes, run `claude --model` interactively
 for its picker, or use the full `claude-<family>-<n>` form directly. A lane
 that parks, refuses, or fails on some steps never blocks any other lane's
@@ -1311,7 +1311,7 @@ m = re.match(r"feature/story-(\d+)", d.get("headRefName") or "") or \
     re.search(r"(?:Fixes|Closes|Resolves) #(\d+)", d.get("body") or "")
 print(m.group(1) if m else "")')"
     [[ -n "$story" ]] || { echo "ADVERSARIAL_REVIEW:not_applicable"; return 0; }
-    item="$(bash "${REPO_ROOT}/scripts/project-queue.sh" add-issue "$story" 2>/dev/null \
+    item="$(bash "${REPO_ROOT}/.claude/tooling/scripts/project-queue.sh" add-issue "$story" 2>/dev/null \
       | python3 -c 'import json,sys; print(json.load(sys.stdin).get("item_id",""))' 2>/dev/null || true)"
     [[ -n "$item" ]] || { echo "ADVERSARIAL_REVIEW:error:item_lookup"; return 0; }
   fi

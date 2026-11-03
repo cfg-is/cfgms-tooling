@@ -6,7 +6,7 @@ Hand-rolled (no unittest, no third-party test runner), matching the
 stdlib only, exit 0 on all-pass, run directly by `scripts/test-scripts.sh`.
 
 No docker daemon is available in this environment (nor in CI's unit-test
-stage -- see `.claude/scripts/tests/investigator_launch.test.sh`'s own header),
+stage -- see `.claude/tooling/scripts/tests/investigator_launch.test.sh`'s own header),
 so `launch()` is exercised against a stubbed `agent-dispatch.sh` -- a real
 executable script this test writes and runs for real via `subprocess.run`,
 the same "stub the external binary, run the real code path against it"
@@ -15,7 +15,7 @@ itself. No `unittest.mock` anywhere in this file: every git operation runs
 against a real temporary repository and every launch runs a real (stubbed)
 subprocess.
 
-Run: python3 .claude/skills/security-review/planner_test.py
+Run: python3 .claude/tooling/security-review/planner_test.py
 """
 from __future__ import annotations
 

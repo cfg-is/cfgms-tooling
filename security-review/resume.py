@@ -2,7 +2,7 @@
 """Resume scanner for the security review harness.
 
 Implements the epic's four-terminal-state table exactly
-(.claude/skills/security-review/docs/harness-architecture.md):
+(.claude/tooling/security-review/docs/harness-architecture.md):
 
 | State      | On resume |
 |------------|-----------|

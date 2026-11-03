@@ -8,7 +8,7 @@ AC4: External author on feature/story-N-agent branch yields story_number=None
      (impersonation defeated).
 AC5: human-reviewed:ok release marker valid only when actor has push+ permission.
 
-Run: python3 .claude/scripts/tests/test-preflight-external-pr.py
+Run: python3 .claude/tooling/scripts/tests/test-preflight-external-pr.py
 """
 import importlib.util
 import json
@@ -695,14 +695,14 @@ class TestWaitVerdictReviewRecommendations(unittest.TestCase):
             [self._make_summary(pr_num=101, story_num=42, has_review=True, verdict="pass")], set())
         self.assertEqual(recs[0]["action"], "enqueue_merge")
         self.assertIn("po-act.sh enqueue", recs[0]["reason"])
-        self.assertIn("./.claude/scripts/po-act.sh enqueue 101 42", recs[0]["reason"])
+        self.assertIn("./.claude/tooling/scripts/po-act.sh enqueue 101 42", recs[0]["reason"])
         self.assertNotIn("gh pr merge", recs[0]["reason"])
 
     def test_enqueue_reason_without_story_omits_story_arg(self):
         recs = self.pf.compute_review_recommendations(
             [self._make_summary(pr_num=101, story_num=None, has_review=True, verdict="pass")], set())
         self.assertEqual(recs[0]["action"], "enqueue_merge")
-        self.assertIn("./.claude/scripts/po-act.sh enqueue 101`", recs[0]["reason"])
+        self.assertIn("./.claude/tooling/scripts/po-act.sh enqueue 101`", recs[0]["reason"])
         self.assertNotIn("gh pr merge", recs[0]["reason"])
 
     def test_external_unreleased_pass_green_never_enqueues(self):
@@ -717,7 +717,7 @@ class TestWaitVerdictReviewRecommendations(unittest.TestCase):
         s["is_released"] = True
         recs = self.pf.compute_review_recommendations([s], set())
         self.assertEqual(recs[0]["action"], "enqueue_merge")
-        self.assertIn("./.claude/scripts/po-act.sh enqueue 202`", recs[0]["reason"])
+        self.assertIn("./.claude/tooling/scripts/po-act.sh enqueue 202`", recs[0]["reason"])
         self.assertNotIn("gh pr merge", recs[0]["reason"])
 
 

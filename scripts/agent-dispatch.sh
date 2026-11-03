@@ -4,7 +4,7 @@
 # can invoke them without triggering manual-approval prompts.
 set -euo pipefail
 
-REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+REPO_ROOT="${CFGMS_TEST_REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 # Fixed root, outside /workspace, where the review container mounts the harness
 # copy of the merge-gate scripts (Issue #5386). Mirrors the repo layout so the
 # scripts' $(dirname "$0")/../.. resolution lands on it unchanged.
@@ -18,13 +18,30 @@ WORKTREE_BASE="${CFGMS_TEST_WORKTREE_BASE:-$(cd "$REPO_ROOT/.." && pwd)/worktree
 #
 # Resolved from THIS SCRIPT's own real location (BASH_SOURCE[0]), never from
 # REPO_ROOT: hermetic tests point CFGMS_TEST_REPO_ROOT at a throwaway bare
-# repo with no .devcontainer/ tree, and this file must still source cleanly
+# repo with no .claude/tooling/devcontainer/ tree, and this file must still source cleanly
 # when they do (verified by scripts/test-scripts.sh's create-clone fixtures).
-_agent_dispatch_self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -f "${_agent_dispatch_self_root}/.devcontainer/agent-context.sh" ]]; then
-  # shellcheck source=../../.devcontainer/agent-context.sh
-  source "${_agent_dispatch_self_root}/.devcontainer/agent-context.sh"
+_agent_dispatch_self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+if [[ -f "${_agent_dispatch_self_root}/.claude/tooling/devcontainer/agent-context.sh" ]]; then
+  # shellcheck source=../devcontainer/agent-context.sh
+  source "${_agent_dispatch_self_root}/.claude/tooling/devcontainer/agent-context.sh"
 fi
+
+# The pipeline tooling is the cfgms-tooling submodule at .claude/tooling. A
+# `git clone --local` of the host checkout leaves it empty, so fill it from
+# the host's own checkout of that submodule first (no network, and the host
+# already holds the pinned commit). If the host checkout lacks that commit,
+# fall back to the URL in .gitmodules.
+init_tooling_submodule() {
+  local dest="$1"
+  [[ -f "$dest/.gitmodules" ]] || return 0
+  if [[ -e "$REPO_ROOT/.claude/tooling/.git" ]] && git -C "$dest" \
+      -c protocol.file.allow=always \
+      -c "submodule..claude/tooling.url=$REPO_ROOT/.claude/tooling" \
+      submodule update --init --quiet -- .claude/tooling 2>/dev/null; then
+    return 0
+  fi
+  git -C "$dest" submodule update --init --quiet -- .claude/tooling
+}
 
 # Atomic lock helper (Issue #5708). Resolved from this file's own location, not
 # $0 or cwd, because tests and the dispatcher source this script.
@@ -55,9 +72,9 @@ AGENT_SESSIONS_MOUNT="/agent-sessions"
 # Token reporter mount (Issue #3041). Every entrypoint resolves the reporter
 # from ${AGENT_METRICS_MOUNT} only, never from /workspace: the branch under
 # dispatch or review must not be able to disable its own accounting by lacking,
-# editing or deleting .claude/metrics.
+# editing or deleting .claude/tooling/metrics.
 #
-# The image bakes a copy at the same path (.devcontainer/Dockerfile), so this
+# The image bakes a copy at the same path (.claude/tooling/devcontainer/Dockerfile), so this
 # bind mount is not what makes the control exist -- it is what keeps every
 # dispatch path on the *harness checkout's* reporter without waiting for an
 # image rebuild, the same no-rebuild pattern already used for setup-env.sh,
@@ -70,14 +87,14 @@ AGENT_SESSIONS_MOUNT="/agent-sessions"
 # old library. When ae5474eb (#4191) added AC_HEADLESS_NO_BG_WAIT_RULE to the
 # helper, every review container died on `unbound variable` under `set -u`
 # two seconds in, and no PR could be reviewed or merged until the image was
-# rebuilt. The pairing is asserted by .devcontainer/agent-context-mount_test.sh.
+# rebuilt. The pairing is asserted by .claude/tooling/devcontainer/agent-context-mount_test.sh.
 # Mounting is conditional on the source existing: Docker
 # would otherwise create an empty host directory and shadow the baked copy with
 # nothing, turning a working control into reporter_missing.
 AGENT_METRICS_MOUNT="/usr/local/share/cfgms-metrics"
 AGENT_METRICS_MOUNT_ARGS=()
-if [ -d "${REPO_ROOT}/.claude/metrics" ]; then
-  AGENT_METRICS_MOUNT_ARGS=(-v "${REPO_ROOT}/.claude/metrics:${AGENT_METRICS_MOUNT}:ro")
+if [ -d "${REPO_ROOT}/.claude/tooling/metrics" ]; then
+  AGENT_METRICS_MOUNT_ARGS=(-v "${REPO_ROOT}/.claude/tooling/metrics:${AGENT_METRICS_MOUNT}:ro")
 fi
 
 # Model-routing mount (Issue #3030), same rule as the reporter above:
@@ -86,7 +103,7 @@ fi
 # so reading routing from there would let a PR branch pick the model of the
 # acceptance reviewer deciding whether it merges, and dev/fix agents run on
 # untrusted issue/PR text. The image bakes a copy at the same path
-# (.devcontainer/Dockerfile); this bind mount keeps every dispatch path on the
+# (.claude/tooling/devcontainer/Dockerfile); this bind mount keeps every dispatch path on the
 # *harness checkout's* routing config without waiting for an image rebuild.
 # Conditional on the source existing as a file: Docker would otherwise create an
 # empty host directory at that path and shadow the baked config, silently
@@ -819,15 +836,15 @@ _review_refusal_hint() {
     already_in_flight)
       echo "a review container for this PR is still running — another review is genuinely in progress. Check /isoagents; no action needed." ;;
     container_exists)
-      echo "a review container for this PR exited NON-ZERO (crashed) and is kept for diagnosis — inspect it with './.claude/scripts/agent-dispatch.sh inspect-container cfg-agent-review-pr-<PR>', then clear it with 'cleanup-container cfg-agent-review-pr-<PR>' and retry. (A cleanly-exited container is reaped automatically and never reaches this refusal.)" ;;
+      echo "a review container for this PR exited NON-ZERO (crashed) and is kept for diagnosis — inspect it with './.claude/tooling/scripts/agent-dispatch.sh inspect-container cfg-agent-review-pr-<PR>', then clear it with 'cleanup-container cfg-agent-review-pr-<PR>' and retry. (A cleanly-exited container is reaped automatically and never reaches this refusal.)" ;;
     lease_held)
       echo "another host holds the pr-<N> lease (reviewing/fixing/rebasing this PR) — wait for it to release." ;;
     lease_error)
-      echo "lease acquisition failed unexpectedly — check './scripts/pipeline-helper.sh lease-acquire' directly." ;;
+      echo "lease acquisition failed unexpectedly — check './.claude/tooling/scripts/pipeline-helper.sh lease-acquire' directly." ;;
     no_new_commit_since_review)
       echo "head is unchanged since the last acceptance review — a re-review would re-reach the same verdict. Dispatch a fix (po-act.sh dispatch-fix <PR>) so a commit lands first, or pass --force if the acceptance criteria changed rather than the code." ;;
     merge_conflicts)
-      echo "PR conflicts with develop (mergeStateStatus=DIRTY), so GitHub builds no merge ref and NO pull_request workflow runs for it — a reviewer would judge it with zero CI evidence. Clear the conflict first: './.claude/scripts/rebase-pr.sh <PR>', escalating to resolve-conflict on REBASE_CONFLICT, then review." ;;
+      echo "PR conflicts with develop (mergeStateStatus=DIRTY), so GitHub builds no merge ref and NO pull_request workflow runs for it — a reviewer would judge it with zero CI evidence. Clear the conflict first: './.claude/tooling/scripts/rebase-pr.sh <PR>', escalating to resolve-conflict on REBASE_CONFLICT, then review." ;;
     *)
       echo "" ;;
   esac
@@ -970,7 +987,7 @@ _container_safe_to_reap() {
 #
 # Pulling the detection out into a function keeps it unit-testable without
 # spinning up docker or hitting the GitHub API. See
-# .claude/scripts/tests/test-review-pr-detection.sh for the fixture set
+# .claude/tooling/scripts/tests/test-review-pr-detection.sh for the fixture set
 # (regression coverage for issue #1806 / PR #1804).
 resolve_pr_story_or_item() {
   local pr_branch="$1"
@@ -1353,7 +1370,7 @@ agent_token_args() {
 # ---------------------------------------------------------------------------
 # Build-inputs staleness gate (Issue #4388).
 #
-# Nothing rebuilds cfg-agent:latest when .devcontainer/ changes on develop.
+# Nothing rebuilds cfg-agent:latest when .claude/tooling/devcontainer/ changes on develop.
 # Some of the scripts that image runs (review-entrypoint.sh,
 # investigator-entrypoint.sh, agent-context.sh, setup-env.sh) are ALSO
 # bind-mounted fresh from this checkout at every launch, so a merge that
@@ -1364,7 +1381,7 @@ agent_token_args() {
 # container died silently for ~50 minutes until a manual rebuild.
 #
 # cfg-agent:latest carries a `cfgms.build_inputs_hash` label — the git tree
-# hash of `.devcontainer` at HEAD (the Dockerfile's own COPY sources and the
+# hash of `.claude/tooling/devcontainer` at HEAD (the Dockerfile's own COPY sources and the
 # exact directory every runtime-mounted script above lives under). The
 # documented build command in .claude/commands/agent-setup.md sets it.
 # ---------------------------------------------------------------------------
@@ -1373,7 +1390,7 @@ IMAGE_REBUILD_LOCK="${CFGMS_TEST_IMAGE_REBUILD_LOCK:-${AGENT_LEDGER_DIR}/image-r
 # _image_build_inputs_hash — this checkout's build-inputs identity. Empty if
 # REPO_ROOT is not a git checkout (never true in production).
 _image_build_inputs_hash() {
-  git -C "$REPO_ROOT" rev-parse "HEAD:.devcontainer" 2>/dev/null || true
+  git -C "$REPO_ROOT" rev-parse "HEAD:.claude/tooling/devcontainer" 2>/dev/null || true
 }
 
 # _image_build_inputs_label — cfg-agent:latest's recorded build-inputs
@@ -1388,7 +1405,7 @@ _image_build_inputs_label() {
 # CLAUDE_CODE_VERSION_OVERRIDE build-arg passed to `docker build` and the
 # `cfgms.claude_code_version` label it stamps always agree (Issue #4473:
 # Claude Code is exempt from the pin-and-cooldown policy every other tool in
-# .devcontainer/Dockerfile follows -- it installs whatever is current at
+# .claude/tooling/devcontainer/Dockerfile follows -- it installs whatever is current at
 # build time instead of a hand-maintained version). Pinning the resolved
 # value via the override build-arg, rather than leaving the Dockerfile's own
 # `@stable` resolution to run unobserved inside the RUN step, is what makes
@@ -1469,7 +1486,7 @@ _image_rebuild__body() {
       --build-arg "CODEX_CLI_VERSION_OVERRIDE=${codex_version}" \
       --label "cfgms.codex_version=${codex_version}" \
       -t cfg-agent:latest \
-      -f "${REPO_ROOT}/.devcontainer/Dockerfile" \
+      -f "${REPO_ROOT}/.claude/tooling/devcontainer/Dockerfile" \
       "${REPO_ROOT}" >&2 || build_exit=$?
   fi
 
@@ -1875,7 +1892,7 @@ _docker_prune_reclaim() {
 }
 
 # gate_image_staleness_for_launch — refuses to launch a container from an
-# image built from stale .devcontainer inputs (Issue #4388). Called
+# image built from stale .claude/tooling/devcontainer inputs (Issue #4388). Called
 # immediately before every `docker run` that starts an agent container.
 #
 # No docker binary at all means no container is starting regardless of what
@@ -2471,6 +2488,7 @@ case "$cmd" in
 
     trap "rm -rf '$dest'" ERR
     git clone --local --branch develop "$REPO_ROOT" "$dest"
+    init_tooling_submodule "$dest"
     cd "$dest"
     git remote set-url origin "$github_url"
     sync_to_remote_develop
@@ -2508,6 +2526,7 @@ case "$cmd" in
 
     trap "rm -rf '$dest'" ERR
     git clone --local --branch develop "$REPO_ROOT" "$dest"
+    init_tooling_submodule "$dest"
     cd "$dest"
     git remote set-url origin "$github_url"
     sync_to_remote_develop
@@ -2539,6 +2558,7 @@ case "$cmd" in
     if git -C "$REPO_ROOT" ls-remote --heads origin "$branch" | grep -q .; then
       # Branch exists: clone develop, then fetch and checkout the branch
       git clone --local --branch develop "$REPO_ROOT" "$dest"
+      init_tooling_submodule "$dest"
       cd "$dest"
       git remote set-url origin "$github_url"
       sync_to_remote_develop
@@ -2549,6 +2569,7 @@ case "$cmd" in
     else
       # Branch does not exist: clone develop, create new branch
       git clone --local --branch develop "$REPO_ROOT" "$dest"
+      init_tooling_submodule "$dest"
       cd "$dest"
       git remote set-url origin "$github_url"
       sync_to_remote_develop
@@ -2640,6 +2661,7 @@ case "$cmd" in
     # Clone and checkout the PR branch
     trap "rm -rf '$dest'" ERR
     git clone --local --branch develop "$REPO_ROOT" "$dest"
+    init_tooling_submodule "$dest"
     cd "$dest"
     git remote set-url origin "$github_url"
     sync_to_remote_develop
@@ -2865,6 +2887,7 @@ case "$cmd" in
       trap "rm -rf '$clone_dir'" ERR
       if git -C "$REPO_ROOT" ls-remote --heads origin "$branch" | grep -q .; then
         git clone --local --branch develop "$REPO_ROOT" "$clone_dir"
+        init_tooling_submodule "$clone_dir"
         cd "$clone_dir"
         git remote set-url origin "$github_url"
         sync_to_remote_develop
@@ -2872,6 +2895,7 @@ case "$cmd" in
         git checkout "$branch"
       else
         git clone --local --branch develop "$REPO_ROOT" "$clone_dir"
+        init_tooling_submodule "$clone_dir"
         cd "$clone_dir"
         git remote set-url origin "$github_url"
         sync_to_remote_develop
@@ -2908,7 +2932,7 @@ case "$cmd" in
       -v "${real_path}:/workspace" \
       -v "${host_claude_dir}:/home/agent/.claude" \
       -v "${host_claude_json}:/home/agent/.claude.json" \
-      -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -e "GH_TOKEN=${gh_token}" \
@@ -2977,6 +3001,7 @@ case "$cmd" in
     else
       trap "rm -rf '$clone_dir'" ERR
       git clone --local --branch develop "$REPO_ROOT" "$clone_dir"
+      init_tooling_submodule "$clone_dir"
       cd "$clone_dir"
       git remote set-url origin "$github_url"
       sync_to_remote_develop
@@ -2999,7 +3024,7 @@ case "$cmd" in
       git -C "$clone_dir" fetch --quiet origin develop \
         || echo "  ! warning: fetch of origin/develop failed; refreshing against last-known origin/develop" >&2
       # Clear skip-worktree / assume-unchanged before inspecting the tree.
-      # `.devcontainer/scripts/setup-env.sh` marks `.mcp.json` skip-worktree so
+      # `.claude/tooling/devcontainer/scripts/setup-env.sh` marks `.mcp.json` skip-worktree so
       # its per-container rewrite doesn't dirty every agent's clone. That hides
       # the file from `status --porcelain`, so the stash below never fired and
       # the checkout then refused with "local changes would be overwritten" —
@@ -3027,6 +3052,7 @@ case "$cmd" in
         fi
       fi
       git -C "$clone_dir" checkout -q -B develop origin/develop
+      init_tooling_submodule "$clone_dir"
     fi
 
     # Build the initial prompt without trailing space when args are empty.
@@ -3079,7 +3105,7 @@ case "$cmd" in
       -v "${real_path}:/workspace" \
       -v "${host_claude_dir}:/home/agent/.claude" \
       -v "${host_claude_json}:/home/agent/.claude.json" \
-      -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
       -e "GH_TOKEN=${gh_token}" \
@@ -3305,7 +3331,7 @@ else:
     # Answers "how many agents of each mode ran in the last N days, and what
     # did they cost" from the durable ledger (Issue #3052) — no docker/GitHub
     # history cross-referencing required.
-    #   ./.claude/scripts/agent-dispatch.sh ledger-report [DAYS]
+    #   ./.claude/tooling/scripts/agent-dispatch.sh ledger-report [DAYS]
     days="${1:-7}"
     if [[ ! -f "$AGENT_LEDGER_FILE" ]]; then
       echo "No ledger yet at ${AGENT_LEDGER_FILE}"
@@ -3464,12 +3490,12 @@ PYEOF
       fi
 
       # Build-inputs staleness check (Issue #4388) — independent of image_age
-      # above: a same-day merge under .devcontainer/ is stale immediately, not
+      # above: a same-day merge under .claude/tooling/devcontainer/ is stale immediately, not
       # after a week.
       checkout_inputs_hash=$(_image_build_inputs_hash)
       image_inputs_label=$(_image_build_inputs_label)
       if [[ -n "$checkout_inputs_hash" && "$checkout_inputs_hash" != "$image_inputs_label" ]]; then
-        echo "WARN:image_inputs_stale:Image build-inputs label (${image_inputs_label:-none}) does not match checkout .devcontainer (${checkout_inputs_hash}). Run /agent-setup rebuild"
+        echo "WARN:image_inputs_stale:Image build-inputs label (${image_inputs_label:-none}) does not match checkout .claude/tooling/devcontainer (${checkout_inputs_hash}). Run /agent-setup rebuild"
         warnings=$((warnings + 1))
       fi
     fi
@@ -3590,7 +3616,7 @@ PYEOF
     # scripts and agent definition read-only under TRUSTED_ROOT. Check each on
     # the host first: docker would create a missing bind-mount source as an
     # empty directory and the gate would then run from nothing.
-    for trusted_src in ".claude/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
+    for trusted_src in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
       if [[ ! -r "${REPO_ROOT}/${trusted_src}" ]]; then
         _emit_review_refused "$pr_num" "trusted_source_missing_${trusted_src//\//_}"
       fi
@@ -3697,7 +3723,7 @@ PYEOF
       esac
     fi
 
-    PROJECT_QUEUE="${REPO_ROOT}/scripts/project-queue.sh"
+    PROJECT_QUEUE="${REPO_ROOT}/.claude/tooling/scripts/project-queue.sh"
     item_id=""
 
     if $is_item_branch; then
@@ -3764,7 +3790,7 @@ for i in items:
     # not_applicable and continues. The detail never leaves this host: a hold
     # posts only the fact of the hold.
     if [[ "${CFGMS_ADVERSARIAL_REVIEW_GATE:-on}" != "off" ]]; then
-      adv_script="${CFGMS_TEST_ADVERSARIAL_SCRIPT:-${REPO_ROOT}/.claude/skills/security-review/security-review.sh}"
+      adv_script="${CFGMS_TEST_ADVERSARIAL_SCRIPT:-${REPO_ROOT}/.claude/tooling/security-review/security-review.sh}"
       adv_line=$("$adv_script" adversarial-review "$pr_num" --item "$item_id" --check 2>/dev/null | tail -n 1 || true)
       case "$adv_line" in
         ADVERSARIAL_REVIEW:not_applicable|ADVERSARIAL_REVIEW:pass|ADVERSARIAL_REVIEW:pass:released) ;;
@@ -3774,7 +3800,7 @@ for i in items:
           # Comment once per PR, not once per cycle.
           adv_marker="${HOME}/.cache/cfgms-adversarial-hold/notified-pr-${pr_num}"
           if [[ ! -f "$adv_marker" ]]; then
-            if "${CFGMS_TEST_PIPELINE_HELPER:-${REPO_ROOT}/scripts/pipeline-helper.sh}" comment-inline "$pr_num" \
+            if "${CFGMS_TEST_PIPELINE_HELPER:-${REPO_ROOT}/.claude/tooling/scripts/pipeline-helper.sh}" comment-inline "$pr_num" \
               "Held for a security review before acceptance. The founder will clear it." >/dev/null 2>&1; then
               mkdir -p "$(dirname "$adv_marker")" && touch "$adv_marker" || true
             fi
@@ -3799,7 +3825,7 @@ for i in items:
     # lease on exit; until then a pre-launch failure must release it, so we arm an
     # EXIT trap and disarm it only after a successful detached launch (then the
     # container owns release).
-    PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-${REPO_ROOT}/scripts/pipeline-helper.sh}"
+    PIPELINE_HELPER="${CFGMS_TEST_PIPELINE_HELPER:-${REPO_ROOT}/.claude/tooling/scripts/pipeline-helper.sh}"
     # Default must match po-act.sh's LEASE_TTL_PR — a shorter value here would
     # expire a review lease under a live container (see lease-gc liveness guard).
     review_lease_out=$(bash "$PIPELINE_HELPER" lease-acquire "pr-${pr_num}" "${CFGMS_LEASE_TTL_PR:-21600}" 2>/dev/null || true)
@@ -3846,7 +3872,7 @@ workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
-Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/scripts\`
+Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/tooling/scripts\`
 (the harness copy), never from a path under /workspace: the PR under review can
 edit the copies in its own checkout.
 
@@ -3854,13 +3880,13 @@ When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
 - **PASS (zero findings)**:
-  mark item Done with \`./scripts/project-queue.sh update-field ${item_id} status Done\`,
-  then run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${item_id}\` to
+  mark item Done with \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
+  then run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\` to
   release the dev agent's container/worktree.
-- **FAIL on first review**: \`./scripts/project-queue.sh update-field ${item_id} status Fix\`.
+- **FAIL on first review**: \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
 - **FAIL on second review (fix cycle)**:
-  \`./scripts/project-queue.sh update-field ${item_id} status Blocked\`,
-  and run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${item_id}\`.
+  \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
+  and run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
@@ -3876,22 +3902,22 @@ workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
-Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/scripts\`
+Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/tooling/scripts\`
 (the harness copy), never from a path under /workspace: the PR under review can
 edit the copies in its own checkout.
 
 When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
-- **PASS (zero findings)**: enqueue with \`${TRUSTED_ROOT}/.claude/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
-  mark story Done with \`./scripts/project-queue.sh update-field ${item_id} status Done\`,
-  then run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
+- **PASS (zero findings)**: enqueue with \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
+  mark story Done with \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
+  then run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
   release the dev agent's container/worktree.
-- **FAIL on first review**: \`./scripts/project-queue.sh update-field ${item_id} status Fix\`.
+- **FAIL on first review**: \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
 - **FAIL on second review (fix cycle)**:
-  \`./scripts/project-queue.sh update-field ${item_id} status Blocked\`,
+  \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
   assign founder via \`gh issue edit ${story_num} --repo cfg-is/cfgms --add-assignee jrdnr\`,
-  and run \`./.claude/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
+  and run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
@@ -3934,12 +3960,12 @@ PROMPT_EOF
       -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
       -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
       -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
-      -v "${REPO_ROOT}/.devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
-      -v "${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
-      -v "${REPO_ROOT}/.claude/scripts:${TRUSTED_ROOT}/.claude/scripts:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/devcontainer/scripts/setup-env.sh:/usr/local/bin/setup-env.sh:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/devcontainer/scripts/review-entrypoint.sh:/usr/local/bin/review-entrypoint.sh:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/scripts:${TRUSTED_ROOT}/.claude/tooling/scripts:ro" \
       -v "${REPO_ROOT}/scripts:${TRUSTED_ROOT}/scripts:ro" \
       -v "${REPO_ROOT}/.claude/agents/acceptance-reviewer.md:${TRUSTED_ROOT}/.claude/agents/acceptance-reviewer.md:ro" \
-      -v "${REPO_ROOT}/.devcontainer/agent-context.sh:/usr/local/bin/agent-context.sh:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/devcontainer/agent-context.sh:/usr/local/bin/agent-context.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
       "${review_session_mount[@]}" \
@@ -4526,17 +4552,17 @@ PROMPT_EOF
       # audited snapshot at /workspace. Mounted read-only at a fixed trusted
       # path; the lane bootstraps consult CFGMS_SECURITY_REVIEW_HARNESS_DIR
       # ahead of any /workspace fallback.
-      inv_harness_dir_host="${REPO_ROOT}/.claude/skills/security-review"
+      inv_harness_dir_host="${REPO_ROOT}/.claude/tooling/security-review"
       if [[ ! -d "$inv_harness_dir_host" ]]; then
         echo "ERROR: trusted harness directory not found: ${inv_harness_dir_host}"
         exit 1
       fi
       inv_lane_entrypoint_mount+=(-v "${inv_harness_dir_host}:/opt/cfgms-harness/security-review:ro")
       inv_lane_entrypoint_mount+=(-e "CFGMS_SECURITY_REVIEW_HARNESS_DIR=/opt/cfgms-harness/security-review")
-      # The review methodology (.claude/skills/security-review/docs/methodology.md)
+      # The review methodology (.claude/tooling/security-review/docs/methodology.md)
       # is review POLICY and is loaded by harness_runner at import; it comes from
       # the same trusted host tree, beside the harness, never from /workspace.
-      inv_methodology_dir_host="${REPO_ROOT}/.claude/skills/security-review/docs"
+      inv_methodology_dir_host="${REPO_ROOT}/.claude/tooling/security-review/docs"
       if [[ ! -f "${inv_methodology_dir_host}/methodology.md" ]]; then
         echo "ERROR: trusted methodology not found: ${inv_methodology_dir_host}/methodology.md"
         exit 1
@@ -4573,7 +4599,7 @@ PROMPT_EOF
     # (`resume.provenance_by_step`, the report's `## Provenance` section) and
     # never gated on. Nothing anywhere compares this value against a prior
     # dispatch.
-    inv_entrypoint_host_path="${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh"
+    inv_entrypoint_host_path="${REPO_ROOT}/.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh"
     inv_harness_identity_hash=$(python3 - "$REPO_ROOT" "$inv_entrypoint_host_path" "$inv_lane_entrypoint" "$inv_agent_profile_host_path" "${inv_sweep_dir}/harness_identity.json" <<'PY'
 import hashlib
 import json
@@ -4677,7 +4703,7 @@ PY
       "${inv_harness_creds_mount[@]}" \
       "${inv_harness_extra_run_args[@]}" \
       "${inv_lane_entrypoint_mount[@]}" \
-      -v "${REPO_ROOT}/.devcontainer/scripts/investigator-entrypoint.sh:/usr/local/bin/investigator-entrypoint.sh:ro" \
+      -v "${REPO_ROOT}/.claude/tooling/devcontainer/scripts/investigator-entrypoint.sh:/usr/local/bin/investigator-entrypoint.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
       "${inv_session_mount[@]}" \
@@ -4797,7 +4823,7 @@ PY
     # Find agent containers (running or exited) whose stories no longer need them.
     # A container is stale if its story issue is CLOSED or has project status Failed or Blocked.
     cleaned=0
-    PROJECT_QUEUE="${REPO_ROOT}/scripts/project-queue.sh"
+    PROJECT_QUEUE="${REPO_ROOT}/.claude/tooling/scripts/project-queue.sh"
 
     # Pre-fetch Failed and Blocked issue numbers from project (one query each vs per-container).
     failed_nums=$(bash "$PROJECT_QUEUE" list-by-status "Failed" 2>/dev/null \
@@ -5016,7 +5042,7 @@ PY
     # frees a key when it is re-acquired directly; this collects the rest (e.g. a
     # crashed dev whose story was picked up by stalled-dispatch recovery under a
     # different code path). Idempotent; best-effort.
-    bash "${REPO_ROOT}/scripts/pipeline-helper.sh" lease-gc 2>/dev/null || true
+    bash "${REPO_ROOT}/.claude/tooling/scripts/pipeline-helper.sh" lease-gc 2>/dev/null || true
 
     echo "CLEANUP_STALE_DONE:cleaned=${cleaned}"
     ;;
@@ -5062,7 +5088,7 @@ PY
     ;;
 
   _test-resolve-pr)
-    # Hidden test hook for .claude/scripts/tests/test-review-pr-detection.sh.
+    # Hidden test hook for .claude/tooling/scripts/tests/test-review-pr-detection.sh.
     # Not user-facing; calls resolve_pr_story_or_item() with the supplied
     # branch + body and prints its result. Safe (no docker, no gh, no writes).
     [[ $# -eq 2 ]] || { echo "_test-resolve-pr requires <branch> <body>"; exit 1; }

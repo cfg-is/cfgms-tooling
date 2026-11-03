@@ -2,7 +2,7 @@
 # Tests that agent-dispatch.sh never pairs a mounted entrypoint with a baked
 # helper library (Issue #4194).
 #
-# The container images bake .devcontainer/agent-context.sh at
+# The container images bake .claude/tooling/devcontainer/agent-context.sh at
 # /usr/local/bin/agent-context.sh (Dockerfile COPY). agent-dispatch.sh also
 # bind-mounts some entrypoints from the harness checkout so a script edit takes
 # effect without an image rebuild. Those two mechanisms update on different
@@ -24,12 +24,12 @@
 # agent-dispatch.sh's own text -- no docker, no image, no network -- so it fails
 # on the PR that introduces the mismatch rather than at dispatch time.
 #
-# Run: bash .devcontainer/agent-context-mount_test.sh
+# Run: bash .claude/tooling/devcontainer/agent-context-mount_test.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DISPATCH="$REPO_ROOT/.claude/scripts/agent-dispatch.sh"
+DISPATCH="$REPO_ROOT/.claude/tooling/scripts/agent-dispatch.sh"
 HELPER="$SCRIPT_DIR/agent-context.sh"
 
 [[ -f "$DISPATCH" ]] || { echo "FAIL: expected file not found: $DISPATCH" >&2; exit 1; }
@@ -103,8 +103,8 @@ while IFS= read -r block; do
     for ep in "${SOURCING[@]}"; do
         # Only entrypoints this block mounts from the checkout are at risk.
         # A baked entrypoint moves with the baked helper, so it is consistent.
-        [[ "$block" == *".devcontainer/scripts/${ep}:/usr/local/bin/${ep}"* ]] ||
-            [[ "$block" == *".devcontainer/${ep}:/usr/local/bin/${ep}"* ]] || continue
+        [[ "$block" == *".claude/tooling/devcontainer/scripts/${ep}:/usr/local/bin/${ep}"* ]] ||
+            [[ "$block" == *".claude/tooling/devcontainer/${ep}:/usr/local/bin/${ep}"* ]] || continue
         checked_pairs=$((checked_pairs + 1))
         if [[ "$block" != *"agent-context.sh:/usr/local/bin/agent-context.sh"* ]]; then
             violations+=("$ep")

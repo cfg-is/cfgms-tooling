@@ -3,7 +3,7 @@
 
 Given a git ref, `create_sweep()` resolves it to a commit sha, computes the
 deterministic `<UTC timestamp>-<short sha>` sweep id (see
-.claude/skills/security-review/docs/harness-architecture.md), and creates the on-disk sweep
+.claude/tooling/security-review/docs/harness-architecture.md), and creates the on-disk sweep
 tree (`manifest.json`, `plan/`, `lanes/<lane>/` per configured lane,
 `report/`) under the base directory `basedir.py::resolve_base_dir()` resolves.
 

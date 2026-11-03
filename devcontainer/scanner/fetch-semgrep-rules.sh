@@ -3,7 +3,7 @@
 # uses (Issue #3982) at the pinned commit recorded in semgrep/upstream/SOURCE,
 # verifying every file's sha256 against that record before it is kept.
 #
-# Runs at IMAGE BUILD time only (.devcontainer/Dockerfile), where network is
+# Runs at IMAGE BUILD time only (.claude/tooling/devcontainer/Dockerfile), where network is
 # available; at runtime the lane container is default-DROP and semgrep reads
 # these files from the image path. The rule text itself is not vendored into
 # this repository: the SOURCE file carries the commit and per-file hashes,

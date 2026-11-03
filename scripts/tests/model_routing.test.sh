@@ -10,13 +10,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-AGENT_CONTEXT="${REPO_ROOT}/.devcontainer/agent-context.sh"
-ENTRYPOINT="${REPO_ROOT}/.devcontainer/entrypoint.sh"
-REVIEW_ENTRYPOINT="${REPO_ROOT}/.devcontainer/scripts/review-entrypoint.sh"
-DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+AGENT_CONTEXT="${REPO_ROOT}/.claude/tooling/devcontainer/agent-context.sh"
+ENTRYPOINT="${REPO_ROOT}/.claude/tooling/devcontainer/entrypoint.sh"
+REVIEW_ENTRYPOINT="${REPO_ROOT}/.claude/tooling/devcontainer/scripts/review-entrypoint.sh"
+DISPATCH="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
 ROUTING_FILE="${REPO_ROOT}/.claude/model-routing.yaml"
-DOCKERFILE="${REPO_ROOT}/.devcontainer/Dockerfile"
+DOCKERFILE="${REPO_ROOT}/.claude/tooling/devcontainer/Dockerfile"
 DOCKERIGNORE="${REPO_ROOT}/.dockerignore"
 
 # The one path the routing config may be read from inside a container. It is

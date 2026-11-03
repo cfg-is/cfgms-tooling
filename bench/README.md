@@ -4,28 +4,28 @@ Answers one question: **for a given pipeline segment, does a model or prompt
 change improve output quality per dollar?**
 
 Part of epic #3026 (pipeline cost engineering); this directory is story #3029.
-Costing comes from `.claude/metrics/token_report.py`, so a benchmark and a
+Costing comes from `.claude/tooling/metrics/token_report.py`, so a benchmark and a
 production report price a token identically.
 
 ## Usage
 
 ```bash
-.claude/bench/bench.py list
+.claude/tooling/bench/bench.py list
 
 # Score an output that already exists. Costs nothing.
-.claude/bench/bench.py replay --case tech-lead/story-validation \
+.claude/tooling/bench/bench.py replay --case tech-lead/story-validation \
     --transcript ~/.claude/projects/-workspace/<session>.jsonl --run-id baseline
 
 # Execute a case against a model. Spends tokens; only ever on explicit request.
-.claude/bench/bench.py run --case tech-lead/story-validation \
+.claude/tooling/bench/bench.py run --case tech-lead/story-validation \
     --model claude-haiku-4-5 --run-id v1-haiku
 
 # Re-apply current assertions (and optionally a judge) to a stored output.
 # Free -- this is why outputs are persisted.
-.claude/bench/bench.py rescore --case tech-lead/story-validation \
+.claude/tooling/bench/bench.py rescore --case tech-lead/story-validation \
     --from-run v1-haiku --run-id v1-haiku-judged --judge-model claude-sonnet-4-6
 
-.claude/bench/bench.py compare --baseline v1-sonnet --candidate v1-haiku
+.claude/tooling/bench/bench.py compare --baseline v1-sonnet --candidate v1-haiku
 ```
 
 **Nothing here runs automatically.** No timer, no cron hook, no dispatch path

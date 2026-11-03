@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Tests for .devcontainer/agent-context.sh (Issue #854).
+# Tests for .claude/tooling/devcontainer/agent-context.sh (Issue #854).
 #
 # Exercises the rendering helpers against canned JSON fixtures and the no-op
 # detection / idempotent-comment logic against a stub `gh` on $PATH.
 #
-# Run: bash .devcontainer/entrypoint_test.sh
+# Run: bash .claude/tooling/devcontainer/entrypoint_test.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

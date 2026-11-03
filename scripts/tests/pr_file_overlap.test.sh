@@ -82,7 +82,7 @@ def active(num, declared, pr_files=None, pr_number=None, fetch_failed=False):
 recs = m.compute_dispatch_recommendations(
     [ready(3284, ["pkg/ha/raft_consensus.go"])],
     [active(3130,
-            ["scripts/pipeline-helper.sh", "scripts/project-queue.sh"],
+            [".claude/tooling/scripts/pipeline-helper.sh", ".claude/tooling/scripts/project-queue.sh"],
             pr_files=["pkg/ha/raft_consensus.go", "pkg/ha/manager.go",
                       "features/controller/server/server.go"],
             pr_number=3262)],

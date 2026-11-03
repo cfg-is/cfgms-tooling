@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the transcript token/cost reporter.
 
-Run: python3 -m unittest discover -s .claude/metrics/tests -t .
+Run: python3 -m unittest discover -s .claude/tooling/metrics/tests -t .
 
 The two tests that matter most are test_duplicate_request_ids_counted_once and
 the cache-TTL pair: both failure modes produce a report that looks plausible

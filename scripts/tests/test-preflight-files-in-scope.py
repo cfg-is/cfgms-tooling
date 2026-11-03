@@ -34,7 +34,7 @@ here pins that difference so the two are not "unified" later.
      `TestScopeCorpusDifferential` below cover the fix; see the
      `extract_scope_paths` docstring for the structural rule.
 
-Run: python3 .claude/scripts/tests/test-preflight-files-in-scope.py
+Run: python3 .claude/tooling/scripts/tests/test-preflight-files-in-scope.py
 """
 import importlib.util
 import os
@@ -164,8 +164,8 @@ class TestPhrasingIsNotIntent(unittest.TestCase):
     def test_extensionless_name_with_line_number(self):
         # #3212 — `Dockerfile:155` has no extension for the suffix strip to anchor on.
         self.assertEqual(
-            scope("- `.devcontainer/Dockerfile:155` — `ARG CLAUDE_CODE_VERSION=2.1.220`"),
-            [".devcontainer/Dockerfile"],
+            scope("- `.claude/tooling/devcontainer/Dockerfile:155` — `ARG CLAUDE_CODE_VERSION=2.1.220`"),
+            [".claude/tooling/devcontainer/Dockerfile"],
         )
 
 
@@ -218,8 +218,8 @@ class TestPreviouslyWorkingForms(unittest.TestCase):
 
     def test_makefile_and_dockerfile(self):
         self.assertEqual(
-            scope("- `Makefile`\n- `.devcontainer/Dockerfile`"),
-            [".devcontainer/Dockerfile", "Makefile"],
+            scope("- `Makefile`\n- `.claude/tooling/devcontainer/Dockerfile`"),
+            [".claude/tooling/devcontainer/Dockerfile", "Makefile"],
         )
 
     def test_deduplicates_repeated_mentions(self):
@@ -685,14 +685,14 @@ class TestTxtExtension(unittest.TestCase):
 
     def test_txt_path_parses_into_files_parsed(self):
         self.assertEqual(
-            scope("- `.devcontainer/scanner/semgrep-requirements.txt` — pin the new rule set.\n"),
-            [".devcontainer/scanner/semgrep-requirements.txt"],
+            scope("- `.claude/tooling/devcontainer/scanner/semgrep-requirements.txt` — pin the new rule set.\n"),
+            [".claude/tooling/devcontainer/scanner/semgrep-requirements.txt"],
         )
 
     def test_txt_path_with_trailing_line_reference_parses_to_same_path(self):
         self.assertEqual(
-            scope("- `.devcontainer/scanner/semgrep-requirements.txt:12` — pin the new rule set.\n"),
-            [".devcontainer/scanner/semgrep-requirements.txt"],
+            scope("- `.claude/tooling/devcontainer/scanner/semgrep-requirements.txt:12` — pin the new rule set.\n"),
+            [".claude/tooling/devcontainer/scanner/semgrep-requirements.txt"],
         )
 
 

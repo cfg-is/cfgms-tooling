@@ -1,0 +1,39 @@
+# Dependabot configuration for cfgms-tooling.
+# Version updates are off (limit 0), as in cfgms; entries exist so security
+# updates still open and honour their ignore rules.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    target-branch: "main"
+
+  # Semgrep scanner image requirements (devcontainer/scanner/)
+  # Version updates are off (limit 0); this entry exists so security updates
+  # honour the ignore below. semgrep pins the whole opentelemetry-* family in
+  # lockstep (api, sdk, exporters, instrumentation), so a single-package bump
+  # cannot resolve under `uv pip install --require-hashes`. Raise the family
+  # together when semgrep itself is bumped.
+  - package-ecosystem: "pip"
+    directory: "/devcontainer/scanner"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 0
+
+    ignore:
+      - dependency-name: "opentelemetry-*"
+
+    labels:
+      - "dependencies"
+      - "automated"
+
+    commit-message:
+      prefix: "deps-scanner"
+
+    target-branch: "main"

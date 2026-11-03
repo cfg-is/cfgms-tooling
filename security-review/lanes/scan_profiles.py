@@ -9,7 +9,7 @@ has already confined to the read-only `/workspace` snapshot. Nothing under
 `/workspace` -- no config file, no `go.mod` `replace`, no `package.json`
 script, no planner output -- can add, remove or alter a profile: the planner
 emits no commands (Decision 3, recorded in the story and in
-`.claude/skills/security-review/docs/harness-architecture.md`), and the snapshot is data
+`.claude/tooling/security-review/docs/harness-architecture.md`), and the snapshot is data
 the checks read, never code the checks load.
 
 Shape rules the registry test (`scan_profiles_test.py`) enforces on every
@@ -110,7 +110,7 @@ MAX_CHECK_TIMEOUT_S = 300
 MAX_CHECK_OUTPUT_BYTES = 24_000
 
 TOOLS: dict[str, Tool] = {
-    # Already in cfg-agent:latest at pinned versions (.devcontainer/Dockerfile);
+    # Already in cfg-agent:latest at pinned versions (.claude/tooling/devcontainer/Dockerfile);
     # this story reinstalls none of them.
     "gosec": Tool("gosec", ("-version",), frozenset({0, 1})),
     "staticcheck": Tool("staticcheck", ("-version",), frozenset({0, 1}), clean_empty_exit_codes=frozenset({0})),

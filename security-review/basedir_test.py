@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coverage tests for basedir.py: fail-closed sweep base directory resolution.
 
-Run: python3 .claude/skills/security-review/basedir_test.py
+Run: python3 .claude/tooling/security-review/basedir_test.py
 """
 from __future__ import annotations
 

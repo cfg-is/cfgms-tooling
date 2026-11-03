@@ -66,9 +66,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-CLI="${REPO_ROOT}/.claude/skills/security-review/security-review.sh"
-DISPATCH="${REPO_ROOT}/.claude/scripts/agent-dispatch.sh"
-SECURITY_REVIEW_DIR="${REPO_ROOT}/.claude/skills/security-review"
+CLI="${REPO_ROOT}/.claude/tooling/security-review/security-review.sh"
+DISPATCH="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
+SECURITY_REVIEW_DIR="${REPO_ROOT}/.claude/tooling/security-review"
 CLAUDE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/claude_lane.py"
 CODEX_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/codex_lane.py"
 OPENCODE_LANE_SCRIPT="${SECURITY_REVIEW_DIR}/lanes/opencode_lane.py"
@@ -367,7 +367,7 @@ trap cleanup_fixtures EXIT
 # "schema.py ... run for real", and it was, just not the schema.py under test.
 #
 # A dedicated fixture repo whose single commit carries a COPY of this
-# checkout's live .claude/.devcontainer closes that: `git archive HEAD` now
+# checkout's live .claude/.claude/tooling/devcontainer closes that: `git archive HEAD` now
 # yields the harness code as it exists in the working tree, so the lane
 # subprocess and the host-side planner validate against the same definitions.
 # This is the pattern the content-provenance case below already established
@@ -391,20 +391,20 @@ seed_harness_fixture_repo() {
   # `git archive`'s tree walk and would leave the snapshot without a .claude
   # at all).
   cp -r "${REPO_ROOT}/.claude" "${dest}/.claude"
-  cp -r "${REPO_ROOT}/.devcontainer" "${dest}/.devcontainer"
+  cp -r "${REPO_ROOT}/.claude/tooling/devcontainer" "${dest}/.claude/tooling/devcontainer"
   # Byte-compiled caches of the very modules under test have no business in a
   # snapshot that is verified byte-for-byte against its own commit.
   find "${dest}/.claude" -type d -name '__pycache__' -prune -exec rm -rf {} +
-  # .claude/metrics/token_report.py (and its test) coincidentally match the
+  # .claude/tooling/metrics/token_report.py (and its test) coincidentally match the
   # #3978 tier table's `*token*` security-tier pattern -- a real file this
   # fixture never needs (agent-dispatch.sh only conditionally mounts it if
   # present, and nothing in this test suite exercises that mount). Left in
   # place, the #3980 G-2/G-3 coverage gates would fail on every single-planner
   # sweep in this file for a "security"-tier file no stub plan below ever
   # covers -- a gap this fixture repo neither intends nor tests.
-  rm -rf "${dest}/.claude/metrics"
+  rm -rf "${dest}/.claude/tooling/metrics"
   # harness_runner.py loads the review methodology from
-  # .claude/skills/security-review/docs/methodology.md at import (Issue #3981)
+  # .claude/tooling/security-review/docs/methodology.md at import (Issue #3981)
   # and fails closed without it -- already carried by the `.claude` copy
   # above, exactly as the real `git archive <commit>` snapshot of this
   # repository does, so no separate copy step is needed here.
@@ -418,19 +418,19 @@ seed_harness_fixture_repo() {
 
 commit_harness_fixture_repo() {
   local dest="$1"
-  git -C "$dest" add .claude .devcontainer pkg
+  git -C "$dest" add .claude .claude/tooling/devcontainer pkg
   git -C "$dest" commit --quiet -m "fixture: harness code and reviewable content"
 }
 
 HARNESS_FIXTURE_REPO="${SANDBOX}/harness-fixture-repo"
 seed_harness_fixture_repo "$HARNESS_FIXTURE_REPO"
 commit_harness_fixture_repo "$HARNESS_FIXTURE_REPO"
-fixture_committed_schema="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:.claude/skills/security-review/schema.py | sha256sum | cut -d' ' -f1)"
+fixture_committed_schema="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:.claude/tooling/security-review/schema.py | sha256sum | cut -d' ' -f1)"
 live_schema="$(sha256sum "${SECURITY_REVIEW_DIR}/schema.py" | cut -d' ' -f1)"
 check_eq "the fixture repo's HEAD commit carries this checkout's live schema.py (the lane imports it from there)" \
   "$fixture_committed_schema" "$live_schema"
-fixture_committed_methodology="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:.claude/skills/security-review/docs/methodology.md | sha256sum | cut -d' ' -f1)"
-live_methodology="$(sha256sum "${REPO_ROOT}/.claude/skills/security-review/docs/methodology.md" | cut -d' ' -f1)"
+fixture_committed_methodology="$(git -C "$HARNESS_FIXTURE_REPO" show HEAD:.claude/tooling/security-review/docs/methodology.md | sha256sum | cut -d' ' -f1)"
+live_methodology="$(sha256sum "${REPO_ROOT}/.claude/tooling/security-review/docs/methodology.md" | cut -d' ' -f1)"
 check_eq "the fixture repo's HEAD commit carries this checkout's live methodology.md (harness_runner loads it from there)" \
   "$fixture_committed_methodology" "$live_methodology"
 
@@ -439,7 +439,7 @@ check_eq "the fixture repo's HEAD commit carries this checkout's live methodolog
 # Since Issue #4056 the harness -- not the planner model -- decides how many
 # steps a sweep has: partition.py cuts the BUNDLE's whole file inventory by
 # directory, so an unbounded launch against this fixture repo would partition
-# its copy of .claude/.devcontainer/docs (scaffolding the lane's snapshot
+# its copy of .claude/.claude/tooling/devcontainer/docs (scaffolding the lane's snapshot
 # needs, never this file's reviewed content -- see seed_harness_fixture_repo)
 # into ~70 steps and run every one of them through every lane. `--path`
 # (Issue #4012) bounds the bundle to the fixture's two reviewable files, which
@@ -2009,7 +2009,7 @@ echo "   D1) =="
 
 CONTENT_FIXTURE_REPO="$(mktemp -d)"
 # Same seeded fixture every other lane-executing case above uses (its own
-# comment explains why the harness's .claude/.devcontainer have to be real
+# comment explains why the harness's .claude/.claude/tooling/devcontainer have to be real
 # tracked files in the fixture's OWN history rather than symlinks or
 # untracked copies), with this test's marker written over the seeded
 # pkg/example/file.go before the commit the sweep will pin to.
@@ -2680,16 +2680,16 @@ check_eq "result.error. is written in exactly one place" "$(grep -c 'result\.err
 echo ""
 echo "== adversarial-review: re-review, base-only reuse, block-at (Issue #5100) =="
 # A stub dispatcher records each launch, so the run count and "no launch" are observable.
-mkdir -p "${ADV_REPO}/.claude/scripts"
+mkdir -p "${ADV_REPO}/.claude/tooling/scripts"
 ADV_LAUNCHES="${ADV_TMP}/launches.log"
-cat >"${ADV_REPO}/.claude/scripts/agent-dispatch.sh" <<STUB
+cat >"${ADV_REPO}/.claude/tooling/scripts/agent-dispatch.sh" <<STUB
 #!/usr/bin/env bash
 mode=""
 while [[ \$# -gt 0 ]]; do [[ "\$1" == "--mode" ]] && mode="\$2"; shift; done
 echo "\$mode" >>"${ADV_LAUNCHES}"
 echo "LAUNCHED_INVESTIGATOR:\${mode}:stub-cid"
 STUB
-chmod +x "${ADV_REPO}/.claude/scripts/agent-dispatch.sh"
+chmod +x "${ADV_REPO}/.claude/tooling/scripts/agent-dispatch.sh"
 mkdir -p "${ADV_BASE}/sweep-b/triage/stories"
 cat >"${ADV_BASE}/sweep-b/triage/stories/index.json" <<'JSON'
 {"901": {"item_id": "PVTI_adv2", "sweep_id": "sweep-b", "slug": "relay", "findings": []}}
@@ -2710,7 +2710,7 @@ adv2_seed() { # <head> <fingerprint> <status> [findings-json]
   python3 -c 'import json,sys; json.dump({"status": sys.argv[1], "findings": json.loads(sys.argv[2])}, open(sys.argv[3], "w"))' "$3" "${4:-[]}" "${d}/result.json"
   python3 "${SECURITY_REVIEW_DIR_FOR_TEST}/adversarial.py" fingerprint-record --pr-dir "$ADV2_PR_DIR" --head "$1" --fingerprint "$2"
 }
-SECURITY_REVIEW_DIR_FOR_TEST="${REPO_ROOT}/.claude/skills/security-review"
+SECURITY_REVIEW_DIR_FOR_TEST="${REPO_ROOT}/.claude/tooling/security-review"
 ADV_OLD="1111111111111111111111111111111111111111"
 launches() { grep -c . "$ADV_LAUNCHES" || true; }
 adv2_index_fp() { # <head>: the fingerprint the CLI recorded for that head

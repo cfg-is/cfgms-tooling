@@ -10,7 +10,7 @@ invented strings, because the property under test is "does a real copied line
 get caught, and does a real legitimate citation get through" -- and a synthetic
 string proves neither.
 
-Run: python3 .claude/skills/security-review/source_leak_test.py
+Run: python3 .claude/tooling/security-review/source_leak_test.py
 """
 from __future__ import annotations
 

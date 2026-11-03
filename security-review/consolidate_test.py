@@ -7,7 +7,7 @@ Hand-rolled (no unittest, no third-party test runner), matching the
 `schema_test.py` / `resume_test.py` / `basedir_test.py` convention: stdlib
 only, exit 0 on all-pass, run directly by `scripts/test-scripts.sh`.
 
-Run: python3 .claude/skills/security-review/consolidate_test.py
+Run: python3 .claude/tooling/security-review/consolidate_test.py
 """
 from __future__ import annotations
 

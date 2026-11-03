@@ -25,7 +25,7 @@ ran=0
 # review-pr refuses a launch when the trusted gate sources are absent
 # (Issue #5386); seed them into a stub repo root.
 seed_trusted_sources() {
-  mkdir -p "$1/.claude/scripts" "$1/.claude/agents" "$1/scripts"
+  mkdir -p "$1/.claude/tooling/scripts" "$1/.claude/agents" "$1/scripts"
   : > "$1/.claude/agents/acceptance-reviewer.md"
 }
 
@@ -437,7 +437,7 @@ assert_review_refusal() {
   # cases pass for the wrong reason: they only assert the output does not
   # contain "merge_conflicts", which a creds-deferred message also satisfies.
   # Injecting CREDS_OK is what actually exercises the guard. (Issue #3459 --
-  # found when .claude/scripts/tests/ was first wired into `make test`.)
+  # found when .claude/tooling/scripts/tests/ was first wired into `make test`.)
   #
   # Also stub CFGMS_TEST_REPO_ROOT so gate_image_staleness_for_launch (#4388)
   # is a no-op here, same as every other pre-existing launch-path test. Without
@@ -497,7 +497,7 @@ cat > "$ADV_ROOT/bin/docker" <<'STUB'
 exit 0
 STUB
 chmod +x "$ADV_ROOT/bin/docker"
-cat > "$ADV_ROOT/scripts/project-queue.sh" <<'STUB'
+cat > "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
   add-issue)    echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
@@ -524,7 +524,7 @@ cat > "$ADV_ROOT/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 exit 0
 STUB
-chmod +x "$ADV_ROOT/scripts/project-queue.sh" "$ADV_ROOT/adversarial.sh" "$ADV_ROOT/pipeline-helper.sh" "$ADV_ROOT/bin/docker"
+chmod +x "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" "$ADV_ROOT/adversarial.sh" "$ADV_ROOT/pipeline-helper.sh" "$ADV_ROOT/bin/docker"
 printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"1111111111111111111111111111111111111111","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' \
   > "$ADV_ROOT/meta.json"
 
@@ -594,7 +594,7 @@ git -C "$PR_ROOT/origin" branch feature/story-4242-agent
 git -C "$PR_ROOT/origin" branch feature/item-PVTI_prompt-agent
 git clone -q "$PR_ROOT/origin" "$PR_ROOT/repo"
 seed_trusted_sources "$PR_ROOT/repo"
-cp "$ADV_ROOT/scripts/project-queue.sh" "$PR_ROOT/repo/scripts/project-queue.sh"
+cp "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" "$PR_ROOT/repo/.claude/tooling/scripts/project-queue.sh"
 cat > "$PR_ROOT/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == run ]]; then
@@ -624,15 +624,15 @@ for kind in story:feature/story-4242-agent item:feature/item-PVTI_prompt-agent; 
   label="${kind%%:*}"; branch="${kind#*:}"
   run_prompt_launch "$branch" "$label"
   assert_adv "$label prompt written" '[[ -s "$PR_ROOT/prompt.md" ]]'
-  assert_adv "$label prompt names the trusted scripts root" 'grep -qF "/opt/cfgms-trusted/.claude/scripts" "$PR_ROOT/prompt.md"'
+  assert_adv "$label prompt names the trusted scripts root" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts" "$PR_ROOT/prompt.md"'
   assert_adv "$label prompt reads the agent definition from the trusted path" 'grep -qF "Read \`/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md\`" "$PR_ROOT/prompt.md"'
-  assert_adv "$label prompt has no relative po-act enqueue" '! grep -qF "./.claude/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
+  assert_adv "$label prompt has no relative po-act enqueue" '! grep -qF "./.claude/tooling/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
   assert_adv "$label prompt has no relative agent definition read" '! grep -E "(^|[^/])\.claude/agents/acceptance-reviewer\.md" "$PR_ROOT/prompt.md" | grep -qv "/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md"'
   assert_adv "$label docker run mounts the three trusted sources read-only" \
-    'grep -qF "$PR_ROOT/repo/.claude/scripts:/opt/cfgms-trusted/.claude/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/scripts:/opt/cfgms-trusted/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/.claude/agents/acceptance-reviewer.md:/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md:ro" "$PR_ROOT/docker-args.txt"'
+    'grep -qF "$PR_ROOT/repo/.claude/tooling/scripts:/opt/cfgms-trusted/.claude/tooling/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/scripts:/opt/cfgms-trusted/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/.claude/agents/acceptance-reviewer.md:/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md:ro" "$PR_ROOT/docker-args.txt"'
 done
 run_prompt_launch feature/story-4242-agent story
-assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
+assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
 
 echo
 echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"
@@ -674,7 +674,7 @@ git -C "$BH_ROOT/origin" branch feature/story-4242-agent
 BR_TIP=$(git -C "$BH_ROOT/origin" rev-parse feature/story-4242-agent)
 git clone -q "$BH_ROOT/origin" "$BH_ROOT/repo"
 seed_trusted_sources "$BH_ROOT/repo"
-cp "$ADV_ROOT/scripts/project-queue.sh" "$BH_ROOT/repo/scripts/project-queue.sh"
+cp "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" "$BH_ROOT/repo/.claude/tooling/scripts/project-queue.sh"
 
 # bh_run <author> <head-in-fixture> <live-head> <approved-sha> <cmd...>
 bh_run() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loader for `.claude/skills/security-review/docs/threat-scenarios.md` (Issue #4059).
+"""Loader for `.claude/tooling/security-review/docs/threat-scenarios.md` (Issue #4059).
 
 The catalogue is the product-level companion to `methodology.md`: it states
 properties that must hold, in terms of this product's shape, so a planner can
@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 import re
 
-CATALOGUE_RELATIVE_PATH = ".claude/skills/security-review/docs/threat-scenarios.md"
+CATALOGUE_RELATIVE_PATH = ".claude/tooling/security-review/docs/threat-scenarios.md"
 
 # One scenario reaches one step's prompt, never every step's, so this bound is
 # about keeping a single step's prompt readable rather than about sweep cost.
