@@ -391,7 +391,10 @@ seed_harness_fixture_repo() {
   # `git archive`'s tree walk and would leave the snapshot without a .claude
   # at all).
   cp -r "${REPO_ROOT}/.claude" "${dest}/.claude"
-  cp -r "${REPO_ROOT}/.claude/tooling/devcontainer" "${dest}/.claude/tooling/devcontainer"
+  # .claude/tooling is the cfgms-tooling checkout (a submodule, or a nested
+  # clone in that repo's CI). Drop its .git so the fixture tracks the harness
+  # as ordinary files instead of recording an embedded repository.
+  rm -rf "${dest}/.claude/tooling/.git"
   # Byte-compiled caches of the very modules under test have no business in a
   # snapshot that is verified byte-for-byte against its own commit.
   find "${dest}/.claude" -type d -name '__pycache__' -prune -exec rm -rf {} +

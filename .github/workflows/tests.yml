@@ -1,14 +1,19 @@
 name: tooling-tests
 
 # The tooling operates on a cfgms checkout, so each run checks out cfgms
-# develop and mounts this commit at .claude/tooling, the same layout cfgms
-# uses through its submodule.
+# (develop, or the cfgms-ref input on a manual run) and mounts this commit at
+# .claude/tooling, the same layout cfgms uses through its submodule.
 
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      cfgms-ref:
+        description: cfgms branch or SHA to test against (default develop)
+        required: false
+        default: develop
 
 permissions: {}
 
@@ -31,7 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: cfg-is/cfgms
-          ref: develop
+          ref: ${{ inputs.cfgms-ref || 'develop' }}
           persist-credentials: false
           fetch-depth: 0
 
