@@ -4620,8 +4620,8 @@ paths = [entrypoint_path, lane_entrypoint_path, agent_profile_path]
 # cover the whole tree, because its job is to say WHICH harness produced a
 # step, and a digest over the entrypoint alone could not answer that.
 if lane_entrypoint_path:
-    paths.append(os.path.join(repo_root, ".claude", "skills", "security-review", "docs", "methodology.md"))
-    harness_dir = os.path.join(repo_root, ".claude", "skills", "security-review")
+    paths.append(os.path.join(repo_root, ".claude", "tooling", "security-review", "docs", "methodology.md"))
+    harness_dir = os.path.join(repo_root, ".claude", "tooling", "security-review")
     for dirpath, dirnames, filenames in os.walk(harness_dir):
         dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
         for name in sorted(filenames):

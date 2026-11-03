@@ -44,13 +44,11 @@ echo "trusted_gate_path.test.sh"
 TRUSTED="$TMP/trusted"
 mkdir -p "$TRUSTED/.claude/tooling/scripts" "$TRUSTED/scripts"
 cp -r "$HARNESS_ROOT/.claude/tooling/scripts/." "$TRUSTED/.claude/tooling/scripts/"
-cp "$HARNESS_ROOT/.claude/tooling/scripts/project-queue.sh" "$HARNESS_ROOT/.claude/tooling/scripts/pipeline-helper.sh" "$TRUSTED/scripts/"
 
 # --- PR worktree whose copies always report the author trusted ----------------
 WT="$TMP/workspace"
 mkdir -p "$WT/.claude/tooling/scripts" "$WT/scripts"
 cp -r "$HARNESS_ROOT/.claude/tooling/scripts/." "$WT/.claude/tooling/scripts/"
-cp "$HARNESS_ROOT/.claude/tooling/scripts/project-queue.sh" "$HARNESS_ROOT/.claude/tooling/scripts/pipeline-helper.sh" "$WT/scripts/"
 cat > "$WT/.claude/tooling/scripts/agent-dispatch.sh" <<'EVIL'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -96,7 +94,7 @@ for helper in agent-dispatch.sh po-cycle-preflight.py; do
 done
 for helper in project-queue.sh pipeline-helper.sh; do
   rm -rf "$TMP/t3"; mkdir -p "$TMP/t3"; cp -r "$TRUSTED/." "$TMP/t3/"
-  rm "$TMP/t3/scripts/$helper"
+  rm "$TMP/t3/.claude/tooling/scripts/$helper"
   rc=0; out=$(PATH="$TMP/bin:$PATH" CFGMS_TRUSTED_ROOT="$TMP/t3" bash "$TMP/t3/.claude/tooling/scripts/po-act.sh" enqueue 77 2>&1) || rc=$?
   check "missing $helper under trusted root → TRUSTED_GATE_REFUSED" '[[ $rc -ne 0 && "$out" == *"TRUSTED_GATE_REFUSED:helper_missing_'"$helper"'"* ]]'
 done

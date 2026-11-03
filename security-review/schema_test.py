@@ -263,7 +263,7 @@ def test_cwe_values_match_the_methodology_document():
     methodology_path = (
         Path(__file__).resolve().parents[3]
         / ".claude"
-        / "skills"
+        / "tooling"
         / "security-review"
         / "docs"
         / "methodology.md"

@@ -473,13 +473,13 @@ TIER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("business", ("features/*", "internal/*", "pkg/*")),
     ("docs", ("docs/*", "*.md", "LICENSE", "LICENSE.*", "examples/*")),
     ("tooling", (
-        ".github/*", ".claude/tooling/devcontainer/*", ".claude/*", ".serena/*", "scripts/*", "build/*",
+        ".github/*", ".devcontainer/*", ".claude/*", ".serena/*", "scripts/*", "build/*",
         "*.sh", "*.ps1", "Makefile", "Dockerfile*", "docker-compose*.yml", "buf.yaml", "buf.*.yaml",
     )),
     ("config", (
         "*.yaml", "*.yml", "*.json", "*.toml", "*.cfg", "*.conf", "*.tsv", "*.jsonl", "*.txt",
         "templates/*", "web/*", "go.mod", "CODEOWNERS", "*.example", "*ignore", "*.baseline",
-        ".gitattributes", ".nvmrc", "staticcheck.conf", "*.wxs", "*.xml", "*.html", "*.js", "postinstall",
+        ".gitattributes", ".gitmodules", ".nvmrc", "staticcheck.conf", "*.wxs", "*.xml", "*.html", "*.js", "postinstall",
     )),
 )
 

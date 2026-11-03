@@ -28,7 +28,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DISPATCH="$REPO_ROOT/.claude/tooling/scripts/agent-dispatch.sh"
 HELPER="$SCRIPT_DIR/agent-context.sh"
 

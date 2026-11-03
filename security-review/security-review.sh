@@ -44,13 +44,20 @@ SECURITY_REVIEW_DIR="${SCRIPT_DIR}"
 # override agent-dispatch.sh has always honored (see its own REPO_ROOT
 # line), needed here so a test can make the snapshot's committed content
 # diverge from a live working tree without ever touching this checkout.
-# Production invocations never set it, so `git rev-parse --show-toplevel`
-# against this script's own location remains the only resolution path that
-# matters outside tests.
+# Production invocations never set it, so the mount-depth resolution below is
+# the only resolution path that matters outside tests.
 if [[ -n "${CFGMS_TEST_REPO_ROOT:-}" ]]; then
   REPO_ROOT="$CFGMS_TEST_REPO_ROOT"
 else
-  REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  # This script lives in the cfgms-tooling repository, mounted in cfgms at
+  # .claude/tooling, so `--show-toplevel` from here names the tooling checkout,
+  # not cfgms. Resolve the cfgms root from the fixed mount depth and confirm it
+  # is a git work-tree top.
+  _candidate="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)"
+  REPO_ROOT="$(git -C "$_candidate" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$REPO_ROOT" && "$(cd "$REPO_ROOT" && pwd)" != "$_candidate" ]]; then
+    REPO_ROOT=""
+  fi
 fi
 if [[ -z "$REPO_ROOT" ]]; then
   echo "ERROR: cannot determine the repository root (\`git rev-parse --show-toplevel\` failed)" >&2

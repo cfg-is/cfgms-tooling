@@ -268,8 +268,17 @@ check_contains "Dockerfile bakes pricing.json alongside it" "$dockerfile_src" \
 # the path that ships harness security updates (entrypoint.sh, init-firewall.sh,
 # pinned tool versions). Assert every .claude source the Dockerfile copies is
 # re-included.
+# The image's own sources live under .claude/tooling/devcontainer/ (the
+# cfgms-tooling submodule) and are re-included as one directory, checked
+# below; they are image source, not agent state, so they are not counted here.
 mapfile -t baked_sources < <(grep -E '^COPY ' "$DOCKERFILE" \
-  | grep -oE '\.claude/[^[:space:]]+' | sort -u)
+  | grep -oE '\.claude/[^[:space:]]+' | grep -v '^\.claude/tooling/devcontainer/' | sort -u)
+if grep -qxF -- '!.claude/tooling/devcontainer' "$DOCKERIGNORE"; then
+  ok ".dockerignore re-includes the image sources (.claude/tooling/devcontainer)"
+else
+  bad ".dockerignore re-includes the image sources (.claude/tooling/devcontainer)" \
+      "the Dockerfile COPYs from it, so the agent image cannot build"
+fi
 # Exactly the harness-owned config the image is allowed to bake: the two
 # reporter files (Issue #3041) plus the model-routing config (Issue #3030).
 # Any further .claude source added to a COPY is a deliberate decision that must

@@ -3313,7 +3313,134 @@ test_devcontainer_suite_skip_status() {
     log_pass "run_devcontainer_suites: exit 77 is a skip, other non-zero statuses still fail"
 }
 
+test_no_pipeline_label_refs_tooling() {
+    log_test "Testing: no pipeline:* or agent:* label references in .claude/tooling/ (except devcontainer/)..."
+
+    local root
+    root="${REPO_ROOT}"
+
+    # Falsifiability check: inject a prohibited label into a temp file and verify
+    # the grep pattern fires, so a broken grep doesn't silently always pass.
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"; trap - RETURN' RETURN
+    printf '# prohibited: pipeline:story label reference\n' > "$tmp_dir/probe.sh"
+    local probe_matches
+    probe_matches=$(grep -rn \
+        "pipeline:story\|pipeline:draft\|pipeline:review\|pipeline:ready\|agent:ready\|agent:success\|agent:in-progress\|agent:failed" \
+        "$tmp_dir/" \
+        2>/dev/null) || true
+    if [[ -n "$probe_matches" ]]; then
+        log_pass "no_pipeline_label_refs: grep pattern correctly detects violations (falsifiability)"
+    else
+        log_fail "no_pipeline_label_refs: grep pattern failed to detect injected violation — grep is broken"
+        return
+    fi
+
+    # Real check: assert zero matches in the actual codebase directories.
+    # Exclude .claude/worktrees/ — that's the agent-dispatch root containing
+    # nested repo copies, not source for this checkout.
+    local matches
+    matches=$(grep -rn \
+        "pipeline:story\|pipeline:draft\|pipeline:review\|pipeline:ready\|agent:ready\|agent:success\|agent:in-progress\|agent:failed" \
+        "${root}/.claude/tooling/" \
+        --exclude="run-tooling-tests.sh" \
+        --exclude-dir="worktrees" \
+        --exclude-dir="devcontainer" \
+        2>/dev/null) || true
+
+    if [[ -z "$matches" ]]; then
+        log_pass "no_pipeline_label_refs: zero prohibited label references in .claude/ and scripts/"
+    else
+        log_fail "no_pipeline_label_refs: found prohibited label references (remove them):"
+        while IFS= read -r line; do
+            echo "    $line"
+        done <<< "$matches"
+    fi
+}
+
+# Issue #5707: a failed parallel suite must print its failing assertion lines
+# ahead of the tail, and a passing one nothing extra.
+test_parallel_suite_failure_lines_printed() {
+    log_test "Testing parallel suite failure reporting prints failing assertion lines..."
+
+    local fake
+    fake=$(printf '  FAIL  alpha\n'; for _ in $(seq 1 30); do printf '  ok\n'; done
+           printf 'not ok 3 beta\n'; for _ in $(seq 1 30); do printf '  ok\n'; done
+           printf 'FAIL: gamma\n'; for _ in $(seq 1 30); do printf '  ok\n'; done)
+    local report want
+    report=$(pipeline_suite_failure_lines "$fake"; echo "$fake" | tail -20)
+    for want in "FAIL  alpha" "not ok 3 beta" "FAIL: gamma"; do
+        if ! grep -qF -- "$want" <<<"$report"; then
+            log_fail "failure report is missing '${want}'"
+            return
+        fi
+    done
+
+    local okout helper_out
+    okout=$(for _ in $(seq 1 30); do printf '  ok\n'; done; printf 'FAILED_OVER is fine\n')
+    helper_out=$(pipeline_suite_failure_lines "$okout")
+    if [[ -n "$helper_out" ]]; then
+        log_fail "helper printed output for a suite with no failure lines: ${helper_out}"
+        return
+    fi
+
+    local runner body pass_arm fail_calls
+    for runner in test_claude_pipeline_suites run_devcontainer_suites; do
+        body=$(declare -f "$runner")
+        pass_arm=$(awk '/^ +pass\)$/{f=1;next} /;;$/{f=0} f' <<<"$body")
+        if grep -q pipeline_suite_failure_lines <<<"$pass_arm"; then
+            log_fail "${runner}: pass arm calls the failure-report helper"
+            return
+        fi
+        fail_calls=$(grep -c 'pipeline_suite_failure_lines "\$out"' <<<"$body" || true)
+        if [[ "$fail_calls" != "3" ]]; then
+            log_fail "${runner}: expected 3 failure-arm helper calls (timeout, missing, fail), found ${fail_calls}"
+            return
+        fi
+    done
+
+    log_pass "parallel suite failure reporting: failing lines printed, passing suites silent"
+}
+
+# Regression guard for the parallel .claude pipeline-suite runner (Issue #4151):
+# a suite whose recorded exit status is absent, empty or non-numeric must be
+# reported as a failure, never as a pass. The same invariant the Makefile shard
+# aggregation holds, on the other side of the same change — and the case
+# `[[ $rc -eq 0 ]]` silently gets wrong, because it compares in arithmetic
+# context where "" and "garbage" are both 0.
+test_pipeline_suite_result_fails_closed() {
+    log_test "Testing .claude pipeline suite aggregation: unusable exit status fails closed..."
+
+    local kind
+    local -a bad_statuses=("" " " "garbage" "0x0" "00abc" $'\n')
+    for kind in "${bad_statuses[@]}"; do
+        local got
+        got=$(pipeline_suite_result_kind "$kind")
+        if [[ "$got" != "missing" ]]; then
+            log_fail "exit status $(printf '%q' "$kind") classified as '${got}', not 'missing' — a suite that recorded no usable status would be reported ${got}"
+            return
+        fi
+    done
+
+    local -a cases=("0:pass" "124:timeout" "1:fail" "2:fail" "137:fail")
+    local c
+    for c in "${cases[@]}"; do
+        local status="${c%%:*}" want="${c##*:}" actual
+        actual=$(pipeline_suite_result_kind "$status")
+        if [[ "$actual" != "$want" ]]; then
+            log_fail "exit status ${status} classified as '${actual}', expected '${want}'"
+            return
+        fi
+    done
+
+    log_pass ".claude pipeline suite aggregation: empty and non-numeric exit statuses fail closed"
+}
+
 TOOLING_TABLE=(
+    "test_pipeline_suite_result_fails_closed:claude-tooling"
+    "test_parallel_suite_failure_lines_printed:claude-tooling"
+    "test_no_pipeline_label_refs_tooling:claude-tooling"
     "test_create_clone_stale_branch_deletion:claude-tooling"
     "test_create_clone_refuses_branch_with_work:claude-tooling"
     "test_create_clone_keep_remote:claude-tooling"
