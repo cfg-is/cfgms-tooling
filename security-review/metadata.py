@@ -177,10 +177,12 @@ def _list_tree(commit_sha: str, repo_root: str | None) -> list[str]:
     module's own log-injection handling (see module docstring) exists to be
     tested against. `-z` gives the raw bytes, split on NUL, so an unusual path
     round-trips as a single, faithful list entry.
+
+    Only blobs are listed. A submodule entry (mode 160000, type `commit`) names
+    a commit in another repository -- cfgms mounts its tooling that way at
+    .claude/tooling -- so it has no content in this repository to read.
     """
-    result = _run_git(["ls-tree", "-r", "-z", "--name-only", commit_sha], repo_root)
-    raw = result.stdout.decode("utf-8", errors="surrogateescape")
-    return [p for p in raw.split("\x00") if p]
+    return [path for path, _blob_sha in _list_tree_with_blobs(commit_sha, repo_root)]
 
 
 def _module_path(commit_sha: str, repo_root: str | None, files: list[str]) -> str | None:
@@ -607,7 +609,9 @@ def _list_tree_with_blobs(commit_sha: str, repo_root: str | None) -> list[tuple[
         parts = meta.split(" ")
         if len(parts) != 3:
             continue
-        _mode, _objtype, blob_sha = parts
+        _mode, objtype, blob_sha = parts
+        if objtype != "blob":
+            continue
         entries.append((path, blob_sha))
     return entries
 
