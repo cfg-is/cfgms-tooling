@@ -3,7 +3,7 @@
 injection-safe log formatter every other module in this package builds on.
 
 Hand-rolled (no unittest, no third-party test runner) matching the existing
-`.claude/skills/refresh-pins/scripts/discover_pins_test.py` convention: stdlib
+`.claude/tooling/refresh-pins/discover_pins_test.py` convention: stdlib
 only, exit 0 on all-pass, non-zero otherwise, run directly by
 `scripts/test-scripts.sh`.
 

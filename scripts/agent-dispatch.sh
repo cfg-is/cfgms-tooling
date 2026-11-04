@@ -34,13 +34,21 @@ fi
 init_tooling_submodule() {
   local dest="$1"
   [[ -f "$dest/.gitmodules" ]] || return 0
+  # Register the submodule (URL from .gitmodules) first, so a later plain
+  # `git submodule update` in the clone works and `submodule status` reports
+  # it initialised; the -c override below only redirects this one fetch.
+  git -C "$dest" submodule init --quiet -- .claude/tooling
   if [[ -e "$REPO_ROOT/.claude/tooling/.git" ]] && git -C "$dest" \
       -c protocol.file.allow=always \
       -c "submodule..claude/tooling.url=$REPO_ROOT/.claude/tooling" \
-      submodule update --init --quiet -- .claude/tooling 2>/dev/null; then
+      submodule update --quiet -- .claude/tooling 2>/dev/null; then
+    # The checkout's origin is now the host path, which does not exist inside
+    # an agent container; point it back at the registered URL.
+    git -C "$dest/.claude/tooling" remote set-url origin \
+      "$(git -C "$dest" config --get submodule..claude/tooling.url)"
     return 0
   fi
-  git -C "$dest" submodule update --init --quiet -- .claude/tooling
+  git -C "$dest" submodule update --quiet -- .claude/tooling
 }
 
 # Atomic lock helper (Issue #5708). Resolved from this file's own location, not
