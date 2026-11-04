@@ -725,6 +725,53 @@ while IFS= read -r -d '' script; do
   done
 done < <(find "${REPO_ROOT_REAL}/.claude/tooling/scripts" -maxdepth 1 -name '*.sh' -print0)
 
+
+# ---------------------------------------------------------------------------
+# T14: production layout — .claude/tooling is a real git submodule. A
+# "HEAD:.claude/tooling/devcontainer" lookup from the parent repo cannot cross
+# the gitlink; it fails and, without --verify, echoes the literal revision
+# string, so the image label and the checkout "hash" both became that string
+# and the gate always reported fresh. The hash must be the submodule's own
+# devcontainer tree, and must change when that tree changes.
+# ---------------------------------------------------------------------------
+SUB_SRC="${SANDBOX}/tooling-src"
+SUB_PARENT="${SANDBOX}/submodule-parent"
+mkdir -p "${SUB_SRC}/devcontainer"
+echo "FROM scratch" > "${SUB_SRC}/devcontainer/Dockerfile"
+"${GIT[@]}" -C "$SUB_SRC" init -q
+"${GIT[@]}" -C "$SUB_SRC" add devcontainer
+"${GIT[@]}" -C "$SUB_SRC" commit -q -m tooling
+mkdir -p "$SUB_PARENT"
+"${GIT[@]}" -C "$SUB_PARENT" init -q
+"${GIT[@]}" -C "$SUB_PARENT" -c protocol.file.allow=always submodule add -q "$SUB_SRC" .claude/tooling
+"${GIT[@]}" -C "$SUB_PARENT" commit -q -m parent
+SUB_TREE="$("${GIT[@]}" -C "${SUB_PARENT}/.claude/tooling" rev-parse HEAD:devcontainer)"
+
+sub_hash="$(REPO_ROOT="$SUB_PARENT"; _image_build_inputs_hash)"
+if [[ -n "$sub_hash" && "$sub_hash" == "$SUB_TREE" ]]; then
+  ok "T14: submodule layout — checkout hash is the submodule's devcontainer tree"
+else
+  bad "T14: submodule layout — checkout hash is the submodule's devcontainer tree" \
+    "got '${sub_hash}', want '${SUB_TREE}'"
+fi
+
+echo "FROM scratch AS changed" > "${SUB_PARENT}/.claude/tooling/devcontainer/Dockerfile"
+"${GIT[@]}" -C "${SUB_PARENT}/.claude/tooling" commit -q -am changed
+sub_hash2="$(REPO_ROOT="$SUB_PARENT"; _image_build_inputs_hash)"
+if [[ -n "$sub_hash2" && "$sub_hash2" != "$sub_hash" ]]; then
+  ok "T14: submodule layout — a devcontainer change moves the checkout hash"
+else
+  bad "T14: submodule layout — a devcontainer change moves the checkout hash" \
+    "before '${sub_hash}', after '${sub_hash2}'"
+fi
+
+no_tree_hash="$(REPO_ROOT="${SANDBOX}/not-a-repo"; _image_build_inputs_hash)"
+if [[ -z "$no_tree_hash" ]]; then
+  ok "T14: a failed lookup yields an empty hash, not the revision string"
+else
+  bad "T14: a failed lookup yields an empty hash, not the revision string" "got '${no_tree_hash}'"
+fi
+
 echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"

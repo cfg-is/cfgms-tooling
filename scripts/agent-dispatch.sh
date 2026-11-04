@@ -1397,8 +1397,14 @@ IMAGE_REBUILD_LOCK="${CFGMS_TEST_IMAGE_REBUILD_LOCK:-${AGENT_LEDGER_DIR}/image-r
 
 # _image_build_inputs_hash — this checkout's build-inputs identity. Empty if
 # REPO_ROOT is not a git checkout (never true in production).
+#
+# .claude/tooling is a submodule in cfgms, and a "HEAD:<path>" lookup from the
+# parent repo cannot cross the gitlink. Resolving "HEAD:./devcontainer" from
+# inside .claude/tooling reads the tree of whichever repo owns that directory:
+# the submodule in production, the fixture repo in tests. --verify keeps a
+# failed lookup from echoing the literal revision string as if it were a hash.
 _image_build_inputs_hash() {
-  git -C "$REPO_ROOT" rev-parse "HEAD:.claude/tooling/devcontainer" 2>/dev/null || true
+  git -C "$REPO_ROOT/.claude/tooling" rev-parse --verify -q "HEAD:./devcontainer" 2>/dev/null || true
 }
 
 # _image_build_inputs_label — cfg-agent:latest's recorded build-inputs
