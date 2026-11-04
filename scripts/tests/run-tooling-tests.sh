@@ -3437,7 +3437,29 @@ test_pipeline_suite_result_fails_closed() {
     log_pass ".claude pipeline suite aggregation: empty and non-numeric exit statuses fail closed"
 }
 
+# Suites that create, lease or delete items on the shared production project
+# board must not run on every test invocation. Moved from cfgms
+# test/unit/build (TestScriptSuiteRequiresOptInForLiveProjectMutations) with
+# the suites it guards.
+test_live_project_tests_require_opt_in() {
+    log_test "Testing: live project-board suites require CFGMS_RUN_LIVE_PROJECT_TESTS=1..."
+    local guard='if [[ "${CFGMS_RUN_LIVE_PROJECT_TESTS:-}" != "1" ]]'
+    local runner="${REPO_ROOT}/.claude/tooling/scripts/tests/run-tooling-tests.sh"
+    local trust="${REPO_ROOT}/.claude/tooling/scripts/tests/trust_boundary_test.sh"
+    local n_runner n_trust
+    n_runner=$(grep -cF -- "$guard" "$runner" || true)
+    n_trust=$(grep -cF -- "$guard" "$trust" || true)
+    # The runner count includes the guard string in this function's own
+    # definition, so two guarded suites read as 3.
+    if [[ "$n_runner" == "3" && "$n_trust" == "1" ]]; then
+        log_pass "live project suites: both runner suites and test_phase2_lifecycle are opt-in"
+    else
+        log_fail "live project suites: expected 2 guarded runner suites and 1 in trust_boundary_test.sh, found runner=$((n_runner - 1)) trust=${n_trust}"
+    fi
+}
+
 TOOLING_TABLE=(
+    "test_live_project_tests_require_opt_in:claude-tooling"
     "test_pipeline_suite_result_fails_closed:claude-tooling"
     "test_parallel_suite_failure_lines_printed:claude-tooling"
     "test_no_pipeline_label_refs_tooling:claude-tooling"
