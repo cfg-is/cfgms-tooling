@@ -433,7 +433,7 @@ test_create_clone_duplicate_pr_gate() {
 }
 
 # Coverage suite for the refresh-pins discovery script. Delegates to
-# .claude/skills/refresh-pins/scripts/discover_pins_test.py, which builds a
+# .claude/tooling/refresh-pins/discover_pins_test.py, which builds a
 # synthetic repo carrying one of every pin shape and asserts each is found.
 #
 # This exists because discovery gaps are silent: a pin the script cannot see is
@@ -444,8 +444,8 @@ test_create_clone_duplicate_pr_gate() {
 test_refresh_pins_discovery() {
     log_test "Testing refresh-pins discover-pins.py coverage..."
 
-    local script=".claude/skills/refresh-pins/scripts/discover-pins.py"
-    local test_script=".claude/skills/refresh-pins/scripts/discover_pins_test.py"
+    local script=".claude/tooling/refresh-pins/discover-pins.py"
+    local test_script=".claude/tooling/refresh-pins/discover_pins_test.py"
 
     if [[ ! -f "$script" ]]; then
         log_fail "discover-pins.py: Not found"
@@ -633,13 +633,13 @@ test_usage_db_suite() {
 }
 
 # Coverage suite for the refresh-pins clean-check script
-# (.claude/skills/refresh-pins/scripts/verify_pin_clean.py): PROSE vs
+# (.claude/tooling/refresh-pins/verify_pin_clean.py): PROSE vs
 # EXECUTING classification of surviving pin-string hits. Same convention and
 # same silent-gap rationale as test_bench_suite above (Issue #4300).
 test_verify_pin_clean_suite() {
     log_test "Testing refresh-pins verify_pin_clean.py coverage..."
 
-    local test_script=".claude/skills/refresh-pins/scripts/verify_pin_clean_test.py"
+    local test_script=".claude/tooling/refresh-pins/verify_pin_clean_test.py"
 
     if [[ ! -f "$test_script" ]]; then
         log_fail "verify_pin_clean_test.py: Not found"
