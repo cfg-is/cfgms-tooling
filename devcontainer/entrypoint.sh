@@ -404,7 +404,10 @@ _verify_landed_tree() {
 
     local -a problems=()
     local dirty head remote_head pr_head
-    dirty=$(git status --porcelain --untracked-files=no 2>/dev/null) || dirty="(git status failed)"
+    # Submodules are ignored: the dispatcher checks .claude/tooling out at the
+    # host's pin, which can differ from the branch's gitlink. That drift is not
+    # agent work and must not fail the run.
+    dirty=$(git status --porcelain --untracked-files=no --ignore-submodules=all 2>/dev/null) || dirty="(git status failed)"
     if [[ -n "$dirty" ]]; then
         problems+=("validated changes were left uncommitted (staged or unstaged tracked files)")
     fi

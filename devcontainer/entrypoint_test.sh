@@ -1405,6 +1405,37 @@ test_25c_landed_tree_clean_pushed_passes() {
     teardown_landed_env
 }
 
+# T25h — the dispatcher checks the tooling submodule out at the host's pin,
+# which can differ from the branch's gitlink (an older branch after the pin
+# moved). That shows as " M <submodule>" but is not agent work: it must not
+# fail the run.
+test_25h_landed_tree_ignores_submodule_pointer_drift() {
+    setup_landed_env
+    local sub="$LANDED_DIR/sub"
+    git init -q "$sub"
+    git -C "$sub" config user.email "test@example.com"
+    git -C "$sub" config user.name "Test"
+    echo one > "$sub/f"; git -C "$sub" add f; git -C "$sub" commit -q -m one
+    git -C "$LANDED_REPO" -c protocol.file.allow=always submodule add -q "$sub" tooling >/dev/null 2>&1
+    git -C "$LANDED_REPO" commit -q -m "add submodule"
+    git -C "$LANDED_REPO" push -q origin "$LANDED_BRANCH"
+    git -C "$LANDED_REPO" rev-parse HEAD > "$LANDED_DIR/gh-pr-head.out"
+    echo two > "$sub/f"; git -C "$sub" commit -q -am two
+    git -C "$LANDED_REPO/tooling" -c protocol.file.allow=always fetch -q origin
+    git -C "$LANDED_REPO/tooling" checkout -q origin/HEAD 2>/dev/null || git -C "$LANDED_REPO/tooling" checkout -q FETCH_HEAD
+
+    local status out log
+    status=$(git -C "$LANDED_REPO" status --porcelain --untracked-files=no)
+    assert_contains "$status" "tooling" "fixture: submodule pointer drift is visible to plain git status"
+    out=$(_landed_run fix-pr "https://github.com/cfg-is/cfgms/pull/4248")
+    log=$(cat "$LANDED_LOG")
+
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "0" "submodule pointer drift alone keeps EXIT_CODE=0"
+    assert_not_contains "$log" "pr ready --undo" "PR is not drafted for submodule drift"
+
+    teardown_landed_env
+}
+
 # T25d — HEAD matches origin/<branch> but the PR head differs (e.g. pushed to
 # another ref): fails. resolve-conflict and no-PR runs skip the gate.
 test_25d_landed_tree_pr_head_mismatch_and_skips() {
@@ -1559,6 +1590,7 @@ run_test "T24b — no validation marker: no promotion, exit 1 (Issue #4709)" tes
 run_test "T24c — resolve-conflict / no linked issue: no promotion (Issue #4709)" test_24c_resolve_conflict_and_no_issue_not_promoted
 run_test "T24d — non-WIP or non-draft PR: no promotion (Issue #4709)" test_24d_non_wip_or_non_draft_not_promoted
 run_test "T24e — failed gh/git step: helper non-zero, caller falls back (Issue #4709)" test_24e_failed_gh_step_falls_back
+run_test "T25h — landed tree: tooling submodule pointer drift is not agent work (cfg-is/cfgms#5932)" test_25h_landed_tree_ignores_submodule_pointer_drift
 run_test "T25a — landed tree: staged validated fix fails the run and drafts the PR (cfg-is/cfgms#5932)" test_25a_landed_tree_staged_change_fails
 run_test "T25b — landed tree: unpushed local commit fails the run" test_25b_landed_tree_unpushed_commit_fails
 run_test "T25c — landed tree: clean pushed tree at the PR head passes" test_25c_landed_tree_clean_pushed_passes
