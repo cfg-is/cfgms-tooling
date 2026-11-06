@@ -915,6 +915,20 @@ _review_is_stale() {
 #   Prints "REVIEW_REFUSED:<pr>:<reason>" with its hint appended when one
 #   exists, then exits 3. Centralizes the format so every review-pr refusal
 #   site stays consistent and self-explanatory without a doc lookup.
+# Reduce a gh error message (read on stdin) to one printable line for a
+# machine-read status line (Issue cfg-is/cfgms#5914). gh stderr can carry
+# caller-influenced text, so newlines and tabs become spaces, every other
+# non-printable byte is dropped, anything shaped like a GitHub token is
+# redacted, and the result is cut to 300 characters. Prints "unknown" when
+# nothing is left.
+_sanitize_gh_error() {
+  local msg
+  msg=$(tr '\n\r\t' '   ' | LC_ALL=C tr -cd '[:print:]' \
+    | sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[REDACTED]/g; s/  +/ /g; s/^ //; s/ $//' \
+    | cut -c1-300)
+  printf '%s\n' "${msg:-unknown}"
+}
+
 _emit_review_refused() {
   local pr_num="$1" reason="$2" hint
   hint=$(_review_refusal_hint "$reason")
@@ -2615,7 +2629,7 @@ case "$cmd" in
     github_url=$(git -C "$REPO_ROOT" remote get-url origin)
 
     # Fetch all PR metadata in one call (author gate + branch + body).
-    pr_meta_fix=$(gh pr view "$pr_num" --json headRefName,headRefOid,baseRefName,body,labels,author 2>/dev/null) || {
+    pr_meta_fix=$(gh pr view "$pr_num" --repo cfg-is/cfgms --json headRefName,headRefOid,baseRefName,body,labels,author 2>/dev/null) || {
       echo "ERROR: Failed to get metadata for PR #${pr_num}"
       exit 1
     }
@@ -3627,10 +3641,12 @@ PYEOF
     gate_image_staleness_for_launch
     # Trusted gate sources (Issue #5386). The merge gate must run a copy the PR
     # cannot change, so the review container gets the harness checkout's
-    # scripts and agent definition read-only under TRUSTED_ROOT. Check each on
+    # scripts and agent definition read-only under TRUSTED_ROOT, plus the
+    # pipeline.yaml the trusted project-queue.sh resolves as
+    # ${SCRIPT_DIR}/../../pipeline.yaml (Issue cfg-is/cfgms#5914). Check each on
     # the host first: docker would create a missing bind-mount source as an
     # empty directory and the gate would then run from nothing.
-    for trusted_src in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
+    for trusted_src in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-reviewer.md" ".claude/pipeline.yaml"; do
       if [[ ! -r "${REPO_ROOT}/${trusted_src}" ]]; then
         _emit_review_refused "$pr_num" "trusted_source_missing_${trusted_src//\//_}"
       fi
@@ -3886,21 +3902,22 @@ workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
-Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/tooling/scripts\`
-(the harness copy), never from a path under /workspace: the PR under review can
-edit the copies in its own checkout.
+Run \`po-act.sh\`, \`check-pr-author\`, \`project-queue.sh\` and \`cleanup-issue\` only from
+\`${TRUSTED_ROOT}/.claude/tooling/scripts\` (the harness copy), never from a path under
+/workspace: the PR under review can edit the copies in its own checkout, and the
+checkout's \`.claude/tooling\` submodule is not initialised.
 
 When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
 - **PASS (zero findings)**:
-  mark item Done with \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
-  then run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\` to
+  mark item Done with \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
+  then run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\` to
   release the dev agent's container/worktree.
-- **FAIL on first review**: \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
+- **FAIL on first review**: \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
 - **FAIL on second review (fix cycle)**:
-  \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
-  and run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\`.
+  \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
+  and run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
@@ -3916,22 +3933,23 @@ workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
-Run \`po-act.sh\` and \`check-pr-author\` only from \`${TRUSTED_ROOT}/.claude/tooling/scripts\`
-(the harness copy), never from a path under /workspace: the PR under review can
-edit the copies in its own checkout.
+Run \`po-act.sh\`, \`check-pr-author\`, \`project-queue.sh\` and \`cleanup-issue\` only from
+\`${TRUSTED_ROOT}/.claude/tooling/scripts\` (the harness copy), never from a path under
+/workspace: the PR under review can edit the copies in its own checkout, and the
+checkout's \`.claude/tooling\` submodule is not initialised.
 
 When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
 - **PASS (zero findings)**: enqueue with \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
-  mark story Done with \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
-  then run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
+  mark story Done with \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
+  then run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
   release the dev agent's container/worktree.
-- **FAIL on first review**: \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
+- **FAIL on first review**: \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
 - **FAIL on second review (fix cycle)**:
-  \`./.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
+  \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
   assign founder via \`gh issue edit ${story_num} --repo cfg-is/cfgms --add-assignee jrdnr\`,
-  and run \`./.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
+  and run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
@@ -3979,6 +3997,7 @@ PROMPT_EOF
       -v "${REPO_ROOT}/.claude/tooling/scripts:${TRUSTED_ROOT}/.claude/tooling/scripts:ro" \
       -v "${REPO_ROOT}/scripts:${TRUSTED_ROOT}/scripts:ro" \
       -v "${REPO_ROOT}/.claude/agents/acceptance-reviewer.md:${TRUSTED_ROOT}/.claude/agents/acceptance-reviewer.md:ro" \
+      -v "${REPO_ROOT}/.claude/pipeline.yaml:${TRUSTED_ROOT}/.claude/pipeline.yaml:ro" \
       -v "${REPO_ROOT}/.claude/tooling/devcontainer/agent-context.sh:/usr/local/bin/agent-context.sh:ro" \
       "${AGENT_METRICS_MOUNT_ARGS[@]}" \
       "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
@@ -5075,10 +5094,18 @@ PY
       echo "AUTHOR_CHECK_ERROR:${_cpa_pr}:bad_head_sha"
       exit 3
     fi
-    _cpa_meta=$(gh pr view "$_cpa_pr" --json author,labels 2>/dev/null) || {
+    # The repository is named explicitly (Issue cfg-is/cfgms#5914): the review
+    # container calls this gate from the trusted root, which is not a git
+    # clone, so gh cannot infer the repository from the working directory.
+    # stderr is kept so a failure says why; it still fails closed (exit 3).
+    _cpa_errf=$(mktemp) || { echo "AUTHOR_CHECK_ERROR:${_cpa_pr}:api_error"; exit 3; }
+    _cpa_meta=$(gh pr view "$_cpa_pr" --repo cfg-is/cfgms --json author,labels 2>"$_cpa_errf") || {
       echo "AUTHOR_CHECK_ERROR:${_cpa_pr}:api_error"
+      echo "AUTHOR_CHECK_DETAIL:${_cpa_pr}:$(_sanitize_gh_error < "$_cpa_errf")"
+      rm -f "$_cpa_errf"
       exit 3
     }
+    rm -f "$_cpa_errf"
     _cpa_login=$(echo "$_cpa_meta" | jq -r '.author.login // empty')
     _cpa_labels=$(echo "$_cpa_meta" | jq -r '.labels[].name')
     _cpa_trust=$(_check_author_permission "$_cpa_login" "$_cpa_pr" "$_cpa_labels" "$_cpa_head")

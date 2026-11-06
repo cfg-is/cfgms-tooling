@@ -116,6 +116,7 @@ check "trusted root constant is /opt/cfgms-trusted" 'grep -q "^TRUSTED_ROOT=\"/o
 mk_launch_root() {  # mk_launch_root <dir>
   mkdir -p "$1/scripts" "$1/home" "$1/bin" "$1/.claude/tooling/scripts" "$1/.claude/agents"
   : > "$1/.claude/agents/acceptance-reviewer.md"
+  : > "$1/.claude/pipeline.yaml"
   cat > "$1/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == run ]]; then echo "DOCKER_RUN" >> "$DOCKER_LOG"; fi
@@ -137,7 +138,7 @@ exit 0
 STUB
 chmod +x "$GH_FIX/gh"
 
-for missing in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-reviewer.md"; do
+for missing in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-reviewer.md" ".claude/pipeline.yaml"; do
   LR="$TMP/launch"; rm -rf "$LR"; mk_launch_root "$LR"
   rm -rf "${LR:?}/${missing}"
   export DOCKER_LOG="$LR/docker.log"; : > "$DOCKER_LOG"
@@ -149,8 +150,137 @@ for missing in ".claude/tooling/scripts" "scripts" ".claude/agents/acceptance-re
     CFGMS_AGENT_CAPACITY_GATE=off \
     "$HARNESS_ROOT/.claude/tooling/scripts/agent-dispatch.sh" review-pr 4242 2>&1) || rc=$?
   check "missing $missing → REVIEW_REFUSED, non-zero, no container" \
-    '[[ $rc -ne 0 && "$out" == *"REVIEW_REFUSED:4242:trusted_source_missing_"* && ! -s "$DOCKER_LOG" ]]'
+    '[[ $rc -ne 0 && "$out" == *"REVIEW_REFUSED:4242:trusted_source_missing_${missing//\//_}"* && ! -s "$DOCKER_LOG" ]]'
 done
+check "missing pipeline.yaml refusal names it exactly" \
+  '[[ "$out" == *"REVIEW_REFUSED:4242:trusted_source_missing_.claude_pipeline.yaml"* ]]'
+
+# --- review-pr launch mounts the harness pipeline.yaml (cfg-is/cfgms#5914) ----
+# The trusted project-queue.sh resolves ${SCRIPT_DIR}/../../pipeline.yaml, i.e.
+# /opt/cfgms-trusted/.claude/pipeline.yaml. A full launch against a throwaway
+# origin; the docker stub records its argv.
+ML="$TMP/mount-launch"
+mkdir -p "$ML"
+git init -q -b develop "$ML/origin"
+git -C "$ML/origin" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+git -C "$ML/origin" branch feature/story-4242-agent
+git clone -q "$ML/origin" "$ML/repo"
+mk_launch_root "$ML/repo"
+cat > "$ML/repo/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == run ]]; then printf '%s\n' "$@" > "$DOCKER_ARGS"; echo fakecontainerid; fi
+exit 0
+STUB
+chmod +x "$ML/repo/bin/docker"
+printf '{"state":"OPEN","headRefName":"feature/story-4242-agent","headRefOid":"%s","body":"Fixes #4242","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN"}' \
+  "$(git -C "$ML/origin" rev-parse feature/story-4242-agent)" > "$ML/repo/meta.json"
+DOCKER_ARGS="$ML/docker-args.txt" GH_FIXTURE="$ML/repo/meta.json" PATH="$ML/repo/bin:$GH_FIX:$PATH" HOME="$ML/repo/home" \
+  CFGMS_TEST_COLLAB_PERM=admin CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" CFGMS_TEST_REPO_ROOT="$ML/repo" \
+  CFGMS_ADVERSARIAL_REVIEW_GATE=off CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
+  CFGMS_AGENT_CAPACITY_GATE=off \
+  "$HARNESS_ROOT/.claude/tooling/scripts/agent-dispatch.sh" review-pr 4242 >"$ML/launch.out" 2>&1 || true
+check "review-pr launch reached docker run" '[[ -s "$ML/docker-args.txt" ]]'
+check "review-pr mounts \${REPO_ROOT}/.claude/pipeline.yaml at /opt/cfgms-trusted/.claude/pipeline.yaml:ro" \
+  'grep -qxF "$ML/repo/.claude/pipeline.yaml:/opt/cfgms-trusted/.claude/pipeline.yaml:ro" "$ML/docker-args.txt"'
+check "no mount sources pipeline.yaml from the PR clone" \
+  '! grep -E ":/opt/cfgms-trusted/.claude/pipeline.yaml" "$ML/docker-args.txt" | grep -qvxF "$ML/repo/.claude/pipeline.yaml:/opt/cfgms-trusted/.claude/pipeline.yaml:ro"'
+
+# --- check-pr-author names the repository (cfg-is/cfgms#5914) -----------------
+# The reviewer runs the gate from /opt/cfgms-trusted, which is not a git clone.
+# This gh stub behaves like the real one there: without a repository it fails
+# with "not a git repository".
+mkdir -p "$TMP/bin-norepo"
+cat > "$TMP/bin-norepo/gh" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1 $2" == "pr view" ]]; then
+  if [[ " $* " == *" --repo cfg-is/cfgms "* || "${GH_REPO:-}" == "cfg-is/cfgms" ]]; then
+    echo '{"author":{"login":"insider"},"labels":[]}'; exit 0
+  fi
+  echo "failed to run git: fatal: not a git repository (or any of the parent directories): .git" >&2
+  exit 1
+fi
+exit 0
+STUB
+chmod +x "$TMP/bin-norepo/gh"
+NOREPO=$(mktemp -d)
+check "the check-pr-author cwd is not a git repository" '! git -C "$NOREPO" rev-parse --git-dir >/dev/null 2>&1'
+rc=0
+out=$(cd "$NOREPO" && env -u GH_REPO PATH="$TMP/bin-norepo:$PATH" HOME="$TMP/home" CFGMS_TEST_COLLAB_PERM=admin \
+  bash "$TRUSTED/.claude/tooling/scripts/agent-dispatch.sh" check-pr-author 77 "$SHA" 2>&1) || rc=$?
+rm -rf "$NOREPO"
+check "check-pr-author from a non-repo cwd → AUTHOR_TRUSTED:77:insider" '[[ $rc -eq 0 && "$out" == "AUTHOR_TRUSTED:77:insider" ]]'
+
+# gh always fails: still fail closed, and say why on one sanitised line.
+mkdir -p "$TMP/bin-ghfail"
+cat > "$TMP/bin-ghfail/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'HTTP 502: upstream \033[31mbad gateway\r\nsecond\tline token=ghp_ABCdef0123456789xyz\n' >&2
+exit 1
+STUB
+chmod +x "$TMP/bin-ghfail/gh"
+GHFAILCWD=$(mktemp -d)
+rc=0
+out=$(cd "$GHFAILCWD" && env -u GH_REPO PATH="$TMP/bin-ghfail:$PATH" HOME="$TMP/home" CFGMS_TEST_COLLAB_PERM=admin \
+  bash "$TRUSTED/.claude/tooling/scripts/agent-dispatch.sh" check-pr-author 77 "$SHA" 2>&1) || rc=$?
+rm -rf "$GHFAILCWD"
+line1=$(printf '%s\n' "$out" | sed -n 1p)
+line2=$(printf '%s\n' "$out" | sed -n 2p)
+nlines=$(printf '%s\n' "$out" | wc -l)
+check "gh failure → exit 3" '[[ $rc -eq 3 ]]'
+check "gh failure → first line AUTHOR_CHECK_ERROR:77:api_error" '[[ "$line1" == "AUTHOR_CHECK_ERROR:77:api_error" ]]'
+check "gh failure → second line is the sanitised reason with the stub message" \
+  '[[ "$line2" == "AUTHOR_CHECK_DETAIL:77:"* && "$line2" == *"HTTP 502: upstream"* && "$line2" == *"bad gateway"* && "$line2" == *"second line"* ]]'
+check "gh failure → reason line has no control characters" '[[ "$line2" != *[[:cntrl:]]* ]]'
+check "gh failure → reason spans exactly one line (two lines total)" '[[ $nlines -eq 2 ]]'
+check "gh failure → token-shaped text is redacted" '[[ "$line2" != *ghp_* && "$line2" == *"[REDACTED]"* ]]'
+
+# --- trusted project-queue.sh finds the mounted pipeline.yaml -----------------
+# Mirror the review container's mounts: scripts plus .claude/pipeline.yaml.
+mkdir -p "$TMP/bin-pq"
+cat > "$TMP/bin-pq/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh $*" >> "$PQ_GH_LOG"
+exit 1
+STUB
+chmod +x "$TMP/bin-pq/gh"
+run_trusted_pq() {  # run_trusted_pq <root>
+  PQ_GH_LOG="$1/gh.log"; : > "$PQ_GH_LOG"
+  (cd "$TMP" && PQ_GH_LOG="$PQ_GH_LOG" PATH="$TMP/bin-pq:$PATH" \
+    bash "$1/.claude/tooling/scripts/project-queue.sh" update-field PVTI_test Status Done 2>&1) || true
+}
+PQ1="$TMP/pq-with"; mkdir -p "$PQ1/.claude/tooling/scripts"
+cp -r "$HARNESS_ROOT/.claude/tooling/scripts/." "$PQ1/.claude/tooling/scripts/"
+cp "$HARNESS_ROOT/.claude/pipeline.yaml" "$PQ1/.claude/pipeline.yaml"
+out=$(run_trusted_pq "$PQ1")
+check "trusted layout with pipeline.yaml → no 'pipeline.yaml not found'" '[[ "$out" != *"pipeline.yaml not found"* ]]'
+check "trusted layout with pipeline.yaml → reached the GitHub API" '[[ -s "$PQ1/gh.log" ]]'
+PQ2="$TMP/pq-without"; mkdir -p "$PQ2/.claude/tooling/scripts"
+cp -r "$HARNESS_ROOT/.claude/tooling/scripts/." "$PQ2/.claude/tooling/scripts/"
+out=$(run_trusted_pq "$PQ2")
+check "control: trusted layout without pipeline.yaml → 'pipeline.yaml not found'" '[[ "$out" == *"pipeline.yaml not found"* && ! -s "$PQ2/gh.log" ]]'
+
+# --- review-entrypoint.sh runs only the trusted scripts (cfg-is/cfgms#5914) ---
+ENTRY="$HARNESS_ROOT/.claude/tooling/devcontainer/scripts/review-entrypoint.sh"
+check "review-entrypoint trusted scripts constant is /opt/cfgms-trusted" \
+  'grep -qx "TRUSTED_SCRIPTS=\"/opt/cfgms-trusted/.claude/tooling/scripts\"" "$ENTRY"'
+check "review-entrypoint Phase 2 failsafe uses the trusted project-queue.sh" \
+  'grep -qx "PROJECT_QUEUE=\"\${TRUSTED_SCRIPTS}/project-queue.sh\"" "$ENTRY"'
+check "review-entrypoint never references the workspace tooling copy" \
+  '! grep -qE "/workspace/\.claude/tooling|\./\.claude/tooling/scripts" "$ENTRY"'
+# release_cfgms_lease, extracted as written, against a trusted layout and a
+# workspace whose .claude/tooling is empty (the review clone never inits it).
+LR2="$TMP/lease"; mkdir -p "$LR2/trusted/.claude/tooling/scripts" "$LR2/workspace/.claude/tooling"
+cat > "$LR2/trusted/.claude/tooling/scripts/pipeline-helper.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "trusted-helper $*" >> "$LEASE_LOG"
+STUB
+chmod +x "$LR2/trusted/.claude/tooling/scripts/pipeline-helper.sh"
+release_fn=$(sed -n '/^release_cfgms_lease() {/,/^}/p' "$ENTRY")
+check "release_cfgms_lease extracted" '[[ "$release_fn" == *"lease-release"* ]]'
+: > "$LR2/lease.log"
+(cd "$LR2/workspace" && LEASE_LOG="$LR2/lease.log" CFGMS_LEASE_KEY=pr-77 \
+  TRUSTED_SCRIPTS="$LR2/trusted/.claude/tooling/scripts" bash -c "${release_fn}"$'\n''release_cfgms_lease') || true
+check "release_cfgms_lease calls the trusted pipeline-helper.sh lease-release" 'grep -qx "trusted-helper lease-release pr-77" "$LR2/lease.log"'
 
 echo ""
 echo "ran ${ran} assertions; failures: ${fail}"

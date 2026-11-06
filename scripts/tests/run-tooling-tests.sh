@@ -2046,6 +2046,7 @@ test_review_pr_item_branch() {
     local fake_repo="${tmp_dir}/repo"
     mkdir -p "${fake_repo}/scripts" "${fake_repo}/.claude/tooling/scripts" "${fake_repo}/.claude/agents"
     : > "${fake_repo}/.claude/agents/acceptance-reviewer.md"
+    : > "${fake_repo}/.claude/pipeline.yaml"
     cat > "${fake_repo}/.claude/tooling/scripts/project-queue.sh" << PQEOF
 #!/usr/bin/env bash
 echo "\$@" >> "${pq_calls_file}"
