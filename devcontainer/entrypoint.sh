@@ -303,6 +303,189 @@ _handle_no_op_run() {
     return 0
 }
 
+# _story_review_passed — succeed only when the newest story-review workflow
+# result written during this run is completed with result.passed == true
+# (cfg-is/cfgms#5932). The marker file is written by the agent itself, so on
+# its own it proves nothing: on #5927 the agent wrote it before the workflow
+# returned. The harness persists each workflow run as
+# <projects>/-workspace/<session>/workflows/wf_<id>.json with top-level
+# "workflowName", "status" ("completed" | "killed") and "result"
+# ({passed, reviewRounds, fixRounds, perRound, remainingFindings, ...}).
+# Files older than the run start are ignored (a re-dispatch reuses the same
+# session directory), and an unreadable newest file counts as not passed.
+#
+# $1 — the -workspace project directory; $2 — run start (epoch seconds).
+# Prints a one-line description of what it found.
+_story_review_passed() {
+    local project_dir="$1" since="$2"
+    python3 - "$project_dir" "$since" <<'PY'
+import glob, json, os, sys
+
+project_dir, since = sys.argv[1], int(sys.argv[2])
+candidates = []
+for path in glob.glob(os.path.join(project_dir, "*", "workflows", "wf_*.json")):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        continue
+    if mtime >= since:
+        candidates.append((mtime, path))
+for _, path in sorted(candidates, reverse=True):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        print(f"newest workflow result {path} is unreadable")
+        sys.exit(1)
+    if data.get("workflowName") != "story-review":
+        continue
+    result = data.get("result")
+    passed = isinstance(result, dict) and result.get("passed") is True
+    status = data.get("status")
+    print(f"story-review result {path}: status={status} passed={passed}")
+    sys.exit(0 if status == "completed" and passed else 1)
+print("no story-review workflow result written during this run")
+sys.exit(1)
+PY
+}
+
+# _distrust_unbacked_marker — remove the agent-written validation marker unless
+# a passing story-review result backs it, so the fallback validation runs
+# instead of the marker being trusted (cfg-is/cfgms#5932).
+#
+# $1 — marker path; $2 — -workspace project directory; $3 — run start (epoch).
+_distrust_unbacked_marker() {
+    local marker="$1" project_dir="$2" since="$3" verdict
+    [[ -f "$marker" ]] || return 0
+    if verdict=$(_story_review_passed "$project_dir" "$since" 2>&1); then
+        echo "Validation marker backed by ${verdict}"
+        return 0
+    fi
+    echo "WARN: validation marker present but not backed by a passing story-review result (${verdict}) — not trusting it"
+    rm -f "$marker"
+}
+
+# _run_validation_fallback — the agent exited 0 without a trusted marker: run
+# make test-agent-complete directly and fail the run if it fails.
+#
+# $1 — marker path. Globals set: EXIT_CODE (1 on failure).
+_run_validation_fallback() {
+    local marker="$1"
+    echo "ERROR: Agent exited 0 but no trusted validation marker was found"
+    echo "The story-review workflow either did not pass or was not run."
+    echo "Running make test-agent-complete as fallback enforcement..."
+    if make test-agent-complete; then
+        echo "Fallback validation passed — proceeding"
+        touch "$marker"
+    else
+        echo "ERROR: make test-agent-complete failed — marking agent as failed"
+        EXIT_CODE=1
+    fi
+}
+
+# _verify_landed_tree — fail the run when the PR head is not the tree the agent
+# left behind (cfg-is/cfgms#5932). On #5927 the agent committed, pushed and
+# opened its PR before the story-review workflow returned; the workflow's fix
+# round then staged a validated fix that nothing committed, the container
+# exited, and the fix was lost while the run counted as a success.
+#
+# Fails on positive evidence only:
+#   - staged or unstaged changes to tracked files (untracked files ignored);
+#   - local HEAD differs from refs/remotes/origin/<branch> (unpushed commits);
+#   - local HEAD differs from the PR's headRefOid.
+# A ref or PR lookup that cannot be read is logged and that check skipped.
+# Never commits or pushes the leftover changes: on failure the run is marked
+# failed, the PR is converted to draft and a breadcrumb comment lists the paths.
+#
+# $1 — PR number. Globals used: CURRENT_BRANCH. Globals set: EXIT_CODE.
+_verify_landed_tree() {
+    local pr_num="$1"
+    [[ "$pr_num" =~ ^[0-9]+$ ]] || return 0
+
+    local -a problems=()
+    local dirty head remote_head pr_head
+    # Submodules are ignored: the dispatcher checks .claude/tooling out at the
+    # host's pin, which can differ from the branch's gitlink. That drift is not
+    # agent work and must not fail the run.
+    dirty=$(git status --porcelain --untracked-files=no --ignore-submodules=all 2>/dev/null) || dirty="(git status failed)"
+    if [[ -n "$dirty" ]]; then
+        problems+=("validated changes were left uncommitted (staged or unstaged tracked files)")
+    fi
+
+    head=$(git rev-parse HEAD 2>/dev/null || echo "")
+    remote_head=$(git rev-parse --verify -q "refs/remotes/origin/${CURRENT_BRANCH:-}" 2>/dev/null || echo "")
+    if [[ -z "$remote_head" ]]; then
+        echo "WARN: landed-tree check: no origin/${CURRENT_BRANCH:-} ref — skipping the upstream comparison"
+    elif [[ "$head" != "$remote_head" ]]; then
+        problems+=("local HEAD ${head:0:12} was not pushed (origin/${CURRENT_BRANCH} is ${remote_head:0:12})")
+    fi
+
+    pr_head=$(gh pr view "$pr_num" --repo cfg-is/cfgms --json headRefOid -q '.headRefOid' 2>/dev/null || echo "")
+    if ! [[ "$pr_head" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "WARN: landed-tree check: could not read the head commit of PR #${pr_num} — skipping the PR head comparison"
+    elif [[ "$head" != "$pr_head" ]]; then
+        problems+=("local HEAD ${head:0:12} is not the PR head ${pr_head:0:12}")
+    fi
+
+    if [[ "${#problems[@]}" -eq 0 ]]; then
+        echo "Landed-tree check passed: PR #${pr_num} head is the local tree"
+        return 0
+    fi
+
+    EXIT_CODE=1
+    local p
+    echo "ERROR: landed-tree check failed for PR #${pr_num}:"
+    for p in "${problems[@]}"; do echo "  - ${p}"; done
+    if [[ -n "$dirty" ]]; then printf '%s\n' "$dirty" | head -50 | sed 's/^/    /'; fi
+
+    gh pr ready --undo "$pr_num" --repo cfg-is/cfgms >/dev/null 2>&1 || \
+        echo "WARN: failed to convert PR #${pr_num} to draft"
+
+    local body
+    body="Agent run marked failed: validated changes were left uncommitted or unpushed, so this PR's head is not the tree the agent validated. Converted to draft; nothing was committed or pushed on the agent's behalf."$'\n'
+    for p in "${problems[@]}"; do body+=$'\n'"- ${p}"; done
+    if [[ -n "$dirty" ]]; then
+        body+=$'\n\n'"Affected paths:"$'\n\n```\n'"$(printf '%s\n' "$dirty" | head -50)"$'\n```'
+    fi
+    gh pr comment "$pr_num" --repo cfg-is/cfgms --body "$body" >/dev/null 2>&1 || \
+        echo "WARN: failed to post landed-tree comment on PR #${pr_num}"
+    return 0
+}
+
+# _enforce_validation — post-run validation decision.
+# In fix-pr / resolve-conflict mode, a run that exits 0 but never advanced HEAD
+# is a silent no-op: the make test-agent-complete fallback would pass trivially
+# on unchanged code, so the no-op is handled first and the fallback skipped. A
+# fix-pr no-op on a salvaged WIP draft whose work already passed validation is
+# promoted instead of failed (Issue #4709) — see _handle_no_op_run.
+# Otherwise a run that exits 0 without a trusted marker runs the fallback. The
+# agent writes the marker itself, so it is trusted only when a passing
+# story-review result backs it (cfg-is/cfgms#5932).
+#
+# $1 — marker path; $2 — -workspace project directory; $3 — run start (epoch).
+# Globals used: MODE, HEAD_ADVANCED. Globals set: EXIT_CODE.
+_enforce_validation() {
+    local marker="$1" project_dir="$2" since="$3"
+    _distrust_unbacked_marker "$marker" "$project_dir" "$since"
+    if [[ "$MODE" == "fix-pr" || "$MODE" == "resolve-conflict" ]] && [ "$EXIT_CODE" -eq 0 ] && [ "$HEAD_ADVANCED" != "true" ]; then
+        _handle_no_op_run "$marker"
+    elif [ "$EXIT_CODE" -eq 0 ] && [ ! -f "$marker" ]; then
+        _run_validation_fallback "$marker"
+    fi
+}
+
+# _landed_tree_gate — run _verify_landed_tree for the modes that open or update
+# a PR from the agent's own commits (issue, branch, fix-pr) when a PR exists.
+#
+# $1 — MODE; $2 — PR URL (may be empty).
+_landed_tree_gate() {
+    local mode="$1" pr_url="$2" pr_num
+    [[ "$mode" == "issue" || "$mode" == "branch" || "$mode" == "fix-pr" ]] || return 0
+    [[ -n "$pr_url" ]] || return 0
+    pr_num=$(echo "$pr_url" | grep -oE '[0-9]+$' || true)
+    _verify_landed_tree "$pr_num"
+}
+
 # Testability hook: sourcing this file with CFGMS_ENTRYPOINT_SOURCE_ONLY=1
 # yields the helper definitions above without running any agent flow.
 if [[ "${CFGMS_ENTRYPOINT_SOURCE_ONLY:-}" == "1" ]]; then
@@ -504,6 +687,8 @@ failed lenses (max 3 rounds), and returns
 
 - If the workflow returns **passed: true**: write the validation marker with
   `touch /tmp/agent-validation-passed`, then proceed to the commit/PR phase.
+  The fix loop only stages its fixes: commit and push every staged or modified
+  file after the verdict. A run whose PR head is not the validated tree fails.
 - If it returns **passed: false** (the fix loop was exhausted without converging):
   do NOT write the marker and do NOT open a normal PR. Open a **draft** PR whose
   body lists the unresolved `remainingFindings` for a human to finish, then stop.
@@ -1102,35 +1287,20 @@ if ac_detect_no_op "$PRE_FIX_HEAD" "$POST_FIX_HEAD"; then
 fi
 
 # --- Phase 2b: Silent no-op detection (fix-pr mode) + validation enforcement ---
-# In fix-pr mode, a run that exits 0 but never advanced HEAD is a silent no-op.
-# The make test-agent-complete fallback would pass trivially on unchanged code,
-# masking the failure. Detect the no-op first and skip the fallback entirely.
-# A fix-pr no-op on a salvaged WIP draft whose work already passed validation is
-# promoted instead of failed (Issue #4709) — see _handle_no_op_run.
-if [[ "$MODE" == "fix-pr" || "$MODE" == "resolve-conflict" ]] && [ "$EXIT_CODE" -eq 0 ] && [ "$HEAD_ADVANCED" != "true" ]; then
-    _handle_no_op_run /tmp/agent-validation-passed
-elif [ "$EXIT_CODE" -eq 0 ] && [ ! -f /tmp/agent-validation-passed ]; then
-    # The agent is instructed to write /tmp/agent-validation-passed only when the
-    # story-review workflow returns passed:true. If the marker is missing, the
-    # workflow either did not pass or was never run — both are failures, so fall
-    # back to enforcing make test-agent-complete directly.
-    echo "ERROR: Agent exited 0 but validation marker not found"
-    echo "The qa-test-runner specialist either failed or was not run."
-    echo "Running make test-agent-complete as fallback enforcement..."
-    if make test-agent-complete; then
-        echo "Fallback validation passed — proceeding"
-        touch /tmp/agent-validation-passed
-    else
-        echo "ERROR: make test-agent-complete failed — marking agent as failed"
-        EXIT_CODE=1
-    fi
-fi
+# See _enforce_validation. The marker counts only when a passing story-review
+# workflow result from this run backs it (cfg-is/cfgms#5932).
+_enforce_validation /tmp/agent-validation-passed "${HOME}/.claude/projects/-workspace" "$AGENT_RUN_START"
 
 # --- Phase 3: Cleanup and reporting ---
 
 # Extract PR URL if one was created
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 PR_URL=$(gh pr list --head "$CURRENT_BRANCH" --json url -q '.[0].url' 2>/dev/null || echo "")
+
+# Fail the run when the PR head is not the tree the agent left behind
+# (cfg-is/cfgms#5932). Runs before the success branch below, which would
+# otherwise mark a resumed fix-pr draft ready.
+_landed_tree_gate "$MODE" "$PR_URL"
 
 # Update project item with the PR number so the pipeline can track it.
 # Non-fatal: a failed set-pr never affects the agent's exit code.

@@ -2359,9 +2359,14 @@ git config --global user.email "agent@test.com" 2>/dev/null || true
 SETUPEOF
     chmod +x "${tmp_dir}/setup-env.sh"
 
-    # Mock claude: creates validation marker and exits 0
+    # Mock claude: writes a passing story-review workflow result (the evidence
+    # the entrypoint requires before trusting the marker, cfg-is/cfgms#5932),
+    # creates the validation marker and exits 0
     cat > "${tmp_dir}/claude" << 'CLAUDEOF'
 #!/usr/bin/env bash
+wf_dir="${HOME}/.claude/projects/-workspace/test-session/workflows"
+mkdir -p "$wf_dir"
+printf '{"workflowName":"story-review","status":"completed","result":{"passed":true}}\n' > "${wf_dir}/wf_test.json"
 touch /tmp/agent-validation-passed
 exit 0
 CLAUDEOF
