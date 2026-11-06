@@ -911,10 +911,6 @@ _review_is_stale() {
   return 0
 }
 
-# _emit_review_refused <pr_num> <reason>
-#   Prints "REVIEW_REFUSED:<pr>:<reason>" with its hint appended when one
-#   exists, then exits 3. Centralizes the format so every review-pr refusal
-#   site stays consistent and self-explanatory without a doc lookup.
 # Reduce a gh error message (read on stdin) to one printable line for a
 # machine-read status line (Issue cfg-is/cfgms#5914). gh stderr can carry
 # caller-influenced text, so newlines and tabs become spaces, every other
@@ -929,6 +925,10 @@ _sanitize_gh_error() {
   printf '%s\n' "${msg:-unknown}"
 }
 
+# _emit_review_refused <pr_num> <reason>
+#   Prints "REVIEW_REFUSED:<pr>:<reason>" with its hint appended when one
+#   exists, then exits 3. Centralizes the format so every review-pr refusal
+#   site stays consistent and self-explanatory without a doc lookup.
 _emit_review_refused() {
   local pr_num="$1" reason="$2" hint
   hint=$(_review_refusal_hint "$reason")
