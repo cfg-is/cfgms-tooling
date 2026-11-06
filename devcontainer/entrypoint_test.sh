@@ -1256,6 +1256,277 @@ test_24e_failed_gh_step_falls_back() {
 # runner
 # ============================================================================
 
+# ============================================================================
+# Landed-tree check + workflow-backed marker (cfg-is/cfgms#5932)
+#
+# On #5927 the agent opened its PR before the story-review workflow returned,
+# and the workflow's fix round then staged a validated fix that nothing
+# committed. These tests drive _landed_tree_gate / _verify_landed_tree in a
+# real repo with a real bare remote (only `gh` is stubbed), and
+# _enforce_validation against real workflow-result files with `make` stubbed.
+# ============================================================================
+
+setup_landed_env() {
+    LANDED_DIR="$(mktemp -d)"
+    LANDED_LOG="$LANDED_DIR/calls.log"
+    : > "$LANDED_LOG"
+
+    # gh stub — records every invocation; `gh pr view` prints gh-pr-head.out
+    # (already in the post--q headRefOid shape).
+    cat > "$LANDED_DIR/gh" <<STUB
+#!/usr/bin/env bash
+echo "gh \$*" >> "$LANDED_LOG"
+if [[ "\$1" == "pr" && "\$2" == "view" ]]; then
+    [[ -f "$LANDED_DIR/gh-pr-head.out" ]] && cat "$LANDED_DIR/gh-pr-head.out"
+fi
+exit 0
+STUB
+    chmod +x "$LANDED_DIR/gh"
+
+    # make stub — records the target; exits with make.rc (default 0).
+    cat > "$LANDED_DIR/make" <<STUB
+#!/usr/bin/env bash
+echo "make \$*" >> "$LANDED_LOG"
+exit "\$(cat "$LANDED_DIR/make.rc" 2>/dev/null || echo 0)"
+STUB
+    chmod +x "$LANDED_DIR/make"
+
+    LANDED_REMOTE="$LANDED_DIR/remote.git"
+    LANDED_REPO="$LANDED_DIR/repo"
+    LANDED_BRANCH="feature/story-9999-landed"
+    git init -q --bare "$LANDED_REMOTE"
+    git init -q "$LANDED_REPO"
+    git -C "$LANDED_REPO" config user.email "test@example.com"
+    git -C "$LANDED_REPO" config user.name "Test"
+    git -C "$LANDED_REPO" checkout -q -b "$LANDED_BRANCH"
+    echo "seed" > "$LANDED_REPO/seed.txt"
+    git -C "$LANDED_REPO" add seed.txt
+    git -C "$LANDED_REPO" commit -q -m "seed"
+    git -C "$LANDED_REPO" remote add origin "$LANDED_REMOTE"
+    git -C "$LANDED_REPO" push -q -u origin "$LANDED_BRANCH"
+
+    ORIG_LANDED_PATH="$PATH"
+    export PATH="$LANDED_DIR:$PATH"
+
+    # shellcheck disable=SC1090
+    CFGMS_ENTRYPOINT_SOURCE_ONLY=1 source "$SCRIPT_DIR/entrypoint.sh"
+}
+
+teardown_landed_env() {
+    export PATH="$ORIG_LANDED_PATH"
+    rm -rf "$LANDED_DIR"
+    unset LANDED_DIR LANDED_LOG LANDED_REMOTE LANDED_REPO LANDED_BRANCH ORIG_LANDED_PATH
+}
+
+# _landed_run <mode> <pr_url> — run the gate in the repo; prints its output and
+# writes the resulting EXIT_CODE to $LANDED_DIR/exit_code.
+_landed_run() {
+    local mode="$1" pr_url="$2"
+    (
+        cd "$LANDED_REPO" || exit 1
+        CURRENT_BRANCH="$LANDED_BRANCH"
+        EXIT_CODE=0
+        _landed_tree_gate "$mode" "$pr_url"
+        echo "$EXIT_CODE" > "$LANDED_DIR/exit_code"
+    ) 2>&1
+}
+
+# T25a — a pushed PR plus a staged validated fix: the run fails, the PR goes
+# to draft with a breadcrumb naming the path, and nothing is committed/pushed.
+test_25a_landed_tree_staged_change_fails() {
+    setup_landed_env
+    git -C "$LANDED_REPO" rev-parse HEAD > "$LANDED_DIR/gh-pr-head.out"
+    local pushed
+    pushed=$(git -C "$LANDED_REPO" rev-parse HEAD)
+    touch "$LANDED_DIR/agent-validation-passed"
+
+    echo "validated fix" > "$LANDED_REPO/seed.txt"
+    git -C "$LANDED_REPO" add seed.txt
+
+    local out log
+    out=$(_landed_run issue "https://github.com/cfg-is/cfgms/pull/4242")
+    log=$(cat "$LANDED_LOG")
+
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "1" "staged leftover marks the run failed (EXIT_CODE=1)"
+    assert_contains "$out" "left uncommitted" "failure names uncommitted changes"
+    assert_contains "$log" "gh pr ready --undo 4242 --repo cfg-is/cfgms" "PR converted to draft"
+    assert_contains "$log" "gh pr comment 4242 --repo cfg-is/cfgms" "breadcrumb comment posted"
+    assert_contains "$log" "uncommitted or unpushed" "breadcrumb says changes were left uncommitted or unpushed"
+    assert_contains "$log" "seed.txt" "breadcrumb lists the affected path"
+    assert_equals "$(git -C "$LANDED_REPO" rev-parse HEAD)" "$pushed" "leftover changes are not auto-committed"
+    assert_equals "$(git -C "$LANDED_REMOTE" rev-parse "$LANDED_BRANCH")" "$pushed" "nothing is auto-pushed"
+
+    teardown_landed_env
+}
+
+# T25b — a local commit that never reached the remote or the PR fails.
+test_25b_landed_tree_unpushed_commit_fails() {
+    setup_landed_env
+    git -C "$LANDED_REPO" rev-parse HEAD > "$LANDED_DIR/gh-pr-head.out"
+
+    echo "fix" > "$LANDED_REPO/fix.txt"
+    git -C "$LANDED_REPO" add fix.txt
+    git -C "$LANDED_REPO" commit -q -m "fix: local only"
+
+    local out log
+    out=$(_landed_run fix-pr "https://github.com/cfg-is/cfgms/pull/4243")
+    log=$(cat "$LANDED_LOG")
+
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "1" "unpushed commit marks the run failed (EXIT_CODE=1)"
+    assert_contains "$out" "was not pushed" "failure names the unpushed HEAD"
+    assert_contains "$out" "is not the PR head" "failure names the PR head mismatch"
+    assert_contains "$log" "gh pr ready --undo 4243 --repo cfg-is/cfgms" "PR converted to draft"
+    assert_contains "$log" "gh pr comment 4243 --repo cfg-is/cfgms" "breadcrumb comment posted"
+
+    teardown_landed_env
+}
+
+# T25c — clean, pushed, HEAD == PR headRefOid: unchanged behaviour.
+test_25c_landed_tree_clean_pushed_passes() {
+    setup_landed_env
+    echo "fix" > "$LANDED_REPO/fix.txt"
+    git -C "$LANDED_REPO" add fix.txt
+    git -C "$LANDED_REPO" commit -q -m "fix: pushed"
+    git -C "$LANDED_REPO" push -q origin "$LANDED_BRANCH"
+    git -C "$LANDED_REPO" rev-parse HEAD > "$LANDED_DIR/gh-pr-head.out"
+    # Untracked files are not part of the check.
+    echo "scratch" > "$LANDED_REPO/untracked.log"
+
+    local out log
+    out=$(_landed_run branch "https://github.com/cfg-is/cfgms/pull/4244")
+    log=$(cat "$LANDED_LOG")
+
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "0" "clean pushed tree keeps EXIT_CODE=0"
+    assert_contains "$out" "Landed-tree check passed" "check reports a pass"
+    assert_contains "$log" "gh pr view 4244 --repo cfg-is/cfgms --json headRefOid" "PR head was read"
+    assert_not_contains "$log" "pr ready --undo" "PR is not drafted"
+    assert_not_contains "$log" "pr comment" "no breadcrumb comment"
+
+    teardown_landed_env
+}
+
+# T25d — HEAD matches origin/<branch> but the PR head differs (e.g. pushed to
+# another ref): fails. resolve-conflict and no-PR runs skip the gate.
+test_25d_landed_tree_pr_head_mismatch_and_skips() {
+    setup_landed_env
+    echo "0123456789abcdef0123456789abcdef01234567" > "$LANDED_DIR/gh-pr-head.out"
+
+    local out
+    out=$(_landed_run issue "https://github.com/cfg-is/cfgms/pull/4245")
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "1" "PR head mismatch marks the run failed"
+    assert_contains "$out" "is not the PR head 0123456789ab" "failure names the PR head"
+
+    : > "$LANDED_LOG"
+    echo "dirty" > "$LANDED_REPO/seed.txt"
+    _landed_run resolve-conflict "https://github.com/cfg-is/cfgms/pull/4246" > /dev/null
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "0" "resolve-conflict mode is not gated"
+    _landed_run issue "" > /dev/null
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "0" "no PR: gate skipped (salvage owns that path)"
+    assert_equals "$(cat "$LANDED_LOG")" "" "skipped gate makes no gh calls"
+
+    teardown_landed_env
+}
+
+# _write_wf_result <session> <name> <status> <passed-json> [mtime-epoch]
+_write_wf_result() {
+    local dir="$LANDED_DIR/projects/-workspace/$1/workflows"
+    mkdir -p "$dir"
+    printf '{"runId":"%s","workflowName":"story-review","status":"%s","result":%s}\n' \
+        "$2" "$3" "$4" > "$dir/$2.json"
+    if [[ -n "${5:-}" ]]; then touch -d "@$5" "$dir/$2.json"; fi
+}
+
+# _validation_run <since> — run _enforce_validation for an issue-mode run that
+# advanced HEAD; prints output, writes EXIT_CODE to $LANDED_DIR/exit_code.
+_validation_run() {
+    (
+        cd "$LANDED_REPO" || exit 1
+        MODE="issue"
+        HEAD_ADVANCED="true"
+        EXIT_CODE=0
+        _enforce_validation "$LANDED_DIR/agent-validation-passed" "$LANDED_DIR/projects/-workspace" "$1"
+        echo "$EXIT_CODE" > "$LANDED_DIR/exit_code"
+    ) 2>&1
+}
+
+# T25e — marker present, no passing workflow result: the marker is not trusted
+# and the make test-agent-complete fallback decides.
+test_25e_marker_without_workflow_result_runs_fallback() {
+    setup_landed_env
+    local since out
+    since=$(date +%s)
+
+    touch "$LANDED_DIR/agent-validation-passed"
+    echo 2 > "$LANDED_DIR/make.rc"
+    out=$(_validation_run "$since")
+    assert_contains "$(cat "$LANDED_LOG")" "make test-agent-complete" "fallback ran despite the marker"
+    assert_contains "$out" "not trusting it" "untrusted marker is logged"
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "1" "failing fallback marks the run failed"
+    [[ -f "$LANDED_DIR/agent-validation-passed" ]] && _fail "untrusted marker should be removed after a failing fallback"
+
+    # Results that do not back the marker: killed, passed:false, and a passing
+    # result older than this run (a re-dispatch reuses the session dir).
+    _write_wf_result s1 wf_stale completed '{"passed":true}' "$((since - 600))"
+    : > "$LANDED_LOG"
+    touch "$LANDED_DIR/agent-validation-passed"
+    echo 0 > "$LANDED_DIR/make.rc"
+    out=$(_validation_run "$since")
+    assert_contains "$(cat "$LANDED_LOG")" "make test-agent-complete" "a passing result from before this run does not back the marker"
+    assert_contains "$out" "no story-review workflow result written during this run" "stale result is ignored"
+
+    _write_wf_result s1 wf_killed killed null
+    for case_result in "killed:null" "completed:{\"passed\":false}"; do
+        : > "$LANDED_LOG"
+        rm -f "$LANDED_DIR/projects/-workspace/s1/workflows/wf_newest.json"
+        _write_wf_result s1 wf_newest "${case_result%%:*}" "${case_result#*:}"
+        touch "$LANDED_DIR/agent-validation-passed"
+        echo 0 > "$LANDED_DIR/make.rc"
+        _validation_run "$since" > /dev/null
+        assert_contains "$(cat "$LANDED_LOG")" "make test-agent-complete" "fallback ran for newest result ${case_result}"
+        assert_equals "$(cat "$LANDED_DIR/exit_code")" "0" "passing fallback keeps the run green (${case_result})"
+    done
+
+    teardown_landed_env
+}
+
+# T25f — marker backed by a completed, passing story-review result from this
+# run: trusted, no fallback (unchanged behaviour for clean runs).
+test_25f_marker_backed_by_passing_result_trusted() {
+    setup_landed_env
+    local since out
+    since=$(date +%s)
+    _write_wf_result s1 wf_old completed '{"passed":false}' "$((since - 600))"
+    _write_wf_result s2 wf_pass completed '{"passed":true,"reviewRounds":2}'
+    touch "$LANDED_DIR/agent-validation-passed"
+
+    out=$(_validation_run "$since")
+    assert_not_contains "$(cat "$LANDED_LOG")" "make" "no fallback when a passing result backs the marker"
+    assert_contains "$out" "status=completed passed=True" "backing result is logged"
+    assert_equals "$(cat "$LANDED_DIR/exit_code")" "0" "run stays green"
+    [[ -f "$LANDED_DIR/agent-validation-passed" ]] || _fail "backed marker must be kept"
+
+    teardown_landed_env
+}
+
+# T25g — the main flow calls both gates (the helpers above are only reachable
+# through these call sites).
+test_25g_main_flow_wires_gates() {
+    local main
+    main=$(sed -n '/^# --- Phase 2: Run Claude ---/,$p' "$SCRIPT_DIR/entrypoint.sh")
+    assert_contains "$main" '_enforce_validation /tmp/agent-validation-passed "${HOME}/.claude/projects/-workspace" "$AGENT_RUN_START"' \
+        "main flow enforces workflow-backed validation"
+    assert_contains "$main" '_landed_tree_gate "$MODE" "$PR_URL"' \
+        "main flow runs the landed-tree gate"
+    local gate_line success_line
+    gate_line=$(grep -n '^_landed_tree_gate "\$MODE"' "$SCRIPT_DIR/entrypoint.sh" | cut -d: -f1)
+    success_line=$(grep -n '^if \[ "\$EXIT_CODE" -eq 0 \]; then' "$SCRIPT_DIR/entrypoint.sh" | tail -1 | cut -d: -f1)
+    if [[ -z "$gate_line" || -z "$success_line" || "$gate_line" -ge "$success_line" ]]; then
+        _fail "landed-tree gate must run before the success branch (gate=${gate_line:-none} success=${success_line:-none})"
+    else
+        echo "    ✓ landed-tree gate runs before the success branch"
+    fi
+}
+
 run_test "T01 — conversation comments render" test_01_conversation_comments_render
 run_test "T02 — issue comments render" test_02_issue_comments_render
 run_test "T03 — no-op detection via SHA compare" test_03_no_op_detection
@@ -1288,6 +1559,13 @@ run_test "T24b — no validation marker: no promotion, exit 1 (Issue #4709)" tes
 run_test "T24c — resolve-conflict / no linked issue: no promotion (Issue #4709)" test_24c_resolve_conflict_and_no_issue_not_promoted
 run_test "T24d — non-WIP or non-draft PR: no promotion (Issue #4709)" test_24d_non_wip_or_non_draft_not_promoted
 run_test "T24e — failed gh/git step: helper non-zero, caller falls back (Issue #4709)" test_24e_failed_gh_step_falls_back
+run_test "T25a — landed tree: staged validated fix fails the run and drafts the PR (cfg-is/cfgms#5932)" test_25a_landed_tree_staged_change_fails
+run_test "T25b — landed tree: unpushed local commit fails the run" test_25b_landed_tree_unpushed_commit_fails
+run_test "T25c — landed tree: clean pushed tree at the PR head passes" test_25c_landed_tree_clean_pushed_passes
+run_test "T25d — landed tree: PR head mismatch fails; resolve-conflict and no-PR skip" test_25d_landed_tree_pr_head_mismatch_and_skips
+run_test "T25e — marker without a passing workflow result runs the fallback" test_25e_marker_without_workflow_result_runs_fallback
+run_test "T25f — marker backed by a passing story-review result is trusted" test_25f_marker_backed_by_passing_result_trusted
+run_test "T25g — main flow wires both gates" test_25g_main_flow_wires_gates
 
 echo ""
 echo "============================================================"
