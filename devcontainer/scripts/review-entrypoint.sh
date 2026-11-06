@@ -42,14 +42,22 @@ fi
 
 PROMPT_FILE="/workspace/.acceptance-review-prompt.md"
 
+# Harness scripts (Issue cfg-is/cfgms#5914). agent-dispatch.sh review-pr mounts
+# the host checkout's scripts and pipeline.yaml read-only under
+# /opt/cfgms-trusted. The PR clone's .claude/tooling submodule is deliberately
+# never initialised (its commit would come from the PR's gitlink), so every
+# script this entrypoint runs comes from the trusted copy, with no fallback to
+# the workspace.
+TRUSTED_SCRIPTS="/opt/cfgms-trusted/.claude/tooling/scripts"
+
 # Distributed-lease release (multi-host cron coordination). agent-dispatch.sh
 # review-pr acquired pr-<N> and passed it as CFGMS_LEASE_KEY; release it on exit
 # so whichever cron host comes back first can pick up the next phase (fix on
 # FAIL, or merge on PASS). TTL reclaim is the backstop if this container dies.
 release_cfgms_lease() {
   [ -n "${CFGMS_LEASE_KEY:-}" ] || return 0
-  [ -f /workspace/.claude/tooling/scripts/pipeline-helper.sh ] || return 0
-  bash /workspace/.claude/tooling/scripts/pipeline-helper.sh lease-release "$CFGMS_LEASE_KEY" >/dev/null 2>&1 || true
+  [ -f "${TRUSTED_SCRIPTS}/pipeline-helper.sh" ] || return 0
+  bash "${TRUSTED_SCRIPTS}/pipeline-helper.sh" lease-release "$CFGMS_LEASE_KEY" >/dev/null 2>&1 || true
 }
 trap release_cfgms_lease EXIT
 
@@ -109,7 +117,7 @@ fi
 PR_NUM=$(grep -oP 'pr:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 STORY_NUM=$(grep -oP 'story:\K[0-9]+' "$PROMPT_FILE" | head -1 || echo "")
 ITEM_ID=$(grep -oP -- '--project-item \K\S+' "$PROMPT_FILE" | head -1 || echo "")
-PROJECT_QUEUE="/workspace/.claude/tooling/scripts/project-queue.sh"
+PROJECT_QUEUE="${TRUSTED_SCRIPTS}/project-queue.sh"
 # Model/effort resolved from .claude/model-routing.yaml (Issue #3030) —
 # see ac_resolve_agent_model in agent-context.sh.
 mapfile -t RESOLVED_MODEL < <(ac_resolve_agent_model "acceptance-review")

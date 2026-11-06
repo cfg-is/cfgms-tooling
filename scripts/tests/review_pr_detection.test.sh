@@ -23,10 +23,12 @@ fail=0
 ran=0
 
 # review-pr refuses a launch when the trusted gate sources are absent
-# (Issue #5386); seed them into a stub repo root.
+# (Issue #5386, pipeline.yaml since cfg-is/cfgms#5914); seed them into a stub
+# repo root.
 seed_trusted_sources() {
   mkdir -p "$1/.claude/tooling/scripts" "$1/.claude/agents" "$1/scripts"
   : > "$1/.claude/agents/acceptance-reviewer.md"
+  : > "$1/.claude/pipeline.yaml"
 }
 
 assert_resolves() {
@@ -591,10 +593,22 @@ git -C "$PR_ROOT/origin" config user.email t@example.com
 git -C "$PR_ROOT/origin" config user.name t
 git -C "$PR_ROOT/origin" commit -q --allow-empty -m init
 git -C "$PR_ROOT/origin" branch feature/story-4242-agent
-git -C "$PR_ROOT/origin" branch feature/item-PVTI_prompt-agent
+# The item branch must match resolve_pr_story_or_item's
+# feature/item-([a-zA-Z0-9]+)-agent, and its suffix must resolve through the
+# list-by-status scan below; otherwise the launch falls back to the body's
+# "Fixes #4242" and the item-branch prompt is never generated.
+git -C "$PR_ROOT/origin" branch feature/item-promptitem01-agent
 git clone -q "$PR_ROOT/origin" "$PR_ROOT/repo"
 seed_trusted_sources "$PR_ROOT/repo"
-cp "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" "$PR_ROOT/repo/.claude/tooling/scripts/project-queue.sh"
+cat > "$PR_ROOT/repo/.claude/tooling/scripts/project-queue.sh" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  add-issue)      echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  list-by-status) echo '[{"item_id":"PVTI_promptitem01"}]' ;;
+  update-field)   echo '{"updated": true}' ;;
+  *)              echo '[]' ;;
+esac
+STUB
 cat > "$PR_ROOT/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == run ]]; then
@@ -620,16 +634,27 @@ run_prompt_launch() {  # run_prompt_launch <branch> <label>
     "$DISPATCH" review-pr 4242 >"$PR_ROOT/launch-$2.out" 2>&1 || true
 }
 
-for kind in story:feature/story-4242-agent item:feature/item-PVTI_prompt-agent; do
+for kind in story:feature/story-4242-agent item:feature/item-promptitem01-agent; do
   label="${kind%%:*}"; branch="${kind#*:}"
   run_prompt_launch "$branch" "$label"
   assert_adv "$label prompt written" '[[ -s "$PR_ROOT/prompt.md" ]]'
+  case "$label" in
+    story) assert_adv "story launch generated the story-branch prompt" 'grep -qF "story:4242 --project-item PVTI_adv_test" "$PR_ROOT/prompt.md"' ;;
+    item)  assert_adv "item launch generated the item-branch prompt" 'grep -qF "story:0 --project-item PVTI_promptitem01" "$PR_ROOT/prompt.md"' ;;
+  esac
   assert_adv "$label prompt names the trusted scripts root" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts" "$PR_ROOT/prompt.md"'
   assert_adv "$label prompt reads the agent definition from the trusted path" 'grep -qF "Read \`/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md\`" "$PR_ROOT/prompt.md"'
   assert_adv "$label prompt has no relative po-act enqueue" '! grep -qF "./.claude/tooling/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
   assert_adv "$label prompt has no relative agent definition read" '! grep -E "(^|[^/])\.claude/agents/acceptance-reviewer\.md" "$PR_ROOT/prompt.md" | grep -qv "/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md"'
-  assert_adv "$label docker run mounts the three trusted sources read-only" \
-    'grep -qF "$PR_ROOT/repo/.claude/tooling/scripts:/opt/cfgms-trusted/.claude/tooling/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/scripts:/opt/cfgms-trusted/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/.claude/agents/acceptance-reviewer.md:/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md:ro" "$PR_ROOT/docker-args.txt"'
+  assert_adv "$label docker run mounts the four trusted sources read-only" \
+    'grep -qF "$PR_ROOT/repo/.claude/tooling/scripts:/opt/cfgms-trusted/.claude/tooling/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/scripts:/opt/cfgms-trusted/scripts:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/.claude/agents/acceptance-reviewer.md:/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md:ro" "$PR_ROOT/docker-args.txt" && grep -qF "$PR_ROOT/repo/.claude/pipeline.yaml:/opt/cfgms-trusted/.claude/pipeline.yaml:ro" "$PR_ROOT/docker-args.txt"'
+  # cfg-is/cfgms#5914: the clone's .claude/tooling submodule is never
+  # initialised, so board commands must name the trusted copy.
+  assert_adv "$label prompt has no workspace-relative tooling command" '! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
+  assert_adv "$label prompt runs update-field from the trusted path" 'grep -qF "\`/opt/cfgms-trusted/.claude/tooling/scripts/project-queue.sh update-field" "$PR_ROOT/prompt.md"'
+  # The review container has no Docker and the host reaps dev agents every
+  # cycle (cleanup-stale), so the reviewer is never told to run cleanup-issue.
+  assert_adv "$label prompt does not mention cleanup-issue" '! grep -qF "cleanup-issue" "$PR_ROOT/prompt.md"'
 done
 run_prompt_launch feature/story-4242-agent story
 assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
