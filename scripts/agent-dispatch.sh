@@ -3890,8 +3890,12 @@ for i in items:
 
     # Write the review prompt into the cloned worktree. The container's
     # review-entrypoint.sh reads it and hands off to claude -p.
+    #
+    # Neither prompt tells the reviewer to run `cleanup-issue`: the review
+    # container has no Docker, and the host reaps dev-agent containers and
+    # clones every cycle (`cleanup-stale` / cleanup_reap_reason).
     if $is_item_branch; then
-      # Item-branch prompt: story:0, cleanup via item_id (no linked issue to close).
+      # Item-branch prompt: story:0, board updates via item_id (no linked issue to close).
       cat > "${clone_dir}/${REVIEW_PROMPT_FILE}" <<PROMPT_EOF
 You are operating as the Acceptance Reviewer agent for CFGMS.
 
@@ -3902,7 +3906,7 @@ workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
-Run \`po-act.sh\`, \`check-pr-author\`, \`project-queue.sh\` and \`cleanup-issue\` only from
+Run \`po-act.sh\`, \`check-pr-author\` and \`project-queue.sh\` only from
 \`${TRUSTED_ROOT}/.claude/tooling/scripts\` (the harness copy), never from a path under
 /workspace: the PR under review can edit the copies in its own checkout, and the
 checkout's \`.claude/tooling\` submodule is not initialised.
@@ -3911,18 +3915,15 @@ When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
 - **PASS (zero findings)**:
-  mark item Done with \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
-  then run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\` to
-  release the dev agent's container/worktree.
+  mark item Done with \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`.
 - **FAIL on first review**: \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
 - **FAIL on second review (fix cycle)**:
-  \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
-  and run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${item_id}\`.
+  \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
     else
-      # Story-branch prompt: includes issue closing and story cleanup.
+      # Story-branch prompt: includes enqueue and founder assignment.
       cat > "${clone_dir}/${REVIEW_PROMPT_FILE}" <<PROMPT_EOF
 You are operating as the Acceptance Reviewer agent for CFGMS.
 
@@ -3933,7 +3934,7 @@ workflow against the PR currently checked out in this workspace. Use real \`gh\`
 commands; you are inside a container with a fresh GH_TOKEN and skip-permissions
 mode, so no approval prompts will block you.
 
-Run \`po-act.sh\`, \`check-pr-author\`, \`project-queue.sh\` and \`cleanup-issue\` only from
+Run \`po-act.sh\`, \`check-pr-author\` and \`project-queue.sh\` only from
 \`${TRUSTED_ROOT}/.claude/tooling/scripts\` (the harness copy), never from a path under
 /workspace: the PR under review can edit the copies in its own checkout, and the
 checkout's \`.claude/tooling\` submodule is not initialised.
@@ -3942,14 +3943,11 @@ When the verdict is determined, post the structured review comment per the
 agent definition. Then take exactly ONE of these closing actions:
 
 - **PASS (zero findings)**: enqueue with \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} ${story_num}\`,
-  mark story Done with \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`,
-  then run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\` to
-  release the dev agent's container/worktree.
+  and mark story Done with \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Done\`.
 - **FAIL on first review**: \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Fix\`.
 - **FAIL on second review (fix cycle)**:
   \`${TRUSTED_ROOT}/.claude/tooling/scripts/project-queue.sh update-field ${item_id} status Blocked\`,
-  assign founder via \`gh issue edit ${story_num} --repo cfg-is/cfgms --add-assignee jrdnr\`,
-  and run \`${TRUSTED_ROOT}/.claude/tooling/scripts/agent-dispatch.sh cleanup-issue ${story_num}\`.
+  and assign founder via \`gh issue edit ${story_num} --repo cfg-is/cfgms --add-assignee jrdnr\`.
 - **WAIT (CI pending)**: post the WAIT verdict comment and exit cleanly. The
   host PO will re-dispatch when CI completes.
 PROMPT_EOF
