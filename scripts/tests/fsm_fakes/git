@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Git wrapper for the FSM tests: records cwd, GIT_DIR, GIT_WORK_TREE and argv of
+every git call to $FSM_FAKE_GITLOG, then runs the real git."""
+import json, os, sys
+log = os.environ.get("FSM_FAKE_GITLOG")
+if log:
+    with open(log, "a") as fh:
+        fh.write(json.dumps({"cwd": os.getcwd(), "GIT_DIR": os.environ.get("GIT_DIR"),
+                             "GIT_WORK_TREE": os.environ.get("GIT_WORK_TREE"),
+                             "argv": sys.argv[1:]}) + "\n")
+os.execv("/usr/bin/git", ["git"] + sys.argv[1:])

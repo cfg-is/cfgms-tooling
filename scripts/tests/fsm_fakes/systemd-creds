@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake systemd-creds: "decrypts" the agent OAuth token for the FSM tests.
+printf '%s\n' "${FSM_FAKE_CLAUDE_TOKEN:-}"
