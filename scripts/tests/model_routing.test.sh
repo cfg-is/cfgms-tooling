@@ -14,6 +14,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 AGENT_CONTEXT="${REPO_ROOT}/.claude/tooling/devcontainer/agent-context.sh"
 ENTRYPOINT="${REPO_ROOT}/.claude/tooling/devcontainer/entrypoint.sh"
 REVIEW_ENTRYPOINT="${REPO_ROOT}/.claude/tooling/devcontainer/scripts/review-entrypoint.sh"
+SUPERVISOR="${REPO_ROOT}/.claude/tooling/scripts/fsm/supervisor.py"
 DISPATCH="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
 ROUTING_FILE="${REPO_ROOT}/.claude/model-routing.yaml"
 DOCKERFILE="${REPO_ROOT}/.claude/tooling/devcontainer/Dockerfile"
@@ -137,15 +138,21 @@ mapfile -t lines <<< "$resolved"
 check_eq "CFGMS_MODEL_OVERRIDE wins with missing file" "${lines[0]:-}" "claude-opus-override"
 unset CFGMS_MODEL_OVERRIDE
 
-printf '\n== entrypoint.sh wiring ==\n'
-entrypoint_src="$(cat "$ENTRYPOINT")"
-check_not_contains "no longer unconditionally hardcodes AGENT_MODEL" "$entrypoint_src" 'AGENT_MODEL="claude-sonnet-4-6"'
-check_contains "resolves model via ac_resolve_agent_model" "$entrypoint_src" "ac_resolve_agent_model"
-check_contains "routes fix-pr to the fix-agent segment" "$entrypoint_src" "fix-agent"
-check_contains "routes dev issue/branch to the dev-agent segment" "$entrypoint_src" "dev-agent"
-check_contains "result manifest records resolved model" "$entrypoint_src" '"model": "${AGENT_MODEL}"'
-check_contains "result manifest records resolved effort" "$entrypoint_src" '"effort": "${AGENT_EFFORT}"'
-if bash -n "$ENTRYPOINT" 2>/dev/null; then ok "entrypoint.sh parses"; else bad "entrypoint.sh parses" "bash -n failed"; fi
+printf '\n== FSM supervisor wiring (dev / fix / resolve agent sessions) ==\n'
+# The headless dev-agent entrypoint is gone; the supervisor resolves the
+# model per session and records it in the manifest.
+supervisor_src="$(cat "$SUPERVISOR")"
+check_contains "resolves model via ac_resolve_agent_model" "$supervisor_src" "ac_resolve_agent_model"
+check_contains "routes fix-pr / resolve-conflict to fix-agent, dev modes to dev-agent" "$supervisor_src" \
+  'segment = "fix-agent" if self.mode in ("fix-pr", "resolve-conflict") else "dev-agent"'
+check_contains "result manifest records resolved model" "$supervisor_src" 'model=x.get("model"'
+check_contains "result manifest records resolved effort" "$supervisor_src" 'effort=x.get("effort"'
+if python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$SUPERVISOR" 2>/dev/null; then
+  ok "supervisor.py parses"
+else
+  bad "supervisor.py parses" "ast.parse failed"
+fi
+check_not_contains "entrypoint.sh no longer starts a model session" "$(grep -v '^[[:space:]]*#' "$ENTRYPOINT")" "claude "
 
 printf '\n== review-entrypoint.sh wiring ==\n'
 review_src="$(cat "$REVIEW_ENTRYPOINT")"

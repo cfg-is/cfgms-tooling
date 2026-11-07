@@ -7,8 +7,8 @@ Three detectors, run before VALIDATE and again before PUBLISH:
   1. exact values of every credential mounted into the agent container, in
      raw, base64 (standard and URL-safe, all three byte alignments) and hex
      (lower and upper) form;
-  2. the credential-name denylist the WIP salvage already applies
-     (`devcontainer/entrypoint.sh` `_salvage_stage_work`), on changed paths;
+  2. a credential-name denylist (basename globs, taken from the removed
+     headless entrypoint's WIP salvage), on changed paths;
   3. an external generic scanner hook: `trufflehog` run from the cfg-agent
      image with no network and the scan dir mounted read-only (default), a
      host binary only when CFGMS_FSM_TRUFFLEHOG names one, or disabled with
@@ -27,7 +27,7 @@ import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-#: Copied from devcontainer/entrypoint.sh `_salvage_stage_work` (basename globs).
+#: Credential basename globs (from the removed headless entrypoint's salvage).
 CREDENTIAL_NAME_GLOBS = (
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", ".netrc", ".npmrc", ".pypirc",
     ".git-credentials", "*.p12", "*.pfx", "*.jks", "*.keystore", "*.kdbx",

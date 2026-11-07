@@ -3,9 +3,9 @@
 report: result manifest, WIP draft strings and dispatch-ledger records
 (DESIGN.md §10).
 
-Manifest `agent-result.json` carries every field the container entrypoint
-writes today (`devcontainer/entrypoint.sh`, "Write result summary" plus the
-usage merge) and the FSM fields. It is written to the run dir and to the last
+Manifest `agent-result.json` carries the fields its readers take from it
+(token_report.py, agent-dispatch.sh ledger_reconcile_exit; the field set the
+removed headless entrypoint wrote) and the FSM fields. It is written to the run dir and to the last
 session dir, where token_report.py reads it.
 
 WIP strings stay compatible with `po-cycle-preflight.py`
@@ -27,7 +27,8 @@ from pathlib import Path
 
 import safefs
 
-#: Fields written by devcontainer/entrypoint.sh today, in its order.
+#: The manifest fields of the removed headless entrypoint, in its order; the
+#: readers above depend on them.
 LEGACY_FIELDS = (
     "mode", "issue", "pr_num", "exit_code", "model", "effort", "agent_duration_seconds",
     "pr_url", "branch", "validation_passed", "pre_head_sha", "post_head_sha", "head_advanced",

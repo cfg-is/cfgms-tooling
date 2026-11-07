@@ -72,9 +72,16 @@ fallback_count=$(grep -c "$cred_mount" "$DISPATCH")
 check_contains "agent-dispatch.sh keeps the file mount only in agent_token_args and the (superseded) po-live path" \
   "$(( fallback_count >= 1 ? 1 : 0 ))" "1"
 splice_count=$(grep -c 'AGENT_CRED_ARGS\[@\]' "$DISPATCH")
-check_contains "agent-dispatch.sh splices AGENT_CRED_ARGS at launch/launch-generic/launch-interactive/review-pr" \
-  "$(( splice_count >= 4 ? 1 : 0 ))" "1"
-check_contains "po-act.sh splices AGENT_CRED_ARGS for its inlined launch" "$po_act_src" 'AGENT_CRED_ARGS[@]'
+check_contains "agent-dispatch.sh splices AGENT_CRED_ARGS at launch-interactive/review-pr" \
+  "$(( splice_count >= 2 ? 1 : 0 ))" "1"
+# po-act.sh starts no container any more: the FSM supervisor launches agent
+# sessions and takes the same token-or-file credential (agent_session.py).
+check_not_contains "po-act.sh has no inlined docker run" "$po_act_src" 'docker run'
+fsm_session_src="$(cat "$(dirname "$DISPATCH")/fsm/agent_session.py")"
+check_contains "FSM agent sessions pass the token by name only" "$fsm_session_src" \
+  'return ["-e", "CLAUDE_CODE_OAUTH_TOKEN"]'
+check_contains "FSM agent sessions fall back to the credentials file mount" "$fsm_session_src" \
+  ':/home/agent/.claude/.credentials.json'
 check_not_contains "po-act.sh no longer bind-mounts the credentials file directly" "$po_act_src" "$cred_mount"
 
 echo ""

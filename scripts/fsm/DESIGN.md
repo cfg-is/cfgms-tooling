@@ -64,12 +64,33 @@ nor with `A` as a work tree). It snapshots a no-follow copy of `A` through
 | `VALIDATE` | validator container | `make test-agent-complete` on `(BASE, candidate_tree)`; verdict from `docker wait` |
 | `SYNC` | supervisor | Bring the candidate onto current `origin/develop` (issue/branch; fix-pr only when needed, §5.2) |
 | `PUBLISH` | supervisor | Idempotent sub-steps: commit, push, find-or-create PR, landed check |
-| `REPORT` | supervisor | Board, follow-ups, manifest, ledger, lease release, exit 0 |
+| `REPORT` | supervisor | Board, follow-ups, manifest, ledger, lease release |
 | `NO_OP` | supervisor | fix-pr/resolve with nothing actionable |
-| `REFUSED` | supervisor | PREPARE gate refused or deferred; no WIP, today's exit-3 / DEFERRED tokens; lease untouched if not acquired |
-| `FAILED` | supervisor | Budget spent or unrecoverable: preserve work as a WIP draft (§10), report, release lease, exit 1 |
+| `REFUSED` | supervisor | PREPARE gate refused or deferred; no WIP; prints `FSM_REFUSED:<target>:<reason>` or `DISPATCH_DEFERRED:<target>:<reason>`; the lease is released only if this run acquired it or was handed it (`--acquire-lease`, `--lease-handoff`) |
+| `FAILED` | supervisor | Budget spent or unrecoverable: preserve work as a WIP draft (§10), report, release lease |
 
-Terminal: `REPORT`, `NO_OP`, `REFUSED`, `FAILED`.
+Terminal: `REPORT`, `NO_OP`, `REFUSED`, `FAILED`. Outside the transition
+table, `supervisor.py abandon <run> --reason R` ends a crashed run that must
+not be resumed (its work finished elsewhere) with an `abandoned` record and
+`terminal_done` (state `ABANDONED`), releasing its lease if this host holds
+it; the run index also treats a run crashed for longer than
+`CFGMS_FSM_CRASHED_TTL_HOURS` (24 h) as abandoned (§11).
+
+Exit codes of `supervisor.py run` / `resume` (`po-act.sh` maps them, §11):
+
+| Code | Meaning |
+|---|---|
+| 0 | `REPORT`, `NO_OP`, or `REFUSED` as a resource deferral (stdout has `DISPATCH_DEFERRED:<target>:<reason>`: capacity, lease held by another host) |
+| 1 | `FAILED` |
+| 2 | usage error (bad mode, target or run id); no run was driven |
+| 3 | `REFUSED` (gate said no: untrusted author, fork PR, no story item, item mismatch, PR not open, head moved, live run on the key, cross-run cap) |
+| 4 | the run is locked by another live supervisor (`resume` of a running run) |
+| 10 | `REFUSED` as a credentials deferral (no agent token and no credentials file) |
+| 75 | interrupted by SIGTERM / SIGHUP / SIGINT; the run is resumable |
+
+`supervisor.py abandon` exits 0 (`FSM_ABANDONED:<run>:<reason>:lease=<…>`,
+or `FSM_ABANDON_SKIPPED:<run>:finished`), 2 on a bad reason or unknown run,
+4 when a live supervisor holds the run (`FSM_ABANDON_SKIPPED:<run>:locked`).
 
 ## 5. Transitions
 
@@ -302,11 +323,49 @@ A crash between sub-steps resumes at the first incomplete one (§11).
 
 ## 11. Supervisor operations
 
-- **Start:** `po-act.sh dispatch|dispatch-fix|resolve-conflict` (one launch
-  path for all modes) acquires the lease, starts `supervisor.py run` with
-  `setsid`, and waits up to 2 min for `state.jsonl` to record the first AGENT
-  launch (or REFUSED/FAILED). Success: lease ownership passes to the
-  supervisor; failure: today's rollback.
+- **Start:** `po-act.sh dispatch|dispatch-fix|resolve-conflict` and
+  `dispatch --branch` are the one launch path for all modes. Before any side
+  effect they apply, in order: the author gate (fix-pr, resolve-conflict,
+  `--branch`), the capacity gate, the image staleness gate (refuse, exit 3,
+  when `cfg-agent:latest`'s `cfgms.build_inputs_hash` label is not this
+  checkout's `devcontainer` tree; this path never rebuilds or retags the
+  image, while review / interactive / investigator launches keep their
+  auto-rebuild), the Dependencies gate (dispatch: no open `#NNN`; an
+  unreadable state counts as open), the unfinished-run gate (no second run
+  beside a live, hung, starting or crashed run for the same key or item; an
+  unreadable run index refuses) and the duplicate-PR gate (no open PR on any
+  branch references the story, the PR being fixed excepted; a failed lookup
+  refuses). fix-pr and resolve-conflict resolve the story's project item from
+  the PR (`feature/story-<N>` or `Fixes #N` → `project-queue.sh
+  item-for-issue`). po-act then acquires the lease, claims the story
+  (dispatch; `dispatch --recover` may claim an item still In Progress once the
+  gates above and the lease prove nothing works on it), starts
+  `supervisor.py run … --lease-key K --lease-handoff --detach` in the
+  background (own session, inherited fds closed, log in
+  `<runs>/launch-logs/`), and polls `runindex.py launch-status` for up to
+  `CFGMS_FSM_LAUNCH_WAIT_SECS` (120 s; up to `CFGMS_FSM_PREPARE_WAIT_SECS`,
+  600 s, while still in PREPARE): an `agent_launched` record (or gates passed
+  without an agent, as resolve-conflict does) means dispatched; a terminal
+  state means the supervisor's exit code is mapped onto po-act's tokens. A
+  claimed story goes back to Ready when no run is left on it. From the
+  handoff on the run owns the lease and releases it on every terminal state,
+  REFUSED included. `po-act.sh dispatch status [RUN_ID]` lists or shows runs.
+
+  po-act exit codes for the launch subcommands: 0 dispatched, deferred
+  (`*_DEFERRED`) or skipped (`*_SKIPPED`: lease held, run in flight, run
+  resumable); 1 the run FAILED before launching (`LAUNCH_FAILED`); 2 usage;
+  3 refused (`*_REFUSED`: author, image_stale, dependency_open,
+  open_pr_exists, open_pr_check_failed, run_index_unreadable, no_story_item,
+  or the supervisor's own refusal); 4 run locked by a live supervisor;
+  10 credentials deferral; 75 interrupted (resumable).
+- **Resume:** `po-act.sh dispatch resume <RUN_ID>` re-runs the PREPARE gates
+  before anything starts. Work finished elsewhere (item Done, story closed,
+  PR merged or closed) abandons the run (`FSM_ABANDONED`, exit 0, lease
+  released); a state that cannot be read refuses (`FSM_RESUME_REFUSED`, 3);
+  an issue/item run whose item is not In Progress is refused; then capacity
+  (deferral), the image gate, and the lease (held here, or free/expired and
+  re-acquired here; held by another host refuses). A lease acquired by the
+  resume is released if the resume fails (`FSM_RESUME_FAILED`).
 - **In flight signal:** `<run>/lock` (`flock`) + `<run>/heartbeat` (updated
   every 60 s), indexed by `~/.cache/cfgms-fsm-runs/active/<key>`. Preflight
   treats an active run as in-flight for its item/PR (and checks `pr-N` leases,
@@ -321,9 +380,18 @@ A crash between sub-steps resumes at the first incomplete one (§11).
   reboot, the next cycle's preflight does this.
 - **Tooling snapshot:** at start the supervisor copies its own code into the
   run dir and runs from there; the tooling commit is recorded.
-- **Run-dir GC:** `cleanup-stale` removes run dirs in a terminal state older
-  than 24 h whose PR merged or whose WIP was pushed; disk usage counts toward
-  the capacity gate.
+- **Run-dir GC:** `cleanup-stale` first abandons crashed runs whose work
+  finished elsewhere, then removes run dirs of finished runs (done or
+  abandoned, crashed past `CFGMS_FSM_CRASHED_TTL_HOURS` included) whose lock
+  is free and that have been idle for `CFGMS_FSM_RUN_RETENTION_HOURS` (24 h),
+  plus stale `active/` entries, old launch logs and the FSM trust dirs
+  (`<trust base>/fsm/`) of runs that are not unfinished. Nothing of an
+  unfinished run (in flight or crashed) is removed: not its run dir, its
+  containers, its session or trust dirs. A container whose run state cannot
+  be read counts as owned; a running validator is removed only when its run
+  is known finished. The run dirs' filesystem counts
+  toward the capacity gate, and every in-flight run with no running container
+  reserves a slot.
 - **Language:** Python 3 (already required by the ledger, preflight and
   token_report). Explicit transition table; `transition()` raises on any edge
   not in the table.

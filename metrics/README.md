@@ -169,12 +169,18 @@ early is still attributable. Directories are pruned by `cleanup-stale` after
 `CFGMS_AGENT_SESSIONS_RETENTION_DAYS` (default 30); retention bounds them, not
 the container lifecycle, because a transcript is meant to outlive its container.
 
-### Dev-agent telemetry needs an image rebuild
+### Dev-agent telemetry comes from the FSM supervisor
 
-The agent image bakes in `setup-env.sh` and `entrypoint.sh`
-(`.claude/tooling/devcontainer/Dockerfile` lines 169-170), and `launch-generic` does **not**
-bind-mount either. So dev and fix agents only produce telemetry once the image
-is rebuilt:
+Dev, fix-pr and resolve-conflict agent sessions run under the host-side FSM
+supervisor (`.claude/tooling/scripts/fsm/supervisor.py`). Each session gets its
+own directory `<container>-<seq>` under this base, mounted at `/agent-sessions`.
+After a session exits, the supervisor copies that directory without following
+links into its own run dir, runs `token_report.py` on the copy, and writes
+`agent-result.json` (per-session usage plus the total) into the run dir and the
+last session dir. The agent entrypoint (`fsm-agent-entrypoint.sh`) is baked
+into the image; `po-act.sh` refuses to start a run on a `cfg-agent:latest`
+whose `cfgms.build_inputs_hash` label is not this checkout's devcontainer tree,
+so a stale image is rebuilt before any dev agent runs:
 
 ```bash
 docker build -t cfg-agent:latest -f .claude/tooling/devcontainer/Dockerfile .
@@ -182,16 +188,12 @@ docker build -t cfg-agent:latest -f .claude/tooling/devcontainer/Dockerfile .
 
 | container | scripts come from | rebuild needed |
 |---|---|---|
-| `launch-generic` (dev / fix agents) | the image | **yes** |
+| FSM agent sessions (dev / fix / resolve) | the image (the launch path refuses a stale one) | **yes** |
 | `review-pr` (acceptance reviewers) | bind-mounted from the repo | no |
-| host side (mount, `meta.json`, retention prune) | host script | no |
+| host side (mount, `meta.json`, retention prune, the supervisor's usage pass) | host script | no |
 
-Running against a stale image **degrades, it does not break**: the host still
-mounts `/agent-sessions`, but the old `setup-env.sh` never creates the symlink,
-so the transcript stays inside the container and dies with it — exactly the
-behaviour that predates this change. There is therefore no ordering hazard
-between merging this and rebuilding, but until the rebuild happens dev-agent
-spend stays invisible.
+`cleanup-stale` never prunes the session dir of an unfinished FSM run, whatever
+its age: the run writes its manifest there at the end.
 
 **The mount lands at `/agent-sessions`, not directly on `~/.claude/projects`.**
 Docker creates a bind mount's missing parent as root and the image ships no

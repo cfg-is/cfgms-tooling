@@ -238,7 +238,7 @@ def main():
             for hook in pl.get("validate_hooks", {}).get(str(idx), []):
                 push_develop(hook)
         save("counters.json", counters)
-        containers[name] = {"status": "exited", "exit_code": code, "logs": logs}
+        containers[name] = {"status": "exited", "exit_code": code, "logs": logs, "labels": labels}
         save("containers.json", containers)
         print(f"cid-{name}")
         return 0
@@ -261,11 +261,58 @@ def main():
         return 0
     if cmd == "kill":
         return 0 if argv[-1] in containers else 1
+    if cmd == "ps":
+        # `docker ps [-a] [--filter k=v]... [-q] [--format F]` over the state
+        # file; a seeded entry may carry "labels" and "status".
+        filters = [argv[i + 1] for i, a in enumerate(argv) if a == "--filter"]
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else "{{.Names}}"
+        show_all = "-a" in argv
+        for cname, c in sorted(containers.items()):
+            labels = c.get("labels") or {}
+            status = c.get("status", "exited")
+            if not show_all and status != "running":
+                continue
+            ok = True
+            for f in filters:
+                k, _, v = f.partition("=")
+                if k == "label":
+                    lk, _, lv = v.partition("=")
+                    ok = ok and lk in labels and (not lv or labels[lk] == lv)
+                elif k == "name":
+                    ok = ok and v.lstrip("^").rstrip("$") in cname
+                elif k == "status":
+                    ok = ok and status == v
+            if not ok:
+                continue
+            if "-q" in argv:
+                print(f"cid-{cname}")
+                continue
+            line = fmt.replace("{{.Names}}", cname)
+            import re as _re
+            line = _re.sub(r'\{\{\.Label "([^"]+)"\}\}', lambda m: labels.get(m.group(1), ""), line)
+            print(line.replace("\\t", "\t"))
+        return 0
     if cmd == "inspect":
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else (
+            argv[argv.index("-f") + 1] if "-f" in argv else "")
+        if "cfgms.build_inputs_hash" in fmt:
+            # the agent image's build-inputs label (po-act.sh image gate)
+            print(os.environ.get("FSM_FAKE_IMAGE_LABEL", ""))
+            return 0
         c = containers.get(argv[-1])
         if not c:
             return 1
-        fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
+        if ".Config.Labels" in fmt:
+            import re as _re
+            m = _re.search(r'"([^"]+)"', fmt)
+            print((c.get("labels") or {}).get(m.group(1), "") if m else "")
+            return 0
+        if "State.Running" in fmt:
+            print("true" if c.get("status") == "running" else "false")
+            return 0
+        if "State.FinishedAt" in fmt:
+            print(c.get("finished_at", "2020-01-01T00:00:00Z"))
+            return 0
         if "State.Status" in fmt:
             print(f"{c['status']} {c['exit_code']}")
         else:

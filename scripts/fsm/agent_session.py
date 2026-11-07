@@ -59,8 +59,10 @@ def sessions_base():
 
 
 def trust_base():
+    """FSM session trust dirs live under <trust base>/fsm/ so the run-dir GC
+    (runindex.gc) can tell them from review / interactive trust dirs."""
     return Path(os.environ.get("CFGMS_AGENT_TRUST_BASE")
-                or Path.home() / ".cache" / "cfgms-agent-trust")
+                or Path.home() / ".cache" / "cfgms-agent-trust") / "fsm"
 
 
 def container_name(mode, target):
@@ -140,8 +142,11 @@ def docker_argv(*, name, mode, kind, seq, run_id, workspace, context_dir, out_di
     if metrics_dir:
         argv += ["-v", f"{metrics_dir}:{METRICS_MOUNT}:ro"]
     if agent_cred_dir:
+        # the scoped key goes in as a read-only file, never as a value; an
+        # empty CFGMS_ADMIN_BUNDLE turns off admin-bundle auto-discovery
         argv += ["-v", f"{agent_cred_dir}:/run/cfgms/agent-cred:ro",
-                 "-e", "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key"]
+                 "-e", "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key",
+                 "-e", "CFGMS_ADMIN_BUNDLE="]
         if tenant:
             argv += ["-e", f"CFGMS_TENANT={tenant}"]
     argv += [

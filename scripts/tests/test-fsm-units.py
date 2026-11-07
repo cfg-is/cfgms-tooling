@@ -506,11 +506,21 @@ class TestReportAndState(unittest.TestCase):
         self.assertEqual(report.attempts_from_body(body), 1)
 
     def test_manifest_has_every_entrypoint_field(self):
-        src = (L.TOOLING / "devcontainer" / "entrypoint.sh").read_text()
-        block = src.split("cat > /tmp/agent-result.json <<RESULT_EOF", 1)[1].split("RESULT_EOF", 1)[0]
+        # The legacy entrypoint that wrote agent-result.json is gone; the
+        # contract is now what its readers take from it: token_report.py and
+        # agent-dispatch.sh's ledger_reconcile_exit (`result.get("<field>")`).
         import re
-        legacy = set(re.findall(r'"([a-z_]+)":', block)) | {"usage"}
-        self.assertEqual(legacy, set(report.LEGACY_FIELDS))
+        read = set()
+        tr = (L.TOOLING / "metrics" / "token_report.py").read_text()
+        tr = tr[tr.index('result_path = container_dir / "agent-result.json"'):]
+        tr = tr[:tr.index("container_calls, _ = collect(")]
+        ad = (L.TOOLING / "scripts" / "agent-dispatch.sh").read_text()
+        ad = ad[ad.index("ledger_reconcile_exit() {"):]
+        ad = ad[:ad.index("\n}\n")]
+        for src in (tr, ad):
+            read |= set(re.findall(r'result\.get\("([a-z_]+)"\)', src))
+        self.assertTrue({"pr_url", "validation_passed", "head_advanced", "usage", "pr_num"} <= read, read)
+        self.assertTrue(read <= set(report.LEGACY_FIELDS), read - set(report.LEGACY_FIELDS))
         m = report.build_manifest(mode="issue", issue=1, pr_num=2, exit_code=0, model="m",
                                   effort="e", duration=3, pr_url="u", branch="b",
                                   final_state="REPORT", reason="", transitions=[], fix_rounds=0,

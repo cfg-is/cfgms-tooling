@@ -6,7 +6,9 @@
 #   AC4  — preflight routes prior-PASS PR to spawn_acceptance_reviewer after a
 #           commit lands post-review (Python unit test)
 #   AC6  — rebase-pr.sh exit 2 triggers DISPATCHED_RESOLVE_CONFLICT:<PR>;
-#           author gate refuses external PR before any clone
+#           author gate refuses external PR before any launch. The launch is
+#           the FSM supervisor in resolve-conflict mode (DESIGN.md §11), with
+#           the story's project item and the pr-<N> lease handed to it.
 
 set -euo pipefail
 
@@ -15,6 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CFGMS_TEST_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh"
 # Bypass the resource admission gate so tests are deterministic on any host.
 export CFGMS_AGENT_CAPACITY_GATE=off
+# shellcheck source=lib-fsm-launch.sh
+source "${SCRIPT_DIR}/lib-fsm-launch.sh"
 PO_ACT="${SCRIPT_DIR}/../po-act.sh"
 PREFLIGHT="${SCRIPT_DIR}/../po-cycle-preflight.py"
 
@@ -84,13 +88,15 @@ cat > "$GH_BIN/gh" <<'GH_EOF'
 args="$*"
 case "$args" in
   *headRefOid*) printf '%s\n' "${GH_HEAD-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"; exit 0 ;;
+  *headRefName,body*) printf '{"headRefName":"feature/story-4242-agent","body":""}\n'; exit 0 ;;
   *collaborators*permission*) echo "${GH_PERM:-read}"; exit 0 ;;
   "pr view"*) cat "${GH_FIXTURE:?}"; exit 0 ;;
   *) exit 0 ;;
 esac
 GH_EOF
 chmod +x "$GH_BIN/gh"
-export PATH="$GH_BIN:$PATH"
+fsm_launch_fakes "$TMPWT/fsm"
+export PATH="$GH_BIN:$TMPWT/fsm/bin:$PATH"
 SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 export GH_FIXTURE="$TMPWT/pr.json"
@@ -106,7 +112,8 @@ MOCK_DISPATCH="$(mktemp)"
 chmod +x "$MOCK_DISPATCH"
 cat > "$MOCK_DISPATCH" <<'MOCK_EOF'
 #!/usr/bin/env bash
-# Minimal mock for agent-dispatch.sh used in resolve-conflict tests.
+# Minimal mock for agent-dispatch.sh used in resolve-conflict tests. Only the
+# author gate is called; the launch is the FSM supervisor stand-in.
 cmd="${1:-}"; shift || true
 case "$cmd" in
   check-pr-author)
@@ -116,27 +123,6 @@ case "$cmd" in
       exit 3
     fi
     echo "AUTHOR_TRUSTED:${pr}:cfg-agent"
-    exit 0
-    ;;
-  create-clone-pr)
-    # Accept optional --dest-prefix flag
-    dest_prefix="pr-fix-"
-    while [[ $# -gt 0 && "$1" == --* ]]; do
-      case "$1" in
-        --dest-prefix) dest_prefix="$2"; shift 2 ;;
-        --expected-head) shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    pr="${1:-0}"
-    echo "CLONE_OK:${dest_prefix}${pr}:feature/story-${pr}-agent"
-    exit 0
-    ;;
-  launch-generic)
-    # Args: <container_name> <clone_dir> [entrypoint_args...]
-    container="${1:-}"; shift || true
-    clone_dir="${1:-}"; shift || true
-    echo "LAUNCHED:${container}:mock-container-id"
     exit 0
     ;;
   *)
@@ -182,24 +168,24 @@ echo "resolve_conflict.test.sh — AC6a: trusted dispatch"
 echo "--------------------------------------------------"
 
 rc=0
-out=$(MOCK_AUTHOR_GATE=trusted \
+out=$(MOCK_AUTHOR_GATE=trusted FAKE_SUP_MODE=agentless \
       CFGMS_TEST_WORKTREE_BASE="$TMPWT" \
       CFGMS_TEST_DISPATCH="$MOCK_DISPATCH" \
       bash "$PO_ACT" resolve-conflict 1234 2>&1) || rc=$?
 check "AC6a: exits 0 for trusted PR" "$rc" "0"
 
-check_contains "AC6a: CLONE_OK emitted"                     "$out" "CLONE_OK"
-check_contains "AC6a: LAUNCHED emitted"                     "$out" "LAUNCHED"
 check_contains "AC6a: DISPATCHED_RESOLVE_CONFLICT emitted"  "$out" "DISPATCHED_RESOLVE_CONFLICT:1234"
-
-# Verify the resolve-conflict namespace (not pr-fix)
-check_contains "AC6a: clone uses resolve-conflict- prefix"  "$out" "CLONE_OK:resolve-conflict-1234"
-check_contains "AC6a: container name is resolve-conflict"   "$out" "LAUNCHED:cfg-agent-resolve-conflict-1234"
+check_contains "AC6a: the run passed its gates without an agent (PREPARE -> SYNC)" "$out" \
+  "FSM_AGENTLESS:1234:SYNC"
+check_contains "AC6a: one launch path, the supervisor in resolve-conflict mode" \
+  "$(cat "$TMPWT/fsm/supervisor.log")" \
+  "run resolve-conflict 1234 --lease-key pr-1234 --lease-handoff --detach --item-id PVTI_fakeitem"
+check_not_contains "AC6a: no clone or legacy container launch" "$out" "CLONE_OK"
 
 # ---------------------------------------------------------------------------
 # Issue #5401 — the release check is bound to the head the agent acts on.
 # The mock delegates check-pr-author to the real agent-dispatch.sh so the real
-# release logic judges the head; clone/launch stay mocked and record argv.
+# release logic judges the head; the launch goes to the supervisor stand-in.
 # ---------------------------------------------------------------------------
 echo ""
 echo "resolve_conflict.test.sh — #5401: release bound to head"
@@ -212,8 +198,6 @@ cat > "$MOCK_BOUND" <<MOCK_BOUND_EOF
 cmd="\${1:-}"; shift || true
 case "\$cmd" in
   check-pr-author) exec "$REAL_DISPATCH" check-pr-author "\$@" ;;
-  create-clone-pr) echo "create-clone-pr \$*" >> "$TMPWT/calls.log"; echo "CLONE_OK:x:y"; exit 0 ;;
-  launch-generic)  echo "LAUNCHED:\${1:-}:mock"; exit 0 ;;
   *) echo "MOCK_UNEXPECTED_CALL:\$cmd" >&2; exit 1 ;;
 esac
 MOCK_BOUND_EOF
@@ -222,7 +206,6 @@ chmod +x "$MOCK_BOUND"
 # run_bound leaves the exit code in $TMPWT/rc (the call runs in a subshell).
 # Release granted at SHA A: maintainer "maint" labelled and approved A.
 run_bound() {  # run_bound <live-head> -> output; rc in $bound_rc
-  : > "$TMPWT/calls.log"
   GH_HEAD="$1" CFGMS_TEST_HEAD_OID="$1" CFGMS_TEST_APPROVALS="maint ${SHA_A}"     CFGMS_TEST_COLLAB_PERM=read CFGMS_TEST_ACTOR_LOGIN=maint CFGMS_TEST_ACTOR_PERM=push     CFGMS_TEST_WORKTREE_BASE="$TMPWT" CFGMS_TEST_DISPATCH="$MOCK_BOUND"     bash "$PO_ACT" resolve-conflict 4321 2>&1 && echo 0 > "$TMPWT/rc" || echo $? > "$TMPWT/rc"
 }
 
@@ -234,8 +217,8 @@ check_not_contains "#5401: stale release launches nothing" "$out" "LAUNCHED"
 out=$(run_bound "$SHA_A"); rc=$(cat "$TMPWT/rc")
 check_contains "#5401: head equals the released head → admitted" \
   "$out" "DISPATCHED_RESOLVE_CONFLICT:4321"
-check_contains "#5401: clone bound to the checked head via --expected-head" \
-  "$(cat "$TMPWT/calls.log")" "--expected-head ${SHA_A}"
+check_contains "#5401: the admitted head reaches the supervisor launch" \
+  "$(cat "$TMPWT/fsm/supervisor.log")" "run resolve-conflict 4321 "
 
 out=$(GH_HEAD="" CFGMS_TEST_WORKTREE_BASE="$TMPWT" CFGMS_TEST_DISPATCH="$MOCK_BOUND" \
       bash "$PO_ACT" resolve-conflict 4321 2>&1) || true
@@ -254,36 +237,11 @@ rc=0
 bash "$PO_ACT" resolve-conflict 2>/dev/null || rc=$?
 check "error: missing PR arg exits non-zero" "$rc" "1"
 
-# launch-generic infra failure → DISPATCHED_RESOLVE_CONFLICT must NOT be emitted
-MOCK_DISPATCH_FAIL="${TMPWT}/mock_dispatch_fail.sh"
-cat > "$MOCK_DISPATCH_FAIL" <<'MOCK_FAIL_EOF'
-#!/usr/bin/env bash
-cmd="${1:-}"; shift || true
-case "$cmd" in
-  check-pr-author)
-    echo "AUTHOR_TRUSTED:${1:-0}:cfg-agent"; exit 0 ;;
-  create-clone-pr)
-    dest_prefix="pr-fix-"
-    while [[ $# -gt 0 && "$1" == --* ]]; do
-      case "$1" in
-        --dest-prefix) dest_prefix="$2"; shift 2 ;;
-        --expected-head) shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    echo "CLONE_OK:${dest_prefix}${1:-0}:feature/story-test"; exit 0 ;;
-  launch-generic)
-    echo "LAUNCH_FAILED: simulated infra error" >&2; exit 1 ;;
-  *)
-    echo "MOCK_UNEXPECTED_CALL:${cmd}" >&2; exit 1 ;;
-esac
-MOCK_FAIL_EOF
-chmod +x "$MOCK_DISPATCH_FAIL"
-
+# The run ends FAILED before any agent → DISPATCHED_RESOLVE_CONFLICT must NOT be emitted
 rc=0
-out=$(MOCK_AUTHOR_GATE=trusted \
+out=$(MOCK_AUTHOR_GATE=trusted FAKE_SUP_MODE=failed \
       CFGMS_TEST_WORKTREE_BASE="$TMPWT" \
-      CFGMS_TEST_DISPATCH="$MOCK_DISPATCH_FAIL" \
+      CFGMS_TEST_DISPATCH="$MOCK_DISPATCH" \
       bash "$PO_ACT" resolve-conflict 5678 2>&1) || rc=$?
 check "error: launch failure exits non-zero" "$rc" "1"
 check_not_contains "error: DISPATCHED_RESOLVE_CONFLICT not emitted on launch failure" \

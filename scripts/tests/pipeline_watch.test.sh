@@ -7,6 +7,11 @@
 #  - develop SHA move emits `merged`
 #  - a vanished cfg-agent-* container emits `container_exited`
 #  - a container past the stall threshold emits `container_stalled` ONCE
+#  - FSM runs: `container_exited` once when a run reaches a terminal state (or
+#    its run dir disappears), `container_stalled reason=heartbeat` once for a
+#    hung or crashed run, nothing for a run first seen terminal; run-labelled
+#    containers are left out of the per-container tracking; the real
+#    runindex.py rows probe drives the same events from real run dirs
 #  - a rising board count emits `board_up`; a falling one does not
 #  - a PR settling green/red emits checks_green/checks_red, once per transition
 #  - a still-pending PR emits nothing
@@ -29,6 +34,8 @@ fi
 
 TMP="$(mktemp -d)"; trap 'rm -rf "${TMP}"' EXIT
 export PO_CACHE_DIR="${TMP}/cache"
+# Every probe of the FSM run index reads this sandbox, never the host's runs.
+export CFGMS_FSM_RUNS_DIR="${TMP}/fsm-runs"
 
 ran=0; fail=0
 check_contains() {
@@ -49,6 +56,7 @@ check_eq() {
 
 fast() { PIPELINE_WATCH_SHA_CMD="printf '%s\n' '$1'" \
          PIPELINE_WATCH_CONTAINERS_CMD="printf '%b' '$2'" \
+         PIPELINE_WATCH_FSM_CMD="${FSM_ROWS_CMD:-printf ''}" \
          PIPELINE_WATCH_STALL_MIN="${3:-90}" \
          bash "${WATCH}" tick-fast 2>&1; }
 
@@ -158,6 +166,101 @@ check_contains "state prints the drained streak" "${out}" "drained_streak=0"
 
 out="$(bash "${WATCH}" --help)"
 check_contains "usage lists record-cycle" "${out}" "record-cycle"
+
+# --- FSM runs: run-terminal and stale-heartbeat events ----------------------
+fsm() { PIPELINE_WATCH_FSM_CMD="printf '%b' '$1'" bash "${WATCH}" tick-fsm 2>&1; }
+bash "${WATCH}" reset >/dev/null
+out="$(fsm 'r-done\tdone\tREPORT\tcfg-agent-41\t3\tstory-41\n')"
+check_eq "a run first seen terminal emits nothing" "${out}" ""
+out="$(fsm 'r42\tlive\tVALIDATE\tcfg-agent-42\t0\tstory-42\n')"
+check_eq "a live run emits nothing" "${out}" ""
+out="$(fsm 'r42\tlive\tPUBLISH\tcfg-agent-42\t0\tstory-42\n')"
+check_eq "a live run moving between states emits nothing" "${out}" ""
+out="$(fsm 'r42\tdone\tREPORT\tcfg-agent-42\t1\tstory-42\n')"
+check_eq "a run reaching a terminal state emits container_exited once" "${out}" \
+  "EVENT container_exited name=cfg-agent-42 run=r42 state=REPORT"
+out="$(fsm 'r42\tdone\tREPORT\tcfg-agent-42\t2\tstory-42\n')"
+check_eq "a terminal run is reported only once" "${out}" ""
+out="$(fsm 'r43\tlive\tAGENT\tcfg-agent-pr-fix-43\t0\tpr-43\n')"
+out="$(fsm 'r43\thung\tAGENT\tcfg-agent-pr-fix-43\t7\tpr-43\n')"
+check_eq "a stale heartbeat (hung) emits container_stalled" "${out}" \
+  "EVENT container_stalled name=cfg-agent-pr-fix-43 age_min=7 run=r43 reason=heartbeat"
+out="$(fsm 'r43\tcrashed\tAGENT\tcfg-agent-pr-fix-43\t9\tpr-43\n')"
+check_eq "a stall is reported only once (hung -> crashed)" "${out}" ""
+out="$(fsm 'r43\tdone\tFAILED\tcfg-agent-pr-fix-43\t9\tpr-43\n')"
+check_eq "the stalled run's terminal state is still reported" "${out}" \
+  "EVENT container_exited name=cfg-agent-pr-fix-43 run=r43 state=FAILED"
+out="$(fsm 'r46\tcrashed\tAGENT\tcfg-agent-46\t30\tstory-46\n')"
+out="$(fsm 'r46\tabandoned\tABANDONED\tcfg-agent-46\t31\tstory-46\n')"
+check_eq "an abandoned run emits container_exited once" "${out}" \
+  "EVENT container_exited name=cfg-agent-46 run=r46 state=ABANDONED"
+out="$(fsm 'r44\tlive\tSNAPSHOT\tcfg-agent-44\t0\tstory-44\n')"
+out="$(fsm '')"
+check_eq "an open run whose run dir disappeared emits container_exited state=gone" "${out}" \
+  "EVENT container_exited name=cfg-agent-44 run=r44 state=gone"
+
+# fast_tick runs the FSM probe too.
+bash "${WATCH}" reset >/dev/null
+fast "sha-f1" '' >/dev/null
+FSM_ROWS_CMD="printf '%b' 'r45\tlive\tAGENT\tcfg-agent-45\t0\tstory-45\n'" fast "sha-f1" '' >/dev/null
+out="$(FSM_ROWS_CMD="printf '%b' 'r45\tdone\tNO_OP\tcfg-agent-45\t0\tstory-45\n'" fast "sha-f1" '')"
+check_contains "tick-fast emits the FSM run-terminal event" "${out}" \
+  "EVENT container_exited name=cfg-agent-45 run=r45 state=NO_OP"
+
+# The real container probe leaves run-labelled (FSM) containers out: their
+# exits and ages are per session, not per run.
+mkdir -p "${TMP}/fakebin"
+cat > "${TMP}/fakebin/docker" <<'DOCKEREOF'
+#!/usr/bin/env bash
+case "$1" in
+  ps) printf 'cfg-agent-50\t\ncfg-agent-51\trun-51\ncfg-agent-review-pr-52\t\n' ;;
+  inspect) date -u -d '-200 minutes' +%Y-%m-%dT%H:%M:%SZ ;;
+esac
+DOCKEREOF
+chmod +x "${TMP}/fakebin/docker"
+bash "${WATCH}" reset >/dev/null
+out="$(PATH="${TMP}/fakebin:${PATH}" PIPELINE_WATCH_SHA_CMD="printf 'sha-x\n'" \
+       PIPELINE_WATCH_FSM_CMD="printf ''" PIPELINE_WATCH_STALL_MIN=90 \
+       bash "${WATCH}" tick-fast 2>&1)"
+check_contains "an unlabelled agent container past the threshold stalls" "${out}" \
+  "EVENT container_stalled name=cfg-agent-50"
+check_not_contains "a run-labelled (FSM) container is not tracked per container" "${out}" "cfg-agent-51"
+check_contains "state lists only unlabelled containers" "$(bash "${WATCH}" state)" \
+  "containers=cfg-agent-50 cfg-agent-review-pr-52"
+
+# End to end with the real probe (runindex.py rows) over real run dirs.
+bash "${WATCH}" reset >/dev/null
+FSMLIB="${SCRIPT_DIR}/../fsm"
+mkrun() {   # mkrun <run_id> <mode> <target> -- a crashed run (no lock, old run.json)
+  python3 - "$FSMLIB" "$1" "$2" "$3" <<'PYEOF'
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+import state
+r = state.RunDir(sys.argv[2])
+r.create({"mode": sys.argv[3], "target": sys.argv[4], "key": f"pr-{sys.argv[4]}"})
+r.append("transition", frm="PREPARE", event="gates_ok", to="AGENT", kind="fix", reason="")
+old = time.time() - 3600
+for f in ("run.json", "state.jsonl"):
+    os.utime(r.p(f), (old, old))
+PYEOF
+}
+finish() { python3 - "$FSMLIB" "$1" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import state
+r = state.RunDir(sys.argv[2])
+r.append("transition", frm="AGENT", event="error", to="FAILED", kind="", reason="agent_error")
+r.append("terminal_done", state="FAILED")
+PYEOF
+}
+mkrun "pr-60-20261107T000000Z-aaaaaa" fix-pr 60
+out="$(bash "${WATCH}" tick-fsm 2>&1)"
+check_contains "real probe: a crashed run emits container_stalled" "${out}" \
+  "EVENT container_stalled name=cfg-agent-pr-fix-60 age_min=60 run=pr-60-20261107T000000Z-aaaaaa reason=heartbeat"
+finish "pr-60-20261107T000000Z-aaaaaa"
+out="$(bash "${WATCH}" tick-fsm 2>&1)"
+check_eq "real probe: the run's terminal state emits container_exited" "${out}" \
+  "EVENT container_exited name=cfg-agent-pr-fix-60 run=pr-60-20261107T000000Z-aaaaaa state=FAILED"
 
 # --- drained shutdown exits CLEANLY ----------------------------------------
 # Regression: the EXIT trap referenced a `local` pidfile, so it ran after the

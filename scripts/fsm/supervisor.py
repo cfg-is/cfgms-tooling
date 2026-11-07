@@ -11,6 +11,7 @@ Usage:
   supervisor.py run resolve-conflict <PR>  [options]
   supervisor.py resume <RUN_ID>
   supervisor.py status <RUN_ID>
+  supervisor.py abandon <RUN_ID> --reason R   end a crashed run without resuming it
 
 Options:
   --item-id ID        project item: the story spec and Files In Scope are read
@@ -22,11 +23,16 @@ Options:
                       by the heartbeat); required unless
                       CFGMS_FSM_ALLOW_NO_LEASE=1 (tests)
   --acquire-lease     acquire KEY instead of expecting it held
+  --lease-handoff     KEY was acquired by the launcher (po-act.sh) and is handed
+                      to this run: the run releases it on every terminal state,
+                      REFUSED included
   --model M / --effort E   agent model and effort (default: model-routing)
   --container-target T     override the container name suffix
   --tooling-src GITDIR     git dir holding the `.claude/tooling` gitlink commit,
                            used to populate it in workspaces and validator clones
   --no-snapshot-tooling    run from this checkout instead of a run-dir copy
+  --detach                 (run, resume) setsid and close inherited fds >2;
+                           po-act.sh starts every run this way
 
 The supervisor owns every side effect. Agents only edit files in the
 workspace `A`; the candidate is a tree in `R`; validation runs in an
@@ -357,8 +363,10 @@ class Supervisor:
         p = self.params
         mode = self.mode
         x = self.x
+        # A handed-off lease (po-act.sh acquired it, then started this run) is
+        # this run's to release on every terminal state, REFUSED included.
         x.update({"issue": p.get("issue"), "item_id": p.get("item_id"), "seq": 0,
-                  "lease_acquired": False})
+                  "lease_acquired": bool(p.get("lease_handoff") and p.get("lease_key"))})
         if not agent_session.uid_matches():
             self.run.append("note", warning=f"supervisor uid {os.getuid()} != agent uid "
                                             f"{agent_session.AGENT_UID}: agent files may be unreadable")
@@ -1091,7 +1099,7 @@ def _params_from_args(a):
     p = {"mode": mode, "base_branch": os.environ.get("CFGMS_FSM_BASE_BRANCH", "develop"),
          "remote_url": publish.remote_url(), "tooling_root": tooling_root,
          "item_id": a.item_id, "epic": a.epic, "lease_key": a.lease_key,
-         "acquire_lease": a.acquire_lease, "model": a.model, "effort": a.effort,
+         "acquire_lease": a.acquire_lease, "lease_handoff": a.lease_handoff, "model": a.model, "effort": a.effort,
          "tooling_src": a.tooling_src, "agent_cred_dir": a.agent_cred_dir, "tenant": a.tenant,
          "started_epoch": time.time(),
          "agent_timeout_min": int(os.environ.get("CFGMS_FSM_AGENT_TIMEOUT_MIN", "180")),
@@ -1197,6 +1205,8 @@ def cmd_drive(run_id, services=None, out=None):
         print(str(exc), file=sys.stderr)
         return EXIT_LOCKED
     _install_signals()
+    # helpers this run calls (the capacity gate) must not count it as a reservation
+    os.environ["CFGMS_FSM_RUN_ID"] = run_id
     try:
         sup = Supervisor(run, services=services, out=out)
         run.start_heartbeat(HEARTBEAT_SECS, on_beat=sup.heartbeat_tick)
@@ -1207,6 +1217,74 @@ def cmd_drive(run_id, services=None, out=None):
     finally:
         run.stop_heartbeat()
         run.release_lock()
+
+
+_ABANDON_REASON_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def cmd_abandon(run_id, reason, out=None):
+    """End a run that is not running and must not be resumed (its work finished
+    elsewhere, or it outlived the crash TTL): record `abandoned` and
+    `terminal_done` (state ABANDONED), release its lease if this host holds
+    it, clear its active-index entry. Never starts a container. Exit 0, 2 on
+    a bad reason or unknown run, 4 when a live supervisor holds the run."""
+    out = out or sys.stdout
+    if not _ABANDON_REASON_RE.match(reason or ""):
+        print(f"invalid abandon reason {reason!r}", file=sys.stderr)
+        return EXIT_USAGE
+    run = statemod.RunDir(run_id)
+    if not run.exists():
+        print(f"unknown run {run_id}", file=sys.stderr)
+        return EXIT_USAGE
+    if any(r.get("type") in ("terminal_done", "abandoned") for r in run.records()):
+        print(f"FSM_ABANDON_SKIPPED:{run_id}:finished", file=out, flush=True)
+        return EXIT_OK
+    try:
+        run.acquire_lock()
+    except statemod.LockBusy:
+        print(f"FSM_ABANDON_SKIPPED:{run_id}:locked", file=out, flush=True)
+        return EXIT_LOCKED
+    try:
+        params = run.params()
+        last = run.last_transition()
+        run.append("abandoned", reason=reason, state=(last or {}).get("to", "PREPARE"))
+        key = params.get("lease_key")
+        lease = "none"
+        if key:
+            helper = adapters.Helper(os.environ.get("CFGMS_FSM_PIPELINE_HELPER") or str(
+                Path(params.get("tooling_root_src") or params.get("tooling_root") or HERE.parent.parent)
+                / "scripts" / "pipeline-helper.sh"))
+            st, _ = helper.lease_status(key)
+            if st == "held_by_me":
+                helper.lease_release(key)
+                lease = "released"
+            else:
+                lease = st
+            run.append("lease", abandon=lease)
+        if params.get("key"):
+            run.clear_active(params["key"])
+        run.append("terminal_done", state="ABANDONED")
+        print(f"FSM_ABANDONED:{run_id}:{reason}:lease={lease}", file=out, flush=True)
+        return EXIT_OK
+    finally:
+        run.release_lock()
+
+
+def _detach():
+    """`--detach`: become a session leader and drop every inherited fd above
+    stderr. po-act.sh starts the run in the background of a shell whose
+    stdout may be a pipe its own caller reads to EOF (the cycle-manifest tee
+    keeps a copy on fd 210); an inherited copy would hold that pipe open for
+    the whole run."""
+    try:
+        limit = min(os.sysconf("SC_OPEN_MAX"), 65536)
+    except (ValueError, OSError):
+        limit = 4096
+    os.closerange(3, limit)
+    try:
+        os.setsid()
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -1220,6 +1298,7 @@ def main(argv=None):
     r.add_argument("--issue")
     r.add_argument("--lease-key")
     r.add_argument("--acquire-lease", action="store_true")
+    r.add_argument("--lease-handoff", action="store_true")
     r.add_argument("--model")
     r.add_argument("--effort")
     r.add_argument("--container-target")
@@ -1227,11 +1306,16 @@ def main(argv=None):
     r.add_argument("--agent-cred-dir")
     r.add_argument("--tenant")
     r.add_argument("--no-snapshot-tooling", action="store_true")
+    r.add_argument("--detach", action="store_true")
     rs = sub.add_parser("resume")
     rs.add_argument("run_id")
+    rs.add_argument("--detach", action="store_true")
     rs.add_argument("--from-snapshot", action="store_true", help=argparse.SUPPRESS)
     st = sub.add_parser("status")
     st.add_argument("run_id")
+    ab = sub.add_parser("abandon")
+    ab.add_argument("run_id")
+    ab.add_argument("--reason", required=True)
     a = ap.parse_args(argv)
 
     if a.cmd == "status":
@@ -1240,6 +1324,12 @@ def main(argv=None):
         print(json.dumps({"run_id": a.run_id, "state": last["to"] if last else "PREPARE",
                           "locked": run.is_locked(), "heartbeat_age": run.heartbeat_age()}))
         return EXIT_OK
+
+    if a.cmd == "abandon":
+        return cmd_abandon(a.run_id, a.reason)
+
+    if getattr(a, "detach", False):
+        _detach()
 
     if a.cmd == "run":
         params = _params_from_args(a)
