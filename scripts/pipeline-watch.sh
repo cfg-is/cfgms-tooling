@@ -23,8 +23,8 @@
 # FSM runs (DESIGN.md §11): one supervisor run starts several agent and
 # validator containers in turn, so its containers are not tracked one by one.
 # `container_exited name=<agent container> run=<id> state=<STATE>` is emitted
-# once, when the run reaches a terminal state (terminal_done recorded) or its
-# run dir disappears (state=gone); `container_stalled name=<c> age_min=<m>
+# once, when the run reaches a terminal state (terminal_done recorded, or
+# abandoned) or its run dir disappears (state=gone); `container_stalled name=<c> age_min=<m>
 # run=<id> reason=heartbeat` once, when the run's heartbeat goes stale (hung)
 # or its supervisor is gone without finishing (crashed). Containers labelled
 # with a run_id are left out of the per-container exit and age tracking.
@@ -266,7 +266,7 @@ fsm_tick() {
   while IFS=$'\t' read -r rid status state container age key; do
     [[ -n "${rid:-}" && -n "${status:-}" ]] || continue
     seen+="${rid} "
-    if [[ "${status}" == "done" ]]; then
+    if [[ "${status}" == "done" || "${status}" == "abandoned" ]]; then
       if [[ " ${prev_open} " == *" ${rid}="* ]]; then
         emit "container_exited name=${container} run=${rid} state=${state}"
       fi

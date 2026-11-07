@@ -150,20 +150,21 @@ BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)
 #: decide pipeline ownership would claim genuine manual work.
 AGENT_BRANCH_RE = re.compile(r"^feature/(?:story-\d+|item-[A-Za-z0-9]+)-agent$")
 
-# Markers identifying a draft PR opened by the container entrypoint's
-# _salvage_no_pr() after a session-truncated run (token reauth/limit, agent
-# never got going). Both a body prefix and a title-suffix form are accepted
-# because either alone is sufficient evidence of a truncated session.
+# Markers identifying a WIP draft PR left by an agent run that did not finish.
+# Both a body prefix and a title-suffix form are accepted because either alone
+# is sufficient evidence.
 #
-# CURRENT emitter (.claude/tooling/devcontainer/entrypoint.sh:117-118, `gh pr create --draft`):
+# CURRENT emitter: the FSM supervisor's FAILED state (scripts/fsm/report.py
+# wip_title / wip_body), pushing the last candidate that passed the export
+# filters and the secret scan:
+#   title: "WIP: <branch> (agent failed)"
+#   body:  "Agent session failed with exit code 1 (FSM run `<id>` ended in
+#           FAILED: <reason>) ..." plus FSM-Reason: / FSM-Attempt: trailers
+#
+# LEGACY form (the removed headless entrypoint's salvage; already-open drafts
+# may still carry it, so it keeps matching):
 #   title: "WIP: <branch> (agent produced no PR)"
 #   body:  "Agent session ended with exit code <N> and no pull request: ..."
-#
-# LEGACY forms (older containers; already-open drafts may still carry these —
-# the emitter strings are never changed to avoid stranding them):
-#   body:  "Agent session failed with exit code ..."
-#   title: "...(agent failed)" (see entrypoint.sh:1065, which rewrites this
-#          leftover legacy title on successful fix-pr resume)
 _WIP_SESSION_FAILED_BODY_PREFIXES = (
     "Agent session ended with exit code",
     "Agent session failed with exit code",
@@ -902,23 +903,6 @@ def _lease_list_rows():
     return rows
 
 
-def live_pr_lease_nums(rows=None):
-    """PR numbers holding a live (unexpired) `pr-<N>` lease on any host.
-
-    `pr-<N>` is shared by review, fix-pr, resolve-conflict and inline rebase:
-    a held one means some host is working that PR right now, so this cycle
-    recommends no second operation on it. Fails open (empty set)."""
-    rows = _lease_list_rows() if rows is None else rows
-    nums = set()
-    for key, _holder, expired in rows or []:
-        if expired or not key.startswith("pr-"):
-            continue
-        tail = key[len("pr-"):]
-        if tail.isdigit():
-            nums.add(int(tail))
-    return nums
-
-
 def _load_runindex():
     path = Path(__file__).resolve().parent / "fsm" / "runindex.py"
     spec = importlib.util.spec_from_file_location("fsm_runindex", str(path))
@@ -943,21 +927,26 @@ def fsm_runs():
 def fsm_run_view(runs, lease_rows=None, host=None):
     """What the FSM runs on this host mean for this cycle (DESIGN.md §11).
 
-    - in flight (live, hung, starting): their story numbers, item ids and PR
-      numbers are being worked; nothing may be dispatched, reviewed, rebased or
-      re-dispatched as stalled for them, and no reaper may touch them.
-    - crashed (not done, lock free): resumable. Recommended action is
-      `po-act.sh dispatch resume <run>` when the run's lease is held by this
-      host or no longer held by anyone; `hold` while another host holds it.
-      A crashed run's story is not a stalled dispatch either: resuming keeps
-      its work, a fresh dispatch would start over beside it.
+    - in flight (live, hung, starting): their story numbers and item ids are
+      being worked (never a stalled dispatch); a fix-pr / resolve-conflict
+      run's PR is in `pr_nums`, so the cycle neither rebases, reviews nor
+      re-dispatches it.
+    - crashed (not finished, lock free, younger than the crash TTL): listed in
+      `recommendations` with action `resume` (run `po-act.sh dispatch resume
+      <run>`, which re-runs the PREPARE gates and abandons the run when its
+      work finished elsewhere) or `hold` (another host holds its lease). Its
+      story is not a stalled dispatch, but its PR is NOT held off review or
+      fix work.
+    - done / abandoned (including a crashed run past
+      CFGMS_FSM_CRASHED_TTL_HOURS): ignored, so a story left In Progress by
+      one shows up as a stalled dispatch.
     """
     host = host or os.environ.get("CFGMS_HOST_ID") or socket.gethostname()
     leases = {k: (h, exp) for k, h, exp in (lease_rows or [])}
-    view = {"in_flight": [], "resumable": [], "story_nums": set(), "item_ids": set(),
-            "pr_nums": set()}
+    view = {"in_flight": [], "resumable": [], "recommendations": [], "story_nums": set(),
+            "item_ids": set(), "pr_nums": set()}
     for r in runs:
-        if r.get("status") == "done":
+        if r.get("status") in ("done", "abandoned"):
             continue
         entry = {k: r.get(k) for k in ("run_id", "status", "state", "mode", "target", "issue",
                                        "pr", "item_id", "lease_key", "container",
@@ -966,20 +955,25 @@ def fsm_run_view(runs, lease_rows=None, host=None):
             view["story_nums"].add(int(r["issue"]))
         if r.get("item_id"):
             view["item_ids"].add(r["item_id"])
-        if r.get("pr"):
-            view["pr_nums"].add(int(r["pr"]))
         if r.get("status") == "crashed":
             holder, expired = leases.get(r.get("lease_key") or "", (None, True))
             if holder is not None and not expired and holder != host:
-                entry["action"] = "hold"
-                entry["reason"] = f"lease {r.get('lease_key')} held by {holder}"
+                action, reason = "hold", f"lease {r.get('lease_key')} held by {holder}"
             else:
-                entry["action"] = "resume"
-                entry["reason"] = (f"run crashed in {r.get('state')}; resume with "
-                                   f"`./.claude/tooling/scripts/po-act.sh dispatch resume {r['run_id']}`")
+                action = "resume"
+                reason = (f"FSM run crashed in {r.get('state')}; run "
+                          f"`./.claude/tooling/scripts/po-act.sh dispatch resume {r['run_id']}` "
+                          "(re-runs the PREPARE gates; abandons the run if its work finished)")
+            entry.update(action=action, reason=reason)
             view["resumable"].append(entry)
+            view["recommendations"].append({
+                "run_id": r["run_id"], "number": r.get("issue"), "pr": r.get("pr"),
+                "item_id": r.get("item_id"), "mode": r.get("mode"), "action": action,
+                "reason": reason})
         else:
             view["in_flight"].append(entry)
+            if r.get("pr") and r.get("mode") in ("fix-pr", "resolve-conflict"):
+                view["pr_nums"].add(int(r["pr"]))
     return view
 
 
@@ -1957,11 +1951,13 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     """Decide what to do with each open story PR.
 
     Action vocabulary:
-    - resume_failed_session: WIP draft PR pushed by entrypoint.sh after a
-              session truncation (token reauth, token limit). Dispatch
-              fix-pr to resume the work; the resumed agent marks the PR
-              ready on success. Takes top priority — these PRs should not
-              be reviewed, rebased, or enqueued in their current state.
+    - resume_failed_session: WIP draft PR left by a run that did not
+              finish (the FSM supervisor's FAILED state, or the removed
+              entrypoint's salvage). Dispatch fix-pr to resume the work;
+              the FSM supervisor validates the result and, on success,
+              publishes it and marks the PR ready (never the agent). Takes
+              top priority — these PRs should not be reviewed, rebased, or
+              enqueued in their current state.
     - skip (founder-managed): a draft PR (other than a wip_session_failed
               resume) or a PR whose linked story has project status Blocked.
               These are manual / fenced-off work — e.g. #1887's Hyper-V branch
@@ -2008,7 +2004,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "skip",
-                "reason": "fix-agent in flight (cfg-agent-pr-fix-<PR> running) — wait for it to exit before rebase or re-dispatch",
+                "reason": "fix or resolve-conflict agent in flight (its container is running or its FSM run is live) — wait for it to finish before rebase or re-dispatch",
             })
             continue
 
@@ -2022,7 +2018,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"],
                 "story": pr["story_number"],
                 "action": "resume_failed_session",
-                "reason": "WIP draft PR from session truncation (token reauth/limit) — run `./.claude/tooling/scripts/po-act.sh dispatch-fix <PR>` to resume; the fix-pr agent will mark the PR ready when it finishes",
+                "reason": "WIP draft PR from an agent run that did not finish — run `./.claude/tooling/scripts/po-act.sh dispatch-fix <PR>` to resume; the FSM supervisor validates the fix and marks the PR ready when it publishes",
             })
             continue
 
@@ -2405,7 +2401,7 @@ def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=No
                 "story": story_num,
                 "pr": pr_num,
                 "action": "skip",
-                "reason": "fix-agent already in flight (cfg-agent-pr-fix-<PR> running)",
+                "reason": "fix or resolve-conflict agent already in flight (container running or FSM run live)",
             })
             continue
         if pr_num in queued_pr_numbers:
@@ -3116,10 +3112,10 @@ def main():
     lease_rows = _lease_list_rows()
     fsm_view = fsm_run_view(fsm_runs(), lease_rows)
     out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
-    active_fix_pr_nums = set(fsm_view["pr_nums"]) | live_pr_lease_nums(lease_rows)
-    for s_ in pr_summaries:
-        if s_.get("story_number") in fsm_view["story_nums"]:
-            active_fix_pr_nums.add(s_["pr"])
+    out["fsm_recommendations"] = fsm_view["recommendations"]
+    # In-flight fix-pr / resolve-conflict FSM runs hold their PR like a running
+    # fix container does. Review leases are not fed in here.
+    active_fix_pr_nums = set(fsm_view["pr_nums"])
     for name in containers or []:
         if name.startswith("cfg-agent-pr-fix-"):
             tail = name.removeprefix("cfg-agent-pr-fix-")
@@ -3227,6 +3223,7 @@ def write_output(out, mode):
         "review_recommendations": out.get("review_recommendations", []),
         "fix_recommendations": out.get("fix_recommendations", []),
         "fsm_runs": out.get("fsm_runs", {"in_flight": [], "resumable": []}),
+        "fsm_recommendations": out.get("fsm_recommendations", []),
     }
     json.dump(summary, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")

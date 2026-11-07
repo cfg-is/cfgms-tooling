@@ -136,7 +136,10 @@ class GhCLI:
     def find_open_pr(self, branch):
         rows = self._json(["pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
                            "--json", self.PR_FIELDS, "--limit", "5"])
-        rows = [r for r in (rows or []) if r.get("headRefName", branch) == branch]
+        # A fork PR can carry the same head branch name; it is never this
+        # run's PR (the supervisor pushes only to this repository).
+        rows = [r for r in (rows or []) if r.get("headRefName", branch) == branch
+                and not r.get("isCrossRepository")]
         return rows[0] if rows else None
 
     def merged_prs(self, branch):

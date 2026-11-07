@@ -59,8 +59,10 @@ def sessions_base():
 
 
 def trust_base():
+    """FSM session trust dirs live under <trust base>/fsm/ so the run-dir GC
+    (runindex.gc) can tell them from review / interactive trust dirs."""
     return Path(os.environ.get("CFGMS_AGENT_TRUST_BASE")
-                or Path.home() / ".cache" / "cfgms-agent-trust")
+                or Path.home() / ".cache" / "cfgms-agent-trust") / "fsm"
 
 
 def container_name(mode, target):

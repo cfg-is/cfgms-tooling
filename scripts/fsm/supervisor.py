@@ -11,6 +11,7 @@ Usage:
   supervisor.py run resolve-conflict <PR>  [options]
   supervisor.py resume <RUN_ID>
   supervisor.py status <RUN_ID>
+  supervisor.py abandon <RUN_ID> --reason R   end a crashed run without resuming it
 
 Options:
   --item-id ID        project item: the story spec and Files In Scope are read
@@ -1218,6 +1219,57 @@ def cmd_drive(run_id, services=None, out=None):
         run.release_lock()
 
 
+_ABANDON_REASON_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def cmd_abandon(run_id, reason, out=None):
+    """End a run that is not running and must not be resumed (its work finished
+    elsewhere, or it outlived the crash TTL): record `abandoned` and
+    `terminal_done` (state ABANDONED), release its lease if this host holds
+    it, clear its active-index entry. Never starts a container. Exit 0, 2 on
+    a bad reason or unknown run, 4 when a live supervisor holds the run."""
+    out = out or sys.stdout
+    if not _ABANDON_REASON_RE.match(reason or ""):
+        print(f"invalid abandon reason {reason!r}", file=sys.stderr)
+        return EXIT_USAGE
+    run = statemod.RunDir(run_id)
+    if not run.exists():
+        print(f"unknown run {run_id}", file=sys.stderr)
+        return EXIT_USAGE
+    if any(r.get("type") in ("terminal_done", "abandoned") for r in run.records()):
+        print(f"FSM_ABANDON_SKIPPED:{run_id}:finished", file=out, flush=True)
+        return EXIT_OK
+    try:
+        run.acquire_lock()
+    except statemod.LockBusy:
+        print(f"FSM_ABANDON_SKIPPED:{run_id}:locked", file=out, flush=True)
+        return EXIT_LOCKED
+    try:
+        params = run.params()
+        last = run.last_transition()
+        run.append("abandoned", reason=reason, state=(last or {}).get("to", "PREPARE"))
+        key = params.get("lease_key")
+        lease = "none"
+        if key:
+            helper = adapters.Helper(os.environ.get("CFGMS_FSM_PIPELINE_HELPER") or str(
+                Path(params.get("tooling_root_src") or params.get("tooling_root") or HERE.parent.parent)
+                / "scripts" / "pipeline-helper.sh"))
+            st, _ = helper.lease_status(key)
+            if st == "held_by_me":
+                helper.lease_release(key)
+                lease = "released"
+            else:
+                lease = st
+            run.append("lease", abandon=lease)
+        if params.get("key"):
+            run.clear_active(params["key"])
+        run.append("terminal_done", state="ABANDONED")
+        print(f"FSM_ABANDONED:{run_id}:{reason}:lease={lease}", file=out, flush=True)
+        return EXIT_OK
+    finally:
+        run.release_lock()
+
+
 def _detach():
     """`--detach`: become a session leader and drop every inherited fd above
     stderr. po-act.sh starts the run in the background of a shell whose
@@ -1261,6 +1313,9 @@ def main(argv=None):
     rs.add_argument("--from-snapshot", action="store_true", help=argparse.SUPPRESS)
     st = sub.add_parser("status")
     st.add_argument("run_id")
+    ab = sub.add_parser("abandon")
+    ab.add_argument("run_id")
+    ab.add_argument("--reason", required=True)
     a = ap.parse_args(argv)
 
     if a.cmd == "status":
@@ -1269,6 +1324,9 @@ def main(argv=None):
         print(json.dumps({"run_id": a.run_id, "state": last["to"] if last else "PREPARE",
                           "locked": run.is_locked(), "heartbeat_age": run.heartbeat_age()}))
         return EXIT_OK
+
+    if a.cmd == "abandon":
+        return cmd_abandon(a.run_id, a.reason)
 
     if getattr(a, "detach", False):
         _detach()

@@ -14,10 +14,15 @@ Every run is classified from its run dir, never from container state:
             (`supervisor.py run` creates the dir, snapshots the tooling and
             re-execs before it takes the lock)
   crashed   not done, not locked, past the start grace: resumable with
-            `supervisor.py resume` when this host still holds the lease
+            `po-act.sh dispatch resume` (which re-runs the PREPARE gates)
+  abandoned terminal without finishing: `supervisor.py abandon` recorded it
+            (the work finished elsewhere: story closed, PR merged or closed,
+            item Done), or the run stayed crashed past
+            CFGMS_FSM_CRASHED_TTL_HOURS (24 h). Treated like done.
 
-In flight = live, hung or starting. A cycle must neither launch a second run
-for an in-flight key nor reap its containers, session dirs or run dir.
+In flight = live, hung or starting. Unfinished = in flight or crashed. A
+cycle must neither launch a second run for an unfinished key nor reap an
+unfinished run's containers, session dirs, trust dirs or run dir.
 
 Usage:
   runindex.py list [--json]
@@ -51,7 +56,24 @@ import state as statemod             # noqa: E402
 
 TERMINAL = ("REPORT", "NO_OP", "REFUSED", "FAILED")
 IN_FLIGHT = ("live", "hung", "starting")
+UNFINISHED = IN_FLIGHT + ("crashed",)
+FINISHED = ("done", "abandoned")
 STALE = ("hung", "crashed")
+
+
+def crashed_ttl_secs():
+    try:
+        return float(os.environ.get("CFGMS_FSM_CRASHED_TTL_HOURS", "24")) * 3600
+    except ValueError:
+        return 24 * 3600.0
+
+
+def fsm_trust_base(trust_base=None):
+    """Per-session trust dirs the FSM owns (agent_session.trust_file). Review,
+    interactive and other launches keep theirs directly under the trust base
+    and are never touched here."""
+    return Path(trust_base or os.environ.get("CFGMS_AGENT_TRUST_BASE")
+                or Path.home() / ".cache" / "cfgms-agent-trust") / "fsm"
 
 
 def stale_secs():
@@ -107,6 +129,7 @@ def describe(run_id, base=None, now=None):
         if rec.get("type") == "transition":
             state, reason, frm = rec.get("to", state), rec.get("reason") or "", rec.get("frm", "")
     done = any(r.get("type") == "terminal_done" for r in recs)
+    abandoned = [r for r in recs if r.get("type") == "abandoned"]
     launched = [r for r in recs if r.get("type") == "agent_launched"]
     gates_passed = any(r.get("type") == "transition" and r.get("frm") == "PREPARE"
                        and r.get("event") == "gates_ok" for r in recs)
@@ -114,12 +137,18 @@ def describe(run_id, base=None, now=None):
     hb = run.heartbeat_age()
     created = _mtime(run.p("run.json")) or now
     last = max([t for t in (_mtime(run.state_file), _mtime(run.p("heartbeat")), created) if t])
-    if done:
+    if abandoned:
+        status = "abandoned"
+        state, reason = "ABANDONED", abandoned[-1].get("reason") or reason
+    elif done:
         status = "done"
     elif locked:
         status = "live" if (hb is not None and hb < stale_secs()) else "hung"
     elif hb is None and now - created < start_grace_secs():
         status = "starting"
+    elif now - last >= crashed_ttl_secs():
+        status = "abandoned"
+        state, reason = "ABANDONED", "crashed_ttl"
     else:
         status = "crashed"
     mode = params.get("mode", "")
@@ -159,6 +188,10 @@ def in_flight(runs):
     return [r for r in runs if r["status"] in IN_FLIGHT]
 
 
+def unfinished(runs):
+    return [r for r in runs if r["status"] in UNFINISHED]
+
+
 def launch_status(run_id, base=None):
     """One token for po-act's launch wait:
       LAUNCHED:<container>   an agent container was started
@@ -188,7 +221,7 @@ def find_unfinished(runs, key=None, item_id=None):
     `item_id`: a launch for the same work must not start beside them."""
     out = []
     for r in runs:
-        if r["status"] == "done":
+        if r["status"] in FINISHED:
             continue
         if (key and key in (r["key"], r["lease_key"])) or (item_id and item_id == r["item_id"]):
             out.append(r)
@@ -196,10 +229,10 @@ def find_unfinished(runs, key=None, item_id=None):
 
 
 def protected_session_dirs(runs, sessions_base=None):
-    """Session dir names (<container>-<seq>) of in-flight runs."""
+    """Session dir names (<container>-<seq>) of unfinished runs (crashed included)."""
     base = Path(sessions_base or os.environ.get("CFGMS_AGENT_SESSIONS_BASE")
                 or Path.home() / ".cache" / "cfgms-agent-sessions")
-    live_ids = {r["run_id"] for r in in_flight(runs)}
+    live_ids = {r["run_id"] for r in unfinished(runs)}
     out = []
     try:
         names = sorted(os.listdir(base))
@@ -222,12 +255,15 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
        trust_base=None):
     """Remove only what belongs to finished runs. Returns output lines.
 
-    - run dirs: `done`, not locked, last activity older than retention
+    - run dirs: `done` or `abandoned`, not locked, last activity older than
+      retention
     - active/<key> entries naming a missing or done run
-    - trust dirs (<container>-<seq>, the per-session .claude.json) older than
-      the trust retention whose container is not an in-flight run's
+    - FSM trust dirs (<trust base>/fsm/<container>-<seq>, the per-session
+      .claude.json) older than the trust retention whose container is not an
+      unfinished run's; review / interactive trust dirs are never touched
     Nothing of a live, hung, starting or crashed run is touched: a crashed run
-    is resumable and keeps its run dir until a resume finishes it.
+    is resumable and keeps its run dir until a resume finishes it or it is
+    abandoned.
     """
     now = time.time() if now is None else now
     base = Path(base) if base else statemod.runs_base()
@@ -235,7 +271,7 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
     runs = list_runs(base, now=now)
     by_id = {r["run_id"]: r for r in runs}
     for r in runs:
-        if r["status"] != "done" or r["locked"]:
+        if r["status"] not in FINISHED or r["locked"]:
             continue
         if now - r["last_activity"] < retention_hours * 3600:
             continue
@@ -252,7 +288,7 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
             continue
         rid = statemod.active_run(key, base=base)
         r = by_id.get(rid or "")
-        if r is None or r["status"] == "done":
+        if r is None or r["status"] in FINISHED:
             if not dry_run:
                 try:
                     (active / key).unlink()
@@ -275,9 +311,8 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
             except OSError:
                 pass
         lines.append(f"CLEANED:fsm-launch-log:{name}")
-    tbase = Path(trust_base or os.environ.get("CFGMS_AGENT_TRUST_BASE")
-                 or Path.home() / ".cache" / "cfgms-agent-trust")
-    live_containers = {r["container"] for r in in_flight(runs) if r["container"]}
+    tbase = fsm_trust_base(trust_base)
+    live_containers = {r["container"] for r in unfinished(runs) if r["container"]}
     try:
         tnames = sorted(os.listdir(tbase))
     except FileNotFoundError:
@@ -353,9 +388,15 @@ def main(argv=None):
                              str(age_min), r["key"] or "-"]))
         return 0
     if a.cmd == "show":
-        d = describe(a.run_id)
+        try:
+            d = describe(a.run_id)
+        except Exception as exc:          # unreadable index: callers fail safe
+            print(json.dumps({"run_id": a.run_id, "status": "unknown", "error": type(exc).__name__}))
+            return 1
         if d is None:
-            print(json.dumps({"run_id": a.run_id, "error": "unknown run"}))
+            # no run dir: `missing` (not `unknown`, which means the index
+            # could not be read)
+            print(json.dumps({"run_id": a.run_id, "status": "missing", "error": "unknown run"}))
             return 1
         print(json.dumps(d, indent=2))
         return 0

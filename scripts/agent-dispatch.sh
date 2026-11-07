@@ -83,8 +83,11 @@ AGENT_SESSIONS_MOUNT="/agent-sessions"
 # runindex.py, never by guessing from container state: one run starts several
 # agent and validator containers in turn, and between them none is running.
 FSM_RUNINDEX_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fsm/runindex.py"
+FSM_SUPERVISOR_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fsm/supervisor.py"
 
-# _fsm_run_status <run_id>  — done | live | hung | starting | crashed | unknown
+# _fsm_run_status <run_id>
+#   done | abandoned | live | hung | starting | crashed | missing (no run dir)
+#   | unknown (the index could not be read)
 _fsm_run_status() {
   [[ -n "${1:-}" ]] || { echo unknown; return 0; }
   local info
@@ -104,12 +107,49 @@ _fsm_container_run() {
 #   supervisor reads its exit code and removes it itself, and a resumed run
 #   re-attaches to it. No reaper may remove it. A run dir that no longer exists
 #   (`unknown`) owns nothing.
+#   Fail safe: a run whose state is unknown or whose run dir is missing still
+#   owns its container. Only a run known to be finished (done / abandoned)
+#   releases it.
 _fsm_container_owned() {
   local rid st
   rid=$(_fsm_container_run "$1")
   [[ -n "$rid" ]] || return 1
   st=$(_fsm_run_status "$rid")
-  [[ "$st" != "done" && "$st" != "unknown" ]]
+  [[ "$st" != "done" && "$st" != "abandoned" ]]
+}
+
+# _fsm_finished_reason <issue> <pr> <item_id> <project_queue_script>
+#   Whether the work an FSM run was doing has finished elsewhere. Prints
+#   item_done | story_closed | pr_merged | pr_closed and returns 0; returns 1
+#   (nothing printed) when it is still open; prints <what>_unreadable and
+#   returns 2 when a state cannot be read (callers fail closed).
+_fsm_finished_reason() {
+  local issue="$1" pr="$2" item="$3" pq="$4" st
+  if [[ -n "$item" ]]; then
+    st=$(bash "$pq" get-item "$item" 2>/dev/null | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('status') or '')
+except Exception: print('')" 2>/dev/null || true)
+    [[ -n "$st" ]] || { echo "item_unreadable"; return 2; }
+    [[ "$st" == "Done" ]] && { echo "item_done"; return 0; }
+  fi
+  if [[ -n "$issue" ]]; then
+    st=$(gh api "repos/cfg-is/cfgms/issues/${issue}" --jq .state 2>/dev/null) || st=""
+    case "$st" in
+      closed) echo "story_closed"; return 0 ;;
+      open) ;;
+      *) echo "issue_unreadable"; return 2 ;;
+    esac
+  fi
+  if [[ -n "$pr" ]]; then
+    st=$(gh pr view "$pr" --repo cfg-is/cfgms --json state --jq .state 2>/dev/null) || st=""
+    case "$st" in
+      MERGED) echo "pr_merged"; return 0 ;;
+      CLOSED) echo "pr_closed"; return 0 ;;
+      OPEN) ;;
+      *) echo "pr_unreadable"; return 2 ;;
+    esac
+  fi
+  return 1
 }
 
 # Token reporter mount (Issue #3041). Every entrypoint resolves the reporter
@@ -708,72 +748,6 @@ agent_trust_file() {
   printf '%s' "${dir}/.claude.json"
 }
 
-# mint_agent_creds <num>
-# Creates agent-test/<num> sub-tenant (idempotent) and issues an agent.dev-scoped
-# API key. Writes key value to ${AGENT_CRED_BASE}/<num>/api.key (0600) and the
-# key ID to ${AGENT_CRED_BASE}/<num>/api.key.id (0600).
-# On failure: emits CRED_MINT_FAILED:<reason> and returns non-zero.
-mint_agent_creds() {
-  local num="$1"
-  local cred_dir="${AGENT_CRED_BASE}/${num}"
-  local tenant_id="agent-test/${num}"
-
-  # Create and secure the per-agent cred dir.
-  mkdir -p "$cred_dir"
-  restrict_to_owner 700 "$cred_dir"
-
-  # 1. Create agent-test sub-tenant (idempotent — 409 is success).
-  local create_resp http_code
-  create_resp=$(_tier1_curl POST /api/v1/tenants \
-    -d "{\"id\":\"${num}\",\"name\":\"Agent Test ${num}\",\"parent_id\":\"agent-test\"}" 2>&1) || {
-    # Check if it was a 409 conflict — tenant already exists, continue.
-    if echo "$create_resp" | grep -q "TENANT_EXISTS\|409\|already exists"; then
-      : # idempotent
-    else
-      rm -rf "$cred_dir"
-      echo "CRED_MINT_FAILED:tenant_create:${create_resp}"
-      return 1
-    fi
-  }
-
-  # 2. Issue agent.dev-scoped API key bound to agent-test/<num>.
-  local key_resp key_value key_id
-  key_resp=$(_tier1_curl POST /api/v1/api-keys \
-    -d "{\"name\":\"agent-${num}\",\"role_id\":\"agent.dev\",\"tenant_id\":\"${tenant_id}\"}" 2>&1) || {
-    rm -rf "$cred_dir"
-    echo "CRED_MINT_FAILED:apikey_create:${key_resp}"
-    return 1
-  }
-
-  # Extract key value and ID from the response envelope.
-  key_value=$(echo "$key_resp" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(d.get('data', {}).get('key', '') or d.get('key', ''))
-" 2>/dev/null || true)
-  key_id=$(echo "$key_resp" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(d.get('data', {}).get('id', '') or d.get('id', ''))
-" 2>/dev/null || true)
-
-  if [[ -z "$key_value" || -z "$key_id" ]]; then
-    rm -rf "$cred_dir"
-    local missing_fields=""
-    [[ -z "$key_value" ]] && missing_fields+="key,"
-    [[ -z "$key_id" ]] && missing_fields+="id,"
-    echo "CRED_MINT_FAILED:apikey_parse:missing=${missing_fields%,}"
-    return 1
-  fi
-
-  # 3. Write credential files (600 — no world or group read).
-  printf '%s' "$key_value" > "${cred_dir}/api.key"
-  restrict_to_owner 600 "${cred_dir}/api.key"
-  printf '%s' "$key_id" > "${cred_dir}/api.key.id"
-  restrict_to_owner 600 "${cred_dir}/api.key.id"
-
-  echo "CRED_MINTED:${num}:${key_id}"
-}
 
 # revoke_agent_creds <num>
 # Deletes the API key and suspends the agent-test/<num> sub-tenant.
@@ -1124,7 +1098,10 @@ delete_stale_remote_branch() {
 #   2. Title-pattern fallback: "(Issue #<N>)" or "#<N>" in an open PR title,
 #      which catches agent PRs whose bodies omit the Fixes keyword
 check_existing_prs_for_issue() {
-  local issue_num="$1"
+  # check_existing_prs_for_issue <issue> [strict]
+  #   strict: a failed query prints QUERY_FAILED and returns 2 instead of
+  #   reading as "no open PR" (po-act.sh's duplicate-PR guard fails closed).
+  local issue_num="$1" strict="${2:-}" q_rc=0
   # Test hook: canned output for hermetic unit tests. Format is newline-separated
   # OPEN_PR_EXISTS:<issue>:<pr>:<title> lines (empty = no conflicts).
   if [[ -n "${CFGMS_TEST_MOCK_EXISTING_PRS:-}" ]]; then
@@ -1147,13 +1124,17 @@ check_existing_prs_for_issue() {
         .data.repository.issue.closedByPullRequestsReferences.nodes[]?
         | select(.state == "OPEN")
         | "OPEN_PR_EXISTS:'"$issue_num"':\(.number):\(.title | gsub(":"; " "))"
-      ' 2>/dev/null) || graphql_out=""
+      ' 2>/dev/null) || { graphql_out=""; q_rc=2; }
   # Title-pattern fallback for PRs that reference the issue without Fixes keyword.
   title_out=$(gh pr list --repo cfg-is/cfgms --state open --limit 50 \
         --search "in:title #${issue_num}" \
         --json number,title --jq '
       .[] | "OPEN_PR_EXISTS:'"$issue_num"':\(.number):\(.title | gsub(":"; " "))"
-    ' 2>/dev/null || true)
+    ' 2>/dev/null) || { title_out=""; q_rc=2; }
+  if [[ "$strict" == "strict" && "$q_rc" -ne 0 ]]; then
+    echo "QUERY_FAILED"
+    return 2
+  fi
   printf '%s\n%s\n' "$graphql_out" "$title_out" | grep -v '^$' | sort -u || true
   return 0
 }
@@ -4767,7 +4748,7 @@ PY
     # Find agent containers (running or exited) whose stories no longer need them.
     # A container is stale if its story issue is CLOSED or has project status Failed or Blocked.
     cleaned=0
-    PROJECT_QUEUE="${REPO_ROOT}/.claude/tooling/scripts/project-queue.sh"
+    PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-${REPO_ROOT}/.claude/tooling/scripts/project-queue.sh}"
 
     # Pre-fetch Failed and Blocked issue numbers from project (one query each vs per-container).
     failed_nums=$(bash "$PROJECT_QUEUE" list-by-status "Failed" 2>/dev/null \
@@ -4845,9 +4826,9 @@ PY
     # measured to be independent of whether the PR merged, closed or was
     # blocked, so keying off PR state would leave the same hole.
     #
-    # No credential revoke here, unlike the story loop: mint_agent_creds is only
-    # ever called from the story launch path, so a fix or resolve-conflict
-    # container has no per-agent credential to revoke.
+    # No credential revoke here, unlike the story loop: a per-agent credential
+    # was only ever minted for story containers (the removed launch path), so
+    # a fix or resolve-conflict container has none to revoke.
     pr_reap_now=$(date -u +%s)
     pr_reap_max_age=1800  # 30 minutes, matching cleanup-stale-reviews
     while IFS= read -r container_name; do
@@ -4893,20 +4874,45 @@ PY
     # --- FSM validator containers (cfg-validate-<N>) and run dirs ---
     # A validator is started detached, without --rm, and removed by its
     # supervisor after `docker wait`. Left behind only when the run died
-    # mid-VALIDATE: removed here once its run is done or its run dir is gone.
-    # A validator of an unfinished run (live, hung, starting, or crashed and
-    # resumable) is kept -- resume rebuilds it, a reap would race a live one.
+    # mid-VALIDATE. Removed (rm -f) only when its run is known finished (done
+    # or abandoned); an exited one whose run dir is gone is removed too. A
+    # validator of an unfinished run, of a run whose state cannot be read, or
+    # a running one of a vanished run is kept: a reap could race a live run.
     while IFS= read -r v_name; do
       [[ -z "$v_name" ]] && continue
-      if _fsm_container_owned "$v_name"; then
-        continue
-      fi
+      v_status=$(_fsm_run_status "$(_fsm_container_run "$v_name")")
+      v_running=$(_ledger_docker_inspect '{{.State.Running}}' "$v_name")
+      case "$v_status" in
+        done|abandoned) ;;
+        missing) [[ "$v_running" == "false" ]] || continue ;;
+        *) continue ;;
+      esac
       if docker rm -f "$v_name" >/dev/null 2>&1; then
         echo "CLEANED:validator:${v_name}"
         cleaned=$((cleaned + 1))
       fi
     done < <(docker ps -a --filter "label=cfg-agent=true" --filter "name=cfg-validate-" \
                --format '{{.Names}}' 2>/dev/null || true)
+    # Crashed runs whose work finished elsewhere (item Done, story closed, PR
+    # merged or closed) are abandoned: terminal, lease released, never resumed.
+    # A state that cannot be read leaves the run alone.
+    while IFS=$'\t' read -r c_run c_issue c_pr c_item; do
+      [[ -n "${c_run:-}" ]] || continue
+      c_reason=$(_fsm_finished_reason "$c_issue" "$c_pr" "$c_item" "$PROJECT_QUEUE") || continue
+      c_out=$(CFGMS_FSM_PIPELINE_HELPER="${CFGMS_FSM_PIPELINE_HELPER:-${REPO_ROOT}/.claude/tooling/scripts/pipeline-helper.sh}" \
+        python3 "$FSM_SUPERVISOR_PY" abandon "$c_run" --reason "$c_reason" 2>&1 || true)
+      echo "$c_out"
+      [[ "$c_out" == FSM_ABANDONED:* ]] && cleaned=$((cleaned + 1))
+    done < <(python3 "$FSM_RUNINDEX_PY" list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    runs = json.load(sys.stdin)
+except Exception:
+    runs = []
+for r in runs:
+    if r.get("status") == "crashed":
+        print("\t".join(str(r.get(k) or "") for k in ("run_id", "issue", "pr", "item_id")))
+' 2>/dev/null || true)
     # Finished runs only (terminal_done recorded, lock free, idle past
     # CFGMS_FSM_RUN_RETENTION_HOURS), plus stale active-index entries, launch
     # logs and per-session trust dirs of runs that are not in flight.
@@ -5104,14 +5110,6 @@ PY
     # no gh, no writes).
     [[ $# -eq 1 ]] || { echo "_test-review-refusal-hint requires <reason>"; exit 1; }
     _review_refusal_hint "$1"
-    ;;
-
-  _test-mint-creds)
-    # Hidden test hook for agent-apikey-injection.test.sh (Issue #2124).
-    # Calls mint_agent_creds with the supplied issue number.
-    # Env overrides: CFGMS_TEST_CRED_BASE, CFGMS_TEST_MOCK_TIER1_DIR, CFGMS_TIER1_URL.
-    [[ $# -eq 1 ]] || { echo "_test-mint-creds requires exactly one issue number"; exit 1; }
-    mint_agent_creds "$1"
     ;;
 
   _test-revoke-creds)

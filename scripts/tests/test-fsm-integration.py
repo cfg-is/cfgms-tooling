@@ -151,16 +151,17 @@ class TestRunIndex(unittest.TestCase):
                             done=True, age=48 * 3600)
         new_done = make_run(self.base, "story-2-new", {"key": "story-2"},
                             [("PREPARE", "gates_ok", "AGENT"), ("AGENT", "error", "FAILED")], done=True)
-        crashed = make_run(self.base, "story-3-crashed", {"key": "story-3"},
-                           [("PREPARE", "gates_ok", "AGENT")], age=48 * 3600)
+        crashed = make_run(self.base, "story-3-crashed", {"key": "story-3", "target": "3"},
+                           [("PREPARE", "gates_ok", "AGENT")], age=12 * 3600)
         live = make_run(self.base, "story-4-live", {"key": "story-4", "target": "4"},
                         [("PREPARE", "gates_ok", "AGENT")], heartbeat=1, age=48 * 3600)
         old_done.register_active("story-1")
         live.register_active("story-4")
         trust = self.root / "trust"
-        for name in ("cfg-agent-4-1", "cfg-agent-99-1"):
+        old = time.time() - 48 * 3600
+        for name in ("fsm/cfg-agent-4-1", "fsm/cfg-agent-99-1", "fsm/cfg-agent-3-1",
+                     "cfg-agent-review-pr-5", "cfg-agent-interactive-x"):
             (trust / name).mkdir(parents=True)
-            old = time.time() - 48 * 3600
             os.utime(trust / name, (old, old))
         h = Held(live)
         try:
@@ -174,8 +175,11 @@ class TestRunIndex(unittest.TestCase):
             self.assertTrue(kept.path.exists(), kept.run_id)
         self.assertIn("CLEANED:fsm-active:story-1", lines)
         self.assertTrue((self.base / "active" / "story-4").exists())
-        self.assertFalse((trust / "cfg-agent-99-1").exists())
-        self.assertTrue((trust / "cfg-agent-4-1").exists(), "an in-flight run's trust dir is kept")
+        self.assertFalse((trust / "fsm" / "cfg-agent-99-1").exists())
+        self.assertTrue((trust / "fsm" / "cfg-agent-4-1").exists(), "an in-flight run's trust dir is kept")
+        self.assertTrue((trust / "fsm" / "cfg-agent-3-1").exists(), "a crashed run's trust dir is kept")
+        for other in ("cfg-agent-review-pr-5", "cfg-agent-interactive-x"):
+            self.assertTrue((trust / other).exists(), f"non-FSM trust dir {other} is never touched")
 
     def test_protected_session_dirs(self):
         live = make_run(self.base, "story-4-live", {"key": "story-4"}, [("PREPARE", "gates_ok", "AGENT")],
@@ -183,8 +187,10 @@ class TestRunIndex(unittest.TestCase):
         make_run(self.base, "story-5-done", {"key": "story-5"},
                  [("PREPARE", "gates_ok", "AGENT"), ("AGENT", "error", "FAILED")], done=True)
         sess = self.root / "sessions"
+        make_run(self.base, "story-7-crashed", {"key": "story-7"}, [("PREPARE", "gates_ok", "AGENT")],
+                 age=3600)
         for name, rid in (("cfg-agent-4-1", "story-4-live"), ("cfg-agent-5-1", "story-5-done"),
-                          ("cfg-agent-6", None)):
+                          ("cfg-agent-6", None), ("cfg-agent-7-1", "story-7-crashed")):
             (sess / name).mkdir(parents=True)
             (sess / name / "meta.json").write_text(json.dumps({"run_id": rid} if rid else {}))
         h = Held(live)
@@ -192,7 +198,7 @@ class TestRunIndex(unittest.TestCase):
             got = runindex.protected_session_dirs(runindex.list_runs(self.base), sessions_base=sess)
         finally:
             h.release()
-        self.assertEqual(got, ["cfg-agent-4-1"])
+        self.assertEqual(got, ["cfg-agent-4-1", "cfg-agent-7-1"])
 
 
 class TestPreflight(unittest.TestCase):
@@ -238,9 +244,14 @@ class TestPreflight(unittest.TestCase):
         self.assertTrue(view["in_flight"][0]["agent_launched"])
         res = {e["run_id"]: e["action"] for e in view["resumable"]}
         self.assertEqual(res, {"pr-7-crashed": "hold", "pr-8-crashed": "resume"})
+        recs = {r["run_id"]: (r["action"], r["pr"]) for r in view["recommendations"]}
+        self.assertEqual(recs, {"pr-7-crashed": ("hold", 7), "pr-8-crashed": ("resume", 8)})
+        self.assertIn("dispatch resume pr-8-crashed", [r for r in view["recommendations"]
+                                                         if r["run_id"] == "pr-8-crashed"][0]["reason"])
         self.assertEqual(view["story_nums"], {42})
-        self.assertEqual(view["pr_nums"], {7, 8})
-        self.assertEqual(self.pf.live_pr_lease_nums(rows), {7, 8, 99})
+        # a crashed run's PR is not held off review/fix work, and pr-<N>
+        # leases (review leases included) are not fed in
+        self.assertEqual(view["pr_nums"], set())
 
     def test_stalled_dispatch_skips_stories_with_an_unfinished_run(self):
         in_progress = [{"number": 42, "item_id": "PVTI_42", "title": "a"},
@@ -507,6 +518,7 @@ class TestPoActDispatch(Integration):
         while time.time() < end and "cfg-agent-42" not in (containers.read_text() if containers.exists() else ""):
             time.sleep(0.1)
         self.assertEqual(runindex.describe(rid, base=self.f.runs)["status"], "crashed")
+        self.set_board(status="In Progress")     # the story is still claimed
         rc, out = self.poact("dispatch", "resume", rid)
         self.assertEqual(rc, 0, out)
         self.assertIn(f"FSM_RESUMED:{rid}", out)
@@ -674,6 +686,8 @@ class TestAgentDispatch(Integration):
                                "labels": {"cfg-agent": "true", "run_id": "pr-8-done", "state": "validate"}},
             "cfg-validate-9": {"status": "running", "exit_code": 0, "logs": "",
                                "labels": {"cfg-agent": "true", "run_id": "gone-run", "state": "validate"}},
+            "cfg-validate-10": {"status": "exited", "exit_code": 1, "logs": "",
+                                "labels": {"cfg-agent": "true", "run_id": "gone-run-2", "state": "validate"}},
         })
         s = self.f.gh()
         s["issues"]["42"]["state"] = "CLOSED"     # a closed story would normally be reaped
@@ -687,10 +701,14 @@ class TestAgentDispatch(Integration):
         self.assertIn("KEPT:container:cfg-agent-42:fsm_run_unfinished", out)
         self.assertNotIn("CLEANED:validator:cfg-validate-7", out)
         self.assertIn("CLEANED:validator:cfg-validate-8", out)
-        self.assertIn("CLEANED:validator:cfg-validate-9", out)
+        self.assertNotIn("CLEANED:validator:cfg-validate-9", out,
+                         "a running validator is removed only when its run is known finished")
+        self.assertIn("CLEANED:validator:cfg-validate-10", out,
+                      "an exited validator whose run dir is gone is removed")
         removed = [r["argv"][-1] for r in self.f.records("docker") if r["argv"][:1] == ["rm"]]
         self.assertNotIn("cfg-agent-42", removed)
         self.assertNotIn("cfg-validate-7", removed)
+        self.assertNotIn("cfg-validate-9", removed)
 
     def test_cleanup_container_refuses_an_unfinished_runs_container(self):
         live = make_run(self.f.runs, "pr-50-live", {"mode": "fix-pr", "target": "50", "key": "pr-50"},
@@ -706,6 +724,256 @@ class TestAgentDispatch(Integration):
         self.assertIn("SKIP:container:cfg-agent-pr-fix-50 belongs to an unfinished FSM run", out)
         removed = [r["argv"][-1] for r in self.f.records("docker") if r["argv"][:1] == ["rm"]]
         self.assertEqual(removed, [])
+
+
+class TestReviewFixes(Integration):
+    """PR #8 review fixes: resume gates and abandon, crash TTL, duplicate-PR
+    guard, recovery claim, fail-closed gates, wiring of two guards."""
+
+    def crashed(self, run_id="story-42-crashed", **params):
+        p = {"key": "story-42", "issue": 42, "item_id": L.ITEM, "lease_key": f"story-{L.ITEM}",
+             "target": "42"}
+        p.update(params)
+        return make_run(self.f.runs, run_id, p, [("PREPARE", "gates_ok", "AGENT")], age=3600)
+
+    def no_docker_run(self):
+        return [r["argv"] for r in self.f.records("docker") if r["argv"][:1] == ["run"]] == []
+
+    # --- M1(a): resume re-runs the PREPARE gates ------------------------------
+    def test_resume_abandons_when_the_story_is_closed(self):
+        r = self.crashed()
+        s = self.f.gh()
+        s["issues"]["42"]["state"] = "CLOSED"
+        self.f.gh(s)
+        self.set_board(status="In Progress")
+        rc, out = self.poact("dispatch", "resume", r.run_id)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"FSM_ABANDONED:{r.run_id}:story_closed:lease=released", out)
+        d = runindex.describe(r.run_id, base=self.f.runs)
+        self.assertEqual((d["status"], d["reason"]), ("abandoned", "story_closed"))
+        self.assertEqual(self.helper("lease-release"), [["lease-release", f"story-{L.ITEM}"]])
+        self.assertTrue(self.no_docker_run(), "an abandon never starts an agent")
+        self.assertNotIn("FSM_RESUMED", out)
+
+    def test_resume_abandons_when_the_pr_merged(self):
+        self.f.commit_on(BRANCH, {"src/app.go": "package src\n"})
+        self.f.add_pr(50, BRANCH, "t (Issue #42)", state="MERGED")
+        r = self.crashed("pr-50-crashed", key="pr-50", mode="fix-pr", target="50", pr=50,
+                         lease_key="pr-50")
+        rc, out = self.poact("dispatch", "resume", r.run_id)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"FSM_ABANDONED:{r.run_id}:pr_merged", out)
+        self.assertTrue(self.no_docker_run())
+
+    def test_resume_abandons_when_the_item_is_done(self):
+        r = self.crashed()
+        self.set_board(status="Done")
+        rc, out = self.poact("dispatch", "resume", r.run_id)
+        self.assertIn(f"FSM_ABANDONED:{r.run_id}:item_done", out)
+
+    def test_resume_refused_when_a_state_is_unreadable(self):
+        r = self.crashed(issue=4040)
+        self.set_board(status="In Progress")
+        rc, out = self.poact("dispatch", "resume", r.run_id)
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f"FSM_RESUME_REFUSED:{r.run_id}:issue_unreadable", out)
+        self.assertEqual(runindex.describe(r.run_id, base=self.f.runs)["status"], "crashed")
+        self.assertTrue(self.no_docker_run())
+
+    def test_resume_refused_when_the_item_is_not_in_progress(self):
+        r = self.crashed()
+        self.set_board(status="Ready")
+        rc, out = self.poact("dispatch", "resume", r.run_id)
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f"FSM_RESUME_REFUSED:{r.run_id}:item_status_Ready", out)
+
+    def test_resume_releases_a_lease_it_acquired_when_it_fails(self):
+        r = self.crashed()
+        self.set_board(status="In Progress")
+        dead = self.f.root / "dead-sup.py"
+        dead.write_text("import sys\nsys.exit(1)\n")
+        rc, out = self.poact("dispatch", "resume", r.run_id, FSM_FAKE_LEASE="free",
+                             CFGMS_TEST_FSM_SUPERVISOR=str(dead))
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"FSM_RESUME_FAILED:{r.run_id}:exit_1", out)
+        self.assertEqual(self.helper("lease-acquire"), [["lease-acquire", f"story-{L.ITEM}", "21600"]])
+        self.assertEqual(self.helper("lease-release"), [["lease-release", f"story-{L.ITEM}"]])
+
+    # --- M1(b): crash TTL and cleanup abandon -----------------------------------
+    def test_crashed_past_ttl_is_abandoned_and_gcd(self):
+        old = make_run(self.f.runs, "story-43-old", {"key": "story-43", "target": "43"},
+                       [("PREPARE", "gates_ok", "AGENT")], age=49 * 3600)
+        young = self.crashed()
+        runs = {r["run_id"]: r for r in runindex.list_runs(self.f.runs)}
+        self.assertEqual((runs["story-43-old"]["status"], runs["story-43-old"]["reason"]),
+                         ("abandoned", "crashed_ttl"))
+        self.assertEqual(runs[young.run_id]["status"], "crashed")
+        lines = runindex.gc(self.f.runs, retention_hours=24, trust_base=self.f.root / "trust")
+        self.assertIn("CLEANED:fsm-run:story-43-old:ABANDONED", lines)
+        self.assertFalse(old.path.exists())
+        self.assertTrue(young.path.exists())
+
+    def test_cleanup_abandons_crashed_runs_whose_work_finished(self):
+        r = self.crashed()
+        open_run = self.crashed("story-44-crashed", key="story-44", issue=44, item_id="PVTI_other",
+                                lease_key="story-PVTI_other", target="44")
+        s = self.f.gh()
+        s["issues"]["42"]["state"] = "CLOSED"
+        s["issues"]["44"] = {"title": "x", "body": "", "state": "OPEN"}
+        self.f.gh(s)
+        self.set_board(status="In Progress")
+        rc, out = self.dispatch_sh("cleanup-stale")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"FSM_ABANDONED:{r.run_id}:story_closed", out)
+        self.assertEqual(runindex.describe(r.run_id, base=self.f.runs)["status"], "abandoned")
+        self.assertEqual(runindex.describe(open_run.run_id, base=self.f.runs)["status"], "crashed")
+
+    # --- M3: duplicate-PR guard ---------------------------------------------------
+    def test_dispatch_refused_when_another_open_pr_references_the_issue(self):
+        self.f.add_pr(77, "feature/someone-else", "unrelated title")
+        s = self.f.gh()
+        s["prs"][-1]["closes"] = [42]
+        self.f.gh(s)
+        rc, out = self.poact("dispatch", "42")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("DISPATCH_REFUSED:42:open_pr_exists:77", out)
+        self.assertEqual(self.helper("lease-acquire"), [])
+        self.assertEqual(runindex.list_runs(self.f.runs), [])
+
+    def test_dispatch_refused_on_a_title_reference_too(self):
+        self.f.add_pr(78, "feature/other", "fix the thing (#42)")
+        rc, out = self.poact("dispatch", "42")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("DISPATCH_REFUSED:42:open_pr_exists:78", out)
+
+    def test_duplicate_pr_lookup_fails_closed(self):
+        for fail in ("graphql", "search"):
+            rc, out = self.poact("dispatch", "42", FSM_FAKE_GH_FAIL=fail)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("DISPATCH_REFUSED:42:open_pr_check_failed", out)
+        self.assertEqual(self.helper("lease-acquire"), [])
+
+    def test_fix_excludes_its_own_pr_but_not_another(self):
+        self.f.commit_on(BRANCH, {"src/app.go": "package src\n\nfunc A() int { return 2 }\n"})
+        self.f.add_pr(50, BRANCH, "src: change A (Issue #42)", body="Fixes #42")
+        s = self.f.gh()
+        s["prs"][-1]["closes"] = [42]
+        self.f.gh(s)
+        self.f.add_pr(51, "feature/dup", "dup (#42)")
+        rc, out = self.poact("dispatch-fix", "50")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("DISPATCH_FIX_REFUSED:50:open_pr_exists:51", out)
+        rc, out = self.poact("resolve-conflict", "50")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("RESOLVE_CONFLICT_REFUSED:50:open_pr_exists:51", out)
+        self.assertEqual(self.helper("lease-acquire"), [])
+
+    # --- recovery claim (stalled re-dispatch) -------------------------------------
+    def test_recover_claims_an_in_progress_story_only_with_the_flag(self):
+        self.set_board(status="In Progress")
+        rc, out = self.poact("dispatch", "42")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not found in project queue with Ready status", out)
+        self.f.plan({"agent": [GOOD]})
+        rc, out = self.poact("dispatch", "--recover", "42")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"RECOVERED:{L.ITEM}", out)
+        self.assertIn("DISPATCHED:42", out)
+        self.wait_done(self.run_id_of(out))
+
+    def test_recover_does_not_bypass_an_unfinished_run(self):
+        self.crashed()
+        self.set_board(status="In Progress")
+        rc, out = self.poact("dispatch", "--recover", "42")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_SKIPPED:42:run_resumable:story-42-crashed", out)
+        self.assertEqual(self.helper("lease-acquire"), [])
+
+    # --- minors ---------------------------------------------------------------------
+    def test_unfinished_gate_fails_closed_on_an_unreadable_index(self):
+        bad = self.f.root / "runs-is-a-file"
+        bad.write_text("x")
+        rc, out = self.poact("dispatch", "42", CFGMS_FSM_RUNS_DIR=str(bad))
+        self.assertEqual(rc, 3, out)
+        self.assertIn("DISPATCH_REFUSED:42:run_index_unreadable", out)
+        self.assertEqual(self.helper("lease-acquire"), [])
+
+    def test_branch_dispatch_refuses_an_untrusted_branch_pr(self):
+        branch = "feature/outside"
+        self.f.commit_on(branch, {"src/new.go": "package src\n"})
+        self.f.add_pr(60, branch, "outside work", author="ext")
+        rc, out = self.poact("dispatch", "--branch", branch, CFGMS_TEST_COLLAB_PERM="read")
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f"DISPATCH_REFUSED:{branch}:external_author", out)
+        self.assertEqual(self.helper("lease-acquire"), [])
+
+    def test_find_open_pr_ignores_fork_prs(self):
+        self.f.add_pr(61, BRANCH, "fork", author="dev")
+        s = self.f.gh()
+        s["prs"][-1]["isCrossRepository"] = True
+        self.f.gh(s)
+        self.f.commit_on(BRANCH, {"src/new.go": "package src\n"})
+        code = ("import sys; sys.path.insert(0, %r); import adapters; "
+                "print(adapters.GhCLI('cfg-is/cfgms').find_open_pr(%r))" % (str(L.FSM), BRANCH))
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=self.env())
+        self.assertEqual(p.stdout.strip(), "None", p.stdout + p.stderr)
+
+    def test_fix_agent_label_only_when_an_agent_launched(self):
+        self.f.commit_on(BRANCH, {"src/app.go": "package src\n\nfunc A() int { return 2 }\n"})
+        self.f.add_pr(50, BRANCH, "src: change A (Issue #42)", body="Fixes #42")
+        rc, out = self.poact("dispatch-fix", "50", FSM_FAKE_CAPACITY="CAPACITY_FULL:ram:slots=0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_FIX_DEFERRED:50:capacity", out)
+        labels = [r["argv"] for r in self.f.records("gh") if "labels[]=fix-agent" in r["argv"]]
+        self.assertEqual(labels, [])
+
+    def test_launch_pending_then_refused_shows_as_stalled(self):
+        """A run reported FSM_LAUNCH_PENDING that later ends REFUSED leaves the
+        story In Progress; the next preflight reports it as a stalled dispatch."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "pf_pending", str(L.TOOLING / "scripts" / "po-cycle-preflight.py"))
+        pf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pf)
+        make_run(self.f.runs, "story-42-refused", {"key": "story-42", "issue": 42, "item_id": L.ITEM},
+                 [("PREPARE", "gate_refused", "REFUSED")], done=True)
+        view = pf.fsm_run_view(runindex.list_runs(self.f.runs), [], host="testhost")
+        stalled = pf.compute_stalled_dispatches(
+            [{"number": 42, "item_id": L.ITEM, "title": "t"}], [], [],
+            fsm_story_nums=view["story_nums"], fsm_item_ids=view["item_ids"])
+        self.assertEqual([x["number"] for x in stalled], [42])
+
+    # --- M4: wiring of two guards -----------------------------------------------------
+    def test_a_run_does_not_reserve_a_slot_for_itself(self):
+        cap = self.f.root / "cap-dispatch.sh"
+        cap.write_text("#!/usr/bin/env bash\n"
+                       f"n=$(python3 {RUNINDEX} reserved)\n"
+                       "if [[ \"$n\" -ge 1 ]]; then echo \"CAPACITY_FULL:reserved=$n\"; "
+                       "else echo CAPACITY_OK:slots=1; fi\n")
+        self.f.plan({"agent": [GOOD]})
+        rc, out, rid = self.f.cli("run", "issue", "42", "--model", "m", "--effort", "e",
+                                  "--item-id", L.ITEM, env_extra={"CFGMS_FSM_AGENT_DISPATCH": str(cap)})
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("DISPATCH_DEFERRED", out)
+        self.assertEqual(runindex.describe(rid, base=self.f.runs)["state"], "REPORT")
+
+    def test_cleanup_stale_keeps_an_unfinished_runs_old_session_dir(self):
+        live = make_run(self.f.runs, "story-42-live", {"key": "story-42"},
+                        [("PREPARE", "gates_ok", "AGENT")], heartbeat=1)
+        sess = self.f.root / "sessions"
+        old = time.time() - 90 * 86400
+        for name, rid in (("cfg-agent-42-1", "story-42-live"), ("cfg-agent-9-1", None)):
+            (sess / name).mkdir(parents=True)
+            (sess / name / "meta.json").write_text(json.dumps({"run_id": rid} if rid else {}))
+            os.utime(sess / name, (old, old))
+        h = Held(live)
+        try:
+            rc, out = self.dispatch_sh("cleanup-stale")
+        finally:
+            h.release()
+        self.assertIn("KEPT:session-dir:cfg-agent-42-1:fsm_run_unfinished", out)
+        self.assertTrue((sess / "cfg-agent-42-1").exists())
+        self.assertFalse((sess / "cfg-agent-9-1").exists())
 
 
 class TestSupervisorLeaseHandoff(unittest.TestCase):

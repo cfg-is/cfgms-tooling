@@ -94,12 +94,38 @@ def main():
     if argv[:2] == ["auth", "token"]:
         print(os.environ.get("FSM_FAKE_GH_TOKEN", "ghp_fake"))
         return 0
+    fail = os.environ.get("FSM_FAKE_GH_FAIL", "")
+    if argv[:2] == ["api", "graphql"] and "closedByPullRequestsReferences" in " ".join(argv):
+        # check_existing_prs_for_issue: open PRs whose body closes the issue
+        # ("closes": [N] on a fixture PR), already shaped like its --jq output
+        if fail == "graphql":
+            return 1
+        num = [a for a in argv if a.startswith("num=")]
+        n = int(num[0][4:]) if num else -1
+        for p in s["prs"]:
+            if p["state"] == "OPEN" and n in p.get("closes", []):
+                print(f"OPEN_PR_EXISTS:{n}:{p['number']}:{p['title'].replace(':', ' ')}")
+        return 0
+    if argv[:2] == ["pr", "list"] and "--search" in argv:
+        # title search fallback: "#N" in an open PR title
+        if fail == "search":
+            return 1
+        q = opt(argv, "--search") or ""
+        n = q.split("#", 1)[1] if "#" in q else ""
+        for p in s["prs"]:
+            if p["state"] == "OPEN" and n and f"#{n}" in p["title"]:
+                print(f"OPEN_PR_EXISTS:{n}:{p['number']}:{p['title'].replace(':', ' ')}")
+        return 0
     if argv[:2] == ["pr", "list"]:
         head, st = opt(argv, "--head"), opt(argv, "--state", "open").upper()
         rows = [pr_out(p) for p in s["prs"] if p["headRefName"] == head and p["state"] == st]
         if st == "MERGED":
             rows = [{"number": p["number"], "headRefOid": p.get("mergedHeadOid", p["headRefOid"])}
                     for p in rows]
+        if opt(argv, "--jq") == ".[0] // empty":     # agent-dispatch.sh _branch_author_gate
+            if rows:
+                print(json.dumps(rows[0]))
+            return 0
         print(json.dumps(rows))
         return 0
     if argv[:2] == ["pr", "view"]:

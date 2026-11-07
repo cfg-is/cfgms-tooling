@@ -64,6 +64,8 @@ cat > "${SANDBOX}/bin/gh" <<'GH_EOF'
 case "$1 ${2:-}" in
   "auth token") echo "mock-gh-token" ;;
   "issue view") echo "[]" ;;
+  "api graphql") exit 0 ;;                       # duplicate-PR guard: no closing PR
+  "pr list") exit 0 ;;                           # duplicate-PR guard: no title match
   "api repos/cfg-is/cfgms/issues/"*)
     case "$2" in
       */77) echo "open" ;;

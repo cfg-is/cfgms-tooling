@@ -190,6 +190,10 @@ check_eq "a stall is reported only once (hung -> crashed)" "${out}" ""
 out="$(fsm 'r43\tdone\tFAILED\tcfg-agent-pr-fix-43\t9\tpr-43\n')"
 check_eq "the stalled run's terminal state is still reported" "${out}" \
   "EVENT container_exited name=cfg-agent-pr-fix-43 run=r43 state=FAILED"
+out="$(fsm 'r46\tcrashed\tAGENT\tcfg-agent-46\t30\tstory-46\n')"
+out="$(fsm 'r46\tabandoned\tABANDONED\tcfg-agent-46\t31\tstory-46\n')"
+check_eq "an abandoned run emits container_exited once" "${out}" \
+  "EVENT container_exited name=cfg-agent-46 run=r46 state=ABANDONED"
 out="$(fsm 'r44\tlive\tSNAPSHOT\tcfg-agent-44\t0\tstory-44\n')"
 out="$(fsm '')"
 check_eq "an open run whose run dir disappeared emits container_exited state=gone" "${out}" \

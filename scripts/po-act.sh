@@ -9,7 +9,10 @@
 #                                   lease + claim (Ready->In Progress) + FSM supervisor run (DESIGN.md §11)
 #   dispatch --branch <BRANCH> [--issue N]   Branch-mode FSM run
 #   dispatch status [RUN_ID]        List FSM runs, or show one
-#   dispatch resume <RUN_ID>        Resume a crashed FSM run (its lease held here, or free/expired)
+#   dispatch resume <RUN_ID>        Resume a crashed FSM run after re-running its PREPARE gates;
+#                                   abandons it when its work finished elsewhere
+#   dispatch --recover <STORY|ITEM> Stalled-dispatch recovery: may claim an item still In Progress
+#                                   once no unfinished run exists and the story lease is free
 #   claim <ITEM_ID>                 Lease + claim a Ready story (Ready->In Progress) for in-session work; CLAIMED/CLAIM_LOST
 #   release-story <ITEM_ID>         Release a story lease held by an in-session (§7) self-dispatch after the PR is up
 #   dispatch-fix <PR_NUM>           Fix cycle: author gate + image/capacity gates + lease pr-<N> + FSM fix-pr run
@@ -597,13 +600,18 @@ for job in jobs or []:
 #   CLAIMED:<item> (rc 0) or CLAIM_LOST:<item> (rc 1). This is the dashboard-state
 #   transition and a same-host overlap guard; cross-host safety comes from the
 #   lease the caller already holds, NOT from this read-then-set.
+#   With DISPATCH_RECOVER=1 (`dispatch --recover`) an item still In Progress is
+#   claimed too: the caller has proved no unfinished run and no other holder of
+#   the story lease exists, so the In Progress status is a stalled leftover.
 _claim_item() {
   local item_id="$1" cur
   cur=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
     | python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('status') or '')
 except Exception: print('')" 2>/dev/null || echo "")
-  if [ "$cur" != "Ready" ]; then
+  if [[ "${DISPATCH_RECOVER:-0}" == "1" && "$cur" == "In Progress" ]]; then
+    echo "RECOVERED:${item_id} (In Progress, no unfinished run, lease free)"
+  elif [ "$cur" != "Ready" ]; then
     echo "CLAIM_LOST:${item_id} (status=${cur:-unknown})"
     return 1
   fi
@@ -729,14 +737,19 @@ print("OK")
   return 0
 }
 
-# _fsm_unfinished_gate <label> <skip_prefix> [--key K] [--item-id I]
+# _fsm_unfinished_gate <label> <skip_prefix> <refuse_prefix> [--key K] [--item-id I]
 #   Skip (return 1) when a run for the same work is not finished: an in-flight
 #   one (live, hung, starting) must not get a second supervisor beside it, and
 #   a crashed one is resumed (`dispatch resume <RUN_ID>`), not replaced.
+#   Refuse (return 3) when the run index cannot be read.
 _fsm_unfinished_gate() {
-  local label="$1" prefix="$2"; shift 2
+  local label="$1" prefix="$2" refuse="$3"; shift 3
   local rows run status state
-  rows=$(python3 "$FSM_RUNINDEX" find "$@" 2>/dev/null || true)
+  # An unreadable run index refuses: it cannot prove no run is working.
+  if ! rows=$(python3 "$FSM_RUNINDEX" find "$@" 2>/dev/null); then
+    echo "${refuse}:${label}:run_index_unreadable"
+    return 3
+  fi
   [[ -n "$rows" ]] || return 0
   IFS=$'\t' read -r run status state <<< "$(head -1 <<< "$rows")"
   if [[ "$status" == "crashed" ]]; then
@@ -884,19 +897,43 @@ _fsm_outcome() {
   esac
 }
 
-# _pr_item_id <pr>  — the project item of a PR's story (feature/story-<N> or
-#   Fixes #N -> project-queue.sh item-for-issue). Prints it, or returns 1.
-_pr_item_id() {
-  local pr="$1" json branch body link num
+# _pr_story_num <pr>  — the story number of a PR (feature/story-<N> branch or
+#   Fixes/Closes/Resolves #N in the body). Prints it, or returns 1.
+_pr_story_num() {
+  local pr="$1" json branch body link
   json=$(gh pr view "$pr" --repo "$REPO" --json headRefName,body 2>/dev/null) || return 1
   branch=$(printf '%s' "$json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('headRefName') or '')" 2>/dev/null || true)
   body=$(printf '%s' "$json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body') or '')" 2>/dev/null || true)
   link=$(resolve_pr_story_or_item "$branch" "$body")
   case "$link" in
-    STORY:*) num="${link#STORY:}" ;;
+    STORY:*) printf '%s\n' "${link#STORY:}" ;;
     *) return 1 ;;
   esac
-  bash "$PROJECT_QUEUE" item-for-issue "$num" 2>/dev/null | tail -1 | grep -E '^PVTI_[A-Za-z0-9_-]+$' || return 1
+}
+
+# _item_for_issue <issue>  — the project item of an issue (project-queue.sh
+#   item-for-issue), or returns 1.
+_item_for_issue() {
+  bash "$PROJECT_QUEUE" item-for-issue "$1" 2>/dev/null | tail -1 | grep -E '^PVTI_[A-Za-z0-9_-]+$' || return 1
+}
+
+# _dup_pr_gate <issue> <label> <refuse_prefix> [<own_pr>]
+#   Refuse (return 1, <refuse_prefix>:<label>:open_pr_exists:<PR>) when any
+#   open PR on any branch references the issue (closing reference or "#N" in
+#   the title; check_existing_prs_for_issue), except <own_pr> in fix-pr and
+#   resolve-conflict. A failed lookup refuses (open_pr_check_failed).
+_dup_pr_gate() {
+  local issue="$1" label="$2" prefix="$3" own="${4:-}" out other
+  if ! out=$(check_existing_prs_for_issue "$issue" strict); then
+    echo "${prefix}:${label}:open_pr_check_failed"
+    return 1
+  fi
+  other=$(grep '^OPEN_PR_EXISTS:' <<< "$out" | cut -d: -f3 | grep -vxF "${own:-none}" | head -1 || true)
+  if [[ -n "$other" ]]; then
+    echo "${prefix}:${label}:open_pr_exists:${other}"
+    return 1
+  fi
+  return 0
 }
 
 # _item_parent_epic <item_id>  — "Parent epic: #N" from the item body, or empty.
@@ -927,20 +964,49 @@ _lease_holder_state() {
 }
 
 # _fsm_resume <run_id>
-#   Resume a crashed run (not done, run lock free). Needs the run's lease: held
-#   by this host, or free/expired and re-acquired here; held by another host
-#   means that host has the work and the run is left alone.
+#   Resume a crashed run (not finished, run lock free). The PREPARE gates are
+#   re-run first and nothing starts until all pass:
+#     - work finished elsewhere (item Done, story closed, PR merged or closed):
+#       the run is abandoned (terminal, lease released): FSM_ABANDONED, exit 0
+#     - a state that cannot be read: FSM_RESUME_REFUSED:<run>:<what>_unreadable, 3
+#     - issue/item mode whose item is not In Progress: refused, 3
+#     - capacity: DISPATCH_DEFERRED, 0; stale image: refused, 3
+#     - lease: held here, or free/expired and re-acquired here; held by another
+#       host refuses (that host has the work)
+#   A lease acquired here is released again if the resume fails.
 _fsm_resume() {
-  local run_id="$1" info status lease_key holder pid i
+  local run_id="$1" info status lease_key mode issue pr item holder pid i why frc acquired="" item_status ttl
   [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "FSM_RESUME_REFUSED:${run_id}:invalid_run_id"; return 3; }
   info=$(python3 "$FSM_RUNINDEX" show "$run_id" 2>/dev/null) || { echo "FSM_RESUME_REFUSED:${run_id}:unknown_run"; return 3; }
-  status=$(printf '%s' "$info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')")
-  lease_key=$(printf '%s' "$info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('lease_key') or '')")
+  IFS=$'\t' read -r status lease_key mode issue pr item <<< "$(printf '%s' "$info" | python3 -c "import json,sys
+d = json.load(sys.stdin)
+print('\t'.join(str(d.get(k) or '-') for k in ('status', 'lease_key', 'mode', 'issue', 'pr', 'item_id')))")"
+  [[ "$lease_key" == "-" ]] && lease_key=""
+  [[ "$issue" == "-" ]] && issue=""
+  [[ "$pr" == "-" ]] && pr=""
+  [[ "$item" == "-" ]] && item=""
   case "$status" in
-    done) echo "FSM_RESUME_SKIPPED:${run_id}:done"; return 0 ;;
+    done|abandoned) echo "FSM_RESUME_SKIPPED:${run_id}:${status}"; return 0 ;;
     crashed) ;;
     *) echo "FSM_RESUME_SKIPPED:${run_id}:in_flight:${status}"; return 4 ;;
   esac
+  frc=0; why=$(_fsm_finished_reason "$issue" "$pr" "$item" "$PROJECT_QUEUE") || frc=$?
+  if [[ "$frc" == 0 ]]; then
+    CFGMS_FSM_PIPELINE_HELPER="$PIPELINE_HELPER" python3 "$FSM_SUPERVISOR" abandon "$run_id" --reason "$why"
+    return 0
+  elif [[ "$frc" == 2 ]]; then
+    echo "FSM_RESUME_REFUSED:${run_id}:${why}"
+    return 3
+  fi
+  if [[ -n "$item" && ( "$mode" == "issue" || "$mode" == "item" ) ]]; then
+    item_status=$(bash "$PROJECT_QUEUE" get-item "$item" 2>/dev/null | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('status') or '')
+except Exception: print('')" 2>/dev/null || true)
+    if [[ "$item_status" != "In Progress" ]]; then
+      echo "FSM_RESUME_REFUSED:${run_id}:item_status_$(printf '%s' "${item_status:-unknown}" | tr -c 'A-Za-z0-9' '_')"
+      return 3
+    fi
+  fi
   if ! cap=$(_capacity_ok); then
     echo "DISPATCH_DEFERRED:${run_id}:resources (${cap})"
     return 0
@@ -950,7 +1016,12 @@ _fsm_resume() {
     holder=$(_lease_holder_state "$lease_key")
     case "$holder" in
       me) ;;
-      free|expired) _acquire_lease "$lease_key" "$LEASE_TTL_PR" "$run_id" || return 0 ;;
+      free|expired)
+        ttl="$LEASE_TTL_PR"
+        [[ "$lease_key" == story-* || "$lease_key" == branch-* ]] && ttl="$LEASE_TTL_STORY"
+        _acquire_lease "$lease_key" "$ttl" "$run_id" || return 0
+        acquired="$lease_key"
+        ;;
       *) echo "FSM_RESUME_REFUSED:${run_id}:lease_${holder}"; return 3 ;;
     esac
   fi
@@ -970,8 +1041,10 @@ _fsm_resume() {
     return 0
   fi
   rc=0; wait "$pid" || rc=$?
+  [[ -n "$acquired" ]] && _release_lease "$acquired"
   echo "FSM_RESUME_FAILED:${run_id}:exit_${rc} (log ${FSM_LAST_LOG})"
-  return "${rc/#0/1}"
+  [[ "$rc" == 0 ]] && rc=1
+  return "$rc"
 }
 
 cmd="${1:-}"
@@ -990,6 +1063,14 @@ fi
 
 case "$cmd" in
   dispatch)
+    DISPATCH_RECOVER=0
+    if [[ "${1:-}" == "--recover" ]]; then
+      # Stalled-dispatch recovery (po.md Step 6a): the story is still In
+      # Progress but nothing works on it. The unfinished-run gate, the
+      # duplicate-PR gate and the story lease below must all pass first.
+      DISPATCH_RECOVER=1
+      shift
+    fi
     arg="${1:?story number or item_id required}"
     PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../../.." && pwd)/.claude/tooling/scripts/project-queue.sh}"
 
@@ -1016,12 +1097,20 @@ case "$cmd" in
           [[ "$branch_issue" =~ ^[0-9]+$ ]] || { echo "ERROR: --issue must be numeric"; exit 2; }
         fi
         sanitized=$(sanitize_branch "$branch")
+        # External-author gate (Issue #4343): an open PR from this branch must
+        # be by a trusted author at its current head before any run reads it.
+        branch_trust=$(_branch_author_gate "$branch")
+        if [[ "$branch_trust" != "internal" ]]; then
+          echo "DISPATCH_REFUSED:${branch}:external_author (${branch_trust})"
+          exit 3
+        fi
         if ! cap=$(_capacity_ok); then
           echo "DISPATCH_DEFERRED:${branch}:resources (${cap})"
           exit 0
         fi
         _fsm_image_gate "$branch" DISPATCH_REFUSED || exit 3
-        _fsm_unfinished_gate "$branch" DISPATCH_SKIPPED --key "branch-${sanitized}" || exit 0
+        gate_rc=0; _fsm_unfinished_gate "$branch" DISPATCH_SKIPPED DISPATCH_REFUSED --key "branch-${sanitized}" || gate_rc=$?
+        [[ "$gate_rc" == 0 ]] || exit "$(( gate_rc == 3 ? 3 : 0 ))"
         _acquire_lease "branch-${sanitized}" "$LEASE_TTL_STORY" "$branch" || exit 0
         trap '_release_lease "branch-${sanitized}"' ERR
         branch_args=(--container-target "branch-${sanitized}")
@@ -1076,11 +1165,13 @@ except Exception: print('')" 2>/dev/null || echo "")
       if [[ -n "$resolved_item_id" ]]; then
         item_id="$resolved_item_id"
       else
-        item_id=$(bash "$PROJECT_QUEUE" list-by-status Ready 2>/dev/null \
+        lookup_status="Ready"
+        [[ "$DISPATCH_RECOVER" == "1" ]] && lookup_status="In Progress"
+        item_id=$(bash "$PROJECT_QUEUE" list-by-status "$lookup_status" 2>/dev/null \
           | jq -r --argjson num "$story" '.[] | select(.issue_num == $num) | .item_id' \
           2>/dev/null || true)
         if [ -z "${item_id:-}" ]; then
-          echo "ERROR: story #${story} not found in project queue with Ready status" >&2
+          echo "ERROR: story #${story} not found in project queue with ${lookup_status} status" >&2
           exit 1
         fi
       fi
@@ -1089,7 +1180,11 @@ except Exception: print('')" 2>/dev/null || echo "")
       # same rule; this keeps a direct dispatch from skipping it).
       _deps_gate "$item_id" "$story" "$story" || exit 3
       # An unfinished run for this story is resumed or left alone, never doubled.
-      _fsm_unfinished_gate "$story" DISPATCH_SKIPPED --key "story-${story}" --item-id "$item_id" || exit 0
+      gate_rc=0; _fsm_unfinished_gate "$story" DISPATCH_SKIPPED DISPATCH_REFUSED --key "story-${story}" --item-id "$item_id" || gate_rc=$?
+      [[ "$gate_rc" == 0 ]] || exit "$(( gate_rc == 3 ? 3 : 0 ))"
+      # No second PR for the story: any open PR, on any branch, that references
+      # the issue refuses the launch (a WIP draft is resumed with dispatch-fix).
+      _dup_pr_gate "$story" "$story" DISPATCH_REFUSED || exit 3
       # Acquire the story lease before any side effect so a second host's
       # out-of-phase cycle can't dispatch the same existing Ready issue.
       _acquire_lease "story-${item_id}" "$LEASE_TTL_STORY" "${story}" || exit 0
@@ -1103,7 +1198,8 @@ except Exception: print('')" 2>/dev/null || echo "")
       # the draft directly.)
       item_id="$arg"
       _deps_gate "$item_id" "$item_id" || exit 3
-      _fsm_unfinished_gate "$item_id" DISPATCH_SKIPPED --item-id "$item_id" || exit 0
+      gate_rc=0; _fsm_unfinished_gate "$item_id" DISPATCH_SKIPPED DISPATCH_REFUSED --item-id "$item_id" || gate_rc=$?
+      [[ "$gate_rc" == 0 ]] || exit "$(( gate_rc == 3 ? 3 : 0 ))"
       # Acquire the story lease BEFORE materialize — materialize-issue mints a
       # fresh GitHub issue every call, so two racing hosts would otherwise create
       # two issues (+ two branches/runs/PRs) for the same draft.
@@ -1210,11 +1306,14 @@ except Exception: print('')" 2>/dev/null || echo "")
     fi
     _fsm_image_gate "$pr" DISPATCH_FIX_REFUSED || exit 3
     # The run reads the spec from the story's project item, never issue text.
-    if ! fix_item=$(_pr_item_id "$pr"); then
+    if ! fix_story=$(_pr_story_num "$pr") || ! fix_item=$(_item_for_issue "$fix_story"); then
       echo "DISPATCH_FIX_REFUSED:${pr}:no_story_item"
       exit 3
     fi
-    _fsm_unfinished_gate "pr-${pr}" DISPATCH_FIX_SKIPPED --key "pr-${pr}" || exit 0
+    gate_rc=0; _fsm_unfinished_gate "pr-${pr}" DISPATCH_FIX_SKIPPED DISPATCH_FIX_REFUSED --key "pr-${pr}" || gate_rc=$?
+    [[ "$gate_rc" == 0 ]] || exit "$(( gate_rc == 3 ? 3 : 0 ))"
+    # No other open PR (this one excluded) may reference the story.
+    _dup_pr_gate "$fix_story" "$pr" DISPATCH_FIX_REFUSED "$pr" || exit 3
     # Cross-host PR lease — pr-<N> is shared by review/fix/resolve (mutually
     # exclusive ops on one PR). If another host already holds it, skip cleanly.
     _acquire_lease "pr-${pr}" "$LEASE_TTL_PR" "pr-${pr}" || exit 0
@@ -1222,8 +1321,8 @@ except Exception: print('')" 2>/dev/null || echo "")
     trap '_release_lease "pr-${pr}"' ERR
     rc=0; _fsm_launch "$pr" fix-pr "$pr" "pr-${pr}" --item-id "$fix_item" || rc=$?
     trap - ERR
-    if [[ "$rc" == "0" ]] && ! grep -q '^DISPATCH_DEFERRED:' "$FSM_LAST_LOG" 2>/dev/null; then
-      # Best-effort PR dashboard label while the fix run is in flight. Display
+    if [[ "$rc" == "0" && "$FSM_LAST_STATUS" == LAUNCHED:* ]]; then
+      # Best-effort PR dashboard label once a fix agent actually started. Display
       # only: the cron never reads it. cleanup-stale reconciles it off once no
       # unfinished run holds the PR. REST API, not `gh pr edit --add-label`
       # (that also queries the deprecated Projects-classic field and fails).
@@ -1254,11 +1353,14 @@ except Exception: print('')" 2>/dev/null || echo "")
       exit 0
     fi
     _fsm_image_gate "$pr" RESOLVE_CONFLICT_REFUSED || exit 3
-    if ! fix_item=$(_pr_item_id "$pr"); then
+    if ! fix_story=$(_pr_story_num "$pr") || ! fix_item=$(_item_for_issue "$fix_story"); then
       echo "RESOLVE_CONFLICT_REFUSED:${pr}:no_story_item"
       exit 3
     fi
-    _fsm_unfinished_gate "pr-${pr}" RESOLVE_CONFLICT_SKIPPED --key "pr-${pr}" || exit 0
+    gate_rc=0; _fsm_unfinished_gate "pr-${pr}" RESOLVE_CONFLICT_SKIPPED RESOLVE_CONFLICT_REFUSED --key "pr-${pr}" || gate_rc=$?
+    [[ "$gate_rc" == 0 ]] || exit "$(( gate_rc == 3 ? 3 : 0 ))"
+    # No other open PR (this one excluded) may reference the story.
+    _dup_pr_gate "$fix_story" "$pr" RESOLVE_CONFLICT_REFUSED "$pr" || exit 3
     # Cross-host PR lease (same pr-<N> key as review/fix — they never run together
     # on one PR). Skip cleanly if another host holds it.
     _acquire_lease "pr-${pr}" "$LEASE_TTL_PR" "pr-${pr}" || exit 0
