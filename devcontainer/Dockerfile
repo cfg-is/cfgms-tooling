@@ -44,8 +44,7 @@ ARG TARGETARCH
 # aborts the build instead of being masked by the default /bin/sh (dash has no
 # pipefail) — which would silently proceed with an empty/partial download (e.g.
 # a 404 on an unpublished Node major would otherwise let apt install Debian's
-# stock Node 18). truffleHog below keeps its explicit `|| true` to stay
-# best-effort by design.
+# stock Node 18).
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # System dependencies. No `sudo`: the egress firewall (iptables/dnsmasq) is
@@ -172,13 +171,16 @@ RUN set -eu; \
        -o "$GOPATH/bin/nancy" \
     && chmod +x "$GOPATH/bin/nancy"
 
-# truffleHog (optional, best-effort secret scanning — pinned release archive,
-# per-architecture SHA-256 from trufflehog_<ver>_checksums.txt at
-# https://github.com/trufflesecurity/trufflehog/releases/download/<ver>/trufflehog_<ver>_checksums.txt
-# `|| true` is deliberate: the tool is optional, so a download or checksum
-# failure leaves it absent rather than failing the image build. Nothing
-# unverified is ever extracted or installed.
-RUN ( set -eu; \
+# truffleHog -- the generic secret scanner of the FSM harness's secret scan
+# (scripts/fsm/secrets_scan.py, scripts/fsm/DESIGN.md §6.4). The supervisor
+# runs it from this image (secrets_scan.image_scanner_hook: `docker run --rm
+# --network none --entrypoint trufflehog`, the scan dir mounted read-only), so
+# it must be on PATH. Required: a download or checksum failure fails the
+# build, and nothing unverified is ever extracted or installed. Pinned release archive, v3.99.7 (published
+# 2026-10-24); per-architecture SHA-256 values copied from the release's
+# trufflehog_3.99.7_checksums.txt asset at
+# https://github.com/trufflesecurity/trufflehog/releases/download/v3.99.7/trufflehog_3.99.7_checksums.txt
+RUN set -eu; \
     TRUFFLEHOG_VERSION='v3.99.7'; \
     case "$TARGETARCH" in \
       amd64) TRUFFLEHOG_SHA256='bdbea0508e439b144f49de14e775908de5f902f3d14ea7ae8354bae72b0b72ef' ;; \
@@ -191,8 +193,8 @@ RUN ( set -eu; \
     printf '%s  /tmp/%s\n' "${TRUFFLEHOG_SHA256}" "${ARCHIVE}" | sha256sum -c -; \
     tar -xzf "/tmp/${ARCHIVE}" -C /tmp trufflehog; \
     install -m 0755 /tmp/trufflehog /usr/local/bin/trufflehog; \
-    rm -f "/tmp/${ARCHIVE}" /tmp/trufflehog \
-    ) || true
+    rm -f "/tmp/${ARCHIVE}" /tmp/trufflehog; \
+    trufflehog --version
 
 # Claude Code — exempt from this repo's pin-and-cooldown rule (every other
 # tool below still follows it; see dependency-pin-check.yml). Founder
@@ -392,6 +394,17 @@ COPY .claude/tooling/devcontainer/agent-context.sh /usr/local/bin/agent-context.
 COPY .claude/tooling/devcontainer/dnsmasq-allowlist-base.conf /etc/dnsmasq-allowlist-base.conf
 COPY .claude/tooling/devcontainer/dnsmasq-allowlist.d/ /etc/dnsmasq-allowlist.d/
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-env.sh /usr/local/bin/entrypoint.sh
+
+# FSM harness (scripts/fsm/DESIGN.md §7, §8): the agent-session and validator
+# entrypoints and the prompt templates are baked into the image, never read
+# from a workspace or a candidate tree. scripts/fsm/agent_session.py and
+# scripts/fsm/validator.py launch containers with `--entrypoint` set to these
+# paths; the image's default ENTRYPOINT below is unchanged.
+COPY .claude/tooling/devcontainer/fsm-agent-entrypoint.sh /usr/local/bin/fsm-agent-entrypoint.sh
+COPY .claude/tooling/devcontainer/fsm-validate-entrypoint.sh /usr/local/bin/fsm-validate-entrypoint.sh
+COPY .claude/tooling/devcontainer/fsm/prompts/ /usr/local/share/cfgms-agent/fsm/prompts/
+RUN chmod 0755 /usr/local/bin/fsm-agent-entrypoint.sh /usr/local/bin/fsm-validate-entrypoint.sh \
+    && chmod -R a+rX,go-w /usr/local/share/cfgms-agent/fsm
 
 # Token reporter (Issue #3028/#3041) — baked into the harness so accounting is a
 # property of the image, never of the branch under dispatch/review. A PR branch
