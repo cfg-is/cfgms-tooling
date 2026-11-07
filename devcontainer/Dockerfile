@@ -411,9 +411,10 @@ RUN chmod 0755 /usr/local/bin/fsm-agent-entrypoint.sh /usr/local/bin/fsm-validat
 # that predates this reporter (or edits/deletes it) must not disable its own
 # telemetry. The review dispatch path additionally bind-mounts .claude/tooling/metrics
 # fresh from the host at runtime (see agent-dispatch.sh review-pr), the same
-# no-rebuild-required pattern already used for review-entrypoint.sh; this bake
-# covers the entrypoint.sh dev/fix/branch paths, which only pick up script
-# changes on image rebuild anyway.
+# no-rebuild-required pattern already used for review-entrypoint.sh. Dev, fix
+# and resolve sessions run under the FSM supervisor, which runs this reporter
+# on the host over a copy of each session dir; the baked copy serves the
+# containers that report from inside.
 COPY .claude/tooling/metrics/token_report.py .claude/tooling/metrics/pricing.json /usr/local/share/cfgms-metrics/
 
 # Per-segment model routing (Issue #3030) — same rule as the reporter above:

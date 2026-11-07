@@ -431,6 +431,8 @@ test_prompts_outputs_and_prohibitions() {
     done
     out=$(cat "$PROMPTS/fix.md")
     assert_contains "$out" "/fsm/out/noop.txt" "fix: instructs noop.txt when nothing is actionable"
+    out=$(cat "$PROMPTS/common.md")
+    assert_contains "$out" "includeTests: false" "story-review runs without its test lens (the supervisor validates)"
     for f in "$PROMPTS"/*.md; do
         out=$(cat "$f")
         assert_not_contains "$out" "git push" "$(basename "$f"): no git push"

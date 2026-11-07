@@ -84,12 +84,17 @@ Workflow({
   name: "story-review",
   args: {
     testTarget: "test-agent-complete",
+    includeTests: false,
     includeAcceptanceChecker: false,
     storyRef: "<the issue #, item id or PR from session.json>",
     changedFiles: [<every path you changed: `git diff --name-only $(git merge-base origin/develop HEAD)` plus `git ls-files --others --exclude-standard`>]
   }
 })
 ```
+
+`includeTests: false` skips the review's own test-runner lens: the
+supervisor runs `make test-agent-complete` in its validator on exactly the
+tree it will publish. Run the suites your change touches yourself.
 
 Its verdict only helps you converge: act on its findings, but do not write
 any marker or claim from it. The supervisor validates independently.

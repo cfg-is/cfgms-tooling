@@ -8,7 +8,9 @@
 # All render_* functions accept JSON on their first arg and print markdown to
 # stdout. All fetch_* functions print JSON to stdout; callers capture via $().
 #
-# This file is sourced by .claude/tooling/devcontainer/entrypoint.sh. Do not `exit` from here.
+# Sourced by fsm-agent-entrypoint.sh and scripts/review-entrypoint.sh (and by
+# agent-dispatch.sh on the host for ac_resolve_agent_model). Do not `exit`
+# from here.
 
 # ----------------------------------------------------------------------------
 # Fetch helpers
