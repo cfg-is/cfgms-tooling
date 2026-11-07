@@ -72,6 +72,7 @@ Lock maintenance (run from the PO cron):
 Distributed leases (multi-host cron coordination — atomic git-ref lock):
   lease-acquire <key> [ttl_seconds]              Try to claim <key>; ACQUIRED/RECLAIMED (rc0), HELD (rc1), ACQUIRE_ERROR (rc2)
   lease-release <key>                            Release <key> (idempotent)
+  lease-renew <key> [ttl_seconds]                Extend a lease this host holds; RENEWED (rc0), NOT_HOLDER (rc1), RENEW_ERROR (rc2)
   lease-status <key>                             HELD:<holder>:exp:expired | FREE
   lease-list                                     TSV of all live leases: key, holder, exp, expired
   lease-gc                                       Delete all expired lease refs (run from cleanup-stale)
@@ -750,6 +751,46 @@ PYEOF
       echo "FREE:${key}"
     fi
     exit 0
+    ;;
+
+  lease-renew)
+    # lease-renew <key> [ttl_seconds]  -- extend a lease this host holds.
+    # RENEWED:<key>:<holder>:exp=<exp>    (rc 0)
+    # NOT_HOLDER:<key>:<current holder>   (rc 1) -- free, or held by someone else
+    # RENEW_ERROR:<key>:<detail>          (rc 2)
+    # The new lease commit has the current one as its parent and the ref is
+    # moved with force=false, so the update is a compare-and-swap: it fails if
+    # another host reclaimed the ref in between.
+    key=$(printf '%s' "${1:?Usage: lease-renew <key> [ttl_seconds]}" | tr -c 'A-Za-z0-9._-' '-')
+    ttl="${2:-3600}"
+    owner="${REPO%%/*}"; name="${REPO##*/}"
+    holder="${CFGMS_HOST_ID:-$(hostname 2>/dev/null || echo unknown)}"
+    if ! cur_sha=$(gh api "repos/${owner}/${name}/git/ref/cfgms-lease/${key}" --jq '.object.sha' 2>/dev/null); then
+      cur_sha=""
+    fi
+    if [ -z "$cur_sha" ]; then echo "NOT_HOLDER:${key}:none"; exit 1; fi
+    cur_msg=$(gh api "repos/${owner}/${name}/git/commits/${cur_sha}" --jq '.message' 2>/dev/null || true)
+    cur_holder=$(printf '%s' "$cur_msg" | grep -oE 'holder=[^ ]+' | head -1 | cut -d= -f2)
+    if [ "${cur_holder:-}" != "$holder" ]; then
+      echo "NOT_HOLDER:${key}:${cur_holder:-unknown}"; exit 1
+    fi
+    now=$(date +%s); exp=$(( now + ttl ))
+    empty_tree="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    msg="cfgms-lease key=${key} holder=${holder} acquired=${now} exp=${exp}"
+    commit_sha=$(gh api -X POST "repos/${owner}/${name}/git/commits" \
+      -f message="$msg" -f tree="$empty_tree" -f "parents[]=${cur_sha}" --jq '.sha' 2>/dev/null || true)
+    if [ -z "$commit_sha" ]; then
+      echo "RENEW_ERROR:${key}:could not create lease commit object"; exit 2
+    fi
+    if gh api -X PATCH "repos/${owner}/${name}/git/refs/cfgms-lease/${key}" \
+        -f sha="$commit_sha" -F force=false >/dev/null 2>&1; then
+      echo "RENEWED:${key}:${holder}:exp=${exp}"; exit 0
+    fi
+    now_sha=$(gh api "repos/${owner}/${name}/git/ref/cfgms-lease/${key}" --jq '.object.sha' 2>/dev/null || true)
+    if [ "$now_sha" != "$cur_sha" ]; then
+      echo "NOT_HOLDER:${key}:moved"; exit 1
+    fi
+    echo "RENEW_ERROR:${key}:ref update failed"; exit 2
     ;;
 
   lease-status)

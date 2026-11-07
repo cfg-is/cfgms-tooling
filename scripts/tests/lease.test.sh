@@ -155,6 +155,21 @@ check_contains "expired lease → RECLAIMED" "$out" "RECLAIMED:stale-key"
 check_rc "reclaim rc 0" "$rc" "0"
 run lease-release stale-key >/dev/null
 
+# 8b. lease-renew: holder extends; another host cannot; a free key is not renewed
+run lease-acquire renew-key 60 >/dev/null
+out="$(run lease-renew renew-key 7200)"; rc=$?
+check_rc "lease-renew by holder" "$rc" 0
+check_contains "lease-renew reports RENEWED" "$out" "RENEWED:renew-key:test-host:exp="
+exp_now=$(run lease-status renew-key | grep -oE 'exp=[0-9]+' | cut -d= -f2)
+check_rc "renewed exp is ~2h out" "$(( exp_now > $(date +%s) + 7000 ))" 1
+rc=0; out="$(PATH="$FAKE_BIN:$PATH" CFGMS_HOST_ID="other-host" bash "$HELPER" lease-renew renew-key 7200)" || rc=$?
+check_rc "lease-renew by another host is refused" "$rc" 1
+check_contains "lease-renew names the holder" "$out" "NOT_HOLDER:renew-key:test-host"
+run lease-release renew-key >/dev/null
+rc=0; out="$(run lease-renew renew-key 7200)" || rc=$?
+check_rc "lease-renew of a free key is refused" "$rc" 1
+check_contains "lease-renew of a free key" "$out" "NOT_HOLDER:renew-key:none"
+
 # 9. lease-gc collects an expired lease
 run lease-acquire gc-key -5 >/dev/null
 out="$(run lease-gc)"
