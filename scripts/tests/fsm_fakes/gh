@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Fake `gh` for the FSM supervisor tests.
+
+State (PRs, issues, permissions) lives in $FSM_FAKE_GH_STATE. Every call is
+logged to $FSM_FAKE_LOG with its argv and the full text of any --body-file /
+-F body=@file argument, so tests can assert what would have been published.
+PR headRefOid is read live from the fixture remote ($FSM_FAKE_REMOTE).
+
+$FSM_FAKE_GH_KILL_ON=pr-create makes the first `gh pr create` SIGKILL its
+parent (the supervisor) before creating anything: a real crash between the
+push and PR-create sub-steps.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ["FSM_FAKE_GH_STATE"])
+LOG = os.environ.get("FSM_FAKE_LOG")
+
+
+def load():
+    try:
+        return json.loads(STATE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"prs": [], "issues": {}, "permissions": {}, "next": 100}
+
+
+def save(s):
+    STATE.write_text(json.dumps(s, indent=1))
+
+
+def opt(argv, name, default=None):
+    if name in argv:
+        i = argv.index(name)
+        return argv[i + 1] if i + 1 < len(argv) else default
+    return default
+
+
+def head_oid(branch):
+    remote = os.environ.get("FSM_FAKE_REMOTE")
+    if not remote:
+        return ""
+    proc = subprocess.run(["/usr/bin/git", "ls-remote", remote, f"refs/heads/{branch}"],
+                          capture_output=True, env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1"))
+    line = proc.stdout.decode().strip()
+    return line.split("\t")[0] if line else ""
+
+
+def pr_out(pr):
+    d = dict(pr)
+    d["headRefOid"] = head_oid(pr["headRefName"])
+    d.setdefault("reviews", [])
+    return d
+
+
+def main():
+    argv = sys.argv[1:]
+    texts = []
+    for i, a in enumerate(argv):
+        if a == "--body-file" and i + 1 < len(argv):
+            texts.append(Path(argv[i + 1]).read_text())
+        if a.startswith("body=@"):
+            texts.append(Path(a[6:]).read_text())
+    if LOG:
+        with open(LOG, "a") as fh:
+            fh.write(json.dumps({"tool": "gh", "argv": argv, "texts": texts,
+                                 "gh_token_env": bool(os.environ.get("GH_TOKEN"))}) + "\n")
+    s = load()
+    if argv[:2] == ["auth", "token"]:
+        print(os.environ.get("FSM_FAKE_GH_TOKEN", "ghp_fake"))
+        return 0
+    if argv[:2] == ["pr", "list"]:
+        head, st = opt(argv, "--head"), opt(argv, "--state", "open").upper()
+        rows = [pr_out(p) for p in s["prs"] if p["headRefName"] == head and p["state"] == st]
+        if st == "MERGED":
+            rows = [{"number": p["number"], "headRefOid": p.get("mergedHeadOid", p["headRefOid"])}
+                    for p in rows]
+        print(json.dumps(rows))
+        return 0
+    if argv[:2] == ["pr", "view"]:
+        n = int(argv[2])
+        for p in s["prs"]:
+            if p["number"] == n:
+                print(json.dumps(pr_out(p)))
+                return 0
+        return 1
+    if argv[:2] == ["issue", "view"]:
+        iss = s["issues"].get(argv[2])
+        if not iss:
+            return 1
+        print(json.dumps(dict(iss, number=int(argv[2]))))
+        return 0
+    if argv[:2] == ["pr", "create"]:
+        marker = STATE.with_name("killed-once")
+        if os.environ.get("FSM_FAKE_GH_KILL_ON") == "pr-create" and not marker.exists():
+            marker.write_text("1")
+            os.kill(os.getppid(), signal.SIGKILL)
+            time.sleep(5)
+            return 1
+        n = s["next"]
+        s["next"] += 1
+        s["prs"].append({"number": n, "headRefName": opt(argv, "--head"), "title": opt(argv, "--title"),
+                         "body": texts[0] if texts else "", "isDraft": "--draft" in argv,
+                         "state": "OPEN", "url": f"https://github.com/cfg-is/cfgms/pull/{n}",
+                         "author": {"login": "cfg-agent"}, "mergeable": "MERGEABLE", "comments": []})
+        save(s)
+        print(f"https://github.com/cfg-is/cfgms/pull/{n}")
+        return 0
+    if argv[0] == "api":
+        path = [a for a in argv[1:] if not a.startswith("-") and "/" in a and "=" not in a]
+        path = path[0] if path else ""
+        if "/collaborators/" in path:
+            login = path.split("/collaborators/")[1].split("/")[0]
+            print(s["permissions"].get(login, "admin"))
+            return 0
+        if "/pulls/" in path:
+            n = int(path.rsplit("/", 1)[1])
+            for p in s["prs"]:
+                if p["number"] == n:
+                    t = opt(argv, "-f")
+                    if t and t.startswith("title="):
+                        p["title"] = t[6:]
+                    if texts:
+                        p["body"] = texts[0]
+            save(s)
+            print("{}")
+            return 0
+        return 0
+    if argv[:2] == ["pr", "ready"]:
+        for p in s["prs"]:
+            if p["number"] == int(argv[2]):
+                p["isDraft"] = False
+        save(s)
+        return 0
+    if argv[:2] == ["pr", "comment"]:
+        for p in s["prs"]:
+            if p["number"] == int(argv[2]):
+                p["comments"].append({"body": texts[0] if texts else ""})
+        save(s)
+        return 0
+    if argv[:2] == ["issue", "comment"]:
+        return 0
+    if argv[:2] == ["pr", "checks"]:
+        print("[]")
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

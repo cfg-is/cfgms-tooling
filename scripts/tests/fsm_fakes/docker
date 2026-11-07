@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Fake `docker` for the FSM supervisor tests.
+
+Records every invocation (argv + whether GitHub credentials were in the client
+environment) to $FSM_FAKE_LOG as JSON lines, keeps container state under
+$FSM_FAKE_STATE, and simulates:
+
+  agent containers   (label state=agent)    apply the next entry of
+                     $FSM_FAKE_PLAN["agent"] to the mounted workspace / out dir
+  validator          (label state=validate) record the clone's staged tree and
+                     HEAD; verdict from $FSM_FAKE_PLAN["validate"] (list of
+                     exit codes) or, by default, exit 2 when any work-tree
+                     file contains FAIL_VALIDATION
+
+The simulated agent uses /usr/bin/git directly: it plays the agent, so its git
+calls are not the supervisor's and stay out of the git-wrapper log.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REAL_GIT = "/usr/bin/git"
+STATE = Path(os.environ["FSM_FAKE_STATE"])
+LOG = os.environ.get("FSM_FAKE_LOG")
+STATE.mkdir(parents=True, exist_ok=True)
+
+
+def log(rec):
+    if LOG:
+        with open(LOG, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+
+def load(name, default):
+    p = STATE / name
+    try:
+        return json.loads(p.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save(name, data):
+    (STATE / name).write_text(json.dumps(data, indent=1))
+
+
+def plan():
+    p = os.environ.get("FSM_FAKE_PLAN")
+    return json.loads(Path(p).read_text()) if p and Path(p).exists() else {}
+
+
+def parse_run(argv):
+    mounts, env, labels, name = {}, [], {}, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--name":
+            name = argv[i + 1]; i += 2; continue
+        if a in ("-v", "--volume"):
+            spec = argv[i + 1].split(":")
+            if len(spec) >= 2:
+                mounts[spec[1]] = spec[0]
+            i += 2; continue
+        if a in ("-e", "--env"):
+            env.append(argv[i + 1]); i += 2; continue
+        if a == "--label":
+            k, _, v = argv[i + 1].partition("=")
+            labels[k] = v; i += 2; continue
+        i += 1
+    return name, mounts, env, labels
+
+
+def secret():
+    return os.environ.get("FSM_FAKE_CLAUDE_TOKEN", "")
+
+
+def apply_agent(actions, ws, out):
+    code = 0
+    for act in actions:
+        op = act["op"]
+        if op == "write":
+            p = ws / act["path"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(act["content"].replace("{SECRET}", secret()))
+        elif op == "append":
+            p = ws / act["path"]
+            with open(p, "a") as fh:
+                fh.write(act["content"])
+        elif op == "delete":
+            (ws / act["path"]).unlink()
+        elif op == "symlink":
+            p = ws / act["path"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(act["target"], p)
+        elif op == "bytes":
+            p = ws / act["path"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x" * int(act["size"]))
+        elif op == "nested_repo":
+            p = ws / act["path"]
+            p.mkdir(parents=True, exist_ok=True)
+            env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(STATE))
+            subprocess.run([REAL_GIT, "init", "-q", str(p)], check=True, env=env)
+            (p / "f.txt").write_text("x\n")
+            subprocess.run([REAL_GIT, "-C", str(p), "add", "f.txt"], check=True, env=env)
+            subprocess.run([REAL_GIT, "-C", str(p), "-c", "user.name=a", "-c", "user.email=a@a",
+                            "commit", "-qm", "n"], check=True, env=env)
+        elif op == "resolve_markers":
+            p = ws / act["path"]
+            keep, out_lines, state = act.get("keep", "both"), [], None
+            for line in p.read_text().splitlines(keepends=True):
+                if line.startswith("<<<<<<<"):
+                    state = "ours"; continue
+                if line.startswith("=======") and state:
+                    state = "theirs"; continue
+                if line.startswith(">>>>>>>") and state:
+                    state = None; continue
+                if state is None or keep == "both" or keep == state:
+                    out_lines.append(line)
+            p.write_text("".join(out_lines))
+        elif op == "out":
+            (out / act["name"]).write_text(act["content"].replace("{SECRET}", secret()))
+        elif op == "out_symlink":
+            os.symlink(act["target"], out / act["name"])
+        elif op == "touch_agent_git":
+            # an agent tampering with its own .git (hooks/config): must never matter
+            hooks = ws / ".git" / "hooks"
+            hooks.mkdir(parents=True, exist_ok=True)
+            (hooks / "pre-commit").write_text("#!/bin/sh\necho PWNED > /dev/null\n")
+            with open(ws / ".git" / "config", "a") as fh:
+                fh.write("[core]\n\tfsmonitor = /bin/false\n")
+        elif op == "exit":
+            code = int(act["code"])
+    return code
+
+
+def push_develop(hook):
+    remote = os.environ["FSM_FAKE_REMOTE"]
+    work = STATE / "devpush"
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(STATE))
+    if work.exists():
+        subprocess.run(["rm", "-rf", str(work)], check=True)
+    subprocess.run([REAL_GIT, "clone", "-q", "-b", "develop", remote, str(work)], check=True, env=env)
+    p = work / hook["path"]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(hook["content"])
+    subprocess.run([REAL_GIT, "-C", str(work), "add", "-A"], check=True, env=env)
+    subprocess.run([REAL_GIT, "-C", str(work), "-c", "user.name=d", "-c", "user.email=d@d",
+                    "commit", "-qm", "develop moved"], check=True, env=env)
+    subprocess.run([REAL_GIT, "-C", str(work), "push", "-q", "origin", "develop"], check=True, env=env)
+
+
+def run_validate(clone):
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(STATE))
+    g = lambda *a: subprocess.run([REAL_GIT, "--git-dir", str(clone / ".git"), "--work-tree",
+                                   str(clone)] + list(a), capture_output=True, env=env
+                                  ).stdout.decode().strip()
+    rec = {"validated_tree": g("write-tree"), "head": g("rev-parse", "HEAD"),
+           "origin_develop": g("rev-parse", "refs/remotes/origin/develop")}
+    found = []
+    for root, dirs, files in os.walk(clone):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for f in files:
+            fp = Path(root) / f
+            try:
+                if not fp.is_symlink() and "FAIL_VALIDATION" in fp.read_text(errors="replace"):
+                    found.append(str(fp.relative_to(clone)))
+            except OSError:
+                pass
+    rec["fail_markers"] = found
+    return rec
+
+
+def main():
+    argv = sys.argv[1:]
+    gh_env = [k for k in ("GH_TOKEN", "GITHUB_TOKEN") if os.environ.get(k)]
+    log({"tool": "docker", "argv": argv, "gh_env": gh_env,
+         "claude_token_env": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))})
+    containers = load("containers.json", {})
+    if not argv:
+        return 1
+    cmd = argv[0]
+    if cmd == "run":
+        name, mounts, env, labels = parse_run(argv)
+        counters = load("counters.json", {"agent": 0, "validate": 0})
+        pl = plan()
+        kind = labels.get("state")
+        logs = ""
+        code = 0
+        if kind == "agent":
+            idx = counters["agent"]
+            counters["agent"] += 1
+            sessions = pl.get("agent", [])
+            actions = sessions[idx] if idx < len(sessions) else []
+            ws, out = Path(mounts["/workspace"]), Path(mounts["/fsm/out"])
+            ctxdir = Path(mounts["/fsm/context"])
+            log({"tool": "docker-agent", "seq": labels.get("seq"), "kind": labels.get("kind"),
+                 "has_git": (ws / ".git").is_dir(),
+                 "failure_md": (ctxdir / "failure.md").read_text() if (ctxdir / "failure.md").exists() else ""})
+            code = apply_agent(actions, ws, out)
+            logs = f"agent session {idx} done\n"
+        elif kind == "validate":
+            idx = counters["validate"]
+            counters["validate"] += 1
+            clone = Path(mounts["/fsm/candidate"])
+            rec = run_validate(clone)
+            codes = pl.get("validate")
+            if codes is not None and idx < len(codes):
+                code = int(codes[idx])
+            else:
+                code = 2 if rec["fail_markers"] else 0
+            rec.update({"tool": "docker-validate", "index": idx, "exit": code})
+            log(rec)
+            logs = "make test-agent-complete\n" + "".join(
+                f"FAIL: marker in {f}\n" for f in rec["fail_markers"]) + f"exit {code}\n"
+            for hook in pl.get("validate_hooks", {}).get(str(idx), []):
+                push_develop(hook)
+        save("counters.json", counters)
+        containers[name] = {"status": "exited", "exit_code": code, "logs": logs}
+        save("containers.json", containers)
+        print(f"cid-{name}")
+        return 0
+    if cmd == "wait":
+        c = containers.get(argv[1])
+        if not c:
+            print("Error: No such container", file=sys.stderr)
+            return 1
+        print(c["exit_code"])
+        return 0
+    if cmd == "logs":
+        c = containers.get(argv[-1])
+        if not c:
+            return 1
+        sys.stdout.write(c["logs"])
+        return 0
+    if cmd == "rm":
+        containers.pop(argv[-1], None)
+        save("containers.json", containers)
+        return 0
+    if cmd == "kill":
+        return 0 if argv[-1] in containers else 1
+    if cmd == "inspect":
+        c = containers.get(argv[-1])
+        if not c:
+            return 1
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
+        if "State.Status" in fmt:
+            print(f"{c['status']} {c['exit_code']}")
+        else:
+            print(f"cid-{argv[-1]}")
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

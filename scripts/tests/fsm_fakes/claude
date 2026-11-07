@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake claude: the supervisor must never run it on the host. Records the call.
+printf '{"tool":"claude","argv":"%s"}\n' "$*" >> "${FSM_FAKE_LOG:-/dev/null}"
+exit 0
