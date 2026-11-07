@@ -5,11 +5,20 @@
 # All actions target the cfg-is/cfgms repo and the develop branch queue.
 #
 # Subcommands:
-#   dispatch <STORY_NUM>            Fresh story: lease + claim (Ready->In Progress) + check-conflicts + clone + launch
+#   dispatch <STORY_NUM>            Fresh story: gates (image, capacity, Dependencies, unfinished run) +
+#                                   lease + claim (Ready->In Progress) + FSM supervisor run (DESIGN.md §11)
+#   dispatch --branch <BRANCH> [--issue N]   Branch-mode FSM run
+#   dispatch status [RUN_ID]        List FSM runs, or show one
+#   dispatch resume <RUN_ID>        Resume a crashed FSM run (its lease held here, or free/expired)
 #   claim <ITEM_ID>                 Lease + claim a Ready story (Ready->In Progress) for in-session work; CLAIMED/CLAIM_LOST
 #   release-story <ITEM_ID>         Release a story lease held by an in-session (§7) self-dispatch after the PR is up
-#   dispatch-fix <PR_NUM>           Fix cycle: lease pr-<N> + remove stale container + clone-pr + launch
-#   resolve-conflict <PR_NUM>       Conflict resolution: lease pr-<N> + author-gate + clone-pr + launch resolve-conflict agent
+#   dispatch-fix <PR_NUM>           Fix cycle: author gate + image/capacity gates + lease pr-<N> + FSM fix-pr run
+#   resolve-conflict <PR_NUM>       Conflict resolution: same gates + lease pr-<N> + FSM resolve-conflict run
+#
+# Exit codes of the launch subcommands: 0 launched or deferred (a
+# DISPATCH_DEFERRED / *_DEFERRED / *_SKIPPED line says which), 1 the run
+# FAILED before launching, 2 usage, 3 refused (*_REFUSED line), 4 run locked by
+# a live supervisor, 10 credentials deferral, 75 interrupted (resumable).
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
 #   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
@@ -37,18 +46,16 @@ set -euo pipefail
 REPO="cfg-is/cfgms"
 DISPATCH="${CFGMS_TEST_DISPATCH:-$(dirname "$0")/agent-dispatch.sh}"
 
-# Reuse prepare_session_dir + AGENT_SESSIONS_* config from agent-dispatch.sh
-# (Issue #3051) instead of duplicating the session-dir logic for the docker run
-# this script inlines below. Sourcing (not shelling out) is required because
-# the dispatch case below builds its own `docker run` rather than calling
-# agent-dispatch.sh launch — see the "Inlined from agent-dispatch.sh launch"
-# comment there. agent-dispatch.sh guards its own command dispatch behind a
-# BASH_SOURCE[0]==$0 check, so sourcing it only defines functions/vars and does
-# not execute its case statement against our args. Deliberately sources the
-# REAL file, not "$DISPATCH": tests set CFGMS_TEST_DISPATCH to a throwaway mock
-# with no such guard, and sourcing that would run the mock's case statement
-# against po-act.sh's own args instead. Source BEFORE setting WORKTREE_BASE
-# below so this script's own value (not agent-dispatch.sh's) wins.
+# Reuse helpers and config from agent-dispatch.sh: the image build-inputs
+# hash, branch validation, PR story-link resolution, the ledger/cycle lock
+# helper and REPO_ROOT. Sourcing (not shelling out) is required to reach those
+# function definitions. agent-dispatch.sh guards its own command dispatch
+# behind a BASH_SOURCE[0]==$0 check, so sourcing it only defines functions/vars
+# and does not execute its case statement against our args. Deliberately
+# sources the REAL file, not "$DISPATCH": tests set CFGMS_TEST_DISPATCH to a
+# throwaway mock with no such guard, and sourcing that would run the mock's
+# case statement against po-act.sh's own args instead. Source BEFORE setting
+# WORKTREE_BASE below so this script's own value (not agent-dispatch.sh's) wins.
 # shellcheck source=agent-dispatch.sh
 source "$(dirname "$0")/agent-dispatch.sh"
 
@@ -642,6 +649,331 @@ _host_serves_env() {
   [[ "$caps" == *",${env},"* ]]
 }
 
+# ── FSM supervisor launch path (DESIGN.md §11) ─────────────────────────────
+# dispatch / dispatch-fix / resolve-conflict (and `dispatch --branch`) have ONE
+# launch path: scripts/fsm/supervisor.py, started detached. This script keeps
+# the gates that must hold before a lease is taken (image staleness, capacity,
+# Dependencies, author trust, an unfinished run on the same work), acquires
+# the lease, hands it to the run (`--lease-handoff`), and waits until the run
+# has launched its first agent (or passed its gates without one, as
+# resolve-conflict does) or ended. From the handoff on, the run owns the lease
+# and releases it on every terminal state.
+FSM_DIR="$(cd "$(dirname "$0")" && pwd)/fsm"
+FSM_SUPERVISOR="${CFGMS_TEST_FSM_SUPERVISOR:-${FSM_DIR}/supervisor.py}"
+FSM_RUNINDEX="${FSM_DIR}/runindex.py"
+FSM_RUNS_BASE="${CFGMS_FSM_RUNS_DIR:-${HOME}/.cache/cfgms-fsm-runs}"
+FSM_LAUNCH_WAIT_SECS="${CFGMS_FSM_LAUNCH_WAIT_SECS:-120}"
+FSM_PREPARE_WAIT_SECS="${CFGMS_FSM_PREPARE_WAIT_SECS:-600}"
+FSM_LAUNCH_POLL_SECS="${CFGMS_FSM_LAUNCH_POLL_SECS:-1}"
+FSM_LAST_RUN_ID=""
+FSM_LAST_LOG=""
+FSM_LAST_STATUS=""
+
+# _fsm_image_gate <label> <refuse_prefix>
+#   Refuse (return 1) when cfg-agent:latest was not built from this checkout's
+#   devcontainer build inputs (the `cfgms.build_inputs_hash` label against
+#   HEAD:./devcontainer of the tooling). The agent and validator entrypoints and
+#   prompts are baked into the image, so a stale image runs another revision of
+#   the harness than the supervisor. This path never rebuilds or retags the
+#   image: the refusal names the condition and an operator rebuilds.
+_fsm_image_gate() {
+  local label="$1" prefix="$2" checkout image
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "${prefix}:${label}:image_unavailable (docker not found)"
+    return 1
+  fi
+  checkout=$(_image_build_inputs_hash)
+  image=$(_image_build_inputs_label)
+  if [[ -n "$checkout" && "$checkout" == "$image" ]]; then
+    return 0
+  fi
+  echo "IMAGE_STALE:${image:-none}:${checkout:-none}"
+  echo "${prefix}:${label}:image_stale (cfg-agent:latest is not built from this checkout's devcontainer inputs; rebuild it)"
+  return 1
+}
+
+# _deps_gate <item_id> <label> [<story_num>]
+#   Refuse (return 1, DISPATCH_REFUSED line) while any #NNN in the story's
+#   `## Dependencies` section is an open issue or PR, or its state cannot be
+#   read (fails closed). The section is parsed with the preflight's own
+#   parse_story, so "None" and decorated headers read the same way here.
+_deps_gate() {
+  local item_id="$1" label="$2" self="${3:-}" out rc=0
+  out=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
+    | PF="$PREFLIGHT" SELF_NUM="$self" DEP_REPO="$REPO" python3 -c '
+import importlib.util, json, os, subprocess, sys
+try:
+    item = json.load(sys.stdin)
+except Exception:
+    print("UNREADABLE"); sys.exit(1)
+spec = importlib.util.spec_from_file_location("preflight", os.environ["PF"])
+pf = importlib.util.module_from_spec(spec); spec.loader.exec_module(pf)
+self_num = os.environ.get("SELF_NUM") or ""
+story = pf.parse_story({"body": item.get("body") or "",
+                        "number": int(self_num) if self_num.isdigit() else item.get("issue_num")})
+blocked = []
+for n in story["deps_parsed"]:
+    p = subprocess.run(["gh", "api", "repos/%s/issues/%d" % (os.environ["DEP_REPO"], n),
+                        "--jq", ".state"], capture_output=True, text=True)
+    state = p.stdout.strip().lower() if p.returncode == 0 else ""
+    if state != "closed":
+        blocked.append("#%d(%s)" % (n, state or "unknown"))
+if blocked:
+    print(",".join(blocked)); sys.exit(1)
+print("OK")
+') || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "DISPATCH_REFUSED:${label}:dependency_open ${out:-unreadable}"
+    return 1
+  fi
+  return 0
+}
+
+# _fsm_unfinished_gate <label> <skip_prefix> [--key K] [--item-id I]
+#   Skip (return 1) when a run for the same work is not finished: an in-flight
+#   one (live, hung, starting) must not get a second supervisor beside it, and
+#   a crashed one is resumed (`dispatch resume <RUN_ID>`), not replaced.
+_fsm_unfinished_gate() {
+  local label="$1" prefix="$2"; shift 2
+  local rows run status state
+  rows=$(python3 "$FSM_RUNINDEX" find "$@" 2>/dev/null || true)
+  [[ -n "$rows" ]] || return 0
+  IFS=$'\t' read -r run status state <<< "$(head -1 <<< "$rows")"
+  if [[ "$status" == "crashed" ]]; then
+    echo "${prefix}:${label}:run_resumable:${run} (resume with: po-act.sh dispatch resume ${run})"
+  else
+    echo "${prefix}:${label}:run_in_flight:${run}:${status}:${state}"
+  fi
+  return 1
+}
+
+# _fsm_launch <label> <mode> <target> <lease_key> [supervisor run args...]
+#   Start `supervisor.py run` detached (own session, inherited fds closed, log
+#   under <runs>/launch-logs/) and wait for its launch outcome. Returns 0 once
+#   the run launched an agent, passed its gates without one, or is still
+#   running past the wait windows (it owns the lease and finishes on its own);
+#   otherwise waits for the supervisor and returns its exit code.
+_fsm_launch() {
+  local label="$1" mode="$2" target="$3" lease_key="$4"; shift 4
+  local logdir="${FSM_RUNS_BASE}/launch-logs" pid rc=0 run_id="" st="" start now
+  mkdir -p "$logdir"
+  chmod 700 "$FSM_RUNS_BASE" "$logdir" 2>/dev/null || true
+  FSM_LAST_LOG="${logdir}/${lease_key}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+  FSM_LAST_RUN_ID=""
+  FSM_LAST_STATUS=""
+  python3 "$FSM_SUPERVISOR" run "$mode" "$target" --lease-key "$lease_key" --lease-handoff \
+    --detach "$@" >"$FSM_LAST_LOG" 2>&1 </dev/null &
+  pid=$!
+  start=$(date +%s)
+  while :; do
+    if [[ -z "$run_id" ]]; then
+      run_id=$(sed -n 's/^FSM_RUN://p' "$FSM_LAST_LOG" 2>/dev/null | head -1 || true)
+    fi
+    if [[ -n "$run_id" ]]; then
+      st=$(python3 "$FSM_RUNINDEX" launch-status "$run_id" 2>/dev/null || echo NOREC)
+      case "$st" in
+        LAUNCHED:*|AGENTLESS:*)
+          FSM_LAST_RUN_ID="$run_id"; FSM_LAST_STATUS="$st"
+          echo "FSM_RUN:${run_id}"
+          echo "FSM_${st%%:*}:${label}:${st#*:}"
+          return 0
+          ;;
+        TERMINAL:*) break ;;
+      esac
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    now=$(date +%s)
+    if (( now - start >= FSM_LAUNCH_WAIT_SECS )); then
+      if [[ "$st" == "GATES_OK" ]] || (( now - start >= FSM_PREPARE_WAIT_SECS )); then
+        FSM_LAST_RUN_ID="$run_id"; FSM_LAST_STATUS="${st:-NOREC}"
+        echo "FSM_RUN:${run_id:-unknown}"
+        echo "FSM_LAUNCH_PENDING:${label}:${st:-NOREC}"
+        return 0
+      fi
+    fi
+    sleep "$FSM_LAUNCH_POLL_SECS"
+  done
+  wait "$pid" || rc=$?
+  FSM_LAST_RUN_ID="$run_id"
+  FSM_LAST_STATUS="$st"
+  [[ -n "$run_id" ]] && echo "FSM_RUN:${run_id}"
+  return "$rc"
+}
+
+# _fsm_log_token <PREFIX>  — "<reason>" of the supervisor's last PREFIX:<target>:<reason> line.
+_fsm_log_token() {
+  local line
+  line=$(grep -E "^$1:" "$FSM_LAST_LOG" 2>/dev/null | tail -1 || true)
+  [[ -n "$line" ]] || return 1
+  line="${line#*:}"
+  printf '%s\n' "${line#*:}"
+}
+
+# _rollback_claim <item_id>  — return a claimed story to Ready, but only while it
+# is still In Progress (a run that ended may have set Blocked / Ready / Done).
+_rollback_claim() {
+  local item_id="$1" cur
+  [[ -n "$item_id" ]] || return 0
+  cur=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
+    | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('status') or '')
+except Exception: print('')" 2>/dev/null || echo "")
+  if [[ "$cur" == "In Progress" ]]; then
+    bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true
+    echo "ROLLED_BACK:${item_id} -> Ready"
+  fi
+}
+
+# _fsm_outcome <rc> <label> <ok_token> <refuse_prefix> <defer_prefix> <lease_key> [<claim_item_id>]
+#   Map the launch result onto po-act's contract and exit:
+#     launched / pending / REPORT / NO_OP   -> <ok_token>, exit 0
+#     resource deferral (0 + DISPATCH_DEFERRED) -> <defer_prefix>:<label>:<reason>, exit 0
+#     credentials deferral (10)              -> <defer_prefix>:<label>:creds, exit 10
+#     refusal (3)                            -> <refuse_prefix>:<label>:<reason>, exit 3
+#     run locked (4)                         -> DISPATCH_SKIPPED:<label>:run_locked, exit 4
+#     interrupted (75)                       -> FSM_INTERRUPTED:<label>:<run>, exit 75 (resumable)
+#     FAILED (1) / anything else             -> LAUNCH_FAILED:<label>:..., exit <rc>
+#   A claimed story is rolled back to Ready for every outcome that leaves no
+#   live run. The lease is released here only when the run never got past
+#   PREPARE far enough to own it (no run dir, or no terminal state recorded and
+#   the supervisor is gone without being interrupted).
+_fsm_outcome() {
+  local rc="$1" label="$2" ok_token="$3" refuse="$4" defer="$5" lease_key="$6" item="${7:-}" why
+  case "$rc" in
+    0)
+      if why=$(_fsm_log_token DISPATCH_DEFERRED); then
+        _rollback_claim "$item"
+        echo "${defer}:${label}:${why}"
+        exit 0
+      fi
+      echo "$ok_token"
+      exit 0
+      ;;
+    10)
+      _rollback_claim "$item"
+      echo "${defer}:${label}:creds"
+      exit 10
+      ;;
+    3)
+      why=$(_fsm_log_token FSM_REFUSED || echo "refused")
+      _rollback_claim "$item"
+      echo "${refuse}:${label}:${why}"
+      exit 3
+      ;;
+    4)
+      echo "DISPATCH_SKIPPED:${label}:run_locked"
+      exit 4
+      ;;
+    75)
+      echo "FSM_INTERRUPTED:${label}:${FSM_LAST_RUN_ID:-unknown} (resume with: po-act.sh dispatch resume ${FSM_LAST_RUN_ID:-<RUN_ID>})"
+      exit 75
+      ;;
+    *)
+      case "$FSM_LAST_STATUS" in
+        TERMINAL:*) ;;
+        *) _release_lease "$lease_key" ;;
+      esac
+      _rollback_claim "$item"
+      if [[ "$rc" == "1" ]]; then
+        echo "LAUNCH_FAILED:${label}:fsm_failed:${FSM_LAST_RUN_ID:-none} (${FSM_LAST_STATUS:-no status})"
+      else
+        echo "LAUNCH_FAILED:${label}:supervisor_exit_${rc}:${FSM_LAST_RUN_ID:-none} (log ${FSM_LAST_LOG})"
+      fi
+      exit "$rc"
+      ;;
+  esac
+}
+
+# _pr_item_id <pr>  — the project item of a PR's story (feature/story-<N> or
+#   Fixes #N -> project-queue.sh item-for-issue). Prints it, or returns 1.
+_pr_item_id() {
+  local pr="$1" json branch body link num
+  json=$(gh pr view "$pr" --repo "$REPO" --json headRefName,body 2>/dev/null) || return 1
+  branch=$(printf '%s' "$json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('headRefName') or '')" 2>/dev/null || true)
+  body=$(printf '%s' "$json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body') or '')" 2>/dev/null || true)
+  link=$(resolve_pr_story_or_item "$branch" "$body")
+  case "$link" in
+    STORY:*) num="${link#STORY:}" ;;
+    *) return 1 ;;
+  esac
+  bash "$PROJECT_QUEUE" item-for-issue "$num" 2>/dev/null | tail -1 | grep -E '^PVTI_[A-Za-z0-9_-]+$' || return 1
+}
+
+# _item_parent_epic <item_id>  — "Parent epic: #N" from the item body, or empty.
+_item_parent_epic() {
+  bash "$PROJECT_QUEUE" get-item "$1" 2>/dev/null \
+    | python3 -c "import json,sys,re
+try:
+    b=json.load(sys.stdin).get('body') or ''
+    m=re.search(r'[Pp]arent epic[:#\s]*#?(\d+)', b)
+    print(m.group(1) if m else '')
+except Exception: print('')" 2>/dev/null || true
+}
+
+# _lease_holder_state <key>  — me | other | free | expired | error
+_lease_holder_state() {
+  local out holder me
+  out=$(bash "$PIPELINE_HELPER" lease-status "$1" 2>/dev/null | tail -1 || true)
+  me="${CFGMS_HOST_ID:-$(hostname 2>/dev/null || echo unknown)}"
+  case "$out" in
+    FREE:*) echo free ;;
+    HELD:*expired=true*) echo expired ;;
+    HELD:*)
+      holder=$(printf '%s' "$out" | cut -d: -f3)
+      [[ "$holder" == "$me" ]] && echo me || echo other
+      ;;
+    *) echo error ;;
+  esac
+}
+
+# _fsm_resume <run_id>
+#   Resume a crashed run (not done, run lock free). Needs the run's lease: held
+#   by this host, or free/expired and re-acquired here; held by another host
+#   means that host has the work and the run is left alone.
+_fsm_resume() {
+  local run_id="$1" info status lease_key holder pid i
+  [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "FSM_RESUME_REFUSED:${run_id}:invalid_run_id"; return 3; }
+  info=$(python3 "$FSM_RUNINDEX" show "$run_id" 2>/dev/null) || { echo "FSM_RESUME_REFUSED:${run_id}:unknown_run"; return 3; }
+  status=$(printf '%s' "$info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')")
+  lease_key=$(printf '%s' "$info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('lease_key') or '')")
+  case "$status" in
+    done) echo "FSM_RESUME_SKIPPED:${run_id}:done"; return 0 ;;
+    crashed) ;;
+    *) echo "FSM_RESUME_SKIPPED:${run_id}:in_flight:${status}"; return 4 ;;
+  esac
+  if ! cap=$(_capacity_ok); then
+    echo "DISPATCH_DEFERRED:${run_id}:resources (${cap})"
+    return 0
+  fi
+  _fsm_image_gate "$run_id" FSM_RESUME_REFUSED || return 3
+  if [[ -n "$lease_key" ]]; then
+    holder=$(_lease_holder_state "$lease_key")
+    case "$holder" in
+      me) ;;
+      free|expired) _acquire_lease "$lease_key" "$LEASE_TTL_PR" "$run_id" || return 0 ;;
+      *) echo "FSM_RESUME_REFUSED:${run_id}:lease_${holder}"; return 3 ;;
+    esac
+  fi
+  mkdir -p "${FSM_RUNS_BASE}/launch-logs"
+  FSM_LAST_LOG="${FSM_RUNS_BASE}/launch-logs/resume-${run_id}-$(date -u +%Y%m%dT%H%M%SZ).log"
+  python3 "$FSM_SUPERVISOR" resume "$run_id" --detach >"$FSM_LAST_LOG" 2>&1 </dev/null &
+  pid=$!
+  for ((i = 0; i < 30; i++)); do
+    status=$(python3 "$FSM_RUNINDEX" show "$run_id" 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null || true)
+    [[ "$status" == "live" || "$status" == "done" ]] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep "$FSM_LAUNCH_POLL_SECS"
+  done
+  if [[ "$status" == "live" || "$status" == "done" ]]; then
+    echo "FSM_RESUMED:${run_id}:${status}"
+    return 0
+  fi
+  rc=0; wait "$pid" || rc=$?
+  echo "FSM_RESUME_FAILED:${run_id}:exit_${rc} (log ${FSM_LAST_LOG})"
+  return "${rc/#0/1}"
+}
+
 cmd="${1:-}"
 shift || true
 
@@ -661,12 +993,56 @@ case "$cmd" in
     arg="${1:?story number or item_id required}"
     PROJECT_QUEUE="${CFGMS_TEST_PROJECT_QUEUE:-$(cd "$(dirname "$0")/../../.." && pwd)/.claude/tooling/scripts/project-queue.sh}"
 
-    # Resource admission gate (before any lease/materialize/clone). Defer if the
+    # FSM run views under the already-permitted `dispatch` subcommand, so the
+    # status and resume operations need no new permission rules:
+    #   dispatch status [RUN_ID]   list runs, or show one (runindex.py)
+    #   dispatch resume <RUN_ID>   resume a crashed run (lease checked first)
+    #   dispatch --branch <BRANCH> [--issue N]   branch-mode run
+    case "$arg" in
+      status)
+        if [[ -n "${2:-}" ]]; then python3 "$FSM_RUNINDEX" show "$2"; else python3 "$FSM_RUNINDEX" list; fi
+        exit $?
+        ;;
+      resume)
+        rc=0; _fsm_resume "${2:?run id required}" || rc=$?
+        exit "$rc"
+        ;;
+      --branch)
+        branch="${2:?branch required}"
+        validate_branch "$branch"
+        branch_issue=""
+        if [[ "${3:-}" == "--issue" ]]; then
+          branch_issue="${4:?--issue needs a number}"
+          [[ "$branch_issue" =~ ^[0-9]+$ ]] || { echo "ERROR: --issue must be numeric"; exit 2; }
+        fi
+        sanitized=$(sanitize_branch "$branch")
+        if ! cap=$(_capacity_ok); then
+          echo "DISPATCH_DEFERRED:${branch}:resources (${cap})"
+          exit 0
+        fi
+        _fsm_image_gate "$branch" DISPATCH_REFUSED || exit 3
+        _fsm_unfinished_gate "$branch" DISPATCH_SKIPPED --key "branch-${sanitized}" || exit 0
+        _acquire_lease "branch-${sanitized}" "$LEASE_TTL_STORY" "$branch" || exit 0
+        trap '_release_lease "branch-${sanitized}"' ERR
+        branch_args=(--container-target "branch-${sanitized}")
+        [[ -n "$branch_issue" ]] && branch_args+=(--issue "$branch_issue")
+        rc=0; _fsm_launch "$branch" branch "$branch" "branch-${sanitized}" "${branch_args[@]}" || rc=$?
+        trap - ERR
+        _fsm_outcome "$rc" "$branch" "DISPATCHED_BRANCH:${branch}" DISPATCH_REFUSED DISPATCH_DEFERRED \
+          "branch-${sanitized}"
+        ;;
+    esac
+
+    # Resource admission gate (before any lease/materialize). Defer if the
     # host has no room for another agent container — RAM/disk 90%, CPU 75%.
     if ! cap=$(_capacity_ok); then
       echo "DISPATCH_DEFERRED:${arg}:resources (${cap})"
       exit 0
     fi
+
+    # Image gate: still before any side effect; a run on a stale image would
+    # run another revision of the agent/validator entrypoints than this one.
+    _fsm_image_gate "$arg" DISPATCH_REFUSED || exit 3
 
     # If arg is an item_id (non-numeric), resolve it to the underlying GitHub
     # issue number. A project item linked to a public issue carries `issue_num`;
@@ -688,10 +1064,10 @@ except Exception: print('')" 2>/dev/null || echo "")
       fi
     fi
 
-    # Phase 1 — resolve identifiers WITHOUT side effects (no clone yet). We must
-    # know the item_id so we can claim the story (status -> In Progress) BEFORE
-    # any clone/launch work; otherwise a second host's out-of-phase cycle could
-    # clone+launch the same Ready story before this one records the claim.
+    # Phase 1 — resolve identifiers WITHOUT side effects. We must know the
+    # item_id so we can claim the story (status -> In Progress) BEFORE the run
+    # starts; otherwise a second host's out-of-phase cycle could start the same
+    # Ready story before this one records the claim.
     story=""
     issue_for_env=""
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -708,10 +1084,13 @@ except Exception: print('')" 2>/dev/null || echo "")
           exit 1
         fi
       fi
-      clone_path="${WORKTREE_BASE}/story-${story}"
-      container_name="cfg-agent-${story}"
       first_arg="${story}"
-      # Acquire the story lease before any clone/launch so a second host's
+      # Dependency gate: no open #NNN in ## Dependencies (preflight applies the
+      # same rule; this keeps a direct dispatch from skipping it).
+      _deps_gate "$item_id" "$story" "$story" || exit 3
+      # An unfinished run for this story is resumed or left alone, never doubled.
+      _fsm_unfinished_gate "$story" DISPATCH_SKIPPED --key "story-${story}" --item-id "$item_id" || exit 0
+      # Acquire the story lease before any side effect so a second host's
       # out-of-phase cycle can't dispatch the same existing Ready issue.
       _acquire_lease "story-${item_id}" "$LEASE_TTL_STORY" "${story}" || exit 0
     else
@@ -723,30 +1102,25 @@ except Exception: print('')" 2>/dev/null || echo "")
       # invisible — Issue #1700 — so we always convert rather than dispatching
       # the draft directly.)
       item_id="$arg"
+      _deps_gate "$item_id" "$item_id" || exit 3
+      _fsm_unfinished_gate "$item_id" DISPATCH_SKIPPED --item-id "$item_id" || exit 0
       # Acquire the story lease BEFORE materialize — materialize-issue mints a
       # fresh GitHub issue every call, so two racing hosts would otherwise create
-      # two issues (+ two branches/containers/PRs) for the same draft.
+      # two issues (+ two branches/runs/PRs) for the same draft.
       _acquire_lease "story-${item_id}" "$LEASE_TTL_STORY" "${item_id}" || exit 0
-      epic_num=$(bash "$PROJECT_QUEUE" get-item "$item_id" 2>/dev/null \
-        | python3 -c "import json,sys,re
-try:
-    b=json.load(sys.stdin).get('body') or ''
-    m=re.search(r'[Pp]arent epic[:#\s]*#?(\d+)', b)
-    print(m.group(1) if m else '')
-except Exception: print('')" 2>/dev/null || echo "")
-      mat=$(bash "$PIPELINE_HELPER" materialize-issue "$item_id" "$epic_num" 2>&1) || {
+      mat=$(bash "$PIPELINE_HELPER" materialize-issue "$item_id" "$(_item_parent_epic "$item_id")" 2>&1) || {
         echo "ERROR: materialize-issue failed for ${item_id}: ${mat}" >&2
+        _release_lease "story-${item_id}"
         exit 1
       }
       story=$(echo "$mat" | grep -oE '#[0-9]+' | tr -d '#' | head -1)
       if [ -z "${story:-}" ]; then
         echo "ERROR: materialize-issue returned no issue number: ${mat}" >&2
+        _release_lease "story-${item_id}"
         exit 1
       fi
       echo "MATERIALIZED_AT_DISPATCH:${item_id}:#${story}"
       issue_for_env="$story"
-      clone_path="${WORKTREE_BASE}/story-${story}"
-      container_name="cfg-agent-${story}"
       first_arg="${story}"
     fi
 
@@ -757,6 +1131,7 @@ except Exception: print('')" 2>/dev/null || echo "")
     req_env=$(_requires_env "$item_id" "$issue_for_env")
     req_env="${req_env:-linux}"
     if ! _host_serves_env "$req_env"; then
+      _release_lease "story-${item_id}"
       echo "DISPATCH_REFUSED:${first_arg}:requires ${req_env} env; host caps=${CFGMS_PO_HOST_CAPS:-linux}"
       exit 0
     fi
@@ -769,92 +1144,19 @@ except Exception: print('')" 2>/dev/null || echo "")
       exit 0
     fi
 
-    # Phase 4 — now do the work. Roll the claim back to Ready on any failure so a
-    # later cycle (or another host) can retry. The ERR trap covers the steps that
-    # run under `set -e` (check-conflicts, create-clone); without it a clone/conflict
-    # failure would exit with the story stuck In Progress. The docker-run failure is
-    # handled explicitly in the LAUNCH_FAILED branch below (it runs inside an `if`
-    # condition, which `set -e`/ERR does not trap).
+    # Phase 4 — start the run. Roll the claim back to Ready and free the lease on
+    # any failure before the supervisor starts; from the handoff on, the run owns
+    # the lease and _fsm_outcome maps its result (rolling the claim back when no
+    # run is left working on the story).
     trap 'rc=$?; bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true; bash "$PIPELINE_HELPER" lease-release "story-${item_id}" >/dev/null 2>&1 || true; echo "ROLLED_BACK:${item_id} -> Ready (dispatch failed before launch, rc=$rc)"; exit "$rc"' ERR
-    # Branch on the RESOLVED story number ($first_arg), not the raw input ($arg).
-    # An issueless draft is materialized above into issue #$story and $first_arg
-    # is set to that number, so it must clone first-class as feature/story-<N>
-    # (matching clone_path=$WORKTREE_BASE/story-<N>). Testing $arg here instead
-    # left materialized drafts on the review-invisible feature/item-<id> path AND
-    # mounted a non-existent worktree (clone_path=story-<N> vs the item-<id> clone
-    # that create-clone-item actually made) → empty /workspace → entrypoint crash.
-    if [[ "$first_arg" =~ ^[0-9]+$ ]]; then
-      "$DISPATCH" check-conflicts "$story" >/dev/null
-      "$DISPATCH" create-clone "$story" | tail -1
-    else
-      "$DISPATCH" create-clone-item "$item_id" | tail -1
-    fi
-
-    # Launch with CFGMS_PROJECT_ITEM_ID so entrypoint sources content from Projects V2.
-    # Inlined from agent-dispatch.sh launch to pass the extra env var without editing
-    # that file.
-    real_path=$(realpath "$clone_path")
-    gh_token=$(gh auth token)
-
-    # Persist this run's transcript to the host so its token spend survives the
-    # container's --rm (Issue #3028; extended to this dispatch path in #3051 —
-    # this inlined docker run was the dev-agent path prepare_session_dir never
-    # reached). Degrades to no mount if the dir can't be created; telemetry
-    # never blocks dispatch.
-    session_mount=()
-    if sessions_dir=$(prepare_session_dir "$container_name" "issue" "${story:-}" "" ""); then
-      session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
-    fi
-
-    ledger_append_launch "$container_name" "issue" "${story:-}" "" "" "dev-agent" "story-${item_id}"
-
-    # Refuse to launch on a stale cfg-agent:latest (Issue #4484). Every other
-    # docker-run launch site gates immediately before its `docker run`; this
-    # inlined dispatch path (see the "Inlined from agent-dispatch.sh launch"
-    # comment above) was the one that didn't, so dev-agent dispatch kept
-    # running on images built from stale .claude/tooling/devcontainer inputs.
-    gate_image_staleness_for_launch
-
-    agent_token_args
-    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
-      --name "$container_name" \
-      --label "cfg-agent=true" \
-      --label "issue=${story:-}" \
-      --label "mode=issue" \
-      --memory=4g \
-      --cpus=4 \
-      --stop-timeout=3600 \
-      -v "${real_path}:/workspace" \
-      "${AGENT_CRED_ARGS[@]}" \
-      -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
-      -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
-      -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
-      "${session_mount[@]}" \
-      -e "GH_TOKEN=${gh_token}" \
-      -e "CFGMS_PROJECT_ITEM_ID=${item_id}" \
-      -e "CFGMS_LEASE_KEY=story-${item_id}" \
-      -e "CFGMS_AUTONOMOUS=true" \
-      --cap-add NET_ADMIN \
-      cfg-agent:latest \
-      "${first_arg}" 2>&1); then
-      trap - ERR
-      echo "LAUNCHED:${first_arg}:${container_id}"
-    else
-      trap - ERR
-      echo "LAUNCH_FAILED:${first_arg}:${container_id}"
-      ledger_append_launch_failed "$container_name" "issue"
-      rm -rf "$clone_path"
-      echo "CLEANED:clone:${clone_path}"
-      # Release the claim + lease: launch never happened, so return the story to
-      # Ready and free the lease for the next cycle/host.
-      bash "$PROJECT_QUEUE" update-field "$item_id" status "Ready" >/dev/null 2>&1 || true
-      _release_lease "story-${item_id}"
-      echo "ROLLED_BACK:${item_id} -> Ready"
-      exit 1
-    fi
-
+    launch_args=(--item-id "$item_id")
+    epic_num=$(_item_parent_epic "$item_id")
+    [[ -n "$epic_num" ]] && launch_args+=(--epic "$epic_num")
+    rc=0; _fsm_launch "$first_arg" issue "$first_arg" "story-${item_id}" "${launch_args[@]}" || rc=$?
+    trap - ERR
     # Status is already In Progress from the claim in Phase 3.
-    echo "DISPATCHED:${first_arg}"
+    _fsm_outcome "$rc" "$first_arg" "DISPATCHED:${first_arg}" DISPATCH_REFUSED DISPATCH_DEFERRED \
+      "story-${item_id}" "$item_id"
     ;;
 
   claim)
@@ -888,9 +1190,10 @@ except Exception: print('')" 2>/dev/null || echo "")
 
   dispatch-fix)
     pr="${1:?PR number required}"
-    container="cfg-agent-pr-fix-${pr}"
+    [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 2; }
     # External-author gate (Issue #1786): refuse before touching any PR content.
-    # Read the head once and bind the trust check and the clone to it (Issue #5401).
+    # Read the head once and bind the trust check to it (Issue #5401). The
+    # supervisor re-checks author trust and refuses if the head moved.
     head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
     if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
       echo "DISPATCH_FIX_REFUSED:${pr}:head_unknown"
@@ -905,30 +1208,37 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "DISPATCH_FIX_DEFERRED:${pr}:resources (${cap})"
       exit 0
     fi
+    _fsm_image_gate "$pr" DISPATCH_FIX_REFUSED || exit 3
+    # The run reads the spec from the story's project item, never issue text.
+    if ! fix_item=$(_pr_item_id "$pr"); then
+      echo "DISPATCH_FIX_REFUSED:${pr}:no_story_item"
+      exit 3
+    fi
+    _fsm_unfinished_gate "pr-${pr}" DISPATCH_FIX_SKIPPED --key "pr-${pr}" || exit 0
     # Cross-host PR lease — pr-<N> is shared by review/fix/resolve (mutually
     # exclusive ops on one PR). If another host already holds it, skip cleanly.
     _acquire_lease "pr-${pr}" "$LEASE_TTL_PR" "pr-${pr}" || exit 0
-    # Release the lease if clone/launch fails; on success the container owns it.
+    # Release the lease if the launch fails before the run takes it over.
     trap '_release_lease "pr-${pr}"' ERR
-    # Remove any stale exited container from a previous attempt
-    docker rm -f "$container" >/dev/null 2>&1 || true
-    # Remove any stale worktree directory
-    rm -rf "${WORKTREE_BASE}/pr-fix-${pr}" 2>/dev/null || true
-    "$DISPATCH" create-clone-pr --expected-head "$head_sha" "$pr" | tail -1
-    CFGMS_LEASE_KEY="pr-${pr}" "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/pr-fix-${pr}" --fix-pr "$pr" | tail -1
+    rc=0; _fsm_launch "$pr" fix-pr "$pr" "pr-${pr}" --item-id "$fix_item" || rc=$?
     trap - ERR
-    echo "DISPATCHED_FIX:$pr"
+    if [[ "$rc" == "0" ]] && ! grep -q '^DISPATCH_DEFERRED:' "$FSM_LAST_LOG" 2>/dev/null; then
+      # Best-effort PR dashboard label while the fix run is in flight. Display
+      # only: the cron never reads it. cleanup-stale reconciles it off once no
+      # unfinished run holds the PR. REST API, not `gh pr edit --add-label`
+      # (that also queries the deprecated Projects-classic field and fails).
+      gh api --method POST "repos/${REPO}/issues/${pr}/labels" -f "labels[]=fix-agent" >/dev/null 2>&1 || true
+    fi
+    _fsm_outcome "$rc" "$pr" "DISPATCHED_FIX:${pr}" DISPATCH_FIX_REFUSED DISPATCH_FIX_DEFERRED "pr-${pr}"
     ;;
 
   resolve-conflict)
     pr="${1:?PR number required}"
     [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 1; }
-    container="cfg-agent-resolve-conflict-${pr}"
     # Subcommand-level author gate (defense in depth — must run before any
-    # clone/fetch/checkout/launch). Uses #1786's permission-level helper
-    # (push/maintain/admin). The interim authorAssociation check was replaced
-    # once #1786 landed; this subcommand-level assertion stays regardless.
-    # Read the head once and bind the trust check and the clone to it (Issue #5401).
+    # fetch or launch). Uses #1786's permission-level helper
+    # (push/maintain/admin); the supervisor re-checks it at PREPARE.
+    # Read the head once and bind the trust check to it (Issue #5401).
     head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
     if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
       echo "RESOLVE_CONFLICT_REFUSED:${pr}:head_unknown"
@@ -943,18 +1253,20 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "RESOLVE_CONFLICT_DEFERRED:${pr}:resources (${cap})"
       exit 0
     fi
+    _fsm_image_gate "$pr" RESOLVE_CONFLICT_REFUSED || exit 3
+    if ! fix_item=$(_pr_item_id "$pr"); then
+      echo "RESOLVE_CONFLICT_REFUSED:${pr}:no_story_item"
+      exit 3
+    fi
+    _fsm_unfinished_gate "pr-${pr}" RESOLVE_CONFLICT_SKIPPED --key "pr-${pr}" || exit 0
     # Cross-host PR lease (same pr-<N> key as review/fix — they never run together
     # on one PR). Skip cleanly if another host holds it.
     _acquire_lease "pr-${pr}" "$LEASE_TTL_PR" "pr-${pr}" || exit 0
     trap '_release_lease "pr-${pr}"' ERR
-    # Remove any stale exited container from a previous attempt
-    docker rm -f "$container" >/dev/null 2>&1 || true
-    # Remove any stale worktree directory (separate namespace from pr-fix-<PR>)
-    rm -rf "${WORKTREE_BASE}/resolve-conflict-${pr}" 2>/dev/null || true
-    "$DISPATCH" create-clone-pr --dest-prefix "resolve-conflict-" --expected-head "$head_sha" "$pr" | tail -1
-    CFGMS_LEASE_KEY="pr-${pr}" "$DISPATCH" launch-generic "$container" "${WORKTREE_BASE}/resolve-conflict-${pr}" --resolve-conflict "$pr" | tail -1
+    rc=0; _fsm_launch "$pr" resolve-conflict "$pr" "pr-${pr}" --item-id "$fix_item" || rc=$?
     trap - ERR
-    echo "DISPATCHED_RESOLVE_CONFLICT:${pr}"
+    _fsm_outcome "$rc" "$pr" "DISPATCHED_RESOLVE_CONFLICT:${pr}" RESOLVE_CONFLICT_REFUSED \
+      RESOLVE_CONFLICT_DEFERRED "pr-${pr}"
     ;;
 
   close-merged)

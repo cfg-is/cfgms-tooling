@@ -132,15 +132,24 @@ check_not_contains "deferral does not reach launch" "$out" "LAUNCHED"
 check_not_contains "deferral does not reach lease (no clone)" "$out" "CLONE_OK"
 
 # T5: with the gate bypassed, dispatch-fix does NOT consult capacity and proceeds
-# (the mock would loudly fail on create-clone-pr, proving capacity was skipped and
-# the path advanced past the gate).
+# to the next gate, the image staleness gate (a docker stub reports an image
+# label that matches no checkout, so the launch is refused there, before any
+# lease or run).
+cat > "$GH_BIN/docker" <<'DOCKER_EOF'
+#!/usr/bin/env bash
+case "$1" in inspect) echo "not-this-checkout" ;; esac
+exit 0
+DOCKER_EOF
+chmod +x "$GH_BIN/docker"
 out="$(CFGMS_TEST_DISPATCH="$MOCK" \
        CFGMS_TEST_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh" \
        CFGMS_TEST_WORKTREE_BASE="$TMP/wt" \
        CFGMS_AGENT_CAPACITY_GATE=off \
        bash "$PO_ACT" dispatch-fix 4242 2>&1)" || true
 check_not_contains "bypass -> no DEFERRED" "$out" "DISPATCH_FIX_DEFERRED"
-check_contains "bypass -> advanced past gate to clone step" "$out" "MOCK_UNEXPECTED:create-clone-pr"
+check_contains "bypass -> advanced past the capacity gate to the image gate" "$out" \
+  "DISPATCH_FIX_REFUSED:4242:image_stale"
+rm -f "$GH_BIN/docker"
 
 # T6: an unreadable PR head is refused before the capacity gate (Issue #5401).
 out="$(GH_HEAD="" CFGMS_TEST_DISPATCH="$MOCK" \

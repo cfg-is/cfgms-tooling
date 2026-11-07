@@ -1,35 +1,26 @@
 #!/usr/bin/env bash
-# Behavioural test for po-act.sh dispatch's image-staleness gating (Issue #4484).
+# Behavioural test for po-act.sh dispatch's single launch path (FSM harness,
+# DESIGN.md §11): the image staleness gate, the Dependencies gate, the
+# unfinished-run gate, and the mapping of the supervisor's outcome onto
+# po-act's tokens and exit codes.
 #
-# agent-dispatch.sh gated every launch site IN ITS OWN FILE (Issue #4388), but
-# po-act.sh dispatch builds its own inlined `docker run -d` (see the comment
-# at po-act.sh:41) rather than calling agent-dispatch.sh launch, so it shipped
-# with no gate at all -- dev agents launched on whatever cfg-agent:latest
-# happened to exist, stale or not. image_staleness.test.sh's structural scan
-# (widened in this same story) catches a missing gate call by reading source
-# text; this file proves the fix end to end -- a real `po-act.sh dispatch`
-# invocation, against a stale-image fixture, actually runs the rebuild stub
-# before it runs the container launch, and a failed rebuild refuses the
-# launch outright.
+# The image gate refuses a launch on a cfg-agent:latest whose
+# `cfgms.build_inputs_hash` label is not this checkout's devcontainer tree
+# (Issue #4484 put a gate on this path; the FSM path refuses instead of
+# rebuilding, so nothing on the launch path ever retags the image).
 #
-# Hermetic, same pattern as dispatch_ledger.test.sh and image_staleness.test.sh:
-# a disposable fixture git repo stands in for the checkout
-# (CFGMS_TEST_REPO_ROOT), CFGMS_TEST_WORKTREE_BASE keeps the clone off real
-# worktrees, CFGMS_TEST_IMAGE_REBUILD_CMD stands in for `docker build` (never a
-# real one), and `docker`/`gh` are shell functions exported into the
-# `po-act.sh dispatch` subprocess (unlike the sourced-function style the other
-# two suites use, dispatch runs as a real child process, so the stand-ins must
-# cross a process boundary via `export -f`). PROJECT_QUEUE and
-# agent-dispatch.sh's own `launch`/`create-clone` entry points are stubbed via
-# their existing CFGMS_TEST_* hooks (CFGMS_TEST_PROJECT_QUEUE is new, added by
-# this story -- project-queue.sh talks to GitHub Projects V2 and had no test
-# hook at all before this).
+# Hermetic: lib-fsm-launch.sh provides a fixture checkout, a docker stub that
+# fails `run`/`build`/`tag`, a scripted stand-in for supervisor.py and a fake
+# project-queue.sh; gh is a PATH stand-in; leases go to
+# mock-pipeline-helper.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 POACT="${REPO_ROOT_REAL}/.claude/tooling/scripts/po-act.sh"
 MOCK_PIPELINE_HELPER="${SCRIPT_DIR}/mock-pipeline-helper.sh"
+# shellcheck source=lib-fsm-launch.sh
+source "${SCRIPT_DIR}/lib-fsm-launch.sh"
 
 for f in "$POACT" "$MOCK_PIPELINE_HELPER"; do
   [[ -f "$f" ]] || { printf 'FAIL: expected file not found: %s\n' "$f" >&2; exit 1; }
@@ -46,7 +37,7 @@ check_eq() {
 check_contains() {
   local desc="$1" hay="$2" needle="$3"
   if [[ "$hay" == *"$needle"* ]]; then ok "$desc"
-  else bad "$desc" "want substring: ${needle}"; fi
+  else bad "$desc" "want substring: ${needle}  actual: ${hay}"; fi
 }
 check_not_contains() {
   local desc="$1" hay="$2" needle="$3"
@@ -61,208 +52,101 @@ echo "------------------------"
 printf '\n== bash -n parses ==\n'
 if bash -n "$POACT" 2>/dev/null; then ok "po-act.sh parses"; else bad "po-act.sh parses" "bash -n failed"; fi
 
-# ---------------------------------------------------------------------------
-# Fixture: a disposable git repo standing in for the checkout (same shape
-# image_staleness.test.sh uses), plus a sandboxed worktree/ledger/session/trust
-# tree so nothing touches real git, docker, or $HOME state.
-# ---------------------------------------------------------------------------
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
+fsm_launch_fakes "$SANDBOX"
+CHECKOUT_HASH="$FAKE_IMAGE_LABEL"
 
-FIXTURE_REPO="${SANDBOX}/fixture-repo"
-mkdir -p "${FIXTURE_REPO}/.claude/tooling/devcontainer"
-echo "FROM scratch" > "${FIXTURE_REPO}/.claude/tooling/devcontainer/Dockerfile"
-GIT=(git -c init.defaultBranch=main -c user.email=test@test.local -c user.name=test)
-"${GIT[@]}" -C "$FIXTURE_REPO" init -q
-"${GIT[@]}" -C "$FIXTURE_REPO" add .claude/tooling/devcontainer
-"${GIT[@]}" -C "$FIXTURE_REPO" commit -q -m fixture
-CHECKOUT_HASH="$("${GIT[@]}" -C "$FIXTURE_REPO" rev-parse HEAD:.claude/tooling/devcontainer)"
-[[ -n "$CHECKOUT_HASH" ]] || { printf 'FAIL: could not compute fixture checkout hash\n' >&2; exit 1; }
-
-WORKTREE_BASE="${SANDBOX}/worktrees"
-mkdir -p "$WORKTREE_BASE"
-
-# ---------------------------------------------------------------------------
-# Mock project-queue.sh (CFGMS_TEST_PROJECT_QUEUE, new in this story). Reads
-# MOCK_STORY_NUM/MOCK_ITEM_ID from the environment so each scenario below can
-# point it at a different fake story without rewriting the script. Every
-# story here is already "Ready" and issueless-draft resolution never applies
-# (the numeric arg short-circuits that branch in po-act.sh), so get-item only
-# ever needs to answer the claim-status and environment-detection reads.
-# ---------------------------------------------------------------------------
-MOCK_PQ="${SANDBOX}/mock-project-queue.sh"
-cat > "$MOCK_PQ" <<'MOCK_EOF'
+# gh stand-in on PATH (the Dependencies gate calls it from Python, where an
+# exported shell function is not visible).
+cat > "${SANDBOX}/bin/gh" <<'GH_EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-cmd="${1:-}"; shift || true
-num="${MOCK_STORY_NUM:-9999}"
-item="${MOCK_ITEM_ID:-PVTI_mock1}"
-case "$cmd" in
-  list-by-status)
-    printf '[{"item_id":"%s","issue_num":%s,"status":"Ready"}]\n' "$item" "$num"
-    ;;
-  get-item)
-    printf '{"item_id":"%s","issue_num":%s,"status":"Ready","body":""}\n' "$item" "$num"
-    ;;
-  update-field)
-    echo "UPDATED:${1:-}:${2:-}:${3:-}"
-    ;;
-  *)
-    echo "MOCK_PROJECT_QUEUE_UNEXPECTED:${cmd} $*" >&2
-    exit 1
-    ;;
+case "$1 ${2:-}" in
+  "auth token") echo "mock-gh-token" ;;
+  "issue view") echo "[]" ;;
+  "api repos/cfg-is/cfgms/issues/"*)
+    case "$2" in
+      */77) echo "open" ;;
+      */78) echo "closed" ;;
+      *) echo '{"message":"Not Found"}'; exit 1 ;;
+    esac ;;
+  *) echo "MOCK_GH_UNEXPECTED:$*" >&2; exit 1 ;;
 esac
-MOCK_EOF
-chmod +x "$MOCK_PQ"
+GH_EOF
+chmod +x "${SANDBOX}/bin/gh"
 
-# ---------------------------------------------------------------------------
-# Mock agent-dispatch.sh (CFGMS_TEST_DISPATCH, pre-existing hook). Only the two
-# subcommands po-act.sh dispatch shells out to before its inlined docker run.
-# create-clone actually creates the clone directory -- po-act.sh immediately
-# `realpath`s it, so it must exist.
-# ---------------------------------------------------------------------------
-MOCK_DISPATCH="${SANDBOX}/mock-dispatch.sh"
-cat > "$MOCK_DISPATCH" <<MOCK_EOF
-#!/usr/bin/env bash
-set -euo pipefail
-case "\${1:-}" in
-  check-conflicts) echo "NO_CONFLICTS:\${2:-}"; exit 0 ;;
-  create-clone)
-    story="\${2:-}"
-    clone_dir="${WORKTREE_BASE}/story-\${story}"
-    rm -rf "\$clone_dir"
-    mkdir -p "\$clone_dir"
-    echo "CLONE_OK:\${story}:\${clone_dir}"
-    ;;
-  *) echo "MOCK_DISPATCH_UNEXPECTED:\$*" >&2; exit 1 ;;
-esac
-MOCK_EOF
-chmod +x "$MOCK_DISPATCH"
-
-# ---------------------------------------------------------------------------
-# `docker` and `gh` stand-ins, exported as shell functions (po-act.sh dispatch
-# runs as a real child process of this test, unlike the sourced-function style
-# image_staleness.test.sh uses, so the stand-ins must cross a process
-# boundary -- `export -f` is what makes a bash-to-bash child pick up a
-# function definition from its environment). `docker inspect`/`image`/`tag`
-# mirror image_staleness.test.sh's fake exactly; `run` additionally logs to
-# DOCKER_CALL_LOG so the ordering assertions below can tell a rebuild from a
-# launch. `gh` only ever needs to satisfy `gh auth token` (docker run env) and
-# `gh issue view ... --json labels` (the capability guard's label lookup) --
-# anything else is a loud, logged failure so an unexpected call is caught
-# rather than silently returning success.
-# ---------------------------------------------------------------------------
-DOCKER_CALL_LOG="${SANDBOX}/docker_calls.log"
-docker() {
-  printf '%s\n' "$*" >> "$DOCKER_CALL_LOG"
-  case "$1" in
-    inspect) printf '%s\n' "${FAKE_IMAGE_LABEL:-}" ;;
-    image)   [[ "${FAKE_IMAGE_EXISTS:-1}" == "1" ]] && return 0 || return 1 ;;
-    tag)     return 0 ;;
-    run)     echo "fake-container-id-$$" ;;
-    *)       return 0 ;;
-  esac
-}
-export -f docker
-export DOCKER_CALL_LOG
-
-gh() {
-  case "$1 ${2:-}" in
-    "auth token") echo "mock-gh-token" ;;
-    "issue view") echo "[]" ;;
-    *) echo "MOCK_GH_UNEXPECTED:$*" >&2; return 1 ;;
-  esac
-}
-export -f gh
-
-# Shared env for every `po-act.sh dispatch` invocation below. CFGMS_TEST_REPO_ROOT
-# + CFGMS_TEST_IMAGE_STALENESS_CHECK=1 opt the gate INTO real checking (its
-# default under CFGMS_TEST_REPO_ROOT alone is a no-op -- see
-# gate_image_staleness_for_launch's doc comment in agent-dispatch.sh); every
-# other CFGMS_TEST_*/CFGMS_AGENT_*_BASE var keeps a side effect off real state.
 run_dispatch() {
-  CFGMS_TEST_REPO_ROOT="$FIXTURE_REPO" \
-  CFGMS_TEST_IMAGE_STALENESS_CHECK=1 \
-  CFGMS_TEST_WORKTREE_BASE="$WORKTREE_BASE" \
-  CFGMS_TEST_PROJECT_QUEUE="$MOCK_PQ" \
-  CFGMS_TEST_DISPATCH="$MOCK_DISPATCH" \
+  rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"
+  printf 'Ready\n' > "${SANDBOX}/board-status"
+  : > "${SANDBOX}/docker.log"; : > "${SANDBOX}/supervisor.log"
+  PATH="${SANDBOX}/bin:${PATH}" \
   CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
-  CFGMS_AGENT_LEDGER_DIR="${SANDBOX}/ledger" \
-  CFGMS_AGENT_SESSIONS_BASE="${SANDBOX}/sessions" \
-  CFGMS_AGENT_TRUST_BASE="${SANDBOX}/trust" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" \
   CFGMS_AGENT_CAPACITY_GATE=off \
   CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" \
   bash "$POACT" dispatch "$1" 2>&1
 }
 
-# ---------------------------------------------------------------------------
-# T1: stale image, rebuild succeeds -> the rebuild stub runs BEFORE the
-# container launch, and the launch proceeds (AC1 + AC4).
-# ---------------------------------------------------------------------------
-printf '\n== T1: stale image, rebuild succeeds -> rebuild runs before launch ==\n'
-: > "$DOCKER_CALL_LOG"
+printf '\n== T1: stale image -> refused, never rebuilt, nothing launched ==\n'
 t1_rc=0
-t1_out=$(
-  MOCK_STORY_NUM=9999 MOCK_ITEM_ID=PVTI_mock_t1 \
-  FAKE_IMAGE_LABEL="some-old-hash" \
-  FAKE_IMAGE_EXISTS=1 \
-  CFGMS_TEST_IMAGE_REBUILD_CMD="echo REBUILD_RAN >> \"\$DOCKER_CALL_LOG\"; exit 0" \
-  run_dispatch 9999
-) || t1_rc=$?
-check_eq "T1: dispatch exits 0" "$t1_rc" "0"
-check_contains "T1: reports IMAGE_STALE before launching" "$t1_out" "IMAGE_STALE:some-old-hash:${CHECKOUT_HASH}"
-check_contains "T1: launch proceeds (LAUNCHED)" "$t1_out" "LAUNCHED:9999:"
+t1_out=$(FAKE_IMAGE_LABEL="some-old-hash" run_dispatch 4242) || t1_rc=$?
+check_eq "T1: dispatch exits 3 (refusal)" "$t1_rc" "3"
+check_contains "T1: reports IMAGE_STALE" "$t1_out" "IMAGE_STALE:some-old-hash:${CHECKOUT_HASH}"
+check_contains "T1: refusal names the condition" "$t1_out" "DISPATCH_REFUSED:4242:image_stale"
+check_not_contains "T1: no lease taken" "$t1_out" "CLAIMED"
+check_eq "T1: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+check_eq "T1: no docker run / build / tag" \
+  "$(grep -cE '^(run|build|tag|image tag) ' "${SANDBOX}/docker.log" || true)" "0"
 
-call_log="$(cat "$DOCKER_CALL_LOG")"
-rebuild_line=$(grep -n '^REBUILD_RAN$' "$DOCKER_CALL_LOG" | head -1 | cut -d: -f1)
-run_line=$(grep -n '^run ' "$DOCKER_CALL_LOG" | head -1 | cut -d: -f1)
-if [[ -n "$rebuild_line" && -n "$run_line" && "$rebuild_line" -lt "$run_line" ]]; then
-  ok "T1: rebuild stub (CFGMS_TEST_IMAGE_REBUILD_CMD) ran before 'docker run'"
-else
-  bad "T1: rebuild stub (CFGMS_TEST_IMAGE_REBUILD_CMD) ran before 'docker run'" \
-    "rebuild_line=${rebuild_line:-missing} run_line=${run_line:-missing} log=[${call_log}]"
-fi
-check_contains "T1: 'docker run' actually launched the agent image" "$call_log" "cfg-agent:latest"
-
-# ---------------------------------------------------------------------------
-# T2: stale image, rebuild fails -> dispatch refuses the launch with
-# IMAGE_REBUILD_FAILED and a non-zero exit; 'docker run' never happens at all
-# and there is no stale-image fallback (AC1).
-# ---------------------------------------------------------------------------
-printf '\n== T2: stale image, rebuild fails -> launch refused, no fallback ==\n'
-: > "$DOCKER_CALL_LOG"
+printf '\n== T2: image without the label -> refused ==\n'
 t2_rc=0
-t2_out=$(
-  MOCK_STORY_NUM=9998 MOCK_ITEM_ID=PVTI_mock_t2 \
-  FAKE_IMAGE_LABEL="some-old-hash" \
-  FAKE_IMAGE_EXISTS=1 \
-  CFGMS_TEST_IMAGE_REBUILD_CMD="exit 1" \
-  run_dispatch 9998
-) || t2_rc=$?
-check_eq "T2: dispatch exits non-zero" "$([[ $t2_rc -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
-check_contains "T2: reports IMAGE_STALE" "$t2_out" "IMAGE_STALE:some-old-hash:${CHECKOUT_HASH}"
-check_contains "T2: reports the distinct IMAGE_REBUILD_FAILED line" "$t2_out" "IMAGE_REBUILD_FAILED"
-check_not_contains "T2: never reaches LAUNCHED" "$t2_out" "LAUNCHED"
-check_not_contains "T2: 'docker run' never invoked (no fallback to the stale image)" \
-  "$(cat "$DOCKER_CALL_LOG")" "run -d"
+t2_out=$(FAKE_IMAGE_LABEL="" run_dispatch 4242) || t2_rc=$?
+check_eq "T2: dispatch exits 3" "$t2_rc" "3"
+check_contains "T2: missing label reads as none" "$t2_out" "IMAGE_STALE:none:${CHECKOUT_HASH}"
 
-# ---------------------------------------------------------------------------
-# T3: matching hash -> no rebuild, launch proceeds (the common case, proving
-# the gate isn't just unconditionally refusing or always rebuilding).
-# ---------------------------------------------------------------------------
-printf '\n== T3: matching hash -> no rebuild, launch proceeds ==\n'
-: > "$DOCKER_CALL_LOG"
+printf '\n== T3: matching image -> one launch path, the supervisor ==\n'
 t3_rc=0
-t3_out=$(
-  MOCK_STORY_NUM=9997 MOCK_ITEM_ID=PVTI_mock_t3 \
-  FAKE_IMAGE_LABEL="$CHECKOUT_HASH" \
-  CFGMS_TEST_IMAGE_REBUILD_CMD="echo REBUILD_RAN >> \"\$DOCKER_CALL_LOG\"; exit 0" \
-  run_dispatch 9997
-) || t3_rc=$?
+t3_out=$(run_dispatch 4242) || t3_rc=$?
 check_eq "T3: dispatch exits 0" "$t3_rc" "0"
-check_not_contains "T3: no IMAGE_STALE (hash already matches)" "$t3_out" "IMAGE_STALE"
-check_contains "T3: launch proceeds (LAUNCHED)" "$t3_out" "LAUNCHED:9997:"
-check_not_contains "T3: rebuild stub never runs" "$(cat "$DOCKER_CALL_LOG")" "REBUILD_RAN"
+check_not_contains "T3: no IMAGE_STALE" "$t3_out" "IMAGE_STALE"
+check_contains "T3: the run launched its agent" "$t3_out" "FSM_LAUNCHED:4242:cfg-agent-4242"
+check_contains "T3: DISPATCHED" "$t3_out" "DISPATCHED:4242"
+sup="$(cat "${SANDBOX}/supervisor.log")"
+check_contains "T3: supervisor run issue mode with the item and handed-off lease" "$sup" \
+  "run issue 4242 --lease-key story-PVTI_fakeitem --lease-handoff --detach --item-id PVTI_fakeitem"
+check_eq "T3: no docker run from po-act itself" "$(grep -c '^run ' "${SANDBOX}/docker.log" || true)" "0"
+check_eq "T3: story claimed In Progress" "$(cat "${SANDBOX}/board-status")" "In Progress"
+
+printf '\n== T4: open dependency -> refused before lease ==\n'
+t4_rc=0
+t4_out=$(FAKE_PQ_BODY=$'## Dependencies\n- #77\n- #78\n' run_dispatch 4242) || t4_rc=$?
+check_eq "T4: exits 3" "$t4_rc" "3"
+check_contains "T4: names the open dependency" "$t4_out" "DISPATCH_REFUSED:4242:dependency_open #77(open)"
+check_not_contains "T4: the closed dependency is not reported" "$t4_out" "#78"
+check_eq "T4: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+check_eq "T4: story stays Ready" "$(cat "${SANDBOX}/board-status")" "Ready"
+
+printf '\n== T5: supervisor refusal -> exit 3, claim rolled back ==\n'
+t5_rc=0
+t5_out=$(FAKE_SUP_MODE="refused:item_mismatch" run_dispatch 4242) || t5_rc=$?
+check_eq "T5: exits 3" "$t5_rc" "3"
+check_contains "T5: refusal relayed" "$t5_out" "DISPATCH_REFUSED:4242:item_mismatch"
+check_contains "T5: claim rolled back" "$t5_out" "ROLLED_BACK:PVTI_fakeitem -> Ready"
+
+printf '\n== T6: supervisor deferral -> exit 0 with DISPATCH_DEFERRED ==\n'
+t6_rc=0
+t6_out=$(FAKE_SUP_MODE="deferred:lease_held" run_dispatch 4242) || t6_rc=$?
+check_eq "T6: exits 0" "$t6_rc" "0"
+check_contains "T6: deferral relayed" "$t6_out" "DISPATCH_DEFERRED:4242:lease_held"
+check_not_contains "T6: not reported as dispatched" "$t6_out" "DISPATCHED:4242"
+
+printf '\n== T7: FAILED before launch -> exit 1, claim rolled back ==\n'
+t7_rc=0
+t7_out=$(FAKE_SUP_MODE="failed" run_dispatch 4242) || t7_rc=$?
+check_eq "T7: exits 1" "$t7_rc" "1"
+check_contains "T7: LAUNCH_FAILED names the run" "$t7_out" "LAUNCH_FAILED:4242:fsm_failed:"
+check_eq "T7: story back to Ready" "$(cat "${SANDBOX}/board-status")" "Ready"
 
 echo ""
 echo "-----------------------------------------"

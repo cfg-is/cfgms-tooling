@@ -26,10 +26,12 @@ the broken-develop state via po-act.sh block instead of dispatching new work
 that would inherit the broken base.
 """
 
+import importlib.util
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -877,7 +879,111 @@ def _pipeline_helper_path():
     return str(Path(__file__).resolve().parent / "pipeline-helper.sh")
 
 
-def live_story_lease_item_ids():
+def _lease_list_rows():
+    """Rows of `pipeline-helper.sh lease-list` as (key, holder, expired) for
+    every lease, or None when the lookup cannot run."""
+    script = _pipeline_helper_path()
+    try:
+        result = subprocess.run(
+            [resolve_bash(), script, "lease-list"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=30,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        rows.append((parts[0], parts[1], parts[3].strip().lower() in ("true", "1", "yes")))
+    return rows
+
+
+def live_pr_lease_nums(rows=None):
+    """PR numbers holding a live (unexpired) `pr-<N>` lease on any host.
+
+    `pr-<N>` is shared by review, fix-pr, resolve-conflict and inline rebase:
+    a held one means some host is working that PR right now, so this cycle
+    recommends no second operation on it. Fails open (empty set)."""
+    rows = _lease_list_rows() if rows is None else rows
+    nums = set()
+    for key, _holder, expired in rows or []:
+        if expired or not key.startswith("pr-"):
+            continue
+        tail = key[len("pr-"):]
+        if tail.isdigit():
+            nums.add(int(tail))
+    return nums
+
+
+def _load_runindex():
+    path = Path(__file__).resolve().parent / "fsm" / "runindex.py"
+    spec = importlib.util.spec_from_file_location("fsm_runindex", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(path.parent))
+    return mod
+
+
+def fsm_runs():
+    """FSM supervisor runs on this host (runindex.list_runs), or [] when the
+    index cannot be read."""
+    try:
+        return _load_runindex().list_runs()
+    except Exception:
+        return []
+
+
+def fsm_run_view(runs, lease_rows=None, host=None):
+    """What the FSM runs on this host mean for this cycle (DESIGN.md §11).
+
+    - in flight (live, hung, starting): their story numbers, item ids and PR
+      numbers are being worked; nothing may be dispatched, reviewed, rebased or
+      re-dispatched as stalled for them, and no reaper may touch them.
+    - crashed (not done, lock free): resumable. Recommended action is
+      `po-act.sh dispatch resume <run>` when the run's lease is held by this
+      host or no longer held by anyone; `hold` while another host holds it.
+      A crashed run's story is not a stalled dispatch either: resuming keeps
+      its work, a fresh dispatch would start over beside it.
+    """
+    host = host or os.environ.get("CFGMS_HOST_ID") or socket.gethostname()
+    leases = {k: (h, exp) for k, h, exp in (lease_rows or [])}
+    view = {"in_flight": [], "resumable": [], "story_nums": set(), "item_ids": set(),
+            "pr_nums": set()}
+    for r in runs:
+        if r.get("status") == "done":
+            continue
+        entry = {k: r.get(k) for k in ("run_id", "status", "state", "mode", "target", "issue",
+                                       "pr", "item_id", "lease_key", "container",
+                                       "heartbeat_age", "agent_launched", "sessions")}
+        if r.get("issue"):
+            view["story_nums"].add(int(r["issue"]))
+        if r.get("item_id"):
+            view["item_ids"].add(r["item_id"])
+        if r.get("pr"):
+            view["pr_nums"].add(int(r["pr"]))
+        if r.get("status") == "crashed":
+            holder, expired = leases.get(r.get("lease_key") or "", (None, True))
+            if holder is not None and not expired and holder != host:
+                entry["action"] = "hold"
+                entry["reason"] = f"lease {r.get('lease_key')} held by {holder}"
+            else:
+                entry["action"] = "resume"
+                entry["reason"] = (f"run crashed in {r.get('state')}; resume with "
+                                   f"`./.claude/tooling/scripts/po-act.sh dispatch resume {r['run_id']}`")
+            view["resumable"].append(entry)
+        else:
+            view["in_flight"].append(entry)
+    return view
+
+
+def live_story_lease_item_ids(rows=False):
     """Item IDs holding a live (unexpired) story lease, from `lease-list`.
 
     One call returns every lease as TSV: ``key<TAB>holder<TAB>exp<TAB>expired``.
@@ -890,27 +996,10 @@ def live_story_lease_item_ids():
     uses it to suppress a stall report, and a lease lookup that cannot run
     should not silently hide genuinely dead dispatches.
     """
-    script = _pipeline_helper_path()
-    try:
-        result = subprocess.run(
-            [resolve_bash(), script, "lease-list"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            check=False, timeout=30,
-        )
-    except Exception:
-        return set()
-    if result.returncode != 0 or not result.stdout.strip():
-        return set()
-
+    rows = _lease_list_rows() if rows is False else rows
     live = set()
-    for line in result.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        key, _holder, _exp, expired = parts[0], parts[1], parts[2], parts[3]
-        if not key.startswith("story-"):
-            continue
-        if expired.strip().lower() in ("true", "1", "yes"):
+    for key, _holder, expired in rows or []:
+        if expired or not key.startswith("story-"):
             continue
         live.add(key[len("story-"):])
     return live
@@ -1517,7 +1606,8 @@ def ci_summary(checks):
 
 def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
                                epic_nums=None, closed_nums=None,
-                               leased_item_ids=None):
+                               leased_item_ids=None, fsm_story_nums=None,
+                               fsm_item_ids=None):
     """Detect In-Progress stories with no running agent container and no open PR.
 
     A story is stalled when:
@@ -1576,7 +1666,14 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
 
     Expired leases do not count — an expired lease is exactly how a genuinely
     dead dispatch presents, and suppressing on it would hide the real thing.
+
+    Stories with an unfinished FSM run on this host (`fsm_story_nums`,
+    `fsm_item_ids`) are skipped too. A run has no container while it
+    snapshots, validates or publishes, and a crashed run's lease expires; it
+    is resumed (`fsm_runs.resumable`), never re-dispatched beside its own work.
     """
+    fsm_story_nums = set(fsm_story_nums or ())
+    fsm_item_ids = set(fsm_item_ids or ())
     epic_nums = set(epic_nums or ())
     closed_nums = set(closed_nums or ())
     leased_item_ids = set(leased_item_ids or ())
@@ -1602,6 +1699,8 @@ def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
         if n in closed_nums:
             continue
         if item.get("item_id") and item["item_id"] in leased_item_ids:
+            continue
+        if n in fsm_story_nums or (item.get("item_id") and item["item_id"] in fsm_item_ids):
             continue
         if n in running_story_nums:
             continue
@@ -3011,7 +3110,16 @@ def main():
     #   cfg-agent-pr-fix-<PR>         — fix-pr agent (Issue #1786)
     #   cfg-agent-resolve-conflict-<PR> — conflict-resolution agent (Issue #1977)
     # Both push to the PR branch and must not race with a rebase or second dispatch.
-    active_fix_pr_nums = set()
+    # FSM runs (DESIGN.md §11): an unfinished run holds its story / PR whether
+    # or not one of its containers is running right now. pr-<N> leases held
+    # by any host mean the same for a PR (review, fix and resolve share it).
+    lease_rows = _lease_list_rows()
+    fsm_view = fsm_run_view(fsm_runs(), lease_rows)
+    out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
+    active_fix_pr_nums = set(fsm_view["pr_nums"]) | live_pr_lease_nums(lease_rows)
+    for s_ in pr_summaries:
+        if s_.get("story_number") in fsm_view["story_nums"]:
+            active_fix_pr_nums.add(s_["pr"])
     for name in containers or []:
         if name.startswith("cfg-agent-pr-fix-"):
             tail = name.removeprefix("cfg-agent-pr-fix-")
@@ -3045,7 +3153,9 @@ def main():
             s["number"] for s in in_progress_parsed
             if s.get("state") in ("CLOSED", "MERGED") and s.get("number") is not None
         },
-        leased_item_ids=live_story_lease_item_ids(),
+        leased_item_ids=live_story_lease_item_ids(lease_rows),
+        fsm_story_nums=fsm_view["story_nums"],
+        fsm_item_ids=fsm_view["item_ids"],
     )
 
     parse_warning_count = sum(
@@ -3116,6 +3226,7 @@ def write_output(out, mode):
         "dispatch_recommendations": out.get("dispatch_recommendations", []),
         "review_recommendations": out.get("review_recommendations", []),
         "fix_recommendations": out.get("fix_recommendations", []),
+        "fsm_runs": out.get("fsm_runs", {"in_flight": [], "resumable": []}),
     }
     json.dump(summary, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")

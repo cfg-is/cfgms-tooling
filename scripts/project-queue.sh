@@ -2,7 +2,8 @@
 # project-queue.sh — GitHub Projects V2 queue operations for CFGMS pipeline
 # Reads field IDs from .claude/pipeline.yaml; uses gh api graphql exclusively.
 # No gh issue calls; no label manipulation.
-# Exit codes: 0=success, 1=GraphQL API error, 2=invalid arguments
+# Exit codes: 0=success, 1=GraphQL API error, 2=invalid arguments,
+#             3=not found (item-for-issue: the issue is not on the project)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +21,7 @@ Subcommands:
   create-draft <story_num> <title> <body_file>   Create a draft project item (Status=Draft)
   list-by-status <status>                         List items by status (JSON array)
   get-item <item_id>                              Get full item JSON
+  item-for-issue <issue_num>                      Print the project item id of an issue (exit 3 when it has none)
   update-field <item_id> <field> <value>          Update a field value
   add-issue <issue_num>                            Add a GitHub issue to the project
   add-pr <pr_num>                                 Add a GitHub PR to the project
@@ -331,6 +333,48 @@ print(json.dumps({
     'issue_num': content.get('number', None),
     'fields': text_fields
 }))
+PYEOF
+}
+
+# item-for-issue <issue_num> — the issue -> project item lookup. The fix-pr and
+# resolve-conflict launch paths know a PR's story number (feature/story-<N>,
+# `Fixes #N`) and need the item id, because the FSM supervisor reads the spec
+# and Files In Scope from the project item, never from issue text. Prints the
+# item id on this project; exit 3 when the issue has no item here.
+cmd_item_for_issue() {
+    [[ $# -ge 1 && "$1" =~ ^[0-9]+$ ]] || {
+        printf 'Usage: %s item-for-issue <issue_num>\n' "$0" >&2
+        exit 2
+    }
+    _require_yaml
+    local project_id
+    project_id=$(_yaml_get project_id)
+    GQ_ISSUE="$1" GQ_PROJECT_ID="$project_id" GQ_OWNER="$REPO_OWNER" GQ_REPO="$REPO_NAME" \
+        python3 - <<'PYEOF'
+import json, os, subprocess, sys
+
+query = ('query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){'
+         'issue(number:$n){projectItems(first:50){nodes{id project{id}}}}}}')
+payload = {'query': query, 'variables': {'o': os.environ['GQ_OWNER'], 'r': os.environ['GQ_REPO'],
+                                         'n': int(os.environ['GQ_ISSUE'])}}
+r = subprocess.run(['gh', 'api', 'graphql', '--input', '-'], input=json.dumps(payload).encode(),
+                   capture_output=True)
+if r.returncode != 0:
+    print(r.stderr.decode().strip(), file=sys.stderr)
+    sys.exit(1)
+resp = json.loads(r.stdout)
+if resp.get('errors'):
+    for e in resp['errors']:
+        print(e.get('message', str(e)), file=sys.stderr)
+    sys.exit(1)
+issue = ((resp.get('data') or {}).get('repository') or {}).get('issue')
+if not issue:
+    sys.exit(3)
+for node in (issue.get('projectItems') or {}).get('nodes') or []:
+    if node and (node.get('project') or {}).get('id') == os.environ['GQ_PROJECT_ID']:
+        print(node['id'])
+        sys.exit(0)
+sys.exit(3)
 PYEOF
 }
 
@@ -793,6 +837,7 @@ case "$subcommand" in
     create-draft)   cmd_create_draft "$@" ;;
     list-by-status) cmd_list_by_status "$@" ;;
     get-item)       cmd_get_item "$@" ;;
+    item-for-issue) cmd_item_for_issue "$@" ;;
     update-field)   cmd_update_field "$@" ;;
     add-issue)      cmd_add_issue "$@" ;;
     add-pr)         cmd_add_pr "$@" ;;

@@ -77,6 +77,41 @@ AGENT_SESSIONS_BASE="${CFGMS_AGENT_SESSIONS_BASE:-${HOME}/.cache/cfgms-agent-ses
 AGENT_SESSIONS_RETENTION_DAYS="${CFGMS_AGENT_SESSIONS_RETENTION_DAYS:-30}"
 AGENT_SESSIONS_MOUNT="/agent-sessions"
 
+# FSM run index (DESIGN.md §11, §12). Dev, fix and resolve-conflict work runs
+# under the host-side supervisor (scripts/fsm/supervisor.py); its runs live in
+# CFGMS_FSM_RUNS_DIR. Capacity, cleanup and fsm-status read them through
+# runindex.py, never by guessing from container state: one run starts several
+# agent and validator containers in turn, and between them none is running.
+FSM_RUNINDEX_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fsm/runindex.py"
+
+# _fsm_run_status <run_id>  — done | live | hung | starting | crashed | unknown
+_fsm_run_status() {
+  [[ -n "${1:-}" ]] || { echo unknown; return 0; }
+  local info
+  info=$(python3 "$FSM_RUNINDEX_PY" show "$1" 2>/dev/null || true)
+  python3 -c "import json,sys
+try: print(json.loads(sys.argv[1]).get('status') or 'unknown')
+except Exception: print('unknown')" "$info" 2>/dev/null || echo unknown
+}
+
+# _fsm_container_run <container>  — the run_id label of an FSM container, or empty.
+_fsm_container_run() {
+  docker inspect -f '{{index .Config.Labels "run_id"}}' "$1" 2>/dev/null || true
+}
+
+# _fsm_container_owned <container>
+#   True when the container belongs to an FSM run that has not finished: the
+#   supervisor reads its exit code and removes it itself, and a resumed run
+#   re-attaches to it. No reaper may remove it. A run dir that no longer exists
+#   (`unknown`) owns nothing.
+_fsm_container_owned() {
+  local rid st
+  rid=$(_fsm_container_run "$1")
+  [[ -n "$rid" ]] || return 1
+  st=$(_fsm_run_status "$rid")
+  [[ "$st" != "done" && "$st" != "unknown" ]]
+}
+
 # Token reporter mount (Issue #3041). Every entrypoint resolves the reporter
 # from ${AGENT_METRICS_MOUNT} only, never from /workspace: the branch under
 # dispatch or review must not be able to disable its own accounting by lacking,
@@ -386,15 +421,27 @@ _capacity_compute() {
   # guard the missing binary exits 127 mid-pipeline and `set -e` aborts the whole
   # function before it prints a CAPACITY_ line, turning "no docker" into "no
   # answer" for every caller of `agent-dispatch.sh capacity`.
+  local running_ids reserved=0
   if command -v docker >/dev/null 2>&1; then
     running=$(docker ps --filter "label=cfg-agent=true" -q 2>/dev/null | wc -l | tr -d ' ')
     docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+    running_ids=$(docker ps --filter "label=cfg-agent=true" --format '{{.Label "run_id"}}' 2>/dev/null \
+      | sort -u | paste -sd, - || true)
   else
     running=0
     docker_root=/var/lib/docker
+    running_ids=""
   fi
+  # An in-flight FSM run between containers (PREPARE, SNAPSHOT, SYNC, PUBLISH)
+  # starts its next agent or validator without asking the gate again, so it
+  # keeps a slot reserved. Validators carry label cfg-agent=true and are
+  # already counted in `running` while they run.
+  reserved=$(python3 "$FSM_RUNINDEX_PY" reserved --running-run-ids "${running_ids}" 2>/dev/null || echo 0)
+  [[ "$reserved" =~ ^[0-9]+$ ]] || reserved=0
+  running=$(( ${running:-0} + reserved ))
   CAP_MODE="$mode" CAP_RUNNING="${running:-0}" CAP_DOCKER_ROOT="$docker_root" \
-  CAP_WORKTREE="$WORKTREE_BASE" python3 - <<'PY'
+  CAP_WORKTREE="$WORKTREE_BASE" CAP_FSM_RUNS="${CFGMS_FSM_RUNS_DIR:-${HOME}/.cache/cfgms-fsm-runs}" \
+  python3 - <<'PY'
 import os
 import shutil
 def f(k, d):
@@ -449,7 +496,10 @@ def nearest_existing(path):
     return path
 
 disk_slot = 999
-for raw in {os.environ.get("CAP_WORKTREE", ""), os.environ.get("CAP_DOCKER_ROOT", "")}:
+# The FSM run dirs (candidate repos, workspaces, per-run validator caches) are
+# measured too: they grow with every run on this host.
+for raw in {os.environ.get("CAP_WORKTREE", ""), os.environ.get("CAP_DOCKER_ROOT", ""),
+            os.environ.get("CAP_FSM_RUNS", "")}:
     if not raw: continue
     p = nearest_existing(raw)
     if not p: continue
@@ -2137,8 +2187,8 @@ Commands:
                                             init, a renamed unit). Fails closed with
                                             LAUNCH_FAILED:...:credential_unavailable naming the exact
                                             directory it looked in when the keypair is not there.
-  launch          <NUM>                     Launch agent container (issue mode)
-  launch-generic  <NAME> <DIR> [ARGS...]    Launch agent container with custom name and args
+  fsm-status [--json]                       List FSM supervisor runs and their states
+                                            (dev/fix/resolve work starts only via po-act.sh)
   live            <BRANCH|NUM>               Drop into live Claude session (branch name or issue number)
   po-live         [PO_ARGS...]               Drop into live Claude session pre-seeded with /po <args> (intent capture, planning team, etc.)
   launch-interactive <BRANCH>               Print docker run command for interactive session
@@ -2147,7 +2197,8 @@ Commands:
   check-creds                                Check OAuth credential validity and remaining time
   cleanup-issue   <NUM>                     Remove container and clone for a specific issue
   cleanup-container <NAME>                  Remove container and associated clone by name
-  cleanup-stale                             Remove containers/clones for closed, blocked, or failed stories
+  cleanup-stale                             Remove containers/clones for closed, blocked, or failed stories,
+                                            exited validators and finished FSM run dirs (never an unfinished run's)
   list-running                              List running agent containers
   capacity [--json]                         Resource admission gate: CAPACITY_OK:slots=<n> (rc0) / CAPACITY_FULL:<binding>:slots=0 (rc1)
   list-exited                               List exited agent containers
@@ -2707,176 +2758,21 @@ case "$cmd" in
     echo "CLONE_OK:${dest_prefix}${pr_num}:${pr_branch}:issue=${issue_num:-none}"
     ;;
 
-  launch)
-    [[ $# -eq 1 ]] || { echo "launch requires exactly one issue number"; exit 1; }
-    num="$1"
-    [[ "$num" =~ ^[0-9]+$ ]] || { echo "launch requires a numeric issue number"; exit 1; }
-    gate_credentials_for_launch
-    clone_path="${WORKTREE_BASE}/story-${num}"
-    [[ -d "$clone_path" ]] || { echo "ERROR: clone not found: ${clone_path}"; exit 1; }
-    gate_image_staleness_for_launch
-    real_path=$(realpath "$clone_path")
-    gh_token=$(gh auth token)
-
-    # Mint sub-tenant + scoped API key; write to per-agent tmpfs dir (Issue #2124).
-    # On mint failure: emit CRED_MINT_FAILED, clean up, exit non-zero — never start the container.
-    cred_dir="${AGENT_CRED_BASE}/${num}"
-    if ! mint_out=$(mint_agent_creds "$num" 2>&1); then
-      echo "$mint_out"
-      rm -rf "$clone_path"
-      echo "CLEANED:clone:${clone_path}"
-      exit 1
-    fi
-    echo "$mint_out"
-
-    tier1_url="${CFGMS_TIER1_URL:-}"
-
-    # Persist this run's transcript to the host so its token spend survives the
-    # container's --rm (Issue #3028; extended to this launch path in #3051 —
-    # `launch` was the one dev-agent path prepare_session_dir never reached).
-    # Degrades to no mount if the dir can't be created; telemetry never blocks
-    # dispatch.
-    session_mount=()
-    if sessions_dir=$(prepare_session_dir "cfg-agent-${num}" "issue" "${num}" "" ""); then
-      session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
-    fi
-
-    ledger_append_launch "cfg-agent-${num}" "issue" "${num}" "" "" "dev-agent" ""
-
-    agent_token_args
-    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
-      --name "cfg-agent-${num}" \
-      --label "cfg-agent=true" \
-      --label "issue=${num}" \
-      --label "mode=issue" \
-      --memory=4g \
-      --cpus=4 \
-      --stop-timeout=3600 \
-      -v "${real_path}:/workspace" \
-      "${AGENT_CRED_ARGS[@]}" \
-      -v "$(agent_trust_file "cfg-agent-${num}"):/home/agent/.claude.json" \
-      -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
-      -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
-      -v "${cred_dir}:/run/cfgms/agent-cred:ro" \
-      "${AGENT_METRICS_MOUNT_ARGS[@]}" \
-      "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
-      "${session_mount[@]}" \
-      -e "GH_TOKEN=${gh_token}" \
-      -e "CFGMS_AUTONOMOUS=true" \
-      -e "CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key" \
-      -e "CFGMS_TENANT=agent-test/${num}" \
-      -e "CFGMS_TIER1_URL=${tier1_url}" \
-      -e "CFGMS_ADMIN_BUNDLE=" \
-      -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
-      --cap-add NET_ADMIN \
-      cfg-agent:latest \
-      "${num}" 2>&1); then
-      echo "LAUNCHED:${num}:${container_id}"
-    else
-      # Launch failed — revoke creds and clean up to prevent orphaned resources.
-      echo "LAUNCH_FAILED:${num}:${container_id}"
-      ledger_append_launch_failed "cfg-agent-${num}" "issue"
-      revoke_agent_creds "$num" || true
-      rm -rf "${cred_dir}" 2>/dev/null || true
-      rm -rf "$clone_path"
-      echo "CLEANED:clone:${clone_path}"
-      exit 1
-    fi
+  launch|launch-generic)
+    # The headless dev-agent launch path (one `claude -p` session holding
+    # GH_TOKEN that implemented, validated, committed, pushed and opened its
+    # own PR) is removed. Dev, fix-pr, resolve-conflict and branch work runs
+    # under the FSM supervisor (scripts/fsm/supervisor.py, DESIGN.md), started
+    # only by po-act.sh. Interactive, po-live, review and investigator
+    # containers keep their own launch subcommands.
+    echo "LAUNCH_REMOVED:${cmd:-launch}: use po-act.sh dispatch <STORY> | dispatch --branch <BRANCH> [--issue N] | dispatch-fix <PR> | resolve-conflict <PR>"
+    exit 2
     ;;
 
-  launch-generic)
-    [[ $# -ge 2 ]] || { echo "launch-generic requires <CONTAINER_NAME> <CLONE_DIR> [ENTRYPOINT_ARGS...]"; exit 1; }
-    container_name="$1"; shift
-    clone_dir="$1"; shift
-    entrypoint_args=("$@")
-
-    gate_credentials_for_launch
-    [[ -d "$clone_dir" ]] || { echo "ERROR: clone not found: ${clone_dir}"; exit 1; }
-    gate_image_staleness_for_launch
-    real_path=$(realpath "$clone_dir")
-    gh_token=$(gh auth token)
-
-    # Forward the distributed lease key (set by po-act dispatch-fix/resolve-conflict)
-    # so the container's entrypoint releases the pr-<N> lease on exit. Empty when
-    # launch-generic is used outside the cron (e.g. branch mode) — then no lease.
-    lease_env=()
-    if [[ -n "${CFGMS_LEASE_KEY:-}" ]]; then
-      lease_env=(-e "CFGMS_LEASE_KEY=${CFGMS_LEASE_KEY}")
-    fi
-
-    # Derive mode and metadata labels from entrypoint args
-    mode_label="branch"
-    fix_pr_num=""
-    issue_arg=""
-    branch_arg=""
-    extra_labels=()
-    for i in "${!entrypoint_args[@]}"; do
-      case "${entrypoint_args[$i]}" in
-        --fix-pr)          mode_label="fix-pr";          fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
-        --resolve-conflict) mode_label="resolve-conflict"; fix_pr_num="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "pr=${entrypoint_args[$((i+1))]}") ;;
-        --branch)          branch_arg="${entrypoint_args[$((i+1))]}"; extra_labels+=(--label "branch=${entrypoint_args[$((i+1))]}") ;;
-        --issue)           issue_arg="${entrypoint_args[$((i+1))]}";  extra_labels+=(--label "issue=${entrypoint_args[$((i+1))]}") ;;
-      esac
-    done
-
-    # Persist this run's transcript to the host so its token spend survives the
-    # container's --rm (Issue #3028). Degrades to no mount if the dir can't be
-    # created; telemetry never blocks dispatch.
-    session_mount=()
-    if sessions_dir=$(prepare_session_dir \
-        "$container_name" "$mode_label" "$issue_arg" "$fix_pr_num" "$branch_arg"); then
-      session_mount=(-v "${sessions_dir}:${AGENT_SESSIONS_MOUNT}")
-    fi
-
-    ledger_segment="dev-agent"
-    if [[ "$mode_label" == "fix-pr" || "$mode_label" == "resolve-conflict" ]]; then
-      ledger_segment="fix-agent"
-    fi
-    ledger_append_launch "$container_name" "$mode_label" "${issue_arg:-}" "${fix_pr_num:-}" \
-      "${branch_arg:-}" "$ledger_segment" "${CFGMS_LEASE_KEY:-}"
-
-    agent_token_args
-    if container_id=$(CLAUDE_CODE_OAUTH_TOKEN="$AGENT_TOKEN_VALUE" docker run -d \
-      --name "$container_name" \
-      --label "cfg-agent=true" \
-      --label "mode=${mode_label}" \
-      "${extra_labels[@]}" \
-      --memory=4g \
-      --cpus=4 \
-      --stop-timeout=3600 \
-      -v "${real_path}:/workspace" \
-      "${AGENT_CRED_ARGS[@]}" \
-      -v "$(agent_trust_file "${container_name}"):/home/agent/.claude.json" \
-      -v "cfgms-go-build-cache:/home/agent/.cache/go-build" \
-      -v "cfgms-go-mod-cache:/home/agent/go/pkg/mod" \
-      "${AGENT_METRICS_MOUNT_ARGS[@]}" \
-      "${AGENT_MODEL_ROUTING_MOUNT_ARGS[@]}" \
-      "${session_mount[@]}" \
-      -e "GH_TOKEN=${gh_token}" \
-      -e "CFGMS_AUTONOMOUS=true" \
-      -e "CFGMS_MODEL_OVERRIDE=${CFGMS_MODEL_OVERRIDE:-}" \
-      "${lease_env[@]}" \
-      --cap-add NET_ADMIN \
-      cfg-agent:latest \
-      "${entrypoint_args[@]}" 2>&1); then
-      echo "LAUNCHED:${container_name}:${container_id}"
-      # Best-effort PR dashboard label — fix-agent marks the PR while the fix
-      # agent is in flight. Display only: the cron never reads it (work-queue
-      # state stays in the project queue). cleanup-stale reconciles it off.
-      # Uses the REST API, not `gh pr edit --add-label`: the latter also queries
-      # the deprecated Projects-classic `projectCards` GraphQL field and exits
-      # non-zero on this repo, so it would silently never apply the label.
-      if [[ "$mode_label" == "fix-pr" && -n "$fix_pr_num" ]]; then
-        gh api --method POST "repos/cfg-is/cfgms/issues/${fix_pr_num}/labels" \
-          -f "labels[]=fix-agent" >/dev/null 2>&1 || true
-      fi
-    else
-      echo "LAUNCH_FAILED:${container_name}:${container_id}"
-      ledger_append_launch_failed "$container_name" "$mode_label"
-      rm -rf "$clone_dir"
-      echo "CLEANED:clone:${clone_dir}"
-      exit 1
-    fi
+  fsm-status)
+    # FSM runs and their states (runindex.py): RUN_ID STATUS STATE MODE TARGET
+    # CONTAINER HEARTBEAT SESSIONS REASON, or --json. Read-only.
+    python3 "$FSM_RUNINDEX_PY" list "$@"
     ;;
 
   live)
@@ -3254,6 +3150,11 @@ else:
   cleanup-issue)
     [[ $# -eq 1 ]] || { echo "cleanup-issue requires exactly one issue number or item_id"; exit 1; }
     num="$1"
+    if [[ "$num" =~ ^[0-9]+$ ]] && _fsm_container_owned "cfg-agent-${num}"; then
+      echo "SKIP:container:cfg-agent-${num} belongs to an unfinished FSM run (po-act.sh dispatch status)"
+      echo "CLEANUP_DONE:${num}"
+      exit 0
+    fi
     if [[ "$num" =~ ^[0-9]+$ ]]; then
       # Issue mode (numeric): revoke API key + suspend tenant, then remove container + clone.
       revoke_agent_creds "$num" || true
@@ -3299,6 +3200,11 @@ else:
   cleanup-container)
     [[ $# -eq 1 ]] || { echo "cleanup-container requires exactly one container name"; exit 1; }
     container_name="$1"
+    if _fsm_container_owned "$container_name"; then
+      echo "SKIP:container:${container_name} belongs to an unfinished FSM run (po-act.sh dispatch status)"
+      echo "CLEANUP_DONE:${container_name}"
+      exit 0
+    fi
     # Copy result file (best-effort)
     docker cp "${container_name}:/tmp/agent-result.json" "/tmp/agent-result-${container_name}.json" 2>/dev/null || true
     ledger_reconcile_exit "$container_name" "/tmp/agent-result-${container_name}.json"
@@ -4837,8 +4743,15 @@ PY
     # container lifecycle.
     if [[ -d "$AGENT_SESSIONS_BASE" ]]; then
       pruned_sessions=0
+      # Session dirs of unfinished FSM runs are never pruned, whatever their
+      # age: the run writes its manifest into the last one at REPORT.
+      fsm_protected_sessions=" $(python3 "$FSM_RUNINDEX_PY" protected-sessions 2>/dev/null | tr '\n' ' ' || true) "
       while IFS= read -r stale_dir; do
         [[ -z "$stale_dir" ]] && continue
+        if [[ "$fsm_protected_sessions" == *" $(basename "$stale_dir") "* ]]; then
+          echo "KEPT:session-dir:$(basename "$stale_dir"):fsm_run_unfinished"
+          continue
+        fi
         rm -rf "$stale_dir" 2>/dev/null && pruned_sessions=$((pruned_sessions + 1))
       done < <(find "$AGENT_SESSIONS_BASE" -mindepth 1 -maxdepth 1 -type d \
                  -mtime "+${AGENT_SESSIONS_RETENTION_DAYS}" 2>/dev/null || true)
@@ -4877,6 +4790,13 @@ PY
         # cleanup-stale-reviews; live/interactive sessions are founder-owned and
         # deliberately never reaped. Do not turn this back into a blanket skip —
         # that is what left two whole classes uncovered.
+        continue
+      fi
+
+      # An unfinished FSM run owns its containers: the supervisor captures
+      # the exit code and removes them, and a resumed run re-attaches.
+      if _fsm_container_owned "$container_name"; then
+        echo "KEPT:container:${container_name}:fsm_run_unfinished"
         continue
       fi
 
@@ -4945,6 +4865,10 @@ PY
 
       cleanup_pr_container_should_reap \
         "$running" "$finished_ts" "$pr_reap_now" "$pr_reap_max_age" || continue
+      if _fsm_container_owned "$container_name"; then
+        echo "KEPT:container:${container_name}:fsm_run_unfinished"
+        continue
+      fi
 
       echo "STALE:${container_name}:${reap_class} exited over $((pr_reap_max_age / 60))m ago"
       docker cp "${container_name}:/tmp/agent-result.json" \
@@ -4966,6 +4890,32 @@ PY
     done < <(docker ps -a --filter "label=cfg-agent=true" \
                --filter "status=exited" --format '{{.Names}}' 2>/dev/null || true)
 
+    # --- FSM validator containers (cfg-validate-<N>) and run dirs ---
+    # A validator is started detached, without --rm, and removed by its
+    # supervisor after `docker wait`. Left behind only when the run died
+    # mid-VALIDATE: removed here once its run is done or its run dir is gone.
+    # A validator of an unfinished run (live, hung, starting, or crashed and
+    # resumable) is kept -- resume rebuilds it, a reap would race a live one.
+    while IFS= read -r v_name; do
+      [[ -z "$v_name" ]] && continue
+      if _fsm_container_owned "$v_name"; then
+        continue
+      fi
+      if docker rm -f "$v_name" >/dev/null 2>&1; then
+        echo "CLEANED:validator:${v_name}"
+        cleaned=$((cleaned + 1))
+      fi
+    done < <(docker ps -a --filter "label=cfg-agent=true" --filter "name=cfg-validate-" \
+               --format '{{.Names}}' 2>/dev/null || true)
+    # Finished runs only (terminal_done recorded, lock free, idle past
+    # CFGMS_FSM_RUN_RETENTION_HOURS), plus stale active-index entries, launch
+    # logs and per-session trust dirs of runs that are not in flight.
+    while IFS= read -r gc_line; do
+      [[ -z "$gc_line" ]] && continue
+      echo "$gc_line"
+      cleaned=$((cleaned + 1))
+    done < <(python3 "$FSM_RUNINDEX_PY" gc 2>/dev/null || true)
+
     # --- Orphaned agent clone reap (Issue #4358) ---
     # Runs after the container reaps above, so a pair they just removed is
     # already gone and what is left has no container at all.
@@ -4985,6 +4935,10 @@ PY
         review-agent) _cprefix="cfg-agent-review-pr-" ;;
       esac
       for _pr in $(gh pr list --repo cfg-is/cfgms --label "$_lbl" --state open --json number --jq '.[].number' 2>/dev/null || true); do
+        if [[ "$_lbl" == "fix-agent" ]] \
+           && [[ -n "$(python3 "$FSM_RUNINDEX_PY" find --key "pr-${_pr}" 2>/dev/null || true)" ]]; then
+          continue   # an unfinished FSM run still works this PR
+        fi
         if ! docker ps --filter "name=^${_cprefix}${_pr}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
           gh api --method DELETE "repos/cfg-is/cfgms/issues/${_pr}/labels/${_lbl}" >/dev/null 2>&1 || true
           echo "LABEL_CLEARED:${_lbl}:${_pr}"

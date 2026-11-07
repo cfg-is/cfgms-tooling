@@ -2323,163 +2323,8 @@ DISPEOF
     rm -rf "$tmp_dir"
 }
 
-test_entrypoint_set_pr_call() {
-    log_test "Testing entrypoint.sh: set-pr called after PR creation with CFGMS_PROJECT_ITEM_ID..."
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"; trap - RETURN' RETURN
-
-    local calls_file="${tmp_dir}/pq-calls.txt"
-    touch "$calls_file"
-
-    # Fake HOME with credentials (far-future expiry so token check passes)
-    local fake_home="${tmp_dir}/home"
-    mkdir -p "${fake_home}/.claude"
-    cat > "${fake_home}/.claude/.credentials.json" << 'CREDEOF'
-{"claudeAiOauth":{"expiresAt":9999999999999,"accessToken":"fake","refreshToken":"fake"}}
-CREDEOF
-    cat > "${fake_home}/.claude.json" << 'CONFIGEOF'
-{"hasCompletedOnboarding":true}
-CONFIGEOF
-
-    # Git repo with correct branch so git branch --show-current returns story branch
-    local git_dir="${tmp_dir}/repo"
-    git init -b develop "$git_dir" >/dev/null 2>&1
-    git -C "$git_dir" config user.email "test@test.com"
-    git -C "$git_dir" config user.name "Test"
-    git -C "$git_dir" commit --allow-empty -m "initial" >/dev/null 2>&1
-    git -C "$git_dir" checkout -b "feature/story-999-agent" >/dev/null 2>&1
-
-    # Mock setup-env.sh — minimal: just git config (no firewall/credentials setup needed)
-    cat > "${tmp_dir}/setup-env.sh" << 'SETUPEOF'
-#!/usr/bin/env bash
-git config --global user.name "test-agent" 2>/dev/null || true
-git config --global user.email "agent@test.com" 2>/dev/null || true
-SETUPEOF
-    chmod +x "${tmp_dir}/setup-env.sh"
-
-    # Mock claude: creates validation marker and exits 0
-    cat > "${tmp_dir}/claude" << 'CLAUDEOF'
-#!/usr/bin/env bash
-touch /tmp/agent-validation-passed
-exit 0
-CLAUDEOF
-    chmod +x "${tmp_dir}/claude"
-
-    # Mock gh: returns PR URL for pr list, {} for everything else
-    cat > "${tmp_dir}/gh" << 'GHEOF'
-#!/usr/bin/env bash
-if [[ "$1" == "pr" && "$2" == "list" ]]; then
-    echo "https://github.com/cfg-is/cfgms/pull/42"
-else
-    echo "{}"
-fi
-exit 0
-GHEOF
-    chmod +x "${tmp_dir}/gh"
-
-    # Mock project-queue.sh: records all calls, responds to get-item and set-pr
-    local pq_recorder="${tmp_dir}/pq-recorder.sh"
-    cat > "$pq_recorder" << PQEOF
-#!/usr/bin/env bash
-echo "\$@" >> "${calls_file}"
-subcmd="\${1:-}"
-case "\$subcmd" in
-    get-item)
-        printf '{"item_id":"PVTI_testitem","title":"Test Story 999","body":"Test body content.","status":"In Progress","fields":{}}\n'
-        ;;
-    set-pr)
-        printf '{"updated":true}\n'
-        ;;
-    *)
-        printf '[]\n'
-        ;;
-esac
-exit 0
-PQEOF
-    chmod +x "$pq_recorder"
-
-    local entrypoint_script
-    entrypoint_script="${REPO_ROOT}/.claude/tooling/devcontainer/entrypoint.sh"
-
-    if [[ ! -f "$entrypoint_script" ]]; then
-        log_fail "entrypoint_set_pr_call: entrypoint.sh not found at ${entrypoint_script}"
-        return
-    fi
-
-    # Run entrypoint.sh from the temp git repo (so git branch --show-current works)
-    rm -f /tmp/agent-validation-passed
-    local output exit_code=0
-    output=$(
-        cd "$git_dir"
-        PATH="${tmp_dir}:${PATH}" \
-        HOME="${fake_home}" \
-        CFGMS_PROJECT_ITEM_ID="PVTI_testitem" \
-        CFGMS_TEST_PROJECT_QUEUE="$pq_recorder" \
-        bash "$entrypoint_script" 999 2>&1
-    ) || exit_code=$?
-
-    if [[ $exit_code -eq 0 ]]; then
-        log_pass "entrypoint_set_pr_call: entrypoint exits 0 with valid mocks"
-    else
-        log_fail "entrypoint_set_pr_call: entrypoint exited ${exit_code}: ${output}"
-        return
-    fi
-
-    if grep -q "set-pr PVTI_testitem 42" "$calls_file" 2>/dev/null; then
-        log_pass "entrypoint_set_pr_call: set-pr called with correct item_id and PR number (42)"
-    else
-        log_fail "entrypoint_set_pr_call: set-pr not called correctly (calls: $(cat "$calls_file" 2>/dev/null))"
-    fi
-
-    # Non-fatal assertion: set-pr failure must not cause entrypoint to fail
-    local fail_pq="${tmp_dir}/fail-pq.sh"
-    cat > "$fail_pq" << FAILPQEOF
-#!/usr/bin/env bash
-subcmd="\${1:-}"
-case "\$subcmd" in
-    get-item)
-        printf '{"item_id":"PVTI_testitem","title":"Test Story 999","body":"Test body.","status":"In Progress","fields":{}}\n'
-        ;;
-    set-pr)
-        echo "simulated set-pr failure" >&2
-        exit 1
-        ;;
-    *)
-        printf '[]\n'
-        ;;
-esac
-FAILPQEOF
-    chmod +x "$fail_pq"
-
-    rm -f /tmp/agent-validation-passed
-    local fail_exit=0
-    local fail_output
-    fail_output=$(
-        cd "$git_dir"
-        PATH="${tmp_dir}:${PATH}" \
-        HOME="${fake_home}" \
-        CFGMS_PROJECT_ITEM_ID="PVTI_testitem" \
-        CFGMS_TEST_PROJECT_QUEUE="$fail_pq" \
-        bash "$entrypoint_script" 999 2>&1
-    ) || fail_exit=$?
-
-    if [[ $fail_exit -eq 0 ]]; then
-        log_pass "entrypoint_set_pr_call: entrypoint exits 0 even when set-pr fails (non-fatal)"
-    else
-        log_fail "entrypoint_set_pr_call: entrypoint should exit 0 when set-pr fails, got ${fail_exit}"
-    fi
-
-    if echo "$fail_output" | grep -q "WARN"; then
-        log_pass "entrypoint_set_pr_call: entrypoint emits WARN when set-pr fails"
-    else
-        log_fail "entrypoint_set_pr_call: should emit WARN when set-pr fails (output: ${fail_output})"
-    fi
-}
-
 test_dispatch_creds_gate() {
-    log_test "Testing agent-dispatch.sh: launch/review-pr/launch-generic pass through CREDS_LOW/EXPIRED, still defer on CREDS_MISSING/ERROR..."
+    log_test "Testing agent-dispatch.sh: review-pr passes through CREDS_LOW, defers on CREDS_MISSING/ERROR; launch/launch-generic are removed..."
 
     local dispatch_script
     dispatch_script="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
@@ -2495,22 +2340,6 @@ test_dispatch_creds_gate() {
     # environment-dependent (gh auth, worktree existence, network), so we only
     # assert the gate itself did not defer, not what happens after it.
     local output exit_code=0
-    output=$(CFGMS_TEST_CREDS_STATUS="CREDS_LOW:5" bash "$dispatch_script" launch 99 2>&1) || exit_code=$?
-    if echo "$output" | grep -q "DISPATCH_DEFERRED:creds_missing:"; then
-        log_fail "dispatch_creds_gate launch CREDS_LOW: gate deferred, expected pass-through: ${output}"
-    else
-        log_pass "dispatch_creds_gate launch CREDS_LOW: gate does not defer (advisory only)"
-    fi
-
-    exit_code=0
-    output=$(CFGMS_TEST_CREDS_STATUS="CREDS_EXPIRED:-3" bash "$dispatch_script" launch 99 2>&1) || exit_code=$?
-    if echo "$output" | grep -q "DISPATCH_DEFERRED:creds_missing:"; then
-        log_fail "dispatch_creds_gate launch CREDS_EXPIRED: gate deferred, expected pass-through: ${output}"
-    else
-        log_pass "dispatch_creds_gate launch CREDS_EXPIRED: gate does not defer (advisory only)"
-    fi
-
-    exit_code=0
     # CFGMS_TEST_REPO_ROOT keeps gate_image_staleness_for_launch (#4388) a
     # no-op here, same as every other pre-existing launch-path test. Without
     # it this call is not hermetic: PR 1589 is a real, merged PR, so `gh pr
@@ -2525,101 +2354,114 @@ test_dispatch_creds_gate() {
         log_pass "dispatch_creds_gate review-pr CREDS_LOW: gate does not defer (advisory only)"
     fi
 
-    exit_code=0
-    output=$(CFGMS_TEST_CREDS_STATUS="CREDS_LOW:8" bash "$dispatch_script" launch-generic "cfg-agent-test" "/tmp/nonexistent" 2>&1) || exit_code=$?
-    if echo "$output" | grep -q "DISPATCH_DEFERRED:creds_missing:"; then
-        log_fail "dispatch_creds_gate launch-generic CREDS_LOW: gate deferred, expected pass-through: ${output}"
-    else
-        log_pass "dispatch_creds_gate launch-generic CREDS_LOW: gate does not defer (advisory only)"
-    fi
+    # The headless launch subcommands are gone (dev/fix/resolve work runs
+    # under the FSM supervisor, started by po-act.sh): they refuse with exit 2
+    # before any gate, whatever the credential state.
+    local verb
+    for verb in launch launch-generic; do
+        exit_code=0
+        output=$(CFGMS_TEST_CREDS_STATUS="CREDS_MISSING:no host credentials" \
+            bash "$dispatch_script" "$verb" 99 2>&1) || exit_code=$?
+        if [[ $exit_code -eq 2 ]] && echo "$output" | grep -q "^LAUNCH_REMOVED:"; then
+            log_pass "dispatch_creds_gate ${verb}: removed (exit 2, LAUNCH_REMOVED)"
+        else
+            log_fail "dispatch_creds_gate ${verb}: expected exit 2 + LAUNCH_REMOVED, got ${exit_code}: ${output}"
+        fi
+    done
 
     # CREDS_MISSING/CREDS_ERROR are the only genuine launch blockers left — no
-    # usable credentials file at all. These still exit at the gate, hermetically,
-    # before any real work happens.
-    exit_code=0
-    output=$(CFGMS_TEST_CREDS_STATUS="CREDS_MISSING:no host credentials" bash "$dispatch_script" launch 99 2>&1) || exit_code=$?
-    if [[ $exit_code -eq 10 ]]; then
-        log_pass "dispatch_creds_gate launch CREDS_MISSING: exits 10"
-    else
-        log_fail "dispatch_creds_gate launch CREDS_MISSING: expected exit 10, got ${exit_code}: ${output}"
-    fi
-    if echo "$output" | grep -q "DISPATCH_DEFERRED:creds_missing:CREDS_MISSING:"; then
-        log_pass "dispatch_creds_gate launch CREDS_MISSING: emits DISPATCH_DEFERRED:creds_missing:CREDS_MISSING:"
-    else
-        log_fail "dispatch_creds_gate launch CREDS_MISSING: expected DISPATCH_DEFERRED:creds_missing:CREDS_MISSING: in output: ${output}"
-    fi
-
-    exit_code=0
-    output=$(CFGMS_TEST_CREDS_STATUS="CREDS_ERROR:docker unreachable" bash "$dispatch_script" launch 99 2>&1) || exit_code=$?
-    if [[ $exit_code -eq 10 ]]; then
-        log_pass "dispatch_creds_gate launch CREDS_ERROR: exits 10"
-    else
-        log_fail "dispatch_creds_gate launch CREDS_ERROR: expected exit 10, got ${exit_code}: ${output}"
-    fi
-    if echo "$output" | grep -q "DISPATCH_DEFERRED:creds_missing:CREDS_ERROR:"; then
-        log_pass "dispatch_creds_gate launch CREDS_ERROR: emits DISPATCH_DEFERRED:creds_missing:CREDS_ERROR:"
-    else
-        log_fail "dispatch_creds_gate launch CREDS_ERROR: expected DISPATCH_DEFERRED:creds_missing:CREDS_ERROR: in output: ${output}"
-    fi
+    # usable credentials file at all. review-pr reads the PR first, so a gh
+    # stand-in answers that read; the gate then exits before any lease, clone
+    # or docker call (the docker stand-in fails loudly on `run`).
+    local tmp_dir status
+    tmp_dir=$(mktemp -d)
+    cat > "${tmp_dir}/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "pr view") echo '{"state":"OPEN","headRefName":"feature/story-1-agent","headRefOid":"1111111111111111111111111111111111111111","body":"Fixes #1","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"dev"},"mergeStateStatus":"CLEAN"}' ;;
+  *) exit 0 ;;
+esac
+GHEOF
+    printf '#!/usr/bin/env bash\n[[ "$1" == run ]] && { echo FAKE_DOCKER_RUN >&2; exit 99; }\nexit 0\n' > "${tmp_dir}/docker"
+    chmod +x "${tmp_dir}/gh" "${tmp_dir}/docker"
+    for status in "CREDS_MISSING:no host credentials" "CREDS_ERROR:docker unreachable"; do
+        exit_code=0
+        output=$(PATH="${tmp_dir}:${PATH}" CFGMS_TEST_CREDS_STATUS="$status" \
+            CFGMS_TEST_PIPELINE_HELPER="${REPO_ROOT}/.claude/tooling/scripts/tests/mock-pipeline-helper.sh" \
+            CFGMS_TEST_REPO_ROOT="${tmp_dir}" CFGMS_AGENT_LEDGER_DIR="${tmp_dir}/ledger" \
+            bash "$dispatch_script" review-pr 4242 2>&1) || exit_code=$?
+        if [[ $exit_code -eq 10 ]]; then
+            log_pass "dispatch_creds_gate review-pr ${status%%:*}: exits 10"
+        else
+            log_fail "dispatch_creds_gate review-pr ${status%%:*}: expected exit 10, got ${exit_code}: ${output}"
+        fi
+        if echo "$output" | grep -q "DISPATCH_DEFERRED:creds_missing:${status%%:*}:"; then
+            log_pass "dispatch_creds_gate review-pr ${status%%:*}: emits DISPATCH_DEFERRED:creds_missing:${status%%:*}:"
+        else
+            log_fail "dispatch_creds_gate review-pr ${status%%:*}: expected DISPATCH_DEFERRED:creds_missing:${status%%:*}: in output: ${output}"
+        fi
+    done
+    rm -rf "$tmp_dir"
 }
 
 test_dispatch_image_gate_hermetic() {
-    log_test "Testing agent-dispatch.sh: launch-generic validates its clone dir before the image-staleness gate, so a forced-stale image never triggers a rebuild (Issue #4423)..."
+    log_test "Testing po-act.sh dispatch-fix: a stale image is refused before any lease or run, and the launch path never rebuilds it (Issues #4423, FSM PR 3)..."
 
-    local dispatch_script
-    dispatch_script="${REPO_ROOT}/.claude/tooling/scripts/agent-dispatch.sh"
+    local poact_script
+    poact_script="${REPO_ROOT}/.claude/tooling/scripts/po-act.sh"
 
-    if [[ ! -f "$dispatch_script" ]]; then
-        log_fail "dispatch_image_gate_hermetic: script not found at $dispatch_script"
+    if [[ ! -f "$poact_script" ]]; then
+        log_fail "dispatch_image_gate_hermetic: script not found at $poact_script"
         return
     fi
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
     local rebuild_marker="${tmp_dir}/rebuild-happened"
-    local nonexistent_clone="${tmp_dir}/nonexistent-clone-dir"
 
-    # Fake `docker` on PATH: report an image label that never matches any real
-    # checkout hash, so gate_image_staleness_for_launch's mismatch branch
-    # always fires if it is ever reached — same tripwire shape as
-    # image_staleness.test.sh, adapted for a subprocess invocation (PATH stub
-    # instead of a sourced shell function, since this test runs the script via
-    # `bash "$dispatch_script" ...` rather than sourcing it).
+    # Fake `docker`: an image label that never matches any checkout hash, and
+    # a loud failure on anything that would build, tag or run. Fake `gh`: a
+    # readable PR head. Mock dispatch: trusted author.
     cat > "${tmp_dir}/docker" << 'DOCKEREOF'
 #!/usr/bin/env bash
 case "$1" in
     inspect) echo "forced-stale-label" ;;
-    image)   exit 1 ;;
+    build|tag|run) echo "FAKE_DOCKER_$1" >> "${FAKE_DOCKER_LOG}"; exit 99 ;;
+    image)   [[ "$2" == tag ]] && echo "FAKE_DOCKER_tag" >> "${FAKE_DOCKER_LOG}"; exit 1 ;;
     *)       exit 0 ;;
 esac
 DOCKEREOF
-    chmod +x "${tmp_dir}/docker"
+    printf '#!/usr/bin/env bash\ncase "$*" in *headRefOid*) echo 1111111111111111111111111111111111111111 ;; esac\nexit 0\n' > "${tmp_dir}/gh"
+    printf '#!/usr/bin/env bash\n[[ "$1" == check-pr-author ]] && exit 0\necho "MOCK_UNEXPECTED:$*" >&2; exit 1\n' > "${tmp_dir}/mock-dispatch.sh"
+    chmod +x "${tmp_dir}/docker" "${tmp_dir}/gh" "${tmp_dir}/mock-dispatch.sh"
 
     local output exit_code=0
     output=$(
         PATH="${tmp_dir}:${PATH}" \
-        CFGMS_TEST_CREDS_STATUS="CREDS_OK:60" \
+        FAKE_DOCKER_LOG="${tmp_dir}/docker.log" \
+        CFGMS_TEST_DISPATCH="${tmp_dir}/mock-dispatch.sh" \
+        CFGMS_TEST_PIPELINE_HELPER="${REPO_ROOT}/.claude/tooling/scripts/tests/mock-pipeline-helper.sh" \
+        CFGMS_AGENT_CAPACITY_GATE=off \
+        CFGMS_FSM_RUNS_DIR="${tmp_dir}/runs" \
         CFGMS_AGENT_LEDGER_DIR="${tmp_dir}/ledger" \
         CFGMS_TEST_IMAGE_REBUILD_CMD="touch '${rebuild_marker}'; exit 0" \
-        bash "$dispatch_script" launch-generic "cfg-agent-test" "$nonexistent_clone" 2>&1
+        bash "$poact_script" dispatch-fix 4242 2>&1
     ) || exit_code=$?
 
-    if [[ $exit_code -eq 1 ]]; then
-        log_pass "dispatch_image_gate_hermetic: launch-generic on a missing clone dir exits 1"
+    if [[ $exit_code -eq 3 ]] && echo "$output" | grep -q "DISPATCH_FIX_REFUSED:4242:image_stale"; then
+        log_pass "dispatch_image_gate_hermetic: stale image refused (exit 3, DISPATCH_FIX_REFUSED:4242:image_stale)"
     else
-        log_fail "dispatch_image_gate_hermetic: expected exit 1, got ${exit_code}: ${output}"
+        log_fail "dispatch_image_gate_hermetic: expected exit 3 + image_stale, got ${exit_code}: ${output}"
     fi
-
-    if echo "$output" | grep -q "ERROR: clone not found: ${nonexistent_clone}"; then
-        log_pass "dispatch_image_gate_hermetic: reports ERROR: clone not found before any gate runs"
+    if [[ -f "$rebuild_marker" || -s "${tmp_dir}/docker.log" ]]; then
+        log_fail "dispatch_image_gate_hermetic: the launch path rebuilt, tagged or ran: $(cat "${tmp_dir}/docker.log" 2>/dev/null)"
     else
-        log_fail "dispatch_image_gate_hermetic: expected 'ERROR: clone not found: ${nonexistent_clone}' in output: ${output}"
+        log_pass "dispatch_image_gate_hermetic: no rebuild, retag or docker run"
     fi
-
-    if [[ -f "$rebuild_marker" ]]; then
-        log_fail "dispatch_image_gate_hermetic: rebuild command ran despite invalid clone dir — image gate ran before input validation"
+    if echo "$output" | grep -q "DISPATCH_SKIPPED\|lease_held\|FSM_RUN:"; then
+        log_fail "dispatch_image_gate_hermetic: reached the lease or the run: ${output}"
     else
-        log_pass "dispatch_image_gate_hermetic: rebuild command never ran (forced-stale image never triggered a real/stubbed docker build)"
+        log_pass "dispatch_image_gate_hermetic: refused before any lease or run"
     fi
 
     rm -rf "$tmp_dir"
@@ -3489,7 +3331,6 @@ TOOLING_TABLE=(
     "test_create_clone_pr_release_base:claude-tooling"
     "test_dispatch_fix_external_author:claude-tooling"
     "test_enqueue_external_author_toctou:claude-tooling"
-    "test_entrypoint_set_pr_call:devinfra"
     "test_preflight_item_dispatch:claude-tooling"
     "test_done_on_merge:claude-tooling"
     "test_preflight_forged_acceptance_review:claude-tooling"

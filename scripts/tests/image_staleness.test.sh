@@ -610,8 +610,28 @@ assert_gate_before_run() {
   fi
 }
 
-assert_gate_before_run "launch" "$(extract_case 'launch)' 'launch-generic)')"
-assert_gate_before_run "launch-generic" "$(extract_case 'launch-generic)' 'live)')"
+# The headless dev-agent launch subcommands are gone: no docker run is left in
+# them. Dev / fix / resolve sessions are started by the FSM supervisor, and
+# po-act.sh refuses a stale image before it starts one (checked below).
+legacy_block="$(extract_case 'launch|launch-generic)' 'fsm-status)')"
+check_contains "launch / launch-generic are a removal notice" "$legacy_block" "LAUNCH_REMOVED"
+if grep -q 'docker run' <<<"$legacy_block"; then
+  bad "launch / launch-generic start no container" "a docker run is still in the removed case"
+else
+  ok "launch / launch-generic start no container"
+fi
+POACT_SRC_FILE="$(dirname "$DISPATCH")/po-act.sh"
+for verb in 'dispatch)' 'dispatch-fix)' 'resolve-conflict)'; do
+  blk="$(awk -v v="  ${verb}" '$0 == v {on=1; next} on && /^  [a-z][a-z-]*\)$/ {exit} on' "$POACT_SRC_FILE")"
+  gate_line=$( (grep -n '_fsm_image_gate' <<<"$blk" || true) | head -1 | cut -d: -f1)
+  launch_line=$( (grep -n '_fsm_launch "' <<<"$blk" || true) | tail -1 | cut -d: -f1)
+  if [[ -n "$gate_line" && -n "$launch_line" && "$gate_line" -lt "$launch_line" ]]; then
+    ok "po-act.sh ${verb%)}: the image gate precedes the supervisor launch"
+  else
+    bad "po-act.sh ${verb%)}: the image gate precedes the supervisor launch" \
+      "gate_line=${gate_line:-missing} launch_line=${launch_line:-missing}"
+  fi
+done
 assert_gate_before_run "live" "$(extract_case 'live)' 'po-live)')"
 assert_gate_before_run "po-live" "$(extract_case 'po-live)' 'launch-interactive)')"
 assert_gate_before_run "launch-interactive" "$(extract_case 'launch-interactive)' 'wait-for-auth)')"

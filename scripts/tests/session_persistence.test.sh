@@ -91,8 +91,14 @@ printf '\n== docker run wiring ==\n'
 
 dispatch_src="$(cat "$DISPATCH")"
 
-check_contains "launch-generic mounts the session dir" "$dispatch_src" \
-  '"${session_mount[@]}"'
+# Dev / fix / resolve agent sessions run under the FSM supervisor, which gives
+# every session its own host dir mounted at the same /agent-sessions target
+# (scripts/fsm/agent_session.py; covered end to end by test-fsm-*.py).
+fsm_session_src="$(cat "${SCRIPT_DIR}/../fsm/agent_session.py")"
+check_contains "FSM agent sessions mount a per-session dir at /agent-sessions" "$fsm_session_src" \
+  'SESSIONS_MOUNT = "/agent-sessions"'
+check_contains "FSM session dirs share the host sessions base" "$fsm_session_src" \
+  'CFGMS_AGENT_SESSIONS_BASE'
 check_contains "review-pr mounts the session dir" "$dispatch_src" \
   '"${review_session_mount[@]}"'
 check_contains "mount targets /agent-sessions, outside ~/.claude" "$dispatch_src" \
@@ -189,15 +195,17 @@ PY
 total_blocks="$(echo "$enum_out" | grep -oP '^TOTAL:\K[0-9]+' || echo 0)"
 missing_blocks="$(echo "$enum_out" | grep '^MISSING:' || true)"
 
-# Sanity floor on the enumeration itself: 5 known blocks exist today (po-act.sh
-# dispatch, agent-dispatch.sh launch, launch-generic, launch-interactive,
-# review-pr). Fewer than that means the parser silently stopped matching a
-# call site -- e.g. a `docker run -d` rewritten to a different form -- which
-# would make the assertion below vacuously pass.
-if [[ "$total_blocks" -ge 5 ]]; then
-  ok "enumeration found ${total_blocks} docker run -d cfg-agent:latest blocks (>=5 expected)"
+# Sanity floor on the enumeration itself: 3 known blocks exist today
+# (launch-interactive, review-pr, launch-investigator). The dev-agent launch
+# sites (po-act.sh dispatch, agent-dispatch.sh launch / launch-generic) are
+# gone: those sessions are started by the FSM supervisor. Fewer than 3 means
+# the parser silently stopped matching a call site -- e.g. a `docker run -d`
+# rewritten to a different form -- which would make the assertion below
+# vacuously pass.
+if [[ "$total_blocks" -ge 3 ]]; then
+  ok "enumeration found ${total_blocks} docker run -d cfg-agent:latest blocks (>=3 expected)"
 else
-  bad "enumeration found docker run -d cfg-agent:latest blocks" "expected >=5, found ${total_blocks} -- a launch call site may have gone undetected"
+  bad "enumeration found docker run -d cfg-agent:latest blocks" "expected >=3, found ${total_blocks} -- a launch call site may have gone undetected"
 fi
 
 if [[ -z "$missing_blocks" ]]; then
@@ -224,8 +232,17 @@ check_contains "prune is retention-driven, not container-driven" "$dispatch_src"
 
 printf '\n== container-side accounting ==\n'
 
-for entry in "${SCRIPT_DIR}/../../devcontainer/entrypoint.sh" \
-             "${SCRIPT_DIR}/../../devcontainer/scripts/review-entrypoint.sh"; do
+# FSM runs: the supervisor writes agent-result.json itself (run dir + the
+# last session dir) with usage summed from token_report.py over a no-follow
+# copy of each session dir.
+sup_src="$(cat "${SCRIPT_DIR}/../fsm/supervisor.py")"
+report_src="$(cat "${SCRIPT_DIR}/../fsm/report.py")"
+check_contains "supervisor measures session usage with the shared reporter" "$sup_src" 'token_report.py'
+check_contains "supervisor writes the manifest into the last session dir" "$sup_src" \
+  'report.write_manifest(m, self.run.path, last.get("session_dir"))'
+check_contains "manifest records an explicit marker when usage is missing" "$report_src" '"usage_error"'
+
+for entry in "${SCRIPT_DIR}/../../devcontainer/scripts/review-entrypoint.sh"; do
   name="$(basename "$entry")"
   src="$(cat "$entry")"
   check_contains "${name} records usage into the manifest" "$src" '"usage"'

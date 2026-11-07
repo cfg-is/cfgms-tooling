@@ -202,37 +202,49 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# T3: launch — key value NOT in container env; cred injected via file
+# T3: agent session — key value NOT in container env; cred injected via file
 # ---------------------------------------------------------------------------
-# Verify the launch block sets CFGMS_API_KEY_FILE, never CFGMS_API_KEY.
-# Structural check: search the dispatch script's launch block.
-launch_api_key_lines=$(awk '/^  launch\)/{p=1} p && /^  [a-z].*\)$/{if(!/^  launch\)/) exit} p' \
-  "${DISPATCH}" | grep -E '^\s*-e\s+"CFGMS_API_KEY=' | grep -v "CFGMS_API_KEY_FILE" || true)
-check "T3 launch does not set CFGMS_API_KEY (key value) in container env" \
-  "${launch_api_key_lines}" ""
+# The headless `launch` subcommand that minted and mounted the scoped key is
+# removed; FSM agent sessions take the minted key the same way through
+# scripts/fsm/agent_session.py (supervisor `--agent-cred-dir` / `--tenant`).
+# Structural check against the argv builder.
+SESSION_PY="$(dirname "${DISPATCH}")/fsm/agent_session.py"
+session_argv=$(python3 - "$(dirname "${DISPATCH}")/fsm" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import agent_session
+argv = agent_session.docker_argv(
+    name="cfg-agent-1", mode="issue", kind="implement", seq=1, run_id="r", workspace="/w",
+    context_dir="/c", out_dir="/o", session_dir="/s", trust="/t", model="m", effort="e",
+    agent_cred_dir="/run/cfgms/agent-cred/1", tenant="agent-test/1")
+print("\n".join(argv))
+PYEOF
+)
+check "T3 agent session does not set CFGMS_API_KEY (key value) in container env" \
+  "$(grep -E '^CFGMS_API_KEY=' <<<"$session_argv" || true)" ""
 
 ran=$((ran + 1))
-if grep -q 'CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key' "${DISPATCH}"; then
-  printf '  ok    T3 launch sets CFGMS_API_KEY_FILE (not key value)\n'
+if grep -qx 'CFGMS_API_KEY_FILE=/run/cfgms/agent-cred/api.key' <<<"$session_argv"; then
+  printf '  ok    T3 agent session sets CFGMS_API_KEY_FILE (not key value)\n'
 else
   fail=$((fail + 1))
-  printf '  FAIL  T3 CFGMS_API_KEY_FILE not found in dispatch script\n'
+  printf '  FAIL  T3 CFGMS_API_KEY_FILE not set by the agent session argv\n'
 fi
 
 ran=$((ran + 1))
-if grep -q 'run/cfgms/agent-cred:ro' "${DISPATCH}"; then
-  printf '  ok    T3 launch bind-mounts cred dir as :ro\n'
+if grep -qx '/run/cfgms/agent-cred/1:/run/cfgms/agent-cred:ro' <<<"$session_argv"; then
+  printf '  ok    T3 agent session bind-mounts cred dir as :ro\n'
 else
   fail=$((fail + 1))
-  printf '  FAIL  T3 cred dir :ro bind-mount not found in dispatch script\n'
+  printf '  FAIL  T3 cred dir :ro bind-mount not in the agent session argv\n'
 fi
 
 ran=$((ran + 1))
-if grep -q 'CFGMS_ADMIN_BUNDLE=' "${DISPATCH}"; then
-  printf '  ok    T3 launch sets CFGMS_ADMIN_BUNDLE="" (bundle auto-discovery disabled)\n'
+if grep -qx 'CFGMS_ADMIN_BUNDLE=' <<<"$session_argv"; then
+  printf '  ok    T3 agent session sets CFGMS_ADMIN_BUNDLE="" (bundle auto-discovery disabled)\n'
 else
   fail=$((fail + 1))
-  printf '  FAIL  T3 CFGMS_ADMIN_BUNDLE="" not found in dispatch script (bundle isolation missing)\n'
+  printf '  FAIL  T3 CFGMS_ADMIN_BUNDLE="" not in the agent session argv (bundle isolation missing)\n'
 fi
 
 # ---------------------------------------------------------------------------
@@ -261,13 +273,14 @@ check_no_file "T4 mint failure leaves no api.key" "${cred_base2}/99/api.key"
 rm -rf "$tmpdir2"
 
 # ---------------------------------------------------------------------------
-# T4b: launch rejects non-numeric issue numbers before credential lookup
+# T4b: the removed launch subcommand refuses every argument (exit 2) and
+# starts nothing
 # ---------------------------------------------------------------------------
 bad_launch_out=$(bash "${DISPATCH}" launch "not-a-number" 2>&1) || true
 bad_launch_exit=0
-(bash "${DISPATCH}" launch "not-a-number" >/dev/null 2>&1) || bad_launch_exit=$?
-check "T4b launch non-numeric exits non-zero" "$bad_launch_exit" "1"
-check_contains "T4b launch non-numeric emits error" "$bad_launch_out" "numeric"
+(bash "${DISPATCH}" launch "4242" >/dev/null 2>&1) || bad_launch_exit=$?
+check "T4b launch exits 2 (removed)" "$bad_launch_exit" "2"
+check_contains "T4b launch names the replacement" "$bad_launch_out" "LAUNCH_REMOVED"
 
 # ---------------------------------------------------------------------------
 # T5: revoke_agent_creds — happy path (key deleted, tenant suspended)
