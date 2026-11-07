@@ -75,7 +75,7 @@ def secret():
     return os.environ.get("FSM_FAKE_CLAUDE_TOKEN", "")
 
 
-def apply_agent(actions, ws, out):
+def apply_agent(actions, ws, out, sess=None):
     code = 0
     for act in actions:
         op = act["op"]
@@ -123,6 +123,8 @@ def apply_agent(actions, ws, out):
             (out / act["name"]).write_text(act["content"].replace("{SECRET}", secret()))
         elif op == "out_symlink":
             os.symlink(act["target"], out / act["name"])
+        elif op == "session_symlink":
+            os.symlink(act["target"], sess / act["name"])
         elif op == "touch_agent_git":
             # an agent tampering with its own .git (hooks/config): must never matter
             hooks = ws / ".git" / "hooks"
@@ -199,7 +201,7 @@ def main():
             log({"tool": "docker-agent", "seq": labels.get("seq"), "kind": labels.get("kind"),
                  "has_git": (ws / ".git").is_dir(),
                  "failure_md": (ctxdir / "failure.md").read_text() if (ctxdir / "failure.md").exists() else ""})
-            code = apply_agent(actions, ws, out)
+            code = apply_agent(actions, ws, out, Path(mounts["/agent-sessions"]))
             logs = f"agent session {idx} done\n"
         elif kind == "validate":
             idx = counters["validate"]

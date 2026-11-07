@@ -53,6 +53,7 @@ import gitops                        # noqa: E402
 import outputs                       # noqa: E402
 import publish                       # noqa: E402
 import report                        # noqa: E402
+import safefs                        # noqa: E402
 import secrets_scan                  # noqa: E402
 import snapshot                      # noqa: E402
 import state as statemod             # noqa: E402
@@ -154,12 +155,16 @@ class Services:
             pass
         return "claude-sonnet-4-6", "high"
 
-    def session_usage(self, session_dir):
+    def session_usage(self, session_dir, scratch):
+        """Token totals of one session. The session dir is agent-writable, so
+        its regular files are copied (no-follow) into supervisor-owned
+        `scratch` first and the reporter reads only the copy."""
         tr = Path(self.tooling_root) / "metrics" / "token_report.py"
         if not tr.is_file():
             return None
+        safefs.copy_regular_tree(session_dir, scratch)
         try:
-            proc = subprocess.run([sys.executable, str(tr), "--projects-dir", str(session_dir),
+            proc = subprocess.run([sys.executable, str(tr), "--projects-dir", str(scratch),
                                    "--format", "totals", "--quiet"], capture_output=True, timeout=120)
             return json.loads(proc.stdout.decode()) if proc.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -398,20 +403,19 @@ class Supervisor:
 
     def _write_pr_context(self, pr):
         cdir = self.run.context_dir
-        (cdir / "pr.md").write_text(f"# PR #{pr.get('number')}: {pr.get('title', '')}\n\n{pr.get('body', '')}\n")
+        safefs.write_file(cdir, "pr.md", f"# PR #{pr.get('number')}: {pr.get('title', '')}\n\n{pr.get('body', '')}\n")
         parts = []
         for r in pr.get("reviews") or []:
             parts.append(f"## Review ({r.get('state', '')})\n\n{r.get('body', '')}\n")
         for c in pr.get("comments") or []:
             parts.append(f"## Comment\n\n{c.get('body', '')}\n")
-        (cdir / "reviews.md").write_text("\n".join(parts) or "(none)\n")
+        safefs.write_file(cdir, "reviews.md", "\n".join(parts) or "(none)\n")
         checks = self.svc.gh.failing_checks(pr.get("number"))
-        (cdir / "ci.md").write_text("\n".join(f"- {c.get('name')}: {c.get('state')} {c.get('link', '')}"
-                                              for c in checks) or "(no failing checks)\n")
+        safefs.write_file(cdir, "ci.md", "\n".join(f"- {c.get('name')}: {c.get('state')} {c.get('link', '')}"
+                                                    for c in checks) or "(no failing checks)\n")
 
     def write_context_common(self, title, body):
-        cdir = self.run.context_dir
-        (cdir / "spec.md").write_text(f"# {title}\n\n{body}\n")
+        safefs.write_file(self.run.context_dir, "spec.md", f"# {title}\n\n{body}\n")
 
     # --- AGENT -------------------------------------------------------------------------
     def candidate_commit(self):
@@ -458,10 +462,7 @@ class Supervisor:
                                            x.get("develop") or x["base"], x["branch"],
                                            publish.PUBLIC_URL, populate=self.tooling_populate())
             x["session_start_tree"] = x["candidate_tree"]
-            out = self.run.out_dir
-            if out.exists() or out.is_symlink():
-                shutil.rmtree(out) if not out.is_symlink() else out.unlink()
-            out.mkdir()
+            safefs.fresh_dir(self.run.out_dir)
             self._write_session_context(kind, seq)
             res = self._launch(name, kind, seq)
         x.pop("session_live", None)
@@ -480,12 +481,11 @@ class Supervisor:
     def _write_session_context(self, kind, seq):
         cdir = self.run.context_dir
         failure = self.rtext("failure-next.md")
-        f = cdir / "failure.md"
         if kind in (T.KIND_FIX, T.KIND_RESOLVE) and failure:
-            f.write_text(failure)
-        elif f.exists():
-            f.unlink()
-        (cdir / "session.json").write_text(json.dumps({
+            safefs.write_file(cdir, "failure.md", failure)
+        else:
+            safefs.remove_nofollow(cdir / "failure.md")
+        safefs.write_file(cdir, "session.json", json.dumps({
             "run_id": self.run.run_id, "kind": kind, "seq": seq, "mode": self.mode,
             "issue": self.x.get("issue"), "item": last12(self.x.get("item_id") or "") or None,
             "branch": self.x.get("branch"), "files_in_scope": self.x.get("allowlist", []),
@@ -534,7 +534,7 @@ class Supervisor:
                                         int(p.get("agent_timeout_min", agent_session.DEFAULT_TIMEOUT_MIN)),
                                         gh_token=gh_token)
         res["session_dir"] = str(sdir)
-        res["usage"] = self.svc.session_usage(sdir)
+        res["usage"] = self.svc.session_usage(sdir, self.run.p("usage", f"s{seq}"))
         report.ledger_exit(name, self.mode, res.get("exit_code"), self.run.run_id, kind, seq,
                            res.get("duration_seconds"), usage=res.get("usage"))
         return res
@@ -658,8 +658,10 @@ class Supervisor:
         validator.build_clone(self.repo, vdir / "repo", base, develop, tree, publish.PUBLIC_URL,
                               populate=self.tooling_populate())
         cache_dir = self.run.p("cache")
+        # Candidate code writes these caches: mount only real directories.
+        safefs.ensure_plain_dir(cache_dir)
         for sub in ("go-build", "tmp"):
-            (cache_dir / sub).mkdir(parents=True, exist_ok=True)
+            safefs.ensure_plain_dir(cache_dir / sub)
         name = validator.container_name(p["target"])
         argv = validator.docker_argv(name, self.run.run_id, n, self.mode,
                                      f"pr={p['pr']}" if p.get("pr") else
@@ -958,7 +960,9 @@ class Supervisor:
             final_tree=x.get("final_tree") or x.get("last_clean_tree"),
             pre_head=x.get("head0"), post_head=x.get("published_sha"), sessions=sessions,
             run_id=self.run.run_id)
-        report.write_manifest(m, self.run.path, last.get("session_dir"))
+        _, failed = report.write_manifest(m, self.run.path, last.get("session_dir"))
+        for f in failed:
+            self.run.append("note", manifest_write_failed=f[:300])
 
 
 # --- CLI ---------------------------------------------------------------------------------

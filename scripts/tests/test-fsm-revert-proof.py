@@ -11,11 +11,16 @@ Tests: the four FSM guarantees that must fail if their guard is removed.
   3. No git process ever runs with the agent workspace's `.git` as its git
      directory (git-wrapper log), even when the agent tampers with that `.git`.
   4. A symlink at `out/summary.md` pointing at a host file is not read.
+  5. Writes into agent-writable directories (the session dir) never follow a
+     planted symlink: not at `agent-result.json`, not at its temp names, not at
+     the session dir path itself; transcripts are read only from a no-follow
+     copy.
 
 Each was verified to fail with its guard disabled (see the PR description).
 
 Run: python3 .claude/tooling/scripts/tests/test-fsm-revert-proof.py
 """
+import json
 import os
 import sys
 import unittest
@@ -23,6 +28,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fsm_testlib as L  # noqa: E402
+
+import agent_session  # noqa: E402
+import report  # noqa: E402
+import safefs  # noqa: E402
 
 BRANCH = "feature/story-42-agent"
 
@@ -128,6 +137,83 @@ class TestSymlinkedOutputNotRead(Base):
                          if (self.f.run_dir(rid) / "summary.md").exists() else "")
         notes = [r for r in self.f.state_records(rid, "note") if "output_problems" in r]
         self.assertEqual(notes[0]["output_problems"], {"summary": "symlink"})
+
+
+class TestUntrustedDirWrites(Base):
+    def canaries(self, n):
+        out = []
+        for i in range(n):
+            c = self.f.root / f"canary-{i}.txt"
+            c.write_text(f"CANARY-{i}\n")
+            out.append(c)
+        return out
+
+    def assert_canaries(self, cs):
+        for i, c in enumerate(cs):
+            self.assertFalse(c.is_symlink())
+            self.assertEqual(c.read_text(), f"CANARY-{i}\n", c)
+
+    def test_manifest_write_does_not_follow_planted_symlinks(self):
+        d = self.f.root / "sess"
+        d.mkdir()
+        cs = self.canaries(3)
+        os.symlink(cs[0], d / "agent-result.json")
+        os.symlink(cs[1], d / "agent-result.json.tmp")
+        os.symlink(cs[2], d / ".agent-result.json.fsm-tmp")
+        written, failed = report.write_manifest({"run_id": "r"}, d)
+        self.assert_canaries(cs)
+        self.assertEqual(failed, [])
+        self.assertFalse((d / "agent-result.json").is_symlink())
+        self.assertIn('"run_id": "r"', (d / "agent-result.json").read_text())
+
+    def test_symlinked_session_dir_fails_closed(self):
+        target = self.f.root / "canary-dir"
+        target.mkdir()
+        (target / "agent-result.json").write_text("CANARY\n")
+        link = self.f.root / "sess-link"
+        os.symlink(target, link)
+        written, failed = report.write_manifest({"run_id": "r"}, link)
+        self.assertEqual(written, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(sorted(os.listdir(target)), ["agent-result.json"])
+        self.assertEqual((target / "agent-result.json").read_text(), "CANARY\n")
+        with self.assertRaises(safefs.UnsafePath):
+            safefs.write_file(link, "meta.json", "x")
+
+    def test_prepare_session_dir_replaces_planted_dir(self):
+        base = self.f.root / "sessions"
+        base.mkdir()
+        target = self.f.root / "canary-dir"
+        target.mkdir()
+        (target / "meta.json").write_text("CANARY\n")
+        os.symlink(target, base / "cfg-agent-9-1")
+        os.environ["CFGMS_AGENT_SESSIONS_BASE"] = str(base)
+        try:
+            d = agent_session.prepare_session_dir("cfg-agent-9", 1, {"mode": "issue"})
+        finally:
+            del os.environ["CFGMS_AGENT_SESSIONS_BASE"]
+        self.assertFalse(d.is_symlink())
+        self.assertEqual((target / "meta.json").read_text(), "CANARY\n")
+        self.assertEqual(sorted(os.listdir(target)), ["meta.json"])
+        self.assertIn('"mode": "issue"', (d / "meta.json").read_text())
+
+    def test_agent_planted_session_symlinks_end_to_end(self):
+        cs = self.canaries(2)
+        secret = self.f.root / "host-transcript-secret.jsonl"
+        secret.write_text('{"HOST-SECRET-9d1e": 1}\n')
+        sess = [[{"op": "write", "path": "src/new.go", "content": "package src\n"},
+                 {"op": "session_symlink", "name": "agent-result.json", "target": str(cs[0])},
+                 {"op": "session_symlink", "name": ".agent-result.json.fsm-tmp", "target": str(cs[1])},
+                 {"op": "session_symlink", "name": "leak.jsonl", "target": str(secret)}]]
+        rc, out, rid = self.run_issue(sess)
+        self.assertEqual(rc, 0, out)
+        self.assert_canaries(cs)
+        sdir = self.f.root / "sessions" / "cfg-agent-42-1"
+        self.assertFalse((sdir / "agent-result.json").is_symlink())
+        self.assertEqual(json.loads((sdir / "agent-result.json").read_text())["run_id"], rid)
+        usage_copy = self.f.run_dir(rid) / "usage" / "s1"
+        self.assertTrue(usage_copy.is_dir())
+        self.assertFalse((usage_copy / "leak.jsonl").exists())
 
 
 if __name__ == "__main__":

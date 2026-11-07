@@ -22,12 +22,12 @@ candidate. Conflict markers are checked on changed text blobs.
 import fnmatch
 import os
 import re
-import shutil
 import stat
 from dataclasses import dataclass, field, asdict
 from pathlib import Path, PurePosixPath
 
 import gitops
+import safefs
 from secrets_scan import credential_name_hit
 
 DEFAULT_MAX_FILES = int(os.environ.get("CFGMS_FSM_SNAPSHOT_MAX_FILES", "300000"))
@@ -392,9 +392,7 @@ def materialize_workspace(repo, run_path, workspace, commit, develop, branch,
     run_path = Path(run_path)
     workspace = Path(workspace)
     staging = run_path / "A.staging"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir()
+    safefs.fresh_dir(staging)
     repo.update_ref("refs/fsm/ws", commit)
     repo.update_ref("refs/fsm/ws-develop", develop)
     sgit = gitops.Repo(staging / ".git", repo.home, repo.gitconfig)
@@ -411,10 +409,6 @@ def materialize_workspace(repo, run_path, workspace, commit, develop, branch,
     sgit.git("config", "user.email", "cfgms-agent@localhost")
     if populate:
         populate(staging)
-    if workspace.exists() or workspace.is_symlink():
-        if workspace.is_symlink():
-            workspace.unlink()
-        else:
-            shutil.rmtree(workspace)
+    safefs.remove_nofollow(workspace)
     os.rename(staging, workspace)
     gitops.forbid_gitdir_under(workspace)

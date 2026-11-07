@@ -18,6 +18,8 @@ import json
 import os
 import re
 import time
+
+import safefs
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,23 +63,33 @@ def container_name(mode, target):
 
 
 def prepare_session_dir(container, seq, meta):
-    """Per-session dir `<sessions-base>/<container>-<seq>` with meta.json."""
-    d = sessions_base() / f"{container}-{seq}"
-    d.mkdir(parents=True, exist_ok=True)
+    """Fresh per-session dir `<sessions-base>/<container>-<seq>` with meta.json.
+
+    The dir is mounted rw into the agent container, so it is untrusted once a
+    session has run: an existing one (an earlier run with the same container
+    name and seq) is renamed aside -- rename never follows a symlink -- and a
+    new directory is created. meta.json is written with safefs.write_file.
+    """
+    base = sessions_base()
+    base.mkdir(parents=True, exist_ok=True)
+    d = base / f"{container}-{seq}"
+    if os.path.lexists(d):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        os.rename(d, base / f"{d.name}.superseded-{stamp}")
+    d.mkdir(mode=0o700, exist_ok=False)
     m = dict(meta)
     m.update({"container": container, "seq": seq,
               "started_at": datetime.now(timezone.utc).isoformat()})
-    (d / "meta.json").write_text(json.dumps(m, indent=2, sort_keys=True))
+    safefs.write_file(d, "meta.json", json.dumps(m, indent=2, sort_keys=True))
     return d
 
 
 def trust_file(container, seq):
-    d = trust_base() / f"{container}-{seq}"
-    d.mkdir(parents=True, exist_ok=True)
-    f = d / ".claude.json"
-    f.write_text('{"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}\n')
-    os.chmod(f, 0o600)
-    return f
+    """A fresh writable `.claude.json` for one session (bind-mounted as a file)."""
+    d = safefs.fresh_dir(trust_base() / f"{container}-{seq}")
+    safefs.write_file(d, ".claude.json",
+                      '{"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}\n')
+    return d / ".claude.json"
 
 
 def claude_credential_args(token_present, credentials_file=None):

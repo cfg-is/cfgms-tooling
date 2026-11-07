@@ -23,11 +23,11 @@ A `(BASE, tree)` pair that passed is cached and never validated again.
 
 import json
 import os
-import shutil
 import time
 from pathlib import Path
 
 import gitops
+import safefs
 
 VALIDATE_ENTRYPOINT = "/usr/local/bin/fsm-validate-entrypoint.sh"
 CANDIDATE_MOUNT = "/fsm/candidate"
@@ -42,10 +42,7 @@ def container_name(target):
 
 def build_clone(repo, dest, base, develop, tree, public_url, populate=None):
     """Build the validator clone of (base, tree) into `dest` (must not exist)."""
-    dest = Path(dest)
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    dest = safefs.fresh_dir(dest)
     cand = repo.commit_tree(tree, [base], "fsm candidate (internal)\n")
     repo.update_ref("refs/fsm/v-base", base)
     repo.update_ref("refs/fsm/v-develop", develop)

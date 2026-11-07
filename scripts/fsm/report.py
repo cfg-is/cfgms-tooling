@@ -25,6 +25,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import safefs
+
 #: Fields written by devcontainer/entrypoint.sh today, in its order.
 LEGACY_FIELDS = (
     "mode", "issue", "pr_num", "exit_code", "model", "effort", "agent_duration_seconds",
@@ -119,20 +121,22 @@ def build_manifest(*, mode, issue, pr_num, exit_code, model, effort, duration, p
 
 
 def write_manifest(manifest, *dirs):
+    """Write agent-result.json into each dir. The first dir (the supervisor-
+    owned run dir) holds the authoritative copy; later ones (the last session
+    dir, agent-writable, read by token_report) are written with
+    safefs.write_file so a planted symlink is replaced, never written through.
+    Returns (written, failed)."""
     data = json.dumps(manifest, indent=2, sort_keys=False)
-    written = []
+    written, failed = [], []
     for d in dirs:
         if not d:
             continue
-        p = Path(d) / "agent-result.json"
         try:
-            tmp = p.with_name(p.name + ".tmp")
-            tmp.write_text(data)
-            os.replace(tmp, p)
-            written.append(str(p))
-        except OSError:
-            continue
-    return written
+            safefs.write_file(d, "agent-result.json", data)
+            written.append(str(Path(d) / "agent-result.json"))
+        except (OSError, safefs.UnsafePath) as exc:
+            failed.append(f"{d}: {exc}")
+    return written, failed
 
 
 # --- ledger ------------------------------------------------------------------
