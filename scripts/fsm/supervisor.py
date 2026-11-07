@@ -645,6 +645,7 @@ class Supervisor:
             on_launched=lambda cid: self.run.append("agent_launched", container=name, kind=kind,
                                                     seq=seq, container_id=str(cid)[:80]))
         res["session_dir"] = str(sdir)
+        self.run.p("logs", f"agent-{seq}.log").write_text(res.pop("log_tail", "") or "")
         res["usage"] = self.svc.session_usage(sdir, self.run.p("usage", f"s{seq}"))
         report.ledger_exit(name, self.mode, res.get("exit_code"), self.run.run_id, kind, seq,
                            res.get("duration_seconds"), usage=res.get("usage"))
