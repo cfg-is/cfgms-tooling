@@ -8,7 +8,8 @@
 # event name to the bundle of §4 steps that event justifies running.
 #
 # Two probe tiers keep the poll cheap:
-#   fast (default 60s)  — local only: git ls-remote, docker ps, container age.
+#   fast (default 60s)  — local only: git ls-remote, docker ps, container age,
+#                         FSM run index (scripts/fsm/runindex.py rows).
 #   slow (default 300s) — GitHub: board status counts, PR check rollups.
 #                         `project-queue.sh list-by-status` costs ~15s per call,
 #                         which is why board polling is not on the fast tier.
@@ -18,6 +19,15 @@
 #   record-cycle <result> [trigger]  report a finished cycle: drained | work
 #   state                          print the persisted state
 #   reset                          clear the state (next tick re-baselines)
+#
+# FSM runs (DESIGN.md §11): one supervisor run starts several agent and
+# validator containers in turn, so its containers are not tracked one by one.
+# `container_exited name=<agent container> run=<id> state=<STATE>` is emitted
+# once, when the run reaches a terminal state (terminal_done recorded) or its
+# run dir disappears (state=gone); `container_stalled name=<c> age_min=<m>
+# run=<id> reason=heartbeat` once, when the run's heartbeat goes stale (hung)
+# or its supervisor is gone without finishing (crashed). Containers labelled
+# with a run_id are left out of the per-container exit and age tracking.
 #
 # Drained shutdown: two consecutive `record-cycle drained full_cycle` reports
 # mean two scheduled full cycles in a row found no work. The watcher then emits
@@ -38,7 +48,7 @@ STALL_MINUTES="${PIPELINE_WATCH_STALL_MIN:-90}"
 DRAINED_LIMIT="${PIPELINE_WATCH_DRAINED_LIMIT:-2}"
 
 usage() {
-  sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------- state
@@ -83,7 +93,19 @@ probe_containers() {
     started="$(docker inspect -f '{{.State.StartedAt}}' "${name}" 2>/dev/null)" || continue
     epoch="$(date -d "${started}" +%s 2>/dev/null)" || continue
     printf '%s\t%s\n' "${name}" "$(( (now - epoch) / 60 ))"
-  done < <(docker ps --filter name=cfg-agent- --format '{{.Names}}' 2>/dev/null || true)
+  done < <(docker ps --filter name=cfg-agent- --format '{{.Names}}	{{.Label "run_id"}}' 2>/dev/null \
+             | awk -F'\t' 'NF && $2 == "" {print $1}' || true)
+}
+
+# Prints "<run_id><TAB><status><TAB><state><TAB><container><TAB><age_min><TAB><key>"
+# per FSM run (runindex.py rows). age_min is the heartbeat age, or the age of a
+# run that never beat.
+probe_fsm_runs() {
+  if [[ -n "${PIPELINE_WATCH_FSM_CMD:-}" ]]; then
+    eval "${PIPELINE_WATCH_FSM_CMD}" || true
+    return
+  fi
+  python3 "${SCRIPT_DIR}/fsm/runindex.py" rows 2>/dev/null || true
 }
 
 # Prints the item count for one project-board status.
@@ -227,6 +249,45 @@ fast_tick() {
     fi
   done < <(printf '%s\n' "${containers}")
   sset stalled "${stalled}"
+
+  fsm_tick
+}
+
+# fsm_tick — run-terminal and stale-heartbeat events for FSM runs. State:
+# fsm_open = "<run_id>=<container> ..." of runs not yet terminal at the last
+# tick; fsm_stalled = run ids already reported stalled. A run first seen
+# already terminal (a fresh watcher, or a run that started and ended between
+# two ticks) emits nothing.
+fsm_tick() {
+  local rows prev_open prev_stalled open="" stalled="" seen=" " rid status state container age key entry
+  rows="$(probe_fsm_runs)"
+  prev_open="$(sget fsm_open)"
+  prev_stalled="$(sget fsm_stalled)"
+  while IFS=$'\t' read -r rid status state container age key; do
+    [[ -n "${rid:-}" && -n "${status:-}" ]] || continue
+    seen+="${rid} "
+    if [[ "${status}" == "done" ]]; then
+      if [[ " ${prev_open} " == *" ${rid}="* ]]; then
+        emit "container_exited name=${container} run=${rid} state=${state}"
+      fi
+      continue
+    fi
+    open+="${rid}=${container} "
+    if [[ "${status}" == "hung" || "${status}" == "crashed" ]]; then
+      stalled+="${rid} "
+      if [[ " ${prev_stalled} " != *" ${rid} "* ]]; then
+        emit "container_stalled name=${container} age_min=${age:-0} run=${rid} reason=heartbeat"
+      fi
+    fi
+  done < <(printf '%s\n' "${rows}")
+  for entry in ${prev_open}; do
+    rid="${entry%%=*}"
+    if [[ "${seen}" != *" ${rid} "* ]]; then
+      emit "container_exited name=${entry#*=} run=${rid} state=gone"
+    fi
+  done
+  sset fsm_open "${open}"
+  sset fsm_stalled "${stalled}"
 }
 
 # queue_tick — emit `queue_removed` for a PR that was in the merge queue last
@@ -547,7 +608,7 @@ cmd_record_cycle() {
 
 cmd_state() {
   local f
-  for f in develop_sha containers stalled queue_set board_Ready board_Fix board_Failed drained_streak last_full; do
+  for f in develop_sha containers stalled fsm_open fsm_stalled queue_set board_Ready board_Fix board_Failed drained_streak last_full; do
     printf '%s=%s\n' "${f}" "$(sget "${f}" | tr '\n' ' ')"
   done
 }
@@ -556,6 +617,7 @@ case "${1:-}" in
   watch)        cmd_watch ;;
   tick-fast)    fast_tick ;;   # single tick, for tests
   tick-slow)    slow_tick ;;   # single tick, for tests
+  tick-fsm)     fsm_tick ;;    # single FSM-runs tick, for tests
   record-cycle) shift; cmd_record_cycle "$@" ;;
   state)        cmd_state ;;
   reset)        rm -rf "${STATE_DIR}"; printf 'reset %s\n' "${STATE_DIR}" ;;
