@@ -11,6 +11,11 @@ Tests: the four FSM guarantees that must fail if their guard is removed.
   3. No git process ever runs with the agent workspace's `.git` as its git
      directory (git-wrapper log), even when the agent tampers with that `.git`.
   4. A symlink at `out/summary.md` pointing at a host file is not read.
+  6. (B1) An agent-planted repository at `A/.claude/tooling` with a filter
+     driver, plus an oversized and a stat-dirty file, never makes git run a
+     child process inside `A` (no host command execution from SNAPSHOT).
+  7. `run_session` refuses to start a container whose argv carries a GitHub
+     credential (the guard itself, not only the argv builder).
   5. Writes into agent-writable directories (the session dir) never follow a
      planted symlink: not at `agent-result.json`, not at its temp names, not at
      the session dir path itself; transcripts are read only from a no-follow
@@ -30,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fsm_testlib as L  # noqa: E402
 
 import agent_session  # noqa: E402
+import gitops  # noqa: E402
+import snapshot  # noqa: E402
 import report  # noqa: E402
 import safefs  # noqa: E402
 
@@ -46,7 +53,8 @@ class Base(unittest.TestCase):
 
     def run_issue(self, sessions, **plan):
         self.f.plan({"agent": sessions, **plan})
-        rc, out, rid = self.f.cli("run", "issue", "42", "--model", "m", "--effort", "e")
+        rc, out, rid = self.f.cli("run", "issue", "42", "--model", "m", "--effort", "e",
+                                  "--item-id", L.ITEM)
         self.assertIsNotNone(rid, out)
         return rc, out, rid
 
@@ -73,9 +81,18 @@ class TestNoGithubCredentialInContainers(Base):
                 [{"op": "write", "path": "src/new.go", "content": "package src\n"}]]
         rc, out, rid = self.run_issue(sess)
         self.assertEqual(rc, 0, out)
-        runs = [r for r in self.f.records("docker") if r["argv"][0] == "run"]
+        all_runs = [r for r in self.f.records("docker") if r["argv"][0] == "run"]
+        runs = [r for r in all_runs if "state=agent" in r["argv"] or "state=validate" in r["argv"]]
         self.assertEqual(len(runs), 4)          # 2 agent + 2 validator
-        for r in runs:
+        scans = [r for r in all_runs if "trufflehog" in r["argv"]]
+        self.assertTrue(scans)
+        for r in scans:
+            self.assertEqual(r["argv"][r["argv"].index("--network") + 1], "none")
+            self.assertEqual(r["gh_env"], [])
+            mounts = [r["argv"][i + 1] for i, a in enumerate(r["argv"]) if a == "-v"]
+            self.assertEqual(len(mounts), 1)
+            self.assertTrue(mounts[0].endswith(":/scan:ro"))
+        for r in all_runs:
             argv = r["argv"]
             joined = " ".join(argv)
             self.assertEqual(r["gh_env"], [], f"docker client env carried {r['gh_env']}")
@@ -98,30 +115,136 @@ class TestNoGitInWorkspaceGitdir(Base):
                {"op": "write", "path": "src/new.go", "content": "package src\n"}]
         rc, out, rid = self.run_issue([tamper, fix])
         ws = os.path.realpath(self.f.run_dir(rid) / "A")
-        calls = self.f.git_calls()
-        self.assertGreater(len(calls), 20)
-        for c in calls:
-            gd = c["GIT_DIR"]
-            argv = c["argv"]
-            for a in argv:
-                if a.startswith("--git-dir="):
-                    gd = a.split("=", 1)[1]
-            if gd is None:
-                # discovery: the repository would come from -C <dir> or the cwd
-                where = c["cwd"]
-                if "-C" in argv:
-                    where = os.path.join(where, argv[argv.index("-C") + 1])
-                where = os.path.realpath(where)
-                self.assertFalse(where == ws or where.startswith(ws + os.sep),
-                                 f"git discovered a repository inside A: {argv}")
-                continue
-            gd = os.path.realpath(os.path.join(c["cwd"], gd))
-            self.assertFalse(gd == ws or gd.startswith(ws + os.sep),
-                             f"git ran with git dir {gd} inside A: {argv[:6]}")
+        assert_no_git_under(self, self.f.trace2_events(), ws)
+        setup = self.f.trace_setup()
+        self.assertTrue(any(k == "git_dir" for k, _ in setup))
+        for k, v in setup:
+            if k in ("git_dir", "worktree", "cwd"):
+                self.assertFalse(_under(v, ws), f"git {k} inside A: {v}")
+        self.assertGreater(len(self.f.git_starts()), 20)
         self.assertEqual(rc, 0, out)
-        # the snapshot did read A (through R's git dir with --work-tree)
-        self.assertTrue(any(c["GIT_WORK_TREE"] and os.path.realpath(c["GIT_WORK_TREE"]) == ws
-                            for c in calls))
+
+
+def _under(path, root):
+    if not path:
+        return False
+    p = os.path.realpath(path)
+    return p == root or p.startswith(root + os.sep)
+
+
+def assert_no_git_under(tc, events, ws):
+    """Every git process and every child git spawned (trace2 events): no
+    repository, work tree or child cwd inside the workspace, and no `status`
+    (the submodule probe) anywhere."""
+    tc.assertTrue(events, "no trace2 events recorded")
+    for e in events:
+        ev = e.get("event")
+        if ev == "def_repo":
+            tc.assertFalse(_under(e.get("worktree"), ws), f"git work tree inside A: {e}")
+        if ev == "child_start":
+            tc.assertFalse(_under(e.get("cd"), ws), f"git child ran inside A: {e}")
+            tc.assertNotIn("status", e.get("argv", []), f"git spawned status: {e}")
+        if ev == "start":
+            argv = e.get("argv", [])
+            tc.assertFalse(len(argv) > 1 and argv[1] == "status", f"git status ran: {argv}")
+            for a in argv:
+                tc.assertFalse(_under(a, ws) and a.endswith(".git"), f"git dir inside A: {argv}")
+
+
+class TestPlantedNestedRepoCannotExecute(unittest.TestCase):
+    """B1: SNAPSHOT must not run git inside an agent-planted repository."""
+
+    def setUp(self):
+        self.f = L.Fixture("fsm-b1")
+
+    def tearDown(self):
+        self.f.cleanup()
+        gitops._FORBIDDEN_ROOTS.clear()
+        os.environ.pop("GIT_TRACE2_EVENT", None)
+        os.environ.pop("GIT_TRACE_SETUP", None)
+
+    def test_planted_tooling_repo_filter_never_runs(self):
+        import subprocess
+        run = self.f.root / "run"
+        run.mkdir()
+        R = gitops.init_bare(run / "R", run, run / "gitconfig")
+        R.git("fetch", "-q", str(self.f.remote), "+refs/heads/develop:refs/fsm/base")
+        base = R.rev("refs/fsm/base")
+        base_tree = R.tree_of(base)
+        A = run / "A"
+        snapshot.materialize_workspace(R, run, A, base, base, "feature/b1", "https://x.invalid/r.git")
+        marker = self.f.root / "PWNED"
+        tool = A / ".claude" / "tooling"
+        tool.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(self.f.root))
+        env.pop("GIT_TRACE2_EVENT", None)
+        g = lambda *a: subprocess.run([L.REAL_GIT, "-C", str(tool)] + list(a), check=True,
+                                      env=env, capture_output=True)
+        g("init", "-q")
+        (tool / "f").write_text("one\n")
+        g("add", "f")
+        gitlink = "1111111111111111111111111111111111111111"
+        (tool / ".git" / "HEAD").write_text(gitlink + "\n")     # HEAD at the gitlink sha
+        (tool / ".gitattributes").write_text("* filter=x\n")
+        with open(tool / ".git" / "config", "a") as fh:
+            fh.write(f'[filter "x"]\n\tclean = "touch {marker}; cat"\n\tsmudge = "touch {marker}; cat"\n'
+                     f'\tprocess = "touch {marker}"\n[core]\n\tfsmonitor = "touch {marker}"\n')
+        os.utime(tool / "f", (1, 1))                            # stat-dirty
+        os.utime(A / "src" / "app.go", (1, 1))                  # stat-dirty tracked file
+        (A / "src" / "big.bin").write_bytes(b"x" * 2048)       # >= the per-file cap below
+        trace = self.f.root / "b1-trace2.json"
+        setup_log = self.f.root / "b1-setup.log"
+        os.environ["GIT_TRACE2_EVENT"] = str(trace)
+        os.environ["GIT_TRACE_SETUP"] = str(setup_log)
+        err = None
+        try:
+            res = snapshot.snapshot(R, run, A, base_tree, max_file=1024)
+        except Exception as exc:          # checked after the marker: a run that
+            err = exc                     # executed the filter and then failed still fails here
+        finally:
+            del os.environ["GIT_TRACE2_EVENT"]
+            del os.environ["GIT_TRACE_SETUP"]
+        self.assertFalse(marker.exists(), "a filter / fsmonitor command from the planted repo ran")
+        if err:
+            raise err
+        for line in setup_log.read_text().splitlines():
+            for k in ("git_dir: ", "worktree: ", "cwd: "):
+                if k in line:
+                    v = line.split(k, 1)[1].strip()
+                    self.assertFalse(_under(v, os.path.realpath(A)), f"git {k}{v}")
+        self.assertFalse(marker.exists(), "a filter / fsmonitor command from the planted repo ran")
+        self.assertIn("src/big.bin", res.oversize)
+        events = []
+        for line in trace.read_text().splitlines():
+            try:
+                events.append(__import__("json").loads(line))
+            except ValueError:
+                pass
+        assert_no_git_under(self, events, os.path.realpath(A))
+
+
+class TestRunSessionGuard(unittest.TestCase):
+    def test_run_session_refuses_credential_before_launch(self):
+        calls = []
+
+        class D:
+            def rm_force(self, n): calls.append("rm")
+            def run_detached(self, argv, env_extra=None): calls.append("run"); return "cid"
+            def wait(self, n, t): return 0
+            def kill(self, n): pass
+            def inspect_exit(self, n): return "exited", 0
+
+        base = agent_session.docker_argv(
+            name="cfg-agent-1", mode="issue", kind="implement", seq=1, run_id="r", workspace="/w",
+            context_dir="/c", out_dir="/o", session_dir="/s", trust="/t", model="m", effort="e")
+        for leak, env in ((base + ["-e", "GH_TOKEN"], {}),
+                          (base + ["-v", "/home/u/.config/gh:/home/agent/.config/gh"], {}),
+                          (base, {"GITHUB_TOKEN": "ghp_x"})):
+            with self.assertRaises(agent_session.CredentialLeak):
+                agent_session.run_session(D(), leak, "cfg-agent-1", env, 1)
+        self.assertEqual(calls, [])
+        agent_session.run_session(D(), base, "cfg-agent-1", {}, 1)
+        self.assertIn("run", calls)
 
 
 class TestSymlinkedOutputNotRead(Base):

@@ -13,9 +13,14 @@ Usage:
   supervisor.py status <RUN_ID>
 
 Options:
-  --item-id ID        project item (board updates); required for `item` mode
+  --item-id ID        project item: the story spec and Files In Scope are read
+                      from it (`project-queue.sh get-item`), never from issue
+                      text; required in issue, item, fix-pr and
+                      resolve-conflict modes
   --epic N            parent epic: follow-ups are filed under it
-  --lease-key KEY     lease the run owns (verified held by this host)
+  --lease-key KEY     lease the run owns (verified held by this host, renewed
+                      by the heartbeat); required unless
+                      CFGMS_FSM_ALLOW_NO_LEASE=1 (tests)
   --acquire-lease     acquire KEY instead of expecting it held
   --model M / --effort E   agent model and effort (default: model-routing)
   --container-target T     override the container name suffix
@@ -27,8 +32,9 @@ The supervisor owns every side effect. Agents only edit files in the
 workspace `A`; the candidate is a tree in `R`; validation runs in an
 agent-free container; PUBLISH commits exactly the validated tree.
 
-Exit codes: 0 REPORT / NO_OP, 1 FAILED, 3 REFUSED, 75 interrupted (resumable),
-2 usage error.
+Exit codes: 0 REPORT / NO_OP / resource deferral (DISPATCH_DEFERRED), 1 FAILED,
+2 usage error, 3 REFUSED, 4 run locked by a live supervisor, 10 credentials
+deferral, 75 interrupted (resumable).
 """
 
 import argparse
@@ -60,11 +66,14 @@ import state as statemod             # noqa: E402
 import transitions as T              # noqa: E402
 import validator                     # noqa: E402
 
-EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED, EXIT_INTERRUPTED = 0, 1, 2, 3, 75
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED, EXIT_LOCKED = 0, 1, 2, 3, 4
+EXIT_CREDS_DEFERRED, EXIT_INTERRUPTED = 10, 75
 REPO = os.environ.get("CFGMS_FSM_REPO", "cfg-is/cfgms")
 RUN_TIMEOUT_MIN = int(os.environ.get("CFGMS_FSM_RUN_TIMEOUT_MIN", "480"))
 HEARTBEAT_SECS = float(os.environ.get("CFGMS_FSM_HEARTBEAT_SECS", "60"))
 TRUSTED_PERMS = ("push", "maintain", "admin", "write")
+LEASE_TTL = int(os.environ.get("CFGMS_FSM_LEASE_TTL", "3600"))
+LEASE_RENEW_SECS = float(os.environ.get("CFGMS_FSM_LEASE_RENEW_SECS", "1800"))
 _TOKEN_CRED_NAME = "claude-oauth-token"
 
 
@@ -73,9 +82,14 @@ class Interrupted(Exception):
 
 
 class Refused(Exception):
-    def __init__(self, reason, deferred=False):
+    """A PREPARE gate said no. `exit_code` keeps today's po-act contract:
+    3 refusal, 0 + DISPATCH_DEFERRED for a resource deferral, 10 for a
+    credentials deferral."""
+
+    def __init__(self, reason, deferred=False, exit_code=None):
         self.reason = reason
         self.deferred = deferred
+        self.exit_code = exit_code if exit_code is not None else (EXIT_OK if deferred else EXIT_REFUSED)
         super().__init__(reason)
 
 
@@ -189,6 +203,8 @@ class Supervisor:
         self.x = self.ctx.extra
         self._warnings = []
         self._scanner = None
+        self.lease_lost = False
+        self._last_renew = time.time()
 
     # --- helpers ------------------------------------------------------------------
     def log(self, msg):
@@ -239,11 +255,11 @@ class Supervisor:
                 creds["supervisor GH token"] = self.svc.gh.token()
             except Exception:
                 pass
-            self._scanner = secrets_scan.Scanner(creds, external=secrets_scan.trufflehog_hook(),
+            self._scanner = secrets_scan.Scanner(creds, external=secrets_scan.scanner_hook(),
                                                  warnings=self._warnings)
             if self._scanner.external is None:
-                self._warnings.append("external secret scanner (trufflehog) not found: skipped")
-                self.run.append("note", warning="external secret scanner not available; skipped")
+                self._warnings.append("external secret scanner disabled (CFGMS_FSM_TRUFFLEHOG=off)")
+                self.run.append("note", warning="external secret scanner disabled; skipped")
         return self._scanner
 
     def record_transition(self, frm, event, res, info):
@@ -284,9 +300,12 @@ class Supervisor:
         self.restore()
         started = self.params.get("started_epoch", time.time())
         while self.state not in T.TERMINAL:
+            if self.lease_lost:
+                self._take_safe("error", {"reason": "lease_lost"})
+                continue
             if time.time() - started > RUN_TIMEOUT_MIN * 60:
-                self.take("error", {"reason": "run_timeout"})
-                break
+                self._take_safe("error", {"reason": "run_timeout"})
+                continue
             handler = getattr(self, f"do_{self.state.lower()}")
             try:
                 event, info = handler()
@@ -294,16 +313,44 @@ class Supervisor:
                 raise
             except Refused as r:
                 self.x["refused_deferred"] = r.deferred
-                self.take("gate_refused", {"reason": r.reason})
+                self.x["refused_exit"] = r.exit_code
+                self._take_safe("gate_refused", {"reason": r.reason})
                 continue
             except Exception as exc:  # host error: FAILED(<state>_error)
                 self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
                                 state=self.state)
                 self.log(f"host error in {self.state}: {type(exc).__name__}: {exc}")
-                self.take("error", {"error": f"{type(exc).__name__}"})
-                break
-            self.take(event, info)
+                self._take_safe("error", {"error": f"{type(exc).__name__}"})
+                continue
+            self._take_safe(event, info)
         return self.finish()
+
+    def _take_safe(self, event, info):
+        """take(), falling back to the always-present `error` edge when the
+        handler produced an event the table does not allow here, so a terminal
+        state (and finish()) is always reached."""
+        try:
+            return self.take(event, info)
+        except T.InvalidTransition as exc:
+            self.run.append("note", error=f"invalid transition: {exc}", state=self.state)
+            return self.take("error", {"reason": f"{self.state.lower()}_invalid_transition"})
+
+    def heartbeat_tick(self):
+        """Called from the heartbeat thread: renew the lease when due."""
+        key = self.params.get("lease_key")
+        if not key or self.lease_lost or self.state in T.TERMINAL:
+            return
+        if time.time() - self._last_renew < LEASE_RENEW_SECS:
+            return
+        st, line = self.svc.helper.lease_renew(key, int(self.params.get("lease_ttl", LEASE_TTL)))
+        if st == "renewed":
+            self._last_renew = time.time()
+            self.run.append("lease", renewed=line[:200])
+        elif st == "not_holder":
+            self.lease_lost = True
+            self.run.append("lease", lost=line[:200])
+        else:
+            self.run.append("lease", renew_error=line[:200])
 
     # --- PREPARE ---------------------------------------------------------------------
     def do_prepare(self):
@@ -312,11 +359,20 @@ class Supervisor:
         x = self.x
         x.update({"issue": p.get("issue"), "item_id": p.get("item_id"), "seq": 0,
                   "lease_acquired": False})
-        # lease
+        if not agent_session.uid_matches():
+            self.run.append("note", warning=f"supervisor uid {os.getuid()} != agent uid "
+                                            f"{agent_session.AGENT_UID}: agent files may be unreadable")
+        if p.get("key"):
+            other = statemod.active_run(p["key"], base=self.run.base)
+            if other and other != self.run.run_id and statemod.RunDir(other, base=self.run.base).is_locked():
+                raise Refused("active_run")
+        # lease (mandatory unless explicitly waived, e.g. by tests)
         key = p.get("lease_key")
+        if not key and os.environ.get("CFGMS_FSM_ALLOW_NO_LEASE") != "1":
+            raise Refused("no_lease")
         if key:
             if p.get("acquire_lease"):
-                ok, line = self.svc.helper.lease_acquire(key, int(p.get("lease_ttl", 3600)))
+                ok, line = self.svc.helper.lease_acquire(key, int(p.get("lease_ttl", LEASE_TTL)))
                 if not ok:
                     raise Refused("lease_held", deferred=True)
                 x["lease_acquired"] = True
@@ -324,9 +380,26 @@ class Supervisor:
                 st, _ = self.svc.helper.lease_status(key)
                 if st != "held_by_me":
                     raise Refused("lease_not_held")
+                rs, line = self.svc.helper.lease_renew(key, int(p.get("lease_ttl", LEASE_TTL)))
+                if rs == "not_holder":
+                    raise Refused("lease_not_held")
+            self._last_renew = time.time()
+        tok, _why = self.svc.claude_token()
+        if not tok and not os.path.isfile(self.svc.credentials_file()):
+            raise Refused("creds", deferred=True, exit_code=EXIT_CREDS_DEFERRED)
         ok, why = self.svc.capacity()
         if not ok:
             raise Refused(f"capacity:{why}"[:120], deferred=True)
+        # the story spec comes from the project item, never from issue text
+        item = None
+        if mode in ("issue", "item", "fix-pr", "resolve-conflict") and not p.get("item_id"):
+            raise Refused("no_story_item")
+        if p.get("item_id"):
+            item = self.svc.board.get_item(p["item_id"])
+            if item is None:
+                raise Refused("story_item_unreadable")
+            if mode == "issue" and item.get("issue_num") not in (None, p.get("issue")):
+                raise Refused("item_mismatch")
 
         # candidate repo R
         if self.run.repo_dir.exists():
@@ -353,18 +426,16 @@ class Supervisor:
             if pr:
                 x["pr_number"] = pr["number"]
                 self.ctx.wip_draft = bool(pr.get("isDraft")) and str(pr.get("title", "")).startswith("WIP:")
-                self.ctx.cross_run_attempts = report.attempts_from_body(pr.get("body", ""))
-            if mode == "item":
-                item = self.svc.board.get_item(p["item_id"]) or {}
+            self.ctx.cross_run_attempts = self._attempts(pr, item)
+            if item:
                 title, body = item.get("title", ""), item.get("body", "")
-            elif p.get("issue"):
-                iss = self.svc.gh.issue_view(p["issue"]) or {}
-                title, body = iss.get("title", ""), iss.get("body", "")
             self.ctx.synced = False
         else:
             pr = self.svc.gh.pr_view(p["pr"])
             if not pr or str(pr.get("state", "OPEN")).upper() != "OPEN":
                 raise Refused("pr_not_open")
+            if pr.get("isCrossRepository"):
+                raise Refused("cross_repository_pr")
             login = ((pr.get("author") or {}).get("login") or "")
             if self.svc.gh.permission(login) not in TRUSTED_PERMS:
                 raise Refused("untrusted_author")
@@ -375,15 +446,15 @@ class Supervisor:
                 raise Refused("head_moved")
             m = re.search(r"feature/story-(\d+)", branch)
             issue = int(m.group(1)) if m else p.get("issue")
+            if issue and item.get("issue_num") not in (None, issue):
+                raise Refused("item_mismatch")
             x.update({"branch": branch, "head0": pr_head0, "base": pr_head0, "pr_number": p["pr"],
                       "issue": issue})
             self.ctx.wip_draft = bool(pr.get("isDraft")) and str(pr.get("title", "")).startswith("WIP:")
-            self.ctx.cross_run_attempts = report.attempts_from_body(pr.get("body", ""))
+            self.ctx.cross_run_attempts = self._attempts(pr, item)
             need_sync = mode == "resolve-conflict" or str(pr.get("mergeable", "")).upper() == "CONFLICTING"
             self.ctx.synced = not need_sync
-            if issue:
-                iss = self.svc.gh.issue_view(issue) or {}
-                title, body = iss.get("title", ""), iss.get("body", "")
+            title, body = item.get("title", ""), item.get("body", "")
             self._write_pr_context(pr)
         x["title"] = title or p.get("branch", "")
         self.wtext("spec.md", body)
@@ -400,6 +471,23 @@ class Supervisor:
         if self.params.get("key"):
             self.run.register_active(self.params["key"])
         return "gates_ok", {}
+
+    def _attempts(self, pr, item):
+        """Failed FSM runs so far: the highest FSM-Attempt trailer in the PR body
+        or in comments posted by the supervisor's own identity, or the board's
+        FsmFailedRuns field, whichever is highest."""
+        n = 0
+        if pr:
+            n = report.attempts_from_body(pr.get("body", ""))
+            me = self.svc.gh.login()
+            if me:
+                for c in self.svc.gh.pr_comments(pr["number"]):
+                    if c.get("author") == me:
+                        n = max(n, report.attempts_from_body(c.get("body", "")))
+        raw = str(((item or {}).get("fields") or {}).get("FsmFailedRuns", "") or "").strip()
+        if raw.isdigit():
+            n = max(n, int(raw))
+        return n
 
     def _write_pr_context(self, pr):
         cdir = self.run.context_dir
@@ -436,8 +524,18 @@ class Supervisor:
             if len(parts) < 3 or parts[1] != "commit":
                 return
             sha = parts[2]
-            target = Path(dest) / snapshot.TOOLING_PATH
-            target.mkdir(parents=True, exist_ok=True)
+            # the checked-out candidate may hold `.claude` as a symlink: create
+            # each component without following links, else skip populating
+            target = Path(dest)
+            for comp in snapshot.TOOLING_PATH.split("/"):
+                target = target / comp
+                try:
+                    os.mkdir(target, 0o755)
+                except FileExistsError:
+                    if os.path.islink(target) or not os.path.isdir(target):
+                        self.run.append("note", warning=f"{snapshot.TOOLING_PATH} not populated: "
+                                                        f"{comp} is not a plain directory")
+                        return
             idx = self.run.p("tooling.idx")
             gitops.run_git(src, ["read-tree", sha], home=self.run.path,
                            gitconfig=self.run.gitconfig, index_file=idx)
@@ -473,9 +571,12 @@ class Supervisor:
                          "exit_code": res.get("exit_code"), "timed_out": res.get("timed_out"),
                          "duration_seconds": res.get("duration_seconds"),
                          "session_dir": res.get("session_dir", ""), "usage": res.get("usage")})
-        if res.get("exit_code") is None or res.get("timed_out") or res.get("error"):
-            reason = "timeout" if res.get("timed_out") else (res.get("error") or "no_exit_code")
-            return "session_error", {"session_reason": reason[:200], "seq": seq}
+        if res.get("timed_out"):
+            return "session_error", {"session_reason": "timeout", "seq": seq}
+        if res.get("exit_code") is None or res.get("error"):
+            # docker launch / wait / infra failure: not the agent's work
+            return "error", {"reason": "agent_error",
+                             "session_reason": (res.get("error") or "no_exit_code")[:200], "seq": seq}
         return "session_ended", {"exit_code": res["exit_code"], "seq": seq}
 
     def _write_session_context(self, kind, seq):
@@ -530,9 +631,11 @@ class Supervisor:
             gh_token = self.svc.gh.token()
         except Exception:
             gh_token = None
-        res = agent_session.run_session(self.svc.docker, argv, name, env_extra,
-                                        int(p.get("agent_timeout_min", agent_session.DEFAULT_TIMEOUT_MIN)),
-                                        gh_token=gh_token)
+        res = agent_session.run_session(
+            self.svc.docker, argv, name, env_extra,
+            int(p.get("agent_timeout_min", agent_session.DEFAULT_TIMEOUT_MIN)), gh_token=gh_token,
+            on_launched=lambda cid: self.run.append("agent_launched", container=name, kind=kind,
+                                                    seq=seq, container_id=str(cid)[:80]))
         res["session_dir"] = str(sdir)
         res["usage"] = self.svc.session_usage(sdir, self.run.p("usage", f"s{seq}"))
         report.ledger_exit(name, self.mode, res.get("exit_code"), self.run.run_id, kind, seq,
@@ -647,14 +750,14 @@ class Supervisor:
     def do_validate(self):
         x, p = self.x, self.params
         base, tree = x["base"], x["candidate_tree"]
+        develop = x.get("develop") or base
         cache = validator.ValidationCache(self.run.p("validate", "cache.json"))
-        hit = cache.hit(base, tree)
+        hit = cache.hit(base, develop, tree)
         if hit:
             x["validated"] = {"base": base, "tree": tree, **hit}
             return "pass", {"cache_hit": True, "tree": tree}
         n = len([d for d in self.run.p("validate").iterdir() if d.is_dir()]) + 1
         vdir = self.run.p("validate", f"v{n}")
-        develop = x.get("develop") or base
         validator.build_clone(self.repo, vdir / "repo", base, develop, tree, publish.PUBLIC_URL,
                               populate=self.tooling_populate())
         cache_dir = self.run.p("cache")
@@ -681,7 +784,7 @@ class Supervisor:
         self.run.append("validate", **info)
         if res["verdict"] == "pass":
             rec = {"validator": name, "validate_seq": n, "duration_seconds": res["duration_seconds"]}
-            cache.record_pass(base, tree, rec)
+            cache.record_pass(base, develop, tree, rec)
             x["validated"] = {"base": base, "tree": tree, **rec}
             return "pass", info
         if res["verdict"] == "fail":
@@ -739,7 +842,8 @@ class Supervisor:
         key = p.get("lease_key")
         if key:
             st, _ = self.svc.helper.lease_status(key)
-            if st != "held_by_me":
+            if st != "held_by_me" or self.lease_lost:
+                self.lease_lost = True
                 return "lease_lost", {"lease": st}
         v = x["validated"]
         tree, base = v["tree"], v["base"]
@@ -800,14 +904,21 @@ class Supervisor:
             self.write_manifest()
             self.release()
             self.run.append("terminal_done", state=st)
-        return {T.REPORT: EXIT_OK, T.NO_OP: EXIT_OK, T.REFUSED: EXIT_REFUSED,
-                T.FAILED: EXIT_FAILED}[st]
+        if st == T.REFUSED:
+            return int(self.x.get("refused_exit", EXIT_REFUSED))
+        return {T.REPORT: EXIT_OK, T.NO_OP: EXIT_OK, T.FAILED: EXIT_FAILED}[st]
 
     def release(self):
         p, x = self.params, self.x
         key = p.get("lease_key")
-        if key and (self.state != T.REFUSED or x.get("lease_acquired")):
-            self.svc.helper.lease_release(key)
+        if key and self.lease_lost:
+            self.run.append("note", lease_not_released="lost")
+        elif key and (self.state != T.REFUSED or x.get("lease_acquired")):
+            st, _ = self.svc.helper.lease_status(key)
+            if st == "held_by_me":
+                self.svc.helper.lease_release(key)
+            else:
+                self.run.append("note", lease_not_released=st)
         if p.get("key"):
             self.run.clear_active(p["key"])
 
@@ -866,6 +977,9 @@ class Supervisor:
             return
         tree, base = x.get("last_clean_tree"), x.get("last_clean_base")
         unsaved = bool(tree) and tree != x.get("start_tree")
+        if self.lease_lost or reason == "lease_lost":
+            self.log(f"Agent failed ({reason}); lease lost: no WIP push")
+            return
         if not unsaved:
             self._salvage_to_done()
             self.log(f"Agent failed ({reason}); no unsaved work")
@@ -874,10 +988,14 @@ class Supervisor:
         pr = self.svc.gh.find_open_pr(branch)
         if pr and not pr.get("isDraft"):
             # Never push unvalidated work onto a ready PR.
+            pushed = [r.get("sha") for r in self.run.records()
+                      if r.get("type") == "publish_step" and r.get("step") == "push"]
+            what = (f"the validated commit `{pushed[-1][:12]}` pushed earlier in this run is the "
+                    "PR head; no WIP commit was pushed" if pushed else "no commit was pushed")
             self.svc.gh.comment(pr["number"], self.wtext("failed-comment.md",
                                 publish.ROUND_MARKER.format(run_id=self.run.run_id) +
                                 f"\nFSM run `{self.run.run_id}` ended in FAILED ({reason}); "
-                                "nothing was pushed.\n\n"
+                                f"{what}.\n\n"
                                 f"{report.FSM_REASON_TRAILER}: {reason}\n"
                                 f"{report.FSM_ATTEMPT_TRAILER}: {attempt}\n"))
             return
@@ -1009,20 +1127,56 @@ def _params_from_args(a):
     return p
 
 
-def snapshot_tooling(run):
-    """Copy this supervisor's code into the run dir; return (path, commit)."""
-    dest = run.p("tooling", "fsm")
-    dest.mkdir(parents=True, exist_ok=True)
-    for f in HERE.glob("*.py"):
-        shutil.copy2(f, dest / f.name)
+#: Tooling files the supervisor invokes, relative to the tooling root (§11).
+TOOLING_SNAPSHOT_FILES = (
+    "scripts/pipeline-helper.sh", "scripts/project-queue.sh", "scripts/po-cycle-preflight.py",
+    "scripts/agent-dispatch.sh", "metrics/token_report.py", "metrics/pricing.json",
+    "devcontainer/agent-context.sh",
+)
+#: Directories copied whole (sourced libraries and the supervisor itself).
+TOOLING_SNAPSHOT_DIRS = ("scripts/lib", "scripts/fsm")
+#: cfgms config the helpers read, relative to the cfgms checkout root.
+CFGMS_SNAPSHOT_FILES = (".claude/pipeline.yaml", ".claude/model-routing.yaml")
+
+
+def snapshot_tooling(run, tooling_root):
+    """Copy every tooling file the supervisor runs into the run dir (§11).
+
+    Layout mirrors a cfgms checkout so the helpers find their config:
+    <run>/tooling/.claude/{pipeline.yaml,model-routing.yaml,tooling/...}.
+    Returns (snapshot tooling root, tooling commit, {path: sha256}).
+    """
+    import hashlib
+    src = Path(tooling_root)
+    cfgms = src.parent.parent
+    root = run.p("tooling")
+    troot = root / ".claude" / "tooling"
+    manifest = {}
+
+    def put(s, d, rel):
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(s, d)
+        manifest[rel] = hashlib.sha256(d.read_bytes()).hexdigest()
+
+    for rel in TOOLING_SNAPSHOT_FILES:
+        if (src / rel).is_file():
+            put(src / rel, troot / rel, rel)
+    for rel in TOOLING_SNAPSHOT_DIRS:
+        for f in sorted((src / rel).rglob("*")) if (src / rel).is_dir() else []:
+            if f.is_file() and not f.is_symlink() and "__pycache__" not in f.parts:
+                r = str(f.relative_to(src))
+                put(f, troot / r, r)
+    for rel in CFGMS_SNAPSHOT_FILES:
+        if (cfgms / rel).is_file():
+            put(cfgms / rel, root / rel, rel)
     commit = ""
     try:
-        proc = subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"], capture_output=True,
+        proc = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True,
                               timeout=30)
         commit = proc.stdout.decode().strip() if proc.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return dest, commit
+    return troot, commit, manifest
 
 
 def _install_signals():
@@ -1041,11 +1195,11 @@ def cmd_drive(run_id, services=None, out=None):
         run.acquire_lock()
     except statemod.LockBusy as exc:
         print(str(exc), file=sys.stderr)
-        return EXIT_USAGE
+        return EXIT_LOCKED
     _install_signals()
-    run.start_heartbeat(HEARTBEAT_SECS)
     try:
         sup = Supervisor(run, services=services, out=out)
+        run.start_heartbeat(HEARTBEAT_SECS, on_beat=sup.heartbeat_tick)
         return sup.drive()
     except Interrupted as sig:
         run.append("note", interrupted=str(sig))
@@ -1094,14 +1248,16 @@ def main(argv=None):
         run.create(params)
         print(f"FSM_RUN:{run_id}", flush=True)
         if not a.no_snapshot_tooling:
-            dest, commit = snapshot_tooling(run)
-            run.append("note", tooling_commit=commit, tooling_snapshot=str(dest))
-            os.execv(sys.executable, [sys.executable, str(dest / "supervisor.py"), "resume",
-                                      run_id, "--from-snapshot"])
+            troot, commit, manifest = snapshot_tooling(run, params["tooling_root"])
+            run.update_params({"tooling_root": str(troot), "tooling_root_src": params["tooling_root"]})
+            run.append("note", tooling_commit=commit, tooling_snapshot=str(troot),
+                       tooling_files=manifest)
+            os.execv(sys.executable, [sys.executable, str(troot / "scripts" / "fsm" / "supervisor.py"),
+                                      "resume", run_id, "--from-snapshot"])
         return cmd_drive(run_id)
 
     run = statemod.RunDir(a.run_id)
-    snap = run.p("tooling", "fsm", "supervisor.py")
+    snap = run.p("tooling", ".claude", "tooling", "scripts", "fsm", "supervisor.py")
     if not a.from_snapshot and snap.is_file() and Path(__file__).resolve() != snap.resolve():
         os.execv(sys.executable, [sys.executable, str(snap), "resume", a.run_id, "--from-snapshot"])
     return cmd_drive(a.run_id)

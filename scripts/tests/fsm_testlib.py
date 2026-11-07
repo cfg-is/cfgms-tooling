@@ -26,6 +26,7 @@ if str(FSM) not in sys.path:
 
 CLAUDE_TOKEN = "sk-ant-oat01-FAKEFSMTESTTOKEN-0123456789abcdefABCDEF"
 GH_TOKEN = "ghp_FAKESUPERVISORTOKEN0123456789abcdef"
+ITEM = "PVTI_lADOtestitem42"
 
 MAKEFILE = """\
 .PHONY: test test-commit test-agent-complete lint
@@ -62,6 +63,7 @@ class Fixture:
         self.remote = self.root / "remote.git"
         self.log = self.root / "fake.log"
         self.gitlog = self.root / "git.log"
+        self.trace2 = self.root / "trace2.json"
         self.plan_file = self.root / "plan.json"
         self.gh_state = self.root / "gh.json"
         self.docker_state = self.root / "docker-state"
@@ -139,10 +141,13 @@ class Fixture:
             self.gh_state.write_text(json.dumps(state))
         return json.loads(self.gh_state.read_text())
 
-    def add_issue(self, n, title, body):
+    def add_issue(self, n, title, body, fields=None):
+        """The story: an issue plus its project item (the spec source)."""
         s = self.gh()
         s["issues"][str(n)] = {"title": title, "body": body}
         self.gh(s)
+        self.board_item.write_text(json.dumps({"item_id": ITEM, "title": title, "body": body,
+                                               "issue_num": n, "fields": fields or {}}))
 
     def add_pr(self, number, branch, title, body="", draft=False, mergeable="MERGEABLE",
                author="dev", state="OPEN"):
@@ -189,8 +194,14 @@ class Fixture:
             "CFGMS_SYSTEMD_CREDS_BIN": str(FAKES / "systemd-creds"),
             "CFGMS_FSM_LANDED_RETRY_SECS": "0",
             "CFGMS_FSM_HEARTBEAT_SECS": "1",
+            "CFGMS_FSM_ALLOW_NO_LEASE": "1",
             "FSM_FAKE_LOG": str(self.log),
             "FSM_FAKE_GITLOG": str(self.gitlog),
+            # every git process the supervisor starts, and every child git
+            # itself spawns, appends its trace2 events here
+            "GIT_TRACE2_EVENT": str(self.trace2),
+            # and its repository setup (git_dir / worktree / cwd)
+            "GIT_TRACE_SETUP": str(self.root / "trace-setup.log"),
             "FSM_FAKE_PLAN": str(self.plan_file),
             "FSM_FAKE_GH_STATE": str(self.gh_state),
             "FSM_FAKE_STATE": str(self.docker_state),
@@ -238,8 +249,35 @@ class Fixture:
             out.extend(r.get("texts", []))
         return "\n".join(out)
 
+    def trace2_events(self):
+        if not self.trace2.exists():
+            return []
+        out = []
+        for line in self.trace2.read_text(errors="replace").splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def trace_setup(self):
+        """[(key, value)] from GIT_TRACE_SETUP: git_dir, worktree, cwd, prefix."""
+        p = self.root / "trace-setup.log"
+        out = []
+        if p.exists():
+            for line in p.read_text(errors="replace").splitlines():
+                if "setup: " in line:
+                    k, _, v = line.split("setup: ", 1)[1].partition(": ")
+                    out.append((k.strip(), v.strip()))
+        return out
+
+    def git_starts(self):
+        """argv of every git process (trace2 `start` events)."""
+        return [e.get("argv", []) for e in self.trace2_events() if e.get("event") == "start"]
+
     def pushes(self):
-        return [c for c in self.git_calls() if c["argv"] and "push" in c["argv"]]
+        return [a for a in self.git_starts() if len(a) > 1 and "push" in a[1:]
+                and not any(x in a for x in ("send-pack", "receive-pack", "pack-objects"))]
 
 
 STORY_BODY = """## Summary

@@ -34,6 +34,7 @@ class Base(unittest.TestCase):
     def run_mode(self, mode, target, sessions, *extra, env_extra=None, **plan):
         self.f.plan({"agent": sessions, **plan})
         rc, out, rid = self.f.cli("run", mode, str(target), "--model", "m", "--effort", "e",
+                                  "--item-id", L.ITEM,
                                   *extra, env_extra=env_extra)
         self.assertIsNotNone(rid, out)
         return rc, out, rid
@@ -178,9 +179,11 @@ class TestFilters(Base):
         s2 = [{"op": "write", "path": "src/new.go", "content": "package src\n"}]
         rc, out, rid = self.run_issue([s1, s2])
         self.assertEqual(rc, 0, out)
-        self.assert_rejected_then_fixed(rid, "gitlink")
-        self.assertNotIn("vendor/sub", L.git(self.f.remote, "ls-tree", "-r", "--name-only",
-                                             self.f.remote_head(BRANCH)))
+        self.assert_rejected_then_fixed(rid, "nested git repository")
+        # no gitlink: the nested repository's files are ordinary files now
+        tree = L.git(self.f.remote, "ls-tree", "-r", self.f.remote_head(BRANCH))
+        self.assertNotIn("160000 commit", "\n".join(l for l in tree.splitlines() if "vendor/" in l))
+        self.assertIn("vendor/sub/f.txt", tree)
 
     def test_oversized_file(self):
         s1 = [{"op": "write", "path": "src/new.go", "content": "package src\n"},
@@ -206,8 +209,8 @@ class TestSecrets(Base):
         tok = L.CLAUDE_TOKEN
         self.assertNotIn(tok, self.f.published_texts())
         self.assertNotIn(tok, self.f.remote_all_text())
-        for c in self.f.pushes():
-            self.assertNotIn(tok, " ".join(c["argv"]))
+        for argv in self.f.pushes():
+            self.assertNotIn(tok, " ".join(argv))
         for r in self.f.records("docker"):
             self.assertNotIn(tok, " ".join(r["argv"]))
         for a in self.f.records("docker-agent"):
@@ -245,6 +248,19 @@ class TestCrashResume(Base):
         self.assertEqual(len(self.f.records("docker-agent")), 1)
         self.assertEqual(self.f.manifest(rid)["fsm_final_state"], "REPORT")
 
+    def test_crash_after_pr_create_no_round_comment(self):
+        sess = [[{"op": "write", "path": "src/new.go", "content": "package src\n"}]]
+        rc, out, rid = self.run_mode("issue", 42, sess,
+                                     env_extra={"FSM_FAKE_GH_KILL_ON": "pr-create-after"})
+        self.assertEqual(rc, -9, out)
+        self.assertEqual(len(self.f.gh()["prs"]), 1)
+        rc2, out2, _ = self.f.cli("resume", rid, env_extra={"FSM_FAKE_GH_KILL_ON": "pr-create-after"})
+        self.assertEqual(rc2, 0, out2)
+        prs = self.f.gh()["prs"]
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["comments"], [])       # its own new PR: no round comment
+        self.assertTrue(self.f.state_records(rid, "publish_step")[-2]["created"])
+
     def test_resume_of_live_run_is_refused(self):
         sess = [[{"op": "write", "path": "src/new.go", "content": "package src\n"}]]
         rc, out, rid = self.run_mode("issue", 42, sess)
@@ -254,7 +270,7 @@ class TestCrashResume(Base):
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             rc2, out2, _ = self.f.cli("resume", rid)
-            self.assertEqual(rc2, 2, out2)
+            self.assertEqual(rc2, 4, out2)
             self.assertIn("locked", out2)
         finally:
             os.close(fd)

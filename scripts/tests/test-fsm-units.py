@@ -94,16 +94,50 @@ class TestSnapshot(RepoCase):
         self.assertEqual(res.tree, self.base_tree)
         self.assertIn("bin/", res.ignored)
 
-    def test_prewalk_caps_and_symlinks_not_followed(self):
+    def test_copy_caps_and_symlinks_not_followed(self):
         os.symlink("/usr", self.A / "usr-link")
-        stats, _ = snapshot.prewalk(self.A)
-        self.assertLess(stats["files"], 50)
+        cr = snapshot.copy_workspace(self.A, self.run / "c1")
+        self.assertLess(cr.stats["files"], 50)
+        self.assertTrue(os.path.islink(self.run / "c1" / "usr-link"))
+        self.assertFalse((self.run / "c1" / ".git").exists())
         for i in range(5):
             (self.A / f"f{i}.txt").write_text("x")
         with self.assertRaises(snapshot.SnapshotTooLarge):
-            snapshot.prewalk(self.A, max_files=5)
+            snapshot.copy_workspace(self.A, self.run / "c2", max_files=5)
         with self.assertRaises(snapshot.SnapshotTooLarge):
-            snapshot.prewalk(self.A, max_total=10)
+            snapshot.copy_workspace(self.A, self.run / "c3", max_total=10)
+
+    def test_special_files_and_claude_symlink_are_violations(self):
+        os.mkfifo(self.A / "src" / "pipe")
+        (self.A / "src" / "nested").mkdir()
+        (self.A / "src" / "nested" / ".git").write_text("gitdir: /etc\n")
+        res = self.snap()
+        got = {v.path: v.reason for v in res.violations}
+        self.assertIn("fifo", got["src/pipe"])
+        self.assertIn("nested git repository", got["src/nested"])
+        # `.claude` replaced by a symlink: rejected, not a crash
+        import shutil
+        shutil.rmtree(self.A / ".claude")
+        os.symlink("/etc", self.A / ".claude")
+        res = self.snap()
+        reasons = " ".join(v.reason for v in res.violations if v.path.startswith(".claude"))
+        self.assertTrue(reasons)
+
+    def test_changed_bytes_cap(self):
+        (self.A / "src" / "a.txt").write_text("x" * 3000)
+        res = self.snap(max_changed=1000)
+        self.assertIn("over the 1000-byte cap", " ".join(v.reason for v in res.violations))
+
+    def test_byte_exact_names(self):
+        name = os.fsdecode(b"src/caf\xe9-\xff.go")
+        with open(os.fsencode(str(self.A)) + b"/src/caf\xe9-\xff.go", "wb") as fh:
+            fh.write(b"package src\n")
+        big = os.fsencode(str(self.A)) + b"/src/big-\xfe.bin"
+        with open(big, "wb") as fh:
+            fh.write(b"x" * 2048)
+        res = self.snap(max_file=1024)
+        self.assertIn(name, [e.path for e in res.entries])
+        self.assertEqual(res.oversize, [os.fsdecode(b"src/big-\xfe.bin")])
 
     def test_oversize_file_left_out_and_reported(self):
         (self.A / "src" / "big.bin").write_bytes(b"x" * 2048)
@@ -138,7 +172,7 @@ class TestSnapshot(RepoCase):
         self.assertIn("credential", got["id_rsa"])
         self.assertIn("protected", got[".github/ci.yml"])
         self.assertIn("protected", got["scripts/lint-gate.sh"])
-        self.assertIn("gitlink", got["vendor/sub"])
+        self.assertIn("nested git repository", got["vendor/sub"])
         # the same protected path is accepted when the story scopes it
         res2 = self.snap(extra_protected=gates, allowlist=[".github/ci.yml"])
         self.assertNotIn(".github/ci.yml", {v.path for v in res2.violations})
@@ -204,7 +238,7 @@ class TestSecrets(RepoCase):
         (self.A / "src" / "leak.go").write_text(f"const t = \"{L.CLAUDE_TOKEN}\"\n")
         (self.A / "src" / "gen.txt").write_text("FAKE-GENERIC-SECRET\n")
         res = self.snap()
-        hook = secrets_scan.trufflehog_hook(binary=str(L.FAKES / "trufflehog"))
+        hook = secrets_scan.host_scanner_hook(str(L.FAKES / "trufflehog"))
         sc = secrets_scan.Scanner({"CLAUDE": L.CLAUDE_TOKEN}, external=hook)
         f = sc.scan_candidate(self.R, self.base_tree, res.tree, res.entries,
                               scan_dir=self.run / "scan")
@@ -213,11 +247,8 @@ class TestSecrets(RepoCase):
         self.assertIn(("external", "diff:src/gen.txt"), kinds)
 
     def test_no_scanner_returns_none(self):
-        os.environ["CFGMS_FSM_TRUFFLEHOG"] = "off"
-        try:
-            self.assertIsNone(secrets_scan.trufflehog_hook())
-        finally:
-            del os.environ["CFGMS_FSM_TRUFFLEHOG"]
+        self.assertIsNone(secrets_scan.scanner_hook("off"))
+        self.assertIsNotNone(secrets_scan.scanner_hook("image"))
 
 
 class TestOutputs(unittest.TestCase):

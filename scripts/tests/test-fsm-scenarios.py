@@ -78,7 +78,9 @@ class TestIssueMode(Base):
         pq = [r["argv"] for r in self.f.records("project-queue")]
         self.assertIn(["set-pr", "PVTI_lADOtestitem42", "100"], pq)
         ph = [r["argv"][0] for r in self.f.records("pipeline-helper")]
-        self.assertEqual(ph.count("lease-status"), 2)       # PREPARE + before PUBLISH
+        # PREPARE, before PUBLISH, before release; renewed once at PREPARE
+        self.assertEqual(ph.count("lease-status"), 3)
+        self.assertEqual(ph.count("lease-renew"), 1)
         self.assertIn("lease-release", ph)
         ledger = [json.loads(l) for l in (self.f.root / "ledger" / "ledger.jsonl").read_text().splitlines()]
         agent_exits = [r for r in ledger if r["event"] == "exit" and r["kind"] == "implement"]
@@ -89,7 +91,8 @@ class TestIssueMode(Base):
         meta = json.loads((sdir / "meta.json").read_text())
         self.assertEqual((meta["mode"], meta["kind"], meta["run_id"]), ("issue", "implement", rid))
         self.assertTrue((sdir / "agent-result.json").is_file())
-        run_args = [r["argv"] for r in self.f.records("docker") if r["argv"][0] == "run"]
+        run_args = [r["argv"] for r in self.f.records("docker")
+                    if r["argv"][0] == "run" and "--rm" not in r["argv"]]
         self.assertIn("cfg-agent-42", run_args[0])
         self.assertIn("cfg-validate-42", run_args[1])
         self.assert_common(rid)

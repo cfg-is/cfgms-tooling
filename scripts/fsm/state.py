@@ -18,7 +18,9 @@ Layout of one run (`<runs-base>/<run-id>/`, runs-base defaults to
     validate/<seq>/  validator clone + per-run caches
     scan/            scratch for the external secret scanner
     logs/            validator log tails, supervisor log
-    tooling/         snapshot of the supervisor code that runs this run
+    tooling/         snapshot of every tooling file the supervisor runs, laid out
+                     as <cfgms>/.claude/{pipeline.yaml, model-routing.yaml,
+                     tooling/...} so the helper scripts resolve their config
 
 `<runs-base>/active/<key>` holds the run id of the live run for an item key
 (`story-<N>`, `pr-<N>`, `item-<LAST12>`, `branch-<slug>`).
@@ -75,6 +77,7 @@ class RunDir:
         self._hb_stop = None
         self._hb_thread = None
         self._seq = None
+        self._append_lock = threading.Lock()   # heartbeat thread appends too
 
     # --- layout ----------------------------------------------------------
     def p(self, *parts):
@@ -114,6 +117,14 @@ class RunDir:
         os.replace(tmp, self.p("run.json"))
         self.state_file.touch()
 
+    def update_params(self, changes):
+        """Rewrite run.json with `changes` merged in (before the run starts)."""
+        params = self.params()
+        params.update(changes)
+        tmp = self.p("run.json.tmp")
+        tmp.write_text(json.dumps(params, indent=2, sort_keys=True))
+        os.replace(tmp, self.p("run.json"))
+
     def exists(self):
         return self.p("run.json").is_file()
 
@@ -138,6 +149,10 @@ class RunDir:
         return out
 
     def append(self, record_type, **fields):
+        with self._append_lock:
+            return self._append(record_type, **fields)
+
+    def _append(self, record_type, **fields):
         if self._seq is None:
             recs = self.records()
             self._seq = (recs[-1].get("seq", 0) if recs else 0)

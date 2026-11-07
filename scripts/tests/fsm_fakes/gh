@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 
 STATE = Path(os.environ["FSM_FAKE_GH_STATE"])
+for _k in [k for k in os.environ if k.startswith("GIT_TRACE")]:
+    del os.environ[_k]
 LOG = os.environ.get("FSM_FAKE_LOG")
 
 
@@ -54,6 +56,7 @@ def pr_out(pr):
     d = dict(pr)
     d["headRefOid"] = head_oid(pr["headRefName"])
     d.setdefault("reviews", [])
+    d.setdefault("isCrossRepository", False)
     return d
 
 
@@ -70,6 +73,9 @@ def main():
             fh.write(json.dumps({"tool": "gh", "argv": argv, "texts": texts,
                                  "gh_token_env": bool(os.environ.get("GH_TOKEN"))}) + "\n")
     s = load()
+    if argv[:2] == ["api", "user"]:
+        print(os.environ.get("FSM_FAKE_GH_LOGIN", "fsm-bot"))
+        return 0
     if argv[:2] == ["auth", "token"]:
         print(os.environ.get("FSM_FAKE_GH_TOKEN", "ghp_fake"))
         return 0
@@ -108,6 +114,10 @@ def main():
                          "state": "OPEN", "url": f"https://github.com/cfg-is/cfgms/pull/{n}",
                          "author": {"login": "cfg-agent"}, "mergeable": "MERGEABLE", "comments": []})
         save(s)
+        if os.environ.get("FSM_FAKE_GH_KILL_ON") == "pr-create-after" and not marker.exists():
+            marker.write_text("1")
+            os.kill(os.getppid(), signal.SIGKILL)       # crash after the PR exists
+            time.sleep(5)
         print(f"https://github.com/cfg-is/cfgms/pull/{n}")
         return 0
     if argv[0] == "api":
@@ -139,7 +149,8 @@ def main():
     if argv[:2] == ["pr", "comment"]:
         for p in s["prs"]:
             if p["number"] == int(argv[2]):
-                p["comments"].append({"body": texts[0] if texts else ""})
+                p["comments"].append({"body": texts[0] if texts else "",
+                                      "author": {"login": os.environ.get("FSM_FAKE_GH_LOGIN", "fsm-bot")}})
         save(s)
         return 0
     if argv[:2] == ["issue", "comment"]:

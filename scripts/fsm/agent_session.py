@@ -12,6 +12,12 @@ Container names stay today's (`cfg-agent-<N>`, `cfg-agent-item-<LAST12>`,
 `cfg-agent-pr-fix-<N>`, `cfg-agent-resolve-conflict-<N>`) so preflight,
 cleanup and isoagents keep recognising them; labels add `run_id`, `state`,
 `kind` and `seq`.
+
+UID assumption: the image's `agent` user is uid 1000 (AGENT_UID) and
+containers run without user-namespace remapping, so files the agent creates
+in `A`, `out/` and its session dir are owned by uid 1000 on the host. The
+supervisor must run as that uid to read and delete them; `uid_matches()`
+checks it and the supervisor records a warning when it does not hold.
 """
 
 import json
@@ -31,6 +37,11 @@ CONTEXT_MOUNT = "/fsm/context"
 OUT_MOUNT = "/fsm/out"
 METRICS_MOUNT = "/usr/local/share/cfgms-metrics"
 DEFAULT_TIMEOUT_MIN = int(os.environ.get("CFGMS_FSM_AGENT_TIMEOUT_MIN", "180"))
+AGENT_UID = int(os.environ.get("CFGMS_FSM_AGENT_UID", "1000"))
+
+
+def uid_matches():
+    return os.getuid() == AGENT_UID
 
 _GH_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
                  "GH_CONFIG_DIR", "GIT_ASKPASS", "GIT_CONFIG_GLOBAL", "CFGMS_FSM_PUSH_TOKEN")
@@ -177,10 +188,13 @@ def assert_no_github_credentials(argv, env):
         raise CredentialLeak("agent argv contains the supervisor's GitHub token value")
 
 
-def run_session(docker, argv, name, env_extra, timeout_min, gh_token=None):
+def run_session(docker, argv, name, env_extra, timeout_min, gh_token=None, on_launched=None):
     """Launch, wait (with timeout), capture exit code, then remove the container.
 
-    Returns {"exit_code", "timed_out", "error", "duration_seconds"}.
+    Raises CredentialLeak (before anything is started) when the argv or the
+    docker client environment carries a GitHub credential. `on_launched(cid)`
+    is called once `docker run` succeeded. Returns {"exit_code", "timed_out",
+    "error", "launch_failed", "duration_seconds"}.
     """
     from adapters import scrubbed_env
     env = scrubbed_env(env_extra)
@@ -191,10 +205,12 @@ def run_session(docker, argv, name, env_extra, timeout_min, gh_token=None):
     started = time.time()
     docker.rm_force(name)
     try:
-        docker.run_detached(argv, env_extra=env_extra)
+        cid = docker.run_detached(argv, env_extra=env_extra)
     except Exception as exc:
         return {"exit_code": None, "timed_out": False, "error": f"launch failed: {exc}"[:500],
-                "duration_seconds": 0}
+                "launch_failed": True, "duration_seconds": 0}
+    if on_launched:
+        on_launched(cid)
     timed_out, error = False, ""
     try:
         code = docker.wait(name, timeout_min * 60)
@@ -205,7 +221,7 @@ def run_session(docker, argv, name, env_extra, timeout_min, gh_token=None):
         docker.kill(name)
         _, code = docker.inspect_exit(name)
     docker.rm_force(name)
-    return {"exit_code": code, "timed_out": timed_out, "error": error,
+    return {"exit_code": code, "timed_out": timed_out, "error": error, "launch_failed": False,
             "duration_seconds": int(time.time() - started)}
 
 

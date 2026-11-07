@@ -23,6 +23,9 @@ from pathlib import Path
 
 REAL_GIT = "/usr/bin/git"
 STATE = Path(os.environ["FSM_FAKE_STATE"])
+# this process plays the agent / validator: its git calls are not the supervisor's
+for _k in [k for k in os.environ if k.startswith("GIT_TRACE")]:
+    del os.environ[_k]
 LOG = os.environ.get("FSM_FAKE_LOG")
 STATE.mkdir(parents=True, exist_ok=True)
 
@@ -132,6 +135,9 @@ def apply_agent(actions, ws, out, sess=None):
             (hooks / "pre-commit").write_text("#!/bin/sh\necho PWNED > /dev/null\n")
             with open(ws / ".git" / "config", "a") as fh:
                 fh.write("[core]\n\tfsmonitor = /bin/false\n")
+        elif op == "sleep":
+            import time
+            time.sleep(float(act["secs"]))
         elif op == "exit":
             code = int(act["code"])
     return code
@@ -184,6 +190,15 @@ def main():
     if not argv:
         return 1
     cmd = argv[0]
+    if cmd == "run" and "--rm" in argv and "trufflehog" in argv:
+        # the secret-scanner container: run the fake trufflehog on the mount
+        _, mounts, _, _ = parse_run(argv)
+        host = mounts["/scan"]
+        proc = subprocess.run([str(Path(__file__).resolve().parent / "trufflehog"), "filesystem", host],
+                              capture_output=True)
+        sys.stdout.write(proc.stdout.decode().replace(host, "/scan"))
+        log({"tool": "docker-scan", "mount": host, "network": argv[argv.index("--network") + 1]})
+        return 0
     if cmd == "run":
         name, mounts, env, labels = parse_run(argv)
         counters = load("counters.json", {"agent": 0, "validate": 0})
@@ -191,6 +206,9 @@ def main():
         kind = labels.get("state")
         logs = ""
         code = 0
+        if kind == "agent" and pl.get("agent_launch_fail"):
+            print("docker: Error response from daemon: simulated launch failure", file=sys.stderr)
+            return 125
         if kind == "agent":
             idx = counters["agent"]
             counters["agent"] += 1

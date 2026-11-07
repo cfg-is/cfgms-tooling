@@ -181,6 +181,11 @@ class Publisher:
             if not number:
                 raise PublishError("pr", "PR creation returned no number")
             created = True
+        elif f"FSM run: `{self.run_id}`" in str(pr.get("body", "")):
+            # this run created it and crashed before recording the step: it is
+            # the run's own new PR, so no round comment
+            number, url = pr["number"], pr.get("url", "")
+            created = True
         else:
             number, url = pr["number"], pr.get("url", "")
             if pr.get("isDraft") and str(pr.get("title", "")).startswith("WIP:"):
