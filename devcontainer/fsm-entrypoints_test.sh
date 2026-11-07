@@ -231,6 +231,13 @@ test_prompt_template_and_effort_guards() {
          done | tr '\n' ' ' )
     assert_equals "$r" "ok ok ok no no no " "only the three baked templates are accepted"
 
+    r=$( source_agent
+         for m in sonnet opus claude-sonnet-4-6 claude-opus-5-5 'claude-opus-5-5[1m]' \
+                  '' '-sonnet' 'sonnet; id' 'son net' 'a$(id)'; do
+             if fsa_model_ok "$m"; then echo "ok"; else echo "no"; fi
+         done | tr '\n' ' ' )
+    assert_equals "$r" "ok ok ok ok ok no no no no no " "model names: aliases and ids accepted, malformed refused"
+
     r=$( source_agent; fsa_effort_args high "  --effort <level>  Effort level" 2>/dev/null | tr '\n' ' ' )
     assert_equals "$r" "--effort high " "valid effort with a CLI that has --effort"
     r=$( source_agent; fsa_effort_args high "no such flag" 2>&1 )
