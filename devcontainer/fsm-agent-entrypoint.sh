@@ -287,7 +287,6 @@ prompt=$(fsa_render_prompt "$template" "$FSA_CONTEXT_DIR")
 # The CLI's background-wait ceiling does not cover background Bash (Issue
 # #4178), so the rule is appended at this single launch point.
 prompt+=$'\n\n'"${AC_HEADLESS_NO_BG_WAIT_RULE}"
-prompt+=$'\n\n''In this session there is nothing to commit or push: wherever the rule above says "commit", keep your files saved and /fsm/out/ current instead.'
 
 mapfile -t effort_args < <(fsa_effort_args "${CFGMS_FSM_EFFORT:-}" "$(claude --help 2>/dev/null || true)")
 

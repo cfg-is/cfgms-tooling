@@ -308,7 +308,10 @@ ac_detect_no_op() {
 # had not committed. Observed 5 times on 2026-09-18/19 across dev and fix
 # containers.
 
-# The rule appended to every headless agent prompt.
+# The rule appended to every headless agent prompt (FSM agent sessions and
+# review containers). Mode-neutral: it says nothing about committing, pushing
+# or opening PRs -- an FSM agent can do none of those, and the supervisor owns
+# every publish step.
 AC_HEADLESS_NO_BG_WAIT_RULE='## Headless execution rule (mandatory)
 
 You are running headless (`claude -p`). Your session ENDS the moment you end
@@ -316,12 +319,12 @@ your turn, and you are never woken up again. Any background Bash command
 (`run_in_background`, a background Monitor, `&`) is killed a few seconds after
 your turn ends, and its output is lost.
 
-- Run every command you need the result of (make test, test suites, builds,
-  `gh run watch`) in the FOREGROUND.
+- Run every command you need the result of (make test, test suites, builds)
+  in the FOREGROUND.
 - If a command may exceed the ~10 minute tool limit, split it into smaller
   foreground commands, or run only the suites your change touches.
-- Commit (and push, if your mode pushes) BEFORE any long command, so progress
-  survives.
+- Keep every file you are working on saved BEFORE any long command, so
+  progress survives.
 - NEVER end your turn with "waiting for the background task / notification /
   validation to finish". Nothing will resume you.'
 
