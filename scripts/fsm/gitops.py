@@ -30,15 +30,27 @@ INTERNAL_IDENT = {
     "GIT_COMMITTER_EMAIL": "cfgms-fsm@localhost",
 }
 
-#: Environment variables that would let the caller's git configuration, a
-#: credential, or an alternate object store leak into a supervisor git call.
-_SCRUB_ENV = (
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_ASKPASS",
-    "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
-    "GH_TOKEN", "GITHUB_TOKEN",
+#: The only inherited environment variables a supervisor git call sees
+#: (allowlist). Everything else -- git's own variables, credentials, proxies,
+#: alternates -- is dropped; the variables git needs are set explicitly below.
+_ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "USER", "LOGNAME")
+#: Diagnostic tracing set by the operator (or a test) on the supervisor itself.
+_ENV_ALLOW_PREFIX = ("GIT_TRACE",)
+
+#: Config applied to every supervisor git call. Submodule handling is off
+#: everywhere: git must never spawn a child process inside a nested repository
+#: (which would read that repository's own config, attributes and filters).
+BASE_CONFIG = (
+    "core.hooksPath=/dev/null",
+    "core.fsmonitor=false",
+    "core.untrackedCache=false",
+    "core.sshCommand=false",
+    "diff.ignoreSubmodules=all",
+    "submodule.recurse=false",
+    "status.submoduleSummary=false",
+    "fetch.recurseSubmodules=false",
+    "protocol.file.allow=always",
+    "protocol.ext.allow=never",
 )
 
 #: Paths under which no git directory may ever be used. Registered by the
@@ -74,7 +86,8 @@ def _check_gitdir(git_dir):
 
 def base_env(home, gitconfig):
     """Environment for every supervisor git call: no inherited git state."""
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
+    env = {k: v for k, v in os.environ.items()
+           if k in _ENV_ALLOW or k.startswith(_ENV_ALLOW_PREFIX)}
     env.update({
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": str(gitconfig),
@@ -110,12 +123,8 @@ def run_git(git_dir, args, *, home, gitconfig, work_tree=None, index_file=None,
         env["GIT_INDEX_FILE"] = str(index_file)
     if extra_env:
         env.update(extra_env)
-    cmd = ["git",
-           "-c", "core.hooksPath=/dev/null",
-           "-c", "core.fsmonitor=false",
-           "-c", "core.untrackedCache=false",
-           "-c", "protocol.file.allow=always"]
-    for kv in config:
+    cmd = ["git"]
+    for kv in BASE_CONFIG + tuple(config):
         cmd += ["-c", kv]
     cmd += list(args)
     # cwd is the git dir itself (its parent before `init` creates it); GIT_DIR
@@ -181,7 +190,6 @@ def init_bare(git_dir, home, gitconfig):
             "[advice]\n\tdetachedHead = false\n"
             "[init]\n\tdefaultBranch = fsm\n"
             "[gc]\n\tauto = 0\n"
-            "[safe]\n\tdirectory = *\n"
         )
     run_git(git_dir, ["init", "--bare", "-q"], home=home, gitconfig=gitconfig)
     return Repo(git_dir, home, gitconfig)

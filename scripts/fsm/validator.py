@@ -18,7 +18,7 @@ The clone is mounted read-only at /fsm/candidate; the image-baked entrypoint
 `make test-agent-complete`. No credential, no `R`, no `A` and no shared cache
 volume is mounted. Verdict = `docker wait` status; evidence = `docker logs`.
 
-A `(BASE, tree)` pair that passed is cached and never validated again.
+A `(BASE, develop tip, tree)` triple that passed is cached and never validated again.
 """
 
 import json
@@ -90,6 +90,7 @@ def docker_argv(name, run_id, seq, mode, target_label, clone_dir, cache_dir, ima
         argv += ["--label", target_label]
     argv += [
         "--memory=4g", "--cpus=4", "--stop-timeout=60",
+        "--pids-limit", "8192", "--security-opt", "no-new-privileges",
         "--cap-add", "NET_ADMIN",
         "--tmpfs", "/workspace:rw,exec,size=12g",
         "-v", f"{clone_dir}:{CANDIDATE_MOUNT}:ro",
@@ -105,7 +106,9 @@ def docker_argv(name, run_id, seq, mode, target_label, clone_dir, cache_dir, ima
 
 
 class ValidationCache:
-    """Passing (BASE, tree) pairs, persisted in the run dir."""
+    """Passing (BASE, develop tip, tree) triples, persisted in the run dir. The
+    develop tip is part of the key because it is the clone's origin/develop,
+    which merge-base gates compare against."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -116,12 +119,12 @@ class ValidationCache:
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
-    def hit(self, base, tree):
-        return self._load().get(f"{base}:{tree}")
+    def hit(self, base, develop, tree):
+        return self._load().get(f"{base}:{develop}:{tree}")
 
-    def record_pass(self, base, tree, info):
+    def record_pass(self, base, develop, tree, info):
         data = self._load()
-        data[f"{base}:{tree}"] = info
+        data[f"{base}:{develop}:{tree}"] = info
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
         os.replace(tmp, self.path)

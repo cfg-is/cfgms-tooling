@@ -74,9 +74,12 @@ class DockerCLI:
         except (IndexError, ValueError):
             raise DockerError(f"docker wait {name}: unparsable status {out!r}")
 
-    def logs_tail(self, name, lines=400):
+    def logs_tail(self, name, lines=400, max_line=2000):
+        """Last `lines` log lines, each cut to `max_line` characters (a single
+        unbounded line from candidate code must not exhaust memory)."""
         proc = self._run(["logs", "--tail", str(lines), name], timeout=120)
-        return (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        text = (proc.stdout[-4 * 1024 * 1024:] + proc.stderr[-1024 * 1024:]).decode("utf-8", "replace")
+        return "\n".join(ln[:max_line] for ln in text.splitlines())
 
     def kill(self, name):
         self._run(["kill", name], timeout=60)
@@ -127,7 +130,8 @@ class GhCLI:
     def _json(self, args):
         return json.loads(self._gh(args).stdout.decode() or "null")
 
-    PR_FIELDS = "number,isDraft,headRefOid,headRefName,title,url,body,state,author,mergeable"
+    PR_FIELDS = ("number,isDraft,headRefOid,headRefName,title,url,body,state,author,mergeable,"
+                 "isCrossRepository")
 
     def find_open_pr(self, branch):
         rows = self._json(["pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
@@ -142,10 +146,6 @@ class GhCLI:
     def pr_view(self, number):
         return self._json(["pr", "view", str(number), "--repo", self.repo, "--json",
                            self.PR_FIELDS + ",comments,reviews"])
-
-    def issue_view(self, number):
-        return self._json(["issue", "view", str(number), "--repo", self.repo, "--json",
-                           "title,body,number"])
 
     def create_pr(self, branch, base, title, body_file, draft=False):
         args = ["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
@@ -175,9 +175,21 @@ class GhCLI:
         self._gh(["issue", "comment", str(number), "--repo", self.repo, "--body-file",
                   str(body_file)])
 
-    def pr_comment_bodies(self, number):
+    def pr_comments(self, number):
+        """[{"body", "author"}] of the PR's issue comments."""
         data = self._json(["pr", "view", str(number), "--repo", self.repo, "--json", "comments"])
-        return [c.get("body", "") for c in (data or {}).get("comments", [])]
+        return [{"body": c.get("body", ""), "author": ((c.get("author") or {}).get("login") or "")}
+                for c in (data or {}).get("comments", [])]
+
+    def pr_comment_bodies(self, number):
+        return [c["body"] for c in self.pr_comments(number)]
+
+    def login(self):
+        """Login of the supervisor's own GitHub identity."""
+        if not getattr(self, "_login", None):
+            proc = self._gh(["api", "user", "--jq", ".login"], check=False)
+            self._login = proc.stdout.decode().strip() if proc.returncode == 0 else ""
+        return self._login
 
     def permission(self, login):
         proc = self._gh(["api", f"repos/{self.repo}/collaborators/{login}/permission",
@@ -249,6 +261,16 @@ class Helper:
     def lease_acquire(self, key, ttl):
         proc = self._run("lease-acquire", key, str(ttl))
         return proc.returncode == 0, proc.stdout.decode().strip()
+
+    def lease_renew(self, key, ttl):
+        """("renewed" | "not_holder" | "error", raw line) via `lease-renew`."""
+        proc = self._run("lease-renew", key, str(ttl))
+        line = (proc.stdout.decode().strip().splitlines() or [""])[-1]
+        if proc.returncode == 0 and line.startswith("RENEWED:"):
+            return "renewed", line
+        if line.startswith("NOT_HOLDER:"):
+            return "not_holder", line
+        return "error", line
 
     def lease_release(self, key):
         return self._run("lease-release", key).returncode == 0

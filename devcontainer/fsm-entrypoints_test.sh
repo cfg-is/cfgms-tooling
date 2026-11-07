@@ -463,6 +463,11 @@ test_dockerfile_bakes_fsm_files() {
     th=$(awk '/TRUFFLEHOG_VERSION=/{f=1} f{print} f&&/trufflehog --version/{exit}' "$SCRIPT_DIR/Dockerfile")
     assert_contains "$th" "sha256sum -c -" "trufflehog checksum-verified"
     assert_not_contains "$th" "|| true" "trufflehog install is required, not best-effort"
+    assert_contains "$th" "install -m 0755 /tmp/trufflehog /usr/local/bin/trufflehog" "trufflehog installed on the image PATH"
+    local hook
+    hook=$(awk '/^def image_scanner_hook/{f=1} f&&/^def host_scanner_hook/{exit} f{print}' "$TOOLING_ROOT/scripts/fsm/secrets_scan.py")
+    assert_contains "$hook" '"--entrypoint", "trufflehog"' "secrets_scan.image_scanner_hook runs the baked trufflehog by name"
+    assert_contains "$hook" '"--network", "none"' "image scanner runs with no network"
     local hashfn
     hashfn=$(grep -A2 '^_image_build_inputs_hash()' "$TOOLING_ROOT/scripts/agent-dispatch.sh" || true)
     assert_contains "$hashfn" 'HEAD:./devcontainer' "image staleness hash covers devcontainer/ (where the FSM files live)"

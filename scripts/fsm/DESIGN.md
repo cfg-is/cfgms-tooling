@@ -50,8 +50,9 @@ checks the agent-written marker afterwards.
 | **Validator container** | `cfg-agent` image, `docker run -d`, root firewall init then drop to `agent`, no `claude` | a private tmpfs clone of the candidate (§7), per-run Go caches | any credential, `R`, `A`, shared cache volumes |
 | **Workspace `A`** | host dir mounted into agent containers | scratch clone the agent edits | — |
 
-The supervisor **never runs git with `A`'s git directory**. It reads `A`'s
-files only through `R`'s git directory with `--work-tree=A` (§6.1).
+The supervisor **never runs git in `A`** (neither with `A`'s git directory
+nor with `A` as a work tree). It snapshots a no-follow copy of `A` through
+`R`'s git directory (§6.1).
 
 ## 4. States
 
@@ -137,20 +138,34 @@ containers with `docker kill` + `docker rm -f` after `timeout … docker wait`
 
 ## 6. Candidate construction and checks
 
-### 6.1 Snapshot (no git in `A`'s gitdir)
+### 6.1 Snapshot (no git in `A`, no git in any repository under `A`)
+Git never runs against `A`. The supervisor first copies `A`, without following
+symlinks, into a fresh supervisor-owned directory `<run>/snapA`: every entry
+named `.git` at any depth is skipped (a nested one is reported as a
+violation), `.claude/tooling` is skipped, symlinks are recreated as symlinks,
+FIFOs/devices/sockets are violations, and the file-count, total-size and
+per-file caps (salvage today: 5 MB; an oversized file is left out unless it is
+byte-identical to the base version) are enforced during the walk. Then:
 ```
-GIT_DIR=R GIT_WORK_TREE=A GIT_INDEX_FILE=<run>/idx \
+GIT_DIR=R GIT_WORK_TREE=<run>/snapA GIT_INDEX_FILE=<run>/idx \
 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=<run>/gitconfig HOME=<run> \
 git -c core.attributesFile=<base .gitattributes extracted from R> \
     -c core.excludesFile=<base .gitignore extracted from R> \
     -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.fileMode=true \
-    read-tree BASE && git add -A -- . ':(exclude).claude/tooling' && git write-tree
+    -c diff.ignoreSubmodules=all -c submodule.recurse=false \
+    read-tree BASE && git update-index --force-remove <gitlinks> \
+    && git add -A -- :/ && git update-index --index-info <gitlinks> && git write-tree
 ```
-`R`'s config is supervisor-written; attributes and ignore rules come from the
-base commit, not from `A`. `A`'s `.git`, config, hooks, index and attributes are
-never read. Before `add`, the supervisor walks `A` without following symlinks
-and enforces a file-count cap, total-size cap and per-file cap (salvage today:
-5 MB), and a wall-clock timeout on the snapshot.
+Gitlinks are out of the index while git looks at the work tree, so git has no
+submodule to inspect and never starts a child process in a nested repository
+(which would read that repository's own config, attributes and filters).
+`R`'s config is supervisor-written and the git environment is an allowlist.
+The top-level attributes and ignore rules come from the base commit. Git also
+reads `.gitignore`/`.gitattributes` files in subdirectories of the copy, which
+the agent may have written; that cannot be switched off and is harmless, since
+`R` defines no filter, diff or merge driver and the top-level files are
+protected paths. A cap on total changed bytes (256 MB) and a wall-clock
+timeout bound the snapshot.
 
 ### 6.2 Filters (on `git diff-tree -r --raw BASE <tree>`)
 Reject, with a reason the agent sees in `context/failure.md` on the next

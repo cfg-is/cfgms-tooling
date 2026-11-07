@@ -172,9 +172,11 @@ RUN set -eu; \
     && chmod +x "$GOPATH/bin/nancy"
 
 # truffleHog -- the generic secret scanner of the FSM harness's secret scan
-# (scripts/fsm/secrets_scan.py, scripts/fsm/DESIGN.md §6.4). Required: a
-# download or checksum failure fails the build, and nothing unverified is ever
-# extracted or installed. Pinned release archive, v3.99.7 (published
+# (scripts/fsm/secrets_scan.py, scripts/fsm/DESIGN.md §6.4). The supervisor
+# runs it from this image (secrets_scan.image_scanner_hook: `docker run --rm
+# --network none --entrypoint trufflehog`, the scan dir mounted read-only), so
+# it must be on PATH. Required: a download or checksum failure fails the
+# build, and nothing unverified is ever extracted or installed. Pinned release archive, v3.99.7 (published
 # 2026-10-24); per-architecture SHA-256 values copied from the release's
 # trufflehog_3.99.7_checksums.txt asset at
 # https://github.com/trufflesecurity/trufflehog/releases/download/v3.99.7/trufflehog_3.99.7_checksums.txt

@@ -9,8 +9,10 @@ Three detectors, run before VALIDATE and again before PUBLISH:
      (lower and upper) form;
   2. the credential-name denylist the WIP salvage already applies
      (`devcontainer/entrypoint.sh` `_salvage_stage_work`), on changed paths;
-  3. an external generic scanner hook: `trufflehog` when it is on PATH (or
-     named by CFGMS_FSM_TRUFFLEHOG), otherwise skipped with a recorded warning.
+  3. an external generic scanner hook: `trufflehog` run from the cfg-agent
+     image with no network and the scan dir mounted read-only (default), a
+     host binary only when CFGMS_FSM_TRUFFLEHOG names one, or disabled with
+     CFGMS_FSM_TRUFFLEHOG=off (recorded as a warning).
 
 Findings never carry the secret value: only a location and the credential
 *name*.
@@ -21,7 +23,6 @@ import binascii
 import fnmatch
 import json
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -119,15 +120,29 @@ class Scanner:
                     findings.append(Finding("credential_value", source, 0, name))
         return findings
 
-    def scan_candidate(self, repo, base, tree, changed, scan_dir=None):
-        """Scan changed blobs of `tree` vs `base`.
+    def _new_root(self, scan_dir):
+        if scan_dir is None:
+            return None
+        scan_dir = Path(scan_dir)
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        n = 0
+        while (scan_dir / f"s{n}").exists():
+            n += 1
+        root = scan_dir / f"s{n}"
+        root.mkdir()
+        return root
 
-        `changed` is a list of filter Entry objects (snapshot.diff_entries).
-        Returns findings; runs the external scanner over the changed blobs
-        materialised into `scan_dir` when one is configured.
+    def scan_candidate(self, repo, base, tree, changed, scan_dir=None):
+        """Scan changed blobs of `tree` vs `base`, one blob at a time.
+
+        `changed` is a list of snapshot.Entry. Each blob is read, scanned and
+        (when an external scanner is configured) written to a fresh directory
+        under `scan_dir` before the next one is read, so memory stays bounded
+        by the largest single blob (the per-file cap). The external scanner
+        then runs once over that directory.
         """
         findings = []
-        materialised = []
+        root = self._new_root(scan_dir) if self.external else None
         for e in changed:
             if e.status == "D":
                 continue
@@ -137,9 +152,11 @@ class Scanner:
             if e.new_mode in ("100644", "100755", "120000"):
                 data = repo.blob(e.new_sha)
                 findings.extend(self.scan_text(f"diff:{e.path}", data))
-                materialised.append((e.path, data))
-        if scan_dir is not None:
-            findings.extend(self.run_external(scan_dir, materialised))
+                if root is not None:
+                    _write_scan_file(root, e.path, data)
+                del data
+        if root is not None:
+            findings.extend(self.external(root, self.warnings))
         return findings
 
     def scan_texts(self, texts, scan_dir=None):
@@ -147,18 +164,19 @@ class Scanner:
         findings = []
         for name, text in texts.items():
             findings.extend(self.scan_text(f"text:{name}", text))
-        if scan_dir is not None and texts:
-            findings.extend(self.run_external(
-                scan_dir, [(f"text/{n}.txt", (t or "").encode("utf-8")) for n, t in texts.items()]))
+        root = self._new_root(scan_dir) if (self.external and texts) else None
+        if root is not None:
+            for n, t in texts.items():
+                _write_scan_file(root, f"text/{n}.txt", (t or "").encode("utf-8"))
+            findings.extend(self.external(root, self.warnings))
         return findings
 
-    # --- external scanner hook ---------------------------------------------
-    def run_external(self, scan_dir, files):
-        if not files:
-            return []
-        if self.external is None:
-            return []
-        return self.external(Path(scan_dir), files, self.warnings)
+
+def _write_scan_file(root, rel, data):
+    dest = Path(root) / _safe_rel(rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "xb") as fh:          # fresh supervisor-owned dir: no links
+        fh.write(data)
 
 
 def _safe_rel(path):
@@ -166,58 +184,85 @@ def _safe_rel(path):
     return "/".join(parts) or "_"
 
 
-def trufflehog_hook(binary=None, timeout=300):
-    """Return an external-scanner callable, or None when no scanner exists.
-
-    CFGMS_FSM_TRUFFLEHOG may name the binary, or be `off` to disable.
-    """
-    choice = binary or os.environ.get("CFGMS_FSM_TRUFFLEHOG", "")
-    if choice == "off":
-        return None
-    path = choice or shutil.which("trufflehog")
-    if not path:
-        return None
-
-    def run(scan_dir, files, warnings):
-        scan_dir.mkdir(parents=True, exist_ok=True)
-        root = scan_dir / f"s{len(list(scan_dir.iterdir()))}"
-        root.mkdir()
-        for rel, data in files:
-            dest = root / _safe_rel(rel)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # regular files only, written from git objects / agent text: no symlinks
-            with open(dest, "wb") as fh:
-                fh.write(data)
+def _parse_trufflehog(stdout, prefix):
+    found = []
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
         try:
-            proc = subprocess.run(
-                [path, "filesystem", str(root), "--json", "--no-update", "--no-verification"],
-                capture_output=True, timeout=timeout)
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "DetectorName" not in rec:
+            continue
+        src = (((rec.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {})
+        fpath = str(src.get("file", ""))
+        if fpath.startswith(prefix):
+            fpath = fpath[len(prefix):].lstrip("/")
+        else:
+            fpath = Path(fpath).name
+        found.append(Finding("external", f"diff:{fpath}", int(src.get("line") or 0),
+                             str(rec.get("DetectorName"))[:60]))
+    return found
+
+
+def _finish(proc, found, warnings):
+    if proc.returncode not in (0, 183) and not found:
+        warnings.append(f"external scanner exited {proc.returncode}")
+        return [Finding("external", "scanner", 0, "scanner_error")]
+    return found
+
+
+TRUFFLEHOG_ARGS = ("--json", "--no-update", "--no-verification")
+
+
+def image_scanner_hook(image=None, docker="docker", timeout=600):
+    """trufflehog from the cfg-agent image: `docker run --rm --network none`,
+    scan dir mounted read-only, no credential, no other mount."""
+    image = image or os.environ.get("CFGMS_FSM_IMAGE", "cfg-agent:latest")
+
+    def run(root, warnings):
+        argv = [docker, "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "--pids-limit", "512",
+                "--label", "cfg-agent-scan=true",
+                "-v", f"{root}:/scan:ro", "--entrypoint", "trufflehog", image,
+                "filesystem", "/scan", *TRUFFLEHOG_ARGS]
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GH_TOKEN", "GITHUB_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                            "CFGMS_FSM_PUSH_TOKEN")}
+        try:
+            proc = subprocess.run(argv, capture_output=True, timeout=timeout, env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             warnings.append(f"external scanner failed to run: {type(exc).__name__}")
             return [Finding("external", "scanner", 0, "scanner_error")]
-        found = []
-        for line in proc.stdout.decode("utf-8", "replace").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "DetectorName" not in rec:
-                continue
-            src = (((rec.get("SourceMetadata") or {}).get("Data") or {})
-                   .get("Filesystem") or {})
-            fpath = str(src.get("file", ""))
-            try:
-                fpath = str(Path(fpath).relative_to(root))
-            except ValueError:
-                fpath = Path(fpath).name
-            found.append(Finding("external", f"diff:{fpath}", int(src.get("line") or 0),
-                                 str(rec.get("DetectorName"))[:60]))
-        if proc.returncode not in (0, 183) and not found:
-            warnings.append(f"external scanner exited {proc.returncode}")
-            return [Finding("external", "scanner", 0, "scanner_error")]
-        return found
+        return _finish(proc, _parse_trufflehog(proc.stdout, "/scan"), warnings)
 
     return run
+
+
+def host_scanner_hook(binary, timeout=300):
+    """trufflehog binary on the host; used only when CFGMS_FSM_TRUFFLEHOG names it."""
+
+    def run(root, warnings):
+        try:
+            proc = subprocess.run([binary, "filesystem", str(root), *TRUFFLEHOG_ARGS],
+                                  capture_output=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warnings.append(f"external scanner failed to run: {type(exc).__name__}")
+            return [Finding("external", "scanner", 0, "scanner_error")]
+        return _finish(proc, _parse_trufflehog(proc.stdout, str(root)), warnings)
+
+    return run
+
+
+def scanner_hook(choice=None):
+    """External scanner selected by CFGMS_FSM_TRUFFLEHOG: unset or `image`
+    (default) runs it in the cfg-agent image; `off` disables it; any other
+    value is the path of a host trufflehog binary."""
+    choice = choice if choice is not None else os.environ.get("CFGMS_FSM_TRUFFLEHOG", "image")
+    if choice == "off":
+        return None
+    if choice in ("", "image"):
+        return image_scanner_hook()
+    return host_scanner_hook(choice)

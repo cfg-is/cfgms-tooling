@@ -2,24 +2,41 @@
 """
 snapshot: build, filter and check the candidate tree (DESIGN.md §6.1-§6.3).
 
-The candidate is a git tree object in the supervisor-owned repository `R`,
-built from the agent workspace `A` without ever using `A`'s git directory:
+The candidate is a git tree object in the supervisor-owned repository `R`.
+Git never runs against the agent workspace `A` itself:
 
-    GIT_DIR=R GIT_WORK_TREE=A GIT_INDEX_FILE=<run>/idx  (+ isolated config)
-    git -c core.attributesFile=<base .gitattributes from R>
-        -c core.excludesFile=<base .gitignore from R> ...
-        read-tree BASE && git add -A -- :/ ':(exclude).claude/tooling' && git write-tree
+  1. `A` is copied, without following symlinks, into a fresh supervisor-owned
+     directory `<run>/snapA`. Every entry named `.git` at any depth is skipped
+     (so no repository -- `A`'s own or a nested one -- exists in the copy),
+     `.claude/tooling` is skipped, symlinks are recreated as symlinks, FIFOs /
+     devices / sockets are reported as violations, and the file-count,
+     total-size and per-file (5 MB, the salvage limit) caps are enforced
+     during the walk. An oversized file is left out unless it is byte-identical
+     to the base version.
+  2. The base tree is read into a supervisor-owned index; every gitlink
+     (`.claude/tooling`) is removed from that index before any work-tree
+     command and re-added by cacheinfo afterwards, so git has no submodule to
+     inspect. Every call runs with submodule handling disabled (gitops).
 
-`A`'s `.git`, config, hooks, index and info/ are never read. Before `add`, `A`
-is walked without following symlinks and file-count / total-size caps are
-enforced; files at or above the per-file cap (5 MB, the salvage limit) that
-would be added are left out and reported.
+        GIT_DIR=R GIT_WORK_TREE=<run>/snapA GIT_INDEX_FILE=<run>/idx
+        git -c core.attributesFile=<base .gitattributes from R>
+            -c core.excludesFile=<base .gitignore from R> ...
+            read-tree BASE; update-index --force-remove <gitlinks>
+            add -A -- :/ ; update-index --index-info <gitlinks>; write-tree
+
+     The top-level ignore and attribute rules come from the base commit.
+     Git also honours `.gitignore` / `.gitattributes` files in subdirectories
+     of the copy, which the agent may have written; that cannot be disabled.
+     It is harmless: R's config defines no filter, diff or merge driver, so
+     attributes cannot run anything, and the top-level files are protected
+     paths.
 
 Filters run on `git diff-tree -r --raw` between the base tree and the
 candidate. Conflict markers are checked on changed text blobs.
 """
 
 import fnmatch
+import hashlib
 import os
 import re
 import stat
@@ -31,8 +48,9 @@ import safefs
 from secrets_scan import credential_name_hit
 
 DEFAULT_MAX_FILES = int(os.environ.get("CFGMS_FSM_SNAPSHOT_MAX_FILES", "300000"))
-DEFAULT_MAX_TOTAL_BYTES = int(os.environ.get("CFGMS_FSM_SNAPSHOT_MAX_TOTAL_BYTES", str(8 * 1024 ** 3)))
+DEFAULT_MAX_TOTAL_BYTES = int(os.environ.get("CFGMS_FSM_SNAPSHOT_MAX_TOTAL_BYTES", str(2 * 1024 ** 3)))
 DEFAULT_MAX_FILE_BYTES = int(os.environ.get("CFGMS_FSM_SNAPSHOT_MAX_FILE_BYTES", str(5 * 1024 * 1024)))
+DEFAULT_MAX_CHANGED_BYTES = int(os.environ.get("CFGMS_FSM_MAX_CHANGED_BYTES", str(256 * 1024 * 1024)))
 DEFAULT_TIMEOUT = int(os.environ.get("CFGMS_FSM_SNAPSHOT_TIMEOUT_SECS", "900"))
 
 TOOLING_PATH = ".claude/tooling"
@@ -54,8 +72,9 @@ PROTECTED_GLOBS = (
     "docs/CODEOWNERS",
 )
 
-#: Roots of the Makefile target graph whose recipes name gate scripts.
-GATE_ROOTS = ("test-commit",)
+#: Root of the Makefile target graph whose recipes name gate scripts: the
+#: target the validator runs (it reaches test-commit and everything else).
+GATE_ROOTS = ("test-agent-complete",)
 
 _MARKER_RE = re.compile(rb"^(<{7}|={7}|>{7})( |$)", re.M)
 _START_END_RE = re.compile(rb"^(<{7}|>{7})( |$)", re.M)
@@ -120,54 +139,114 @@ def extract_base_rules(repo, base_tree, dest_dir):
     return out
 
 
-# --- pre-walk ----------------------------------------------------------------
+# --- no-follow copy of the workspace ------------------------------------------
 
-def prewalk(workspace, max_files=DEFAULT_MAX_FILES, max_total=DEFAULT_MAX_TOTAL_BYTES,
-            max_file=DEFAULT_MAX_FILE_BYTES):
-    """Walk A without following symlinks. Returns (stats, large_paths).
+@dataclass
+class CopyResult:
+    stats: dict
+    oversize: list          # [(rel, git blob sha, mode)] regular files at/above the cap
+    specials: list          # [(rel, kind)]
+    nested_git: list        # dirs that contained a .git entry (not the root)
+
+
+def _blob_sha(fd, size):
+    h = hashlib.sha1(b"blob %d\0" % size)
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def copy_workspace(src, dst, max_files=DEFAULT_MAX_FILES, max_total=DEFAULT_MAX_TOTAL_BYTES,
+                   max_file=DEFAULT_MAX_FILE_BYTES):
+    """Copy `src` into a fresh `dst` without following symlinks (see module doc).
 
     Raises SnapshotTooLarge when the file-count or total-size cap is exceeded.
-    Skips A's top-level `.git` and `.claude/tooling` (neither is snapshotted).
+    Names are handled as os.fsdecode() strings (surrogateescape), which round-
+    trip byte-exactly.
     """
-    root = str(workspace)
+    safefs.fresh_dir(dst)
     files = total = 0
-    large = []
+    oversize, specials, nested = [], [], []
     stack = [""]
     while stack:
         rel_dir = stack.pop()
-        abs_dir = os.path.join(root, rel_dir) if rel_dir else root
         try:
-            it = os.scandir(abs_dir)
+            dfd = os.open(os.path.join(str(src), rel_dir) if rel_dir else str(src),
+                          os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError:
+            if rel_dir:
+                specials.append((rel_dir, "unreadable directory"))
             continue
-        with it:
-            for de in it:
-                rel = f"{rel_dir}/{de.name}" if rel_dir else de.name
-                if rel in (".git", TOOLING_PATH):
+        try:
+            for name in sorted(os.listdir(dfd)):
+                rel = f"{rel_dir}/{name}" if rel_dir else name
+                if name == ".git":
+                    if rel_dir:
+                        nested.append(rel_dir)
+                    continue
+                if rel == TOOLING_PATH:
                     continue
                 try:
-                    st = de.stat(follow_symlinks=False)
+                    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
                 except OSError:
+                    specials.append((rel, "unreadable"))
                     continue
+                out = os.path.join(str(dst), rel)
                 if stat.S_ISDIR(st.st_mode):
+                    os.mkdir(out, 0o755)
                     stack.append(rel)
                     continue
-                files += 1
-                if files > max_files:
-                    raise SnapshotTooLarge(f"workspace has more than {max_files} files")
-                if stat.S_ISREG(st.st_mode):
+                if stat.S_ISLNK(st.st_mode):
+                    files += 1
+                    os.symlink(os.readlink(name, dir_fd=dfd), out)
+                elif stat.S_ISREG(st.st_mode):
+                    files += 1
                     total += st.st_size
                     if total > max_total:
                         raise SnapshotTooLarge(f"workspace exceeds {max_total} bytes")
-                    if st.st_size >= max_file:
-                        large.append(rel)
-    return {"files": files, "bytes": total}, large
+                    mode = "100755" if st.st_mode & 0o111 else "100644"
+                    try:
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+                    except OSError:
+                        specials.append((rel, "unreadable"))
+                        continue
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            specials.append((rel, "not a regular file"))
+                            continue
+                        if st.st_size >= max_file:
+                            oversize.append((rel, _blob_sha(fd, st.st_size), mode))
+                            continue
+                        with open(out, "xb") as fh:
+                            while True:
+                                chunk = os.read(fd, 1 << 20)
+                                if not chunk:
+                                    break
+                                fh.write(chunk)
+                        os.chmod(out, 0o755 if mode == "100755" else 0o644)
+                    finally:
+                        os.close(fd)
+                else:
+                    kind = ("fifo" if stat.S_ISFIFO(st.st_mode) else
+                            "socket" if stat.S_ISSOCK(st.st_mode) else
+                            "device" if (stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode))
+                            else "special file")
+                    specials.append((rel, kind))
+                    continue
+                if files > max_files:
+                    raise SnapshotTooLarge(f"workspace has more than {max_files} files")
+        finally:
+            os.close(dfd)
+    return CopyResult({"files": files, "bytes": total}, oversize, specials, nested)
 
 
 # --- tree build ----------------------------------------------------------------
 
-def _literal(path):
-    return f":(top,exclude,literal){path}"
+def _z(proc):
+    return [p for p in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
 def build_tree(repo, run_path, workspace, base_tree, *, max_file=DEFAULT_MAX_FILE_BYTES,
@@ -175,7 +254,9 @@ def build_tree(repo, run_path, workspace, base_tree, *, max_file=DEFAULT_MAX_FIL
                timeout=DEFAULT_TIMEOUT):
     """Snapshot `workspace` into a tree in `repo`. Returns (tree, info)."""
     run_path = Path(run_path)
-    stats, large = prewalk(workspace, max_files=max_files, max_total=max_total, max_file=max_file)
+    copy = run_path / "snapA"
+    cr = copy_workspace(workspace, copy, max_files=max_files, max_total=max_total,
+                        max_file=max_file)
     rules = extract_base_rules(repo, base_tree, run_path)
     idx = run_path / "idx"
     if idx.exists():
@@ -188,29 +269,62 @@ def build_tree(repo, run_path, workspace, base_tree, *, max_file=DEFAULT_MAX_FIL
         "core.autocrlf=false",
         "core.safecrlf=false",
     )
-    kw = dict(work_tree=workspace, index_file=idx, config=cfg, timeout=timeout)
-    repo.git("read-tree", base_tree, **kw)
+    kw = dict(work_tree=copy, index_file=idx, config=cfg, timeout=timeout)
+    repo.git("read-tree", base_tree, index_file=idx, timeout=timeout)
 
-    # Which of the large files would actually be added (not ignored)?
+    # gitlinks out of the index before any work-tree command
+    staged = repo.git("ls-files", "-s", "-z", index_file=idx, timeout=timeout)
+    links = []
+    for rec in _z(staged):
+        meta, _, path = rec.partition("\t")
+        mode, sha, _stage = meta.split(" ")
+        if mode == "160000":
+            links.append((sha, path))
+    if links:
+        repo.git("update-index", "-z", "--force-remove", "--stdin", work_tree=copy,
+                 index_file=idx, input_bytes=b"".join(p.encode("utf-8", "surrogateescape") + b"\0"
+                                      for _, p in links), timeout=timeout)
+
+    # the copy holds no .claude/tooling (skipped) and no .git anywhere
+    repo.git("add", "-A", "--", ":/", **kw)
+
+    # oversized files: keep byte-identical base versions, leave the rest out
+    left_out = []
+    if cr.oversize:
+        base_map = {}
+        for rec in _z(repo.git("ls-tree", "-r", "-z", base_tree, timeout=timeout)):
+            meta, _, path = rec.partition("\t")
+            mode, _typ, sha = meta.split(" ")
+            base_map[path] = (mode, sha)
+        for rel, sha, mode in cr.oversize:
+            if base_map.get(rel, (None, None))[1] == sha:
+                repo.git("update-index", "--add", "--cacheinfo",
+                         f"{base_map[rel][0]},{sha},{rel}", work_tree=copy, index_file=idx,
+                         timeout=timeout)
+            else:
+                left_out.append(rel)
+
+    link_conflicts = []
+    for sha, path in links:
+        proc = repo.git("update-index", "--add", "--cacheinfo", f"160000,{sha},{path}",
+                        work_tree=copy, index_file=idx, timeout=timeout, check=False)
+        if proc.returncode != 0:
+            link_conflicts.append(path)
+    tree = repo.out("write-tree", index_file=idx, timeout=timeout)
+
+    ignored = sorted(_z(repo.git("ls-files", "-z", "-o", "-i", "--exclude-standard",
+                                 "--directory", "--", ":/", **kw)))
     oversize = []
-    if large:
-        cand = set()
-        repo.git("update-index", "-q", "--refresh", check=False, **kw)
-        proc = repo.git("ls-files", "-z", "-o", "--exclude-standard", "--", ":/", **kw)
-        cand.update(p for p in proc.stdout.decode("utf-8", "replace").split("\0") if p)
-        proc = repo.git("diff-files", "-z", "--name-only", "--", ":/", **kw)
-        cand.update(p for p in proc.stdout.decode("utf-8", "replace").split("\0") if p)
-        oversize = sorted(p for p in large if p in cand)
-
-    add = ["add", "-A", "--", ":/", f":(top,exclude){TOOLING_PATH}"]
-    add += [_literal(p) for p in oversize]
-    repo.git(*add, **kw)
-    tree = repo.out("write-tree", **kw)
-
-    ign = repo.git("ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory", "--", ":/",
-                   **kw)
-    ignored = sorted(p for p in ign.stdout.decode("utf-8", "replace").split("\0") if p)
-    return tree, {"stats": stats, "oversize": oversize, "ignored": ignored}
+    if left_out:
+        proc = repo.git("check-ignore", "-z", "--no-index", "--stdin", check=False,
+                        input_bytes=b"".join(p.encode("utf-8", "surrogateescape") + b"\0"
+                                             for p in left_out), **kw)
+        ign = set(_z(proc))
+        oversize = sorted(p for p in left_out if p not in ign)
+        ignored = sorted(set(ignored) | (set(left_out) & ign))
+    return tree, {"stats": cr.stats, "oversize": oversize, "ignored": ignored,
+                  "specials": cr.specials, "nested_git": cr.nested_git,
+                  "link_conflicts": link_conflicts}
 
 
 # --- diff + filters --------------------------------------------------------------
@@ -279,6 +393,14 @@ def makefile_gate_scripts(makefile_text, roots=GATE_ROOTS):
         seen.add(t)
         queue.extend(rules[t]["deps"])
         for rl in rules[t]["recipe"]:
+            # recursive make: `$(MAKE) target`, `${MAKE} -C . target`, `make target`
+            m = re.search(r"(?:\$\(MAKE\)|\$\{MAKE\}|(?<![\w/.-])make)\s+(.*)", rl)
+            if m:
+                for tok in m.group(1).split():
+                    if tok.startswith(("-", "$")) or "=" in tok:
+                        continue
+                    if re.fullmatch(r"[A-Za-z0-9_.%/-]+", tok):
+                        queue.append(tok)
             for tok in re.findall(r"(?<![A-Za-z0-9_./-])(?:\./)?(scripts/[A-Za-z0-9_./-]+)", rl):
                 found.add(tok.rstrip("/."))
     out = []
@@ -366,13 +488,34 @@ def conflict_markers(repo, entries, max_blob=2 * 1024 * 1024):
 
 # --- full snapshot ------------------------------------------------------------------
 
-def snapshot(repo, run_path, workspace, base_tree, allowlist=(), extra_protected=(), **caps):
+def changed_bytes(repo, entries):
+    """Total size of the added/modified blobs (one cat-file --batch-check call)."""
+    shas = [e.new_sha for e in entries if e.status != "D" and e.new_mode != "160000"]
+    if not shas:
+        return 0
+    out = repo.git("cat-file", "--batch-check=%(objectsize)",
+                   input_bytes=("\n".join(shas) + "\n").encode()).stdout.decode().split()
+    return sum(int(x) for x in out if x.isdigit())
+
+
+def snapshot(repo, run_path, workspace, base_tree, allowlist=(), extra_protected=(),
+             max_changed=DEFAULT_MAX_CHANGED_BYTES, **caps):
     tree, info = build_tree(repo, run_path, workspace, base_tree, **caps)
     entries = diff_entries(repo, base_tree, tree)
     protected = tuple(PROTECTED_GLOBS) + tuple(extra_protected)
     violations = filter_entries(repo, entries, allowlist, protected)
     for p in info["oversize"]:
         violations.append(Violation(p, "file at or above the per-file size cap (left out)"))
+    for p, kind in info["specials"]:
+        violations.append(Violation(p, f"{kind} is not allowed in the workspace (left out)"))
+    for p in info["nested_git"]:
+        violations.append(Violation(p, "nested git repository: its .git was not snapshotted"))
+    for p in info["link_conflicts"]:
+        violations.append(Violation(p, "path conflicts with the base gitlink"))
+    changed = changed_bytes(repo, entries)
+    if changed > max_changed:
+        violations.append(Violation("(candidate)", f"changed content is {changed} bytes, "
+                                                   f"over the {max_changed}-byte cap"))
     markers = conflict_markers(repo, entries)
     return SnapshotResult(tree=tree, entries=entries, violations=violations, markers=markers,
                           ignored=info["ignored"], oversize=info["oversize"], stats=info["stats"])

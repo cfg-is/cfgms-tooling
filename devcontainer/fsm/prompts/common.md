@@ -55,8 +55,10 @@ requests (its Agent Workflow Phase 4, its draft-PR failure handling, and the
   the Makefile's `test-commit` calls. Never touch the `.claude/tooling`
   submodule.
 - It also rejects symlinks that point outside the repository, files over
-  5 MB, and credential-like file names. Leave no build output or scratch
-  files in `/workspace`; files the repository ignores are not exported.
+  5 MB, credential-like file names, FIFOs, sockets and device files, a nested
+  git repository (any `.git` below the top of `/workspace`), and more than
+  256 MB of changed content in total. Leave no build output or scratch files
+  in `/workspace`; files the repository ignores are not exported.
 - Do not modify `CLAUDE.md` or `docs/product/roadmap.md`. Do not add
   dependencies without a justification the spec supports.
 
