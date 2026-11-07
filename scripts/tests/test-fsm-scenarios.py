@@ -95,6 +95,8 @@ class TestIssueMode(Base):
                     if r["argv"][0] == "run" and "--rm" not in r["argv"]]
         self.assertIn("cfg-agent-42", run_args[0])
         self.assertIn("cfg-validate-42", run_args[1])
+        # the agent container's output is kept in the run dir before it is removed
+        self.assertIn("agent session", (self.f.run_dir(rid) / "logs" / "agent-1.log").read_text())
         self.assert_common(rid)
 
     def test_validation_fail_fix_pass(self):

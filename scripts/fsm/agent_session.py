@@ -34,6 +34,7 @@ PROMPT_DIR = "/usr/local/share/cfgms-agent/fsm/prompts"
 IMAGE = os.environ.get("CFGMS_FSM_IMAGE", "cfg-agent:latest")
 SESSIONS_MOUNT = "/agent-sessions"
 CONTEXT_MOUNT = "/fsm/context"
+LOG_TAIL_LINES = 200
 OUT_MOUNT = "/fsm/out"
 METRICS_MOUNT = "/usr/local/share/cfgms-metrics"
 DEFAULT_TIMEOUT_MIN = int(os.environ.get("CFGMS_FSM_AGENT_TIMEOUT_MIN", "180"))
@@ -225,9 +226,24 @@ def run_session(docker, argv, name, env_extra, timeout_min, gh_token=None, on_la
         timed_out = True
         docker.kill(name)
         _, code = docker.inspect_exit(name)
+    log_tail = _log_tail(docker, name, env_extra)
     docker.rm_force(name)
     return {"exit_code": code, "timed_out": timed_out, "error": error, "launch_failed": False,
-            "duration_seconds": int(time.time() - started)}
+            "duration_seconds": int(time.time() - started), "log_tail": log_tail}
+
+
+def _log_tail(docker, name, env_extra):
+    """The container's last output lines, kept before the container is
+    removed so a start-up failure stays diagnosable. Values passed in
+    `env_extra` (the Claude token) are redacted. Never raises."""
+    try:
+        text = docker.logs_tail(name, lines=LOG_TAIL_LINES)
+    except Exception:
+        return ""
+    for v in (env_extra or {}).values():
+        if v and len(v) >= 8:
+            text = text.replace(v, "[REDACTED]")
+    return text
 
 
 _TARGET_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")

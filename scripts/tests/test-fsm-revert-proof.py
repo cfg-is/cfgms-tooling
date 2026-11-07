@@ -246,6 +246,23 @@ class TestRunSessionGuard(unittest.TestCase):
         agent_session.run_session(D(), base, "cfg-agent-1", {}, 1)
         self.assertIn("run", calls)
 
+    def test_log_tail_redacts_the_claude_token(self):
+        token = "sk-ant-oat01-testtokenvalue"
+
+        class D:
+            def rm_force(self, n): pass
+            def run_detached(self, argv, env_extra=None): return "cid"
+            def wait(self, n, t): return 1
+            def logs_tail(self, n, lines): return f"ERROR: start-up failed\nauth {token}\n"
+
+        base = agent_session.docker_argv(
+            name="cfg-agent-1", mode="issue", kind="implement", seq=1, run_id="r", workspace="/w",
+            context_dir="/c", out_dir="/o", session_dir="/s", trust="/t", model="m", effort="e")
+        res = agent_session.run_session(D(), base, "cfg-agent-1",
+                                        {"CLAUDE_CODE_OAUTH_TOKEN": token}, 1)
+        self.assertIn("ERROR: start-up failed", res["log_tail"])
+        self.assertNotIn(token, res["log_tail"])
+
 
 class TestSymlinkedOutputNotRead(Base):
     def test_summary_symlink_to_host_file(self):

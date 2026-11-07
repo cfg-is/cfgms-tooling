@@ -180,6 +180,14 @@ fsa_prompt_template_ok() {
     esac
 }
 
+# fsa_model_ok <model> -- an alias or full model id, optionally with a `[1m]`
+# style suffix. In a bash bracket expression a backslash is literal, so `]`
+# must come first and `-` last; `\[\]` would close the bracket early and
+# reject every name.
+fsa_model_ok() {
+    [[ "$1" =~ ^[A-Za-z0-9][]A-Za-z0-9._:/@[-]*$ ]]
+}
+
 # fsa_effort_args <effort> <claude-help-text>
 # Prints `--effort <level>` (one word per line) when the level is valid and
 # the installed CLI documents the flag; prints nothing otherwise.
@@ -275,7 +283,7 @@ if ! fsa_prompt_template_ok "$template"; then
     exit 1
 fi
 model="${CFGMS_FSM_MODEL:-}"
-if [[ ! "$model" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]*$ ]]; then
+if ! fsa_model_ok "$model"; then
     echo "ERROR: CFGMS_FSM_MODEL is empty or malformed (got '${model}')" >&2
     exit 1
 fi
