@@ -1598,6 +1598,135 @@ def ci_summary(checks):
     }
 
 
+# How long required contexts may stay pending while no workflow run for the
+# head is queued or in progress before the PR counts as stuck (Issue #5948).
+# Once every run on a head has completed, a pending context cannot resolve by
+# waiting: nothing is left to report it. The only legitimate gap is the few
+# minutes between one run completing and a chained (workflow_run) run or a
+# runner-queue-delayed run appearing. 30 minutes is several times that gap,
+# and it bounds the wait to about one or two cycles instead of the ~18 hours
+# PR #5897 waited behind two startup_failure runs.
+CI_STALE_PENDING_MINUTES = 30
+
+# Run statuses that mean CI on the head is still making progress. Any of them
+# keeps a pending PR in ordinary `defer` (unless a run already ended
+# startup_failure, which no amount of waiting fixes).
+_ACTIVE_RUN_STATUSES = {"queued", "in_progress", "waiting", "requested", "pending"}
+
+# Completed-run conclusions a re-run can plausibly clear (a flake, a cancelled
+# or timed-out run). startup_failure is deliberately absent: GitHub does not
+# offer a re-run for a run that failed to start, so those need a new head.
+_RERUNNABLE_CONCLUSIONS = {"failure", "cancelled", "timed_out"}
+
+
+def classify_ci_stuck(ci, runs, now, latest_commit_date=None):
+    """Decide whether a PR whose CI rollup is `pending` is actually stuck.
+
+    `ci` is the ci_summary() dict, `runs` the workflow runs on the PR's
+    current head (REST `actions/runs?head_sha=` objects: name, status,
+    conclusion, id, run_attempt, updated_at), `now` an aware datetime.
+    Returns None for ordinary pending CI, else a dict:
+      {"kind": "startup_failure"|"stale_pending",
+       "remedy": "rebase"|"rerun",
+       "rerun_run_ids": [...], "runs": [names], "detail": str}
+
+    Stuck when (Issue #5948):
+    - any run on the head ended `startup_failure` — its checks will never
+      report, so the PR would wait forever; or
+    - no run on the head is queued/in progress and the newest run activity
+      (or the head commit, when no run exists) is older than
+      CI_STALE_PENDING_MINUTES.
+
+    Remedy: re-run the completed runs a re-run can clear, unless one of them
+    was already re-run (run_attempt > 1) or none exist; otherwise rebase, so
+    a new head SHA starts every workflow afresh.
+    """
+    if (ci or {}).get("overall") != "pending" or runs is None:
+        return None
+    runs = [r for r in runs if isinstance(r, dict)]
+
+    startup_failed = [r for r in runs if (r.get("conclusion") or "").lower() == "startup_failure"]
+    if startup_failed:
+        names = sorted({r.get("name") or str(r.get("id")) for r in startup_failed})
+        return {
+            "kind": "startup_failure",
+            "remedy": "rebase",
+            "rerun_run_ids": [],
+            "runs": names,
+            "detail": f"workflow run(s) ended startup_failure on the head: {', '.join(names)}",
+        }
+
+    if any((r.get("status") or "").lower() in _ACTIVE_RUN_STATUSES for r in runs):
+        return None
+
+    stamps = [_parse_iso8601(r.get("updated_at") or r.get("created_at")) for r in runs]
+    stamps = [s for s in stamps if s is not None]
+    last_activity = max(stamps) if stamps else _parse_iso8601(latest_commit_date)
+    if last_activity is None:
+        return None
+    idle_minutes = (now - last_activity).total_seconds() / 60
+    if idle_minutes <= CI_STALE_PENDING_MINUTES:
+        return None
+
+    rerunnable = [r for r in runs
+                  if (r.get("conclusion") or "").lower() in _RERUNNABLE_CONCLUSIONS
+                  and r.get("id") is not None]
+    already_rerun = any((r.get("run_attempt") or 1) > 1 for r in rerunnable)
+    pending = (ci.get("pending_checks") or [])[:3]
+    detail = (
+        f"required contexts pending ({', '.join(pending)}) for {int(idle_minutes)}m "
+        f"with no workflow run queued or in progress on the head "
+        f"(threshold {CI_STALE_PENDING_MINUTES}m)"
+    )
+    if rerunnable and not already_rerun:
+        return {
+            "kind": "stale_pending",
+            "remedy": "rerun",
+            "rerun_run_ids": sorted(r["id"] for r in rerunnable),
+            "runs": sorted({r.get("name") or str(r.get("id")) for r in rerunnable}),
+            "detail": detail,
+        }
+    return {
+        "kind": "stale_pending",
+        "remedy": "rebase",
+        "rerun_run_ids": [],
+        "runs": [],
+        "detail": detail + ("; a re-run already happened" if already_rerun else ""),
+    }
+
+
+def _ci_pending_rec(pr, reason_prefix):
+    """Recommendation for a PR whose CI rollup is `pending`: `ci_stuck` when
+    classify_ci_stuck() found it stuck (injected as pr["ci_stuck"] in main()),
+    otherwise the ordinary `defer` with `reason_prefix` + pending names."""
+    stuck = pr.get("ci_stuck")
+    if stuck:
+        if stuck.get("remedy") == "rerun":
+            cmds = "; ".join(f"`gh run rerun --repo {REPO} {rid}`" for rid in stuck["rerun_run_ids"])
+            action_text = (f"re-run the completed runs: {cmds}. If the PR is still stuck "
+                           "next cycle the run attempt is > 1 and the preflight recommends a rebase")
+        else:
+            action_text = ("rebase via `./.claude/tooling/scripts/rebase-pr.sh <PR>` (holding the "
+                           "pr-<N> lease) so a new head SHA starts every workflow; a re-run cannot "
+                           "help. On REBASE_NOOP the branch is already current — escalate via "
+                           "`po-act.sh block`")
+        return {
+            "pr": pr["pr"],
+            "story": pr["story_number"],
+            "action": "ci_stuck",
+            "remedy": stuck.get("remedy"),
+            "rerun_run_ids": list(stuck.get("rerun_run_ids") or []),
+            "reason": f"CI stuck, not pending ({stuck.get('kind')}): {stuck.get('detail')} — {action_text}",
+        }
+    pending = pr["ci_summary"]["pending_checks"][:3]
+    return {
+        "pr": pr["pr"],
+        "story": pr["story_number"],
+        "action": "defer",
+        "reason": f"{reason_prefix}{', '.join(pending)}",
+    }
+
+
 def compute_stalled_dispatches(in_progress_issues, containers, pr_summaries,
                                epic_nums=None, closed_nums=None,
                                leased_item_ids=None, fsm_story_nums=None,
@@ -1977,7 +2106,13 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
               fix commit landed *after* the review — see fix_landed_after_review
               — with CI now green). A FAIL is never enqueued; it must pass a
               re-review first.
-    - defer: CI still pending.
+    - defer: CI still pending (a run on the head is queued or in progress,
+              or the pending contexts are younger than CI_STALE_PENDING_MINUTES).
+    - ci_stuck: CI rollup is pending but cannot finish by waiting — a run on
+              the head ended startup_failure, or contexts have stayed pending
+              past CI_STALE_PENDING_MINUTES with no run queued or in progress
+              (Issue #5948). `remedy` is `rerun` (re-run `rerun_run_ids`) or
+              `rebase` (a new head SHA; a re-run cannot help).
     - investigate: CI red and not stale-base; needs diagnose + dispatch-fix.
 
     `active_fix_pr_nums`: set of PR numbers with `cfg-agent-pr-fix-<N>`
@@ -2134,13 +2269,8 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                     "reason": "acceptance review FAILED; a fix commit landed after the review and CI is green — re-review required before this PR can merge",
                 })
             elif overall == "pending":
-                pending = pr["ci_summary"]["pending_checks"][:3]
-                recs.append({
-                    "pr": pr["pr"],
-                    "story": pr["story_number"],
-                    "action": "defer",
-                    "reason": f"acceptance review FAILED; a fix landed, CI re-running: {', '.join(pending)}",
-                })
+                recs.append(_ci_pending_rec(
+                    pr, "acceptance review FAILED; a fix landed, CI re-running: "))
             else:
                 recs.append({
                     "pr": pr["pr"],
@@ -2165,13 +2295,8 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                         "reason": "commit landed after review PASS — prior verdict invalidated; re-review required before enqueue",
                     })
                 elif overall == "pending":
-                    pending = pr["ci_summary"]["pending_checks"][:3]
-                    recs.append({
-                        "pr": pr["pr"],
-                        "story": pr["story_number"],
-                        "action": "defer",
-                        "reason": f"commit landed after review PASS; CI re-running: {', '.join(pending)} — re-review once CI completes",
-                    })
+                    recs.append(_ci_pending_rec(
+                        pr, "commit landed after review PASS — re-review once CI completes; CI re-running: "))
                 else:
                     recs.append({
                         "pr": pr["pr"],
@@ -2197,13 +2322,8 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                         "reason": "acceptance-review comment present but verdict is WAIT or unparseable — re-spawn to obtain a definitive PASS or FAIL before enqueueing",
                     })
                 elif overall == "pending":
-                    pending = pr["ci_summary"]["pending_checks"][:3]
-                    recs.append({
-                        "pr": pr["pr"],
-                        "story": pr["story_number"],
-                        "action": "defer",
-                        "reason": f"acceptance-review comment present but no parseable verdict; CI pending: {', '.join(pending)}",
-                    })
+                    recs.append(_ci_pending_rec(
+                        pr, "acceptance-review comment present but no parseable verdict; CI pending: "))
                 else:
                     recs.append({
                         "pr": pr["pr"],
@@ -2318,13 +2438,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "reason": "CI all green; no existing acceptance-review comment",
             })
         elif overall == "pending":
-            pending = pr["ci_summary"]["pending_checks"][:3]
-            recs.append({
-                "pr": pr["pr"],
-                "story": pr["story_number"],
-                "action": "defer",
-                "reason": f"CI pending: {', '.join(pending)}",
-            })
+            recs.append(_ci_pending_rec(pr, "CI pending: "))
         else:
             # CI red. Two possibilities:
             # - stale base (recent develop merges introduced the failure
@@ -2522,6 +2636,22 @@ def _latest_failing_run_attempt(head_ref):
     return 1
 
 
+def _head_workflow_runs(head_sha):
+    """Workflow runs on head_sha (Issue #5948), or None when the lookup fails.
+
+    The check-run rollup alone cannot show a run that ended startup_failure
+    (it produces no check runs), so the stuck-CI classifier reads the runs
+    API. None, not [], on failure: an unknown run set must not read as "no
+    run is active" and trip the stale-pending rule.
+    """
+    if not head_sha:
+        return None
+    data = gh("api", f"repos/{REPO}/actions/runs?head_sha={head_sha}&per_page=100", check=False)
+    if not isinstance(data, dict) or not isinstance(data.get("workflow_runs"), list):
+        return None
+    return data["workflow_runs"]
+
+
 def _build_pr_summaries(prs):
     """Build pr_summaries from raw PR nodes (Phase 4 of the preflight cycle).
 
@@ -2616,6 +2746,10 @@ def _build_pr_summaries(prs):
                 pr.get("timeline_items", []), pr.get("latest_commit_date")),
             "queue_state": None,
             "failed_run_attempt": 1,
+            # Issue #5948: head SHA for the scoped workflow-run lookup, and the
+            # stuck-CI classification main() injects for pending PRs.
+            "head_oid": pr.get("head_oid", ""),
+            "ci_stuck": None,
         })
     return summaries
 
@@ -3068,6 +3202,21 @@ def main():
             and (s.get("ci_summary") or {}).get("overall") == "red"
         ):
             s["failed_run_attempt"] = _latest_failing_run_attempt(s.get("head_ref", ""))
+
+    # Issue #5948: a pending rollup is not proof CI is still running. For each
+    # pending PR outside the queue, read the head's workflow runs and classify
+    # startup_failure / long-stale pending as stuck. One scoped call per
+    # pending PR; a failed lookup leaves ci_stuck None (ordinary defer) and is
+    # reported as degraded.
+    now = datetime.now(timezone.utc)
+    for s in pr_summaries:
+        if (s.get("ci_summary") or {}).get("overall") != "pending" or s["pr"] in queued_pr_numbers:
+            continue
+        runs = _head_workflow_runs(s.get("head_oid", ""))
+        if runs is None:
+            degraded_reasons.append(f"workflow-run lookup failed for PR #{s['pr']}; stuck-CI check skipped")
+            continue
+        s["ci_stuck"] = classify_ci_stuck(s["ci_summary"], runs, now, s.get("latest_commit_date"))
 
     out["prs_open"] = pr_summaries
 
