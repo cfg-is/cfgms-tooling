@@ -246,6 +246,23 @@ class TestSecrets(RepoCase):
         self.assertIn(("credential_value", "diff:src/leak.go"), kinds)
         self.assertIn(("external", "diff:src/gen.txt"), kinds)
 
+    def test_external_finding_on_unchanged_line_is_dropped(self):
+        doc = self.A / "docs" / "dsn.md"
+        doc.parent.mkdir(exist_ok=True)
+        doc.write_text("intro\nexample FAKE-GENERIC-SECRET placeholder\n")
+        first = self.snap()
+        # the candidate edits the file around the pre-existing line and adds one new hit
+        doc.write_text("new heading\nintro\nexample FAKE-GENERIC-SECRET placeholder\n"
+                       "added FAKE-GENERIC-SECRET line\n")
+        res = snapshot.snapshot(self.R, self.run, self.A, first.tree)
+        hook = secrets_scan.host_scanner_hook(str(L.FAKES / "trufflehog"))
+        w = []
+        sc = secrets_scan.Scanner({"CLAUDE": L.CLAUDE_TOKEN}, external=hook, warnings=w)
+        f = sc.scan_candidate(self.R, first.tree, res.tree, res.entries,
+                              scan_dir=self.run / "scan")
+        self.assertEqual([(x.source, x.line) for x in f], [("diff:docs/dsn.md", 4)])
+        self.assertTrue(any("unchanged line" in m for m in w), w)
+
     def test_no_scanner_returns_none(self):
         self.assertIsNone(secrets_scan.scanner_hook("off"))
         self.assertIsNotNone(secrets_scan.scanner_hook("image"))
