@@ -52,6 +52,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import safefs                        # noqa: E402
 import state as statemod             # noqa: E402
 
 TERMINAL = ("REPORT", "NO_OP", "REFUSED", "FAILED")
@@ -257,6 +258,9 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
 
     - run dirs: `done` or `abandoned`, not locked, last activity older than
       retention
+    - the `cache/` dir (validator build cache) of a `done` or `abandoned`,
+      not locked run still inside retention: the supervisor drops it at the
+      terminal state; this covers a supervisor that died before doing so
     - active/<key> entries naming a missing or done run
     - FSM trust dirs (<trust base>/fsm/<container>-<seq>, the per-session
       .claude.json) older than the trust retention whose container is not an
@@ -274,6 +278,13 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
         if r["status"] not in FINISHED or r["locked"]:
             continue
         if now - r["last_activity"] < retention_hours * 3600:
+            # retained for diagnosis; its validator cache is not needed for that
+            cache = Path(r["path"]) / "cache"
+            if os.path.lexists(cache):
+                if not dry_run:
+                    safefs.remove_tree(cache)
+                if dry_run or not os.path.lexists(cache):
+                    lines.append(f"CLEANED:fsm-run-cache:{r['run_id']}:{r['state']}")
             continue
         if not dry_run:
             shutil.rmtree(r["path"], ignore_errors=True)

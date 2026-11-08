@@ -11,6 +11,7 @@ exhausted -> FAILED with a WIP draft; item mode; branch with an existing PR.
 Run: python3 .claude/tooling/scripts/tests/test-fsm-scenarios.py
 """
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -47,6 +48,8 @@ class Base(unittest.TestCase):
         self.assertFalse((self.f.runs / "active").exists() and any((self.f.runs / "active").iterdir()))
         self.assertEqual(self.f.state_records(rid, "terminal_done")[-1]["type"], "terminal_done")
         self.assertTrue((rd / "agent-result.json").is_file())
+        # a terminal run keeps no validator cache
+        self.assertFalse(os.path.lexists(rd / "cache"), "terminal run kept cache/")
 
     def validates(self):
         return self.f.records("docker-validate")
@@ -98,6 +101,32 @@ class TestIssueMode(Base):
         # the agent container's output is kept in the run dir before it is removed
         self.assertIn("agent session", (self.f.run_dir(rid) / "logs" / "agent-1.log").read_text())
         self.assert_common(rid)
+
+    def test_terminal_run_drops_validation_cache(self):
+        canary_dir = self.f.root / "outside"
+        canary_dir.mkdir()
+        canary = canary_dir / "keep.txt"
+        canary.write_text("CANARY\n")
+        rc, out, rid = self.run_issue([GOOD], validate_cache_readonly=True,
+                                      validate_cache_symlink=str(canary_dir))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.f.path_states(rid)[-1], ("PUBLISH", "published", "REPORT"))
+        self.assertTrue(self.validates(), "the run validated, so it had a cache")
+        rd = self.f.run_dir(rid)
+        self.assertFalse(os.path.lexists(rd / "cache"))
+        notes = [r for r in self.f.state_records(rid, "note") if "cache_dropped" in r]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertTrue(notes[0]["cache_dropped"], notes)
+        self.assertEqual(notes[0]["cache_errors"], [])
+        self.assertGreater(notes[0]["cache_freed_bytes"], 0)
+        self.assertIn("dropped validation cache", (rd / "logs" / "supervisor.log").read_text())
+        # diagnosis material is kept
+        for kept in ("state.jsonl", "run.json", "agent-result.json", "logs/validate-1.log",
+                     "logs/agent-1.log", "context", "validate/cache.json"):
+            self.assertTrue(os.path.lexists(rd / kept), kept)
+        # the symlink in cache/ was not followed
+        self.assertEqual(canary.read_text(), "CANARY\n")
+        self.assertEqual(sorted(os.listdir(canary_dir)), ["keep.txt"])
 
     def test_validation_fail_fix_pass(self):
         bad = [{"op": "write", "path": "src/new.go", "content": "package src\n// FAIL_VALIDATION\n"}]

@@ -15,7 +15,10 @@ Layout of one run (`<runs-base>/<run-id>/`, runs-base defaults to
     A/               agent workspace (mounted rw into agent containers)
     context/         read-only context for the next agent session
     out/             agent-written outputs of the current session
-    validate/<seq>/  validator clone + per-run caches
+    validate/        validator clones (v<seq>/) and the passing-tree record
+                     (cache.json)
+    cache/           validator Go build cache + TMPDIR; removed at the
+                     terminal state
     scan/            scratch for the external secret scanner
     logs/            validator log tails, supervisor log
     tooling/         snapshot of every tooling file the supervisor runs, laid out

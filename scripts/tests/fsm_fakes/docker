@@ -181,6 +181,30 @@ def run_validate(clone):
     return rec
 
 
+def fill_validate_cache(mounts, pl):
+    """Write into the per-run cache mounts as a real build would: a build-cache
+    entry always; with $FSM_FAKE_PLAN["validate_cache_readonly"] a read-only
+    module-cache-like tree (0555 dirs, 0444 files) in TMPDIR; with
+    ["validate_cache_symlink"] = <host path> a symlink to it inside the cache."""
+    build = mounts.get("/home/agent/.cache/go-build")
+    tmp = mounts.get("/home/agent/.cache/fsm-tmp")
+    if build:
+        entry = Path(build) / "ab"
+        entry.mkdir(parents=True, exist_ok=True)
+        (entry / "ab0123-d").write_bytes(b"x" * 4096)
+    if tmp and pl.get("validate_cache_readonly"):
+        mod = Path(tmp) / "mod" / "example.com" / "dep@v1.0.0"
+        mod.mkdir(parents=True, exist_ok=True)
+        (mod / "dep.go").write_text("package dep\n")
+        os.chmod(mod / "dep.go", 0o444)
+        for d in (mod, mod.parent, mod.parent.parent):
+            os.chmod(d, 0o555)
+    if build and pl.get("validate_cache_symlink"):
+        link = Path(build) / "escape"
+        if not os.path.lexists(link):
+            os.symlink(pl["validate_cache_symlink"], link)
+
+
 def main():
     argv = sys.argv[1:]
     gh_env = [k for k in ("GH_TOKEN", "GITHUB_TOKEN") if os.environ.get(k)]
@@ -237,6 +261,7 @@ def main():
                 f"FAIL: marker in {f}\n" for f in rec["fail_markers"]) + f"exit {code}\n"
             for hook in pl.get("validate_hooks", {}).get(str(idx), []):
                 push_develop(hook)
+            fill_validate_cache(mounts, pl)
         save("counters.json", counters)
         containers[name] = {"status": "exited", "exit_code": code, "logs": logs, "labels": labels}
         save("containers.json", containers)
