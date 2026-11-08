@@ -156,8 +156,34 @@ class Scanner:
                     _write_scan_file(root, e.path, data)
                 del data
         if root is not None:
-            findings.extend(self.external(root, self.warnings))
+            ext = self.external(root, self.warnings)
+            findings.extend(self._drop_preexisting(repo, changed, ext))
         return findings
+
+    def _drop_preexisting(self, repo, changed, ext):
+        """External findings on a line whose exact text is already a line of
+        the base blob are dropped: that text is on develop already and the
+        candidate did not add it (a doc placeholder DSN, for example). Our own
+        credential-value matches are never dropped. A finding with no line, a
+        scanner error, or an added file is kept."""
+        by_path = {e.path: e for e in changed if e.status != "D"}
+        kept = []
+        for f in ext:
+            e = by_path.get(f.source[5:]) if f.source.startswith("diff:") else None
+            if e is None or f.line <= 0 or not e.old_sha or set(e.old_sha) == {"0"}:
+                kept.append(f)
+                continue
+            try:
+                new_lines = repo.blob(e.new_sha).splitlines()
+                line = new_lines[f.line - 1] if f.line <= len(new_lines) else None
+                pre = line is not None and line.strip() and line in repo.blob(e.old_sha).splitlines()
+            except Exception:
+                pre = False
+            if pre:
+                self.warnings.append(f"external finding on unchanged line ignored: {f.describe()}")
+            else:
+                kept.append(f)
+        return kept
 
     def scan_texts(self, texts, scan_dir=None):
         """texts: {name: str}. Returns findings over agent-written text."""

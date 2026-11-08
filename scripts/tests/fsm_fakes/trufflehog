@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fake trufflehog: reports a finding for any file containing FAKE-GENERIC-SECRET."""
+"""Fake trufflehog: reports a finding for each line containing FAKE-GENERIC-SECRET."""
 import json, os, sys
 root = sys.argv[2]
 for d, _, files in os.walk(root):
     for f in files:
         p = os.path.join(d, f)
-        if "FAKE-GENERIC-SECRET" in open(p, errors="replace").read():
-            print(json.dumps({"DetectorName": "FakeGeneric", "SourceMetadata": {"Data": {"Filesystem": {"file": p, "line": 1}}}}))
+        for n, line in enumerate(open(p, errors="replace").read().splitlines(), 1):
+            if "FAKE-GENERIC-SECRET" in line:
+                print(json.dumps({"DetectorName": "FakeGeneric", "SourceMetadata": {"Data": {"Filesystem": {"file": p, "line": n}}}}))
