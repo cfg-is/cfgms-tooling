@@ -913,6 +913,14 @@ class Supervisor:
             self.write_manifest()
             self.release()
             self.run.append("terminal_done", state=st)
+        # Still under the run lock, so runindex.gc cannot race this; also runs
+        # when a re-driven run was already done and its cache survived.
+        line = drop_run_cache(self.run)
+        if line:
+            try:
+                self.log(line)
+            except OSError:
+                pass
         if st == T.REFUSED:
             return int(self.x.get("refused_exit", EXIT_REFUSED))
         return {T.REPORT: EXIT_OK, T.NO_OP: EXIT_OK, T.FAILED: EXIT_FAILED}[st]
@@ -1092,6 +1100,33 @@ class Supervisor:
             self.run.append("note", manifest_write_failed=f[:300])
 
 
+def drop_run_cache(run):
+    """Remove the run's validator cache dir (`cache/`: the per-run Go build
+    cache and TMPDIR the validator container mounts) once the run is terminal.
+    Nothing else in the run dir is touched; logs, state.jsonl, the manifest and
+    context/ stay for diagnosis. A terminal run is never validated again, and
+    the cache only speeds a rebuild (the pass/fail record lives in
+    validate/cache.json), so dropping it loses nothing. Best effort: never
+    raises. Records a `note` and returns a log line, or "" when there was no
+    cache."""
+    try:
+        path = run.p("cache")
+        if not os.path.lexists(path):
+            return ""
+        freed, errors = safefs.remove_tree(path)
+        gone = not os.path.lexists(path)
+    except Exception as exc:          # never fail a finished run over its cache
+        freed, errors, gone = 0, [f"{type(exc).__name__}: {exc}"], False
+    try:
+        run.append("note", cache_dropped=gone, cache_freed_bytes=freed,
+                   cache_errors=[e[:200] for e in errors[:5]])
+    except Exception:
+        pass
+    if gone:
+        return f"dropped validation cache ({freed} bytes)"
+    return f"validation cache not fully removed: {'; '.join(errors[:3])[:500]}"
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def _params_from_args(a):
@@ -1265,6 +1300,7 @@ def cmd_abandon(run_id, reason, out=None):
         if params.get("key"):
             run.clear_active(params["key"])
         run.append("terminal_done", state="ABANDONED")
+        drop_run_cache(run)
         print(f"FSM_ABANDONED:{run_id}:{reason}:lease={lease}", file=out, flush=True)
         return EXIT_OK
     finally:

@@ -20,6 +20,8 @@ Tests: the four FSM guarantees that must fail if their guard is removed.
      planted symlink: not at `agent-result.json`, not at its temp names, not at
      the session dir path itself; transcripts are read only from a no-follow
      copy.
+  8. Removing a terminal run's validator cache (safefs.remove_tree) removes
+     read-only trees and never follows a symlink out of the cache.
 
 Each was verified to fail with its guard disabled (see the PR description).
 
@@ -354,6 +356,67 @@ class TestUntrustedDirWrites(Base):
         usage_copy = self.f.run_dir(rid) / "usage" / "s1"
         self.assertTrue(usage_copy.is_dir())
         self.assertFalse((usage_copy / "leak.jsonl").exists())
+
+
+class TestRemoveTreeNoFollow(unittest.TestCase):
+    """safefs.remove_tree (a terminal run's validator cache): read-only trees
+    are removed, symlinks anywhere are unlinked and never followed."""
+
+    def setUp(self):
+        self.root = Path(L.tempfile.mkdtemp(prefix="fsm-rmtree-"))
+        self.outside = self.root / "outside"
+        (self.outside / "sub").mkdir(parents=True)
+        (self.outside / "keep.txt").write_text("CANARY\n")
+        (self.outside / "sub" / "keep2.txt").write_text("CANARY2\n")
+        os.chmod(self.outside / "sub", 0o555)
+
+    def tearDown(self):
+        for dp, dns, _ in os.walk(self.root):
+            for d in dns:
+                p = os.path.join(dp, d)
+                if not os.path.islink(p):
+                    os.chmod(p, 0o755)
+        L.shutil.rmtree(self.root, ignore_errors=True)
+
+    def assert_outside_intact(self):
+        self.assertEqual((self.outside / "keep.txt").read_text(), "CANARY\n")
+        self.assertEqual((self.outside / "sub" / "keep2.txt").read_text(), "CANARY2\n")
+        self.assertEqual(os.stat(self.outside / "sub").st_mode & 0o777, 0o555,
+                         "a directory outside the tree was chmod'ed through a link")
+
+    def test_read_only_tree_and_outside_symlinks(self):
+        cache = self.root / "run" / "cache"
+        mod = cache / "tmp" / "mod" / "dep@v1.0.0" / "inner"
+        mod.mkdir(parents=True)
+        (mod / "a.go").write_text("package a\n")
+        os.chmod(mod / "a.go", 0o444)
+        os.mkdir(cache / "noaccess")
+        (cache / "noaccess" / "f").write_text("x")
+        os.chmod(cache / "noaccess", 0o000)
+        for d in (mod, mod.parent, mod.parent.parent):
+            os.chmod(d, 0o555)
+        os.symlink(self.outside, cache / "dirlink")
+        os.chmod(mod.parent, 0o755)
+        os.symlink(self.outside / "sub", mod.parent / "ro-dirlink")
+        os.chmod(mod.parent, 0o555)
+        os.symlink(self.outside / "keep.txt", cache / "filelink")
+        freed, errors = safefs.remove_tree(cache)
+        self.assertEqual(errors, [])
+        self.assertFalse(os.path.lexists(cache))
+        self.assertTrue((self.root / "run").is_dir(), "only the named tree is removed")
+        self.assertGreater(freed, 0)
+        self.assert_outside_intact()
+
+    def test_tree_path_itself_a_symlink_is_unlinked_not_followed(self):
+        link = self.root / "cache"
+        os.symlink(self.outside, link)
+        freed, errors = safefs.remove_tree(link)
+        self.assertEqual((freed, errors), (0, []))
+        self.assertFalse(os.path.lexists(link))
+        self.assert_outside_intact()
+
+    def test_missing_path_is_a_no_op(self):
+        self.assertEqual(safefs.remove_tree(self.root / "nope"), (0, []))
 
 
 if __name__ == "__main__":

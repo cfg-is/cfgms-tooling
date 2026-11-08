@@ -19,8 +19,11 @@ process from such a directory is first copied out by `copy_regular_tree`.
   copy_regular_tree
                walk with lstat semantics and copy regular files only, each
                opened O_NOFOLLOW, under a total-size cap.
+  remove_tree  fd-based removal that never follows a link and makes each
+               read-only directory writable through its fd before emptying it.
 """
 
+import errno
 import os
 import shutil
 import stat
@@ -81,6 +84,108 @@ def remove_nofollow(path):
         shutil.rmtree(path)
     else:
         os.unlink(path)
+
+
+def _open_child_dir(dfd, name):
+    """Open directory `name` under `dfd` without following a link. A directory
+    with no read/search bit is made owner-accessible first (fchmodat with
+    AT_SYMLINK_NOFOLLOW: a link swapped in is never chmod'ed through)."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        return os.open(name, flags, dir_fd=dfd)
+    except PermissionError:
+        try:
+            os.chmod(name, 0o700, dir_fd=dfd, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), name)
+        return os.open(name, flags, dir_fd=dfd)
+
+
+def _clear_dir_fd(dfd, errors, freed):
+    """Empty the directory open at `dfd`. Every child is reached relative to a
+    directory fd and opened O_NOFOLLOW: a symlink is unlinked, never followed.
+    Each directory is made owner-writable through its fd first, so read-only
+    trees (a Go module cache) can be emptied."""
+    try:
+        os.fchmod(dfd, 0o700)
+    except OSError as exc:
+        errors.append(f"fchmod: {exc.strerror}")
+    try:
+        names = os.listdir(dfd)
+    except OSError as exc:
+        errors.append(f"listdir: {exc.strerror}")
+        return
+    for name in names:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{name}: {exc.strerror}")
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                cfd = _open_child_dir(dfd, name)
+            except OSError as exc:
+                errors.append(f"{name}: {exc.strerror}")
+                continue
+            try:
+                _clear_dir_fd(cfd, errors, freed)
+            finally:
+                os.close(cfd)
+            try:
+                os.rmdir(name, dir_fd=dfd)
+            except OSError as exc:
+                errors.append(f"{name}: {exc.strerror}")
+            continue
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{name}: {exc.strerror}")
+            continue
+        if stat.S_ISREG(st.st_mode):
+            freed[0] += st.st_size
+
+
+def remove_tree(path):
+    """Remove `path` and everything under it without following any symlink.
+
+    For trees candidate code or an agent wrote (a run's validator cache):
+    read-only files and directories are removed (each directory is chmod'ed
+    u+rwx through its own fd first), a symlink anywhere -- `path` itself
+    included -- is unlinked and its target left alone. Never raises on a
+    filesystem error. Returns (bytes_freed, errors); `path` is gone when
+    `errors` is empty.
+    """
+    path = Path(path)
+    errors, freed = [], [0]
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return 0, []
+    except OSError as exc:
+        return 0, [f"lstat: {exc.strerror}"]
+    if not stat.S_ISDIR(st.st_mode):
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            errors.append(f"unlink: {exc.strerror}")
+        return 0, errors
+    try:
+        dfd = _open_dir(path)
+    except UnsafePath as exc:
+        return 0, [str(exc)]
+    try:
+        _clear_dir_fd(dfd, errors, freed)
+    finally:
+        os.close(dfd)
+    try:
+        os.rmdir(path)
+    except OSError as exc:
+        errors.append(f"rmdir: {exc.strerror}")
+    return freed[0], errors
 
 
 def fresh_dir(path, mode=0o700):

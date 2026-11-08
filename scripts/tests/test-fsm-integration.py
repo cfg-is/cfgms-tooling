@@ -181,6 +181,81 @@ class TestRunIndex(unittest.TestCase):
         for other in ("cfg-agent-review-pr-5", "cfg-agent-interactive-x"):
             self.assertTrue((trust / other).exists(), f"non-FSM trust dir {other} is never touched")
 
+    def _plant_cache(self, run):
+        c = run.p("cache")
+        (c / "go-build" / "ab").mkdir(parents=True)
+        (c / "go-build" / "ab" / "entry-d").write_text("x" * 100)
+        ro = c / "tmp" / "mod" / "dep@v1"
+        ro.mkdir(parents=True)
+        (ro / "dep.go").write_text("package dep\n")
+        os.chmod(ro / "dep.go", 0o444)
+        os.chmod(ro, 0o555)
+        os.chmod(ro.parent, 0o555)
+        return c
+
+    def test_gc_drops_cache_of_finished_retained_runs_only(self):
+        fin = [("PREPARE", "gates_ok", "AGENT"), ("AGENT", "error", "FAILED")]
+        done = make_run(self.base, "story-1-done", {"key": "story-1"}, fin, done=True)
+        aband = make_run(self.base, "story-2-ab", {"key": "story-2"}, [("PREPARE", "gates_ok", "AGENT")])
+        aband.append("abandoned", reason="story_closed", state="AGENT")
+        aband.append("terminal_done", state="ABANDONED")
+        crashed = make_run(self.base, "story-3-crashed", {"key": "story-3", "target": "3"},
+                           [("PREPARE", "gates_ok", "VALIDATE")], age=3600, heartbeat=3600)
+        live = make_run(self.base, "story-4-live", {"key": "story-4", "target": "4"},
+                        [("PREPARE", "gates_ok", "VALIDATE")], heartbeat=1)
+        hung = make_run(self.base, "story-5-hung", {"key": "story-5", "target": "5"},
+                        [("PREPARE", "gates_ok", "VALIDATE")], heartbeat=4000)
+        starting = make_run(self.base, "story-6-start", {"key": "story-6", "target": "6"})
+        # done, but its (re-driven) supervisor still holds the lock
+        locked_done = make_run(self.base, "story-7-lockdone", {"key": "story-7"}, fin, done=True)
+        runs = (done, aband, crashed, live, hung, starting, locked_done)
+        caches = {r.run_id: self._plant_cache(r) for r in runs}
+        held = [Held(live), Held(hung), Held(locked_done)]
+        try:
+            statuses = {r["run_id"]: r["status"] for r in runindex.list_runs(self.base)}
+            dry = runindex.gc(self.base, retention_hours=24, trust_base=self.root / "trust",
+                              dry_run=True)
+            self.assertTrue(caches["story-1-done"].exists(), "dry run removes nothing")
+            lines = runindex.gc(self.base, retention_hours=24, trust_base=self.root / "trust")
+        finally:
+            for h in held:
+                h.release()
+        self.assertEqual(statuses, {"story-1-done": "done", "story-2-ab": "abandoned",
+                                    "story-3-crashed": "crashed", "story-4-live": "live",
+                                    "story-5-hung": "hung", "story-6-start": "starting",
+                                    "story-7-lockdone": "done"})
+        want = ["CLEANED:fsm-run-cache:story-1-done:FAILED",
+                "CLEANED:fsm-run-cache:story-2-ab:ABANDONED"]
+        self.assertEqual([l for l in lines if "fsm-run-cache" in l], want)
+        self.assertEqual([l for l in dry if "fsm-run-cache" in l], want)
+        for rid in ("story-1-done", "story-2-ab"):
+            self.assertFalse(os.path.lexists(caches[rid]), rid)
+            rd = self.base / rid
+            self.assertTrue((rd / "state.jsonl").is_file() and (rd / "run.json").is_file(),
+                            "a retained run dir keeps everything but cache/")
+        for rid in ("story-3-crashed", "story-4-live", "story-5-hung", "story-6-start",
+                    "story-7-lockdone"):
+            self.assertTrue((caches[rid] / "tmp" / "mod" / "dep@v1" / "dep.go").is_file(), rid)
+            self.assertTrue((caches[rid] / "go-build" / "ab" / "entry-d").is_file(), rid)
+        for rid in caches:   # let tearDown remove the read-only trees
+            for d in (caches[rid] / "tmp" / "mod", caches[rid] / "tmp" / "mod" / "dep@v1"):
+                if d.exists():
+                    os.chmod(d, 0o755)
+
+    def test_abandon_drops_cache(self):
+        r = make_run(self.base, "story-8-crashed", {"key": "story-8", "target": "8"},
+                     [("PREPARE", "gates_ok", "VALIDATE")], age=3600)
+        cache = self._plant_cache(r)
+        env = dict(os.environ, CFGMS_FSM_RUNS_DIR=str(self.base))
+        p = subprocess.run([sys.executable, str(L.SUPERVISOR), "abandon", r.run_id,
+                            "--reason", "story_closed"], capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"FSM_ABANDONED:{r.run_id}:story_closed", p.stdout)
+        self.assertFalse(os.path.lexists(cache))
+        notes = [x for x in r.records() if x.get("type") == "note" and "cache_dropped" in x]
+        self.assertEqual([n["cache_dropped"] for n in notes], [True])
+        self.assertTrue(r.p("state.jsonl").is_file())
+
     def test_protected_session_dirs(self):
         live = make_run(self.base, "story-4-live", {"key": "story-4"}, [("PREPARE", "gates_ok", "AGENT")],
                         heartbeat=1)

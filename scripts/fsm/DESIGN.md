@@ -233,7 +233,10 @@ synced candidates: the develop tip it was rebased onto), the candidate tree
 `security-precommit` and `check-architecture` see the change, and merge-base
 based gates such as complexity/duplication/frontend work), and a writable
 private `.git`. Go caches are per-run (image-baked module cache plus a
-per-run build cache directory), never the shared named volumes.
+per-run build cache directory, `<run>/cache/`), never the shared named
+volumes. The supervisor removes `<run>/cache/` when the run reaches a terminal
+state (a `note` with `cache_dropped` in `state.jsonl`, a line in
+`logs/supervisor.log`); a crashed, resumable run keeps it.
 
 The entrypoint (`devcontainer/fsm-validate-entrypoint.sh`, image-baked) runs
 `init-firewall.sh` as root, drops to `agent`, and runs
@@ -384,7 +387,8 @@ A crash between sub-steps resumes at the first incomplete one (§11).
   finished elsewhere, then removes run dirs of finished runs (done or
   abandoned, crashed past `CFGMS_FSM_CRASHED_TTL_HOURS` included) whose lock
   is free and that have been idle for `CFGMS_FSM_RUN_RETENTION_HOURS` (24 h),
-  plus stale `active/` entries, old launch logs and the FSM trust dirs
+  the `cache/` dir of finished, unlocked runs still inside retention (a
+  supervisor that died before dropping it at the terminal state), plus stale `active/` entries, old launch logs and the FSM trust dirs
   (`<trust base>/fsm/`) of runs that are not unfinished. Nothing of an
   unfinished run (in flight or crashed) is removed: not its run dir, its
   containers, its session or trust dirs. A container whose run state cannot
