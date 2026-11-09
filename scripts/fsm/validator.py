@@ -22,6 +22,7 @@ A `(BASE, develop tip, tree)` triple that passed is cached and never validated a
 """
 
 import json
+import re
 import os
 import time
 from pathlib import Path
@@ -34,6 +35,14 @@ CANDIDATE_MOUNT = "/fsm/candidate"
 IMAGE = os.environ.get("CFGMS_FSM_IMAGE", "cfg-agent:latest")
 DEFAULT_TIMEOUT_MIN = int(os.environ.get("CFGMS_FSM_VALIDATE_TIMEOUT_MIN", "75"))
 LOG_TAIL_LINES = 400
+# On a failed run the validator reads this many lines instead. Parallel test
+# shards (test-framework-api-sharded runs 8 at once) print a failing shard's
+# output long before the last 400 lines, so a 400-line tail can hold only a
+# passing shard and the make error, and name no failing test.
+FAIL_LOG_LINES = 50000
+FAIL_EXCERPT_MAX = 300
+FAIL_CONTEXT = 6
+_FAIL_RE = re.compile(r"^(--- FAIL|FAIL\s|panic:|WARNING: DATA RACE|fatal error:|\s+Error Trace:|\s+Error:|make(\[\d+\])?: \*\*\*)")
 
 
 def container_name(target):
@@ -154,8 +163,12 @@ def run_validator(docker, argv, name, timeout_min, log_path):
     if code is None and not tail_note:
         timed_out = True
         docker.kill(name)
-    tail = docker.logs_tail(name, LOG_TAIL_LINES)
+    failed = not (code == 0 and not timed_out)
+    tail = docker.logs_tail(name, FAIL_LOG_LINES if failed else LOG_TAIL_LINES)
     docker.rm_force(name)
+    excerpt = failure_excerpt(tail) if failed else ""
+    if excerpt:
+        tail = excerpt + "\n\n=== log ===\n" + tail
     Path(log_path).write_text(tail)
     if timed_out:
         verdict = "infra_error"
@@ -170,4 +183,32 @@ def run_validator(docker, argv, name, timeout_min, log_path):
         verdict = "fail"
     return {"verdict": verdict, "exit_code": code, "timed_out": timed_out,
             "duration_seconds": int(time.time() - started),
-            "log_tail": (tail_note + "\n" + tail).strip()[-20000:]}
+            "log_tail": _summary(tail_note, excerpt, tail)}
+
+
+def failure_excerpt(text):
+    """The failure lines of a test log with FAIL_CONTEXT lines after each,
+    capped at FAIL_EXCERPT_MAX lines; "" when nothing matches."""
+    lines = text.splitlines()
+    keep = []
+    for i, ln in enumerate(lines):
+        if _FAIL_RE.match(ln):
+            keep.extend(range(i, min(len(lines), i + FAIL_CONTEXT + 1)))
+    if not keep:
+        return ""
+    out, last = [], -2
+    for i in sorted(set(keep)):
+        if i != last + 1:
+            out.append("...")
+        out.append(lines[i])
+        last = i
+    return "=== failure lines ===\n" + "\n".join(out[:FAIL_EXCERPT_MAX])
+
+
+def _summary(note, excerpt, tail):
+    """At most 20000 characters for the fix agent: the failure lines first,
+    then as much of the end of the log as fits."""
+    head = (note + "\n" + excerpt).strip()
+    budget = 20000 - len(head) - 2
+    rest = tail if not excerpt else tail.split("\n\n=== log ===\n", 1)[-1]
+    return (head + "\n\n" + (rest[-budget:] if budget > 0 else "")).strip()[:20000]
