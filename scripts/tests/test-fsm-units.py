@@ -367,6 +367,45 @@ class TestValidatorAndAgentArgv(RepoCase):
         self.assertTrue(r["timed_out"])
         self.assertEqual([c[0] for c in calls], ["rm", "run", "wait", "kill", "rm"])
 
+    def test_failed_validation_keeps_failure_lines_beyond_the_tail(self):
+        # a failing shard prints early; thousands of passing-shard lines follow
+        log = (["=== RUN   TestEarly", "--- FAIL: TestEarly (0.01s)",
+                "    x_test.go:9: boom", "FAIL\tgithub.com/x/api\t1.2s"]
+               + [f"ok line {i}" for i in range(5000)]
+               + ["make[1]: *** [Makefile:990: test-framework-api-sharded] Error 1"])
+        asked = []
+
+        class D:
+            def rm_force(self, n): pass
+            def run_detached(self, argv): pass
+            def wait(self, n, t): return 2
+            def kill(self, n): pass
+            def logs_tail(self, n, lines):
+                asked.append(lines)
+                return "\n".join(log[-lines:])
+        r = validator.run_validator(D(), ["run", "-d"], "cfg-validate-1", 1, self.run / "v.log")
+        self.assertEqual(r["verdict"], "fail")
+        self.assertGreater(asked[0], validator.LOG_TAIL_LINES)
+        self.assertIn("--- FAIL: TestEarly", r["log_tail"])
+        self.assertIn("x_test.go:9: boom", r["log_tail"])
+        self.assertLessEqual(len(r["log_tail"]), 20000)
+        self.assertTrue(r["log_tail"].startswith("=== failure lines ==="))
+        self.assertIn("--- FAIL: TestEarly", (self.run / "v.log").read_text())
+
+    def test_passing_validation_keeps_the_short_tail(self):
+        asked = []
+
+        class D:
+            def rm_force(self, n): pass
+            def run_detached(self, argv): pass
+            def wait(self, n, t): return 0
+            def kill(self, n): pass
+            def logs_tail(self, n, lines): asked.append(lines); return "ok"
+        r = validator.run_validator(D(), ["run", "-d"], "cfg-validate-1", 1, self.run / "v.log")
+        self.assertEqual(r["verdict"], "pass")
+        self.assertEqual(asked, [validator.LOG_TAIL_LINES])
+        self.assertNotIn("failure lines", r["log_tail"])
+
     def agent_argv(self, **kw):
         base = dict(name="cfg-agent-7", mode="issue", kind="implement", seq=1, run_id="r",
                     workspace="/w", context_dir="/c", out_dir="/o", session_dir="/s", trust="/t",
