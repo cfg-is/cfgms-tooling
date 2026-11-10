@@ -12,8 +12,11 @@ there are no implicit edges.
 Budgets: every AGENT(fix) entry consumes one `fix_budget` (default 3), every
 AGENT(resolve) entry one `resolve_budget` (default 2). Every loop in the table
 passes through one of those, so each run terminates. VALIDATE infra errors get
-one retry (`validator_retries`). The cross-run cap (§10) is a PREPARE gate:
-`cross_run_cap_reached` routes to REFUSED.
+one retry (`validator_retries`). A fix session that answers a VALIDATE failure
+but changes nothing and writes out/noop.txt gets one re-validation of the same
+tree (`revalidate_budget`); a second failure ends FAILED(validation_unreproducible).
+The cross-run cap (§10) is a PREPARE gate: `cross_run_cap_reached` routes to
+REFUSED.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -42,6 +45,7 @@ MODES = ("issue", "branch", "item", "fix-pr", "resolve-conflict")
 DEFAULT_FIX_BUDGET = 3
 DEFAULT_RESOLVE_BUDGET = 2
 DEFAULT_VALIDATOR_RETRIES = 1
+DEFAULT_REVALIDATE_BUDGET = 1
 DEFAULT_CROSS_RUN_CAP = 2
 
 
@@ -57,6 +61,9 @@ class Ctx:
     fix_budget: int = DEFAULT_FIX_BUDGET
     resolve_budget: int = DEFAULT_RESOLVE_BUDGET
     validator_retries: int = DEFAULT_VALIDATOR_RETRIES
+    revalidate_budget: int = DEFAULT_REVALIDATE_BUDGET
+    after_validate_fail: bool = False  # the AGENT(fix) session answers a VALIDATE failure
+    revalidating: bool = False     # this VALIDATE re-checks a tree the fix session left unchanged
     synced: bool = False           # candidate is on the develop tip it will be published on
     noop: bool = False             # the last fix session wrote out/noop.txt
     wip_draft: bool = False        # target PR is a WIP draft from an earlier failed run
@@ -88,6 +95,11 @@ GUARDS = {
     "mode_resolve_conflict": lambda c: c.mode == "resolve-conflict",
     "cross_run_cap_reached": lambda c: c.cross_run_attempts >= c.cross_run_cap,
     "kind_implement": lambda c: c.kind == KIND_IMPLEMENT,
+    "fix_noop_after_validate_fail_revalidate_left":
+        lambda c: c.kind == KIND_FIX and c.noop and c.after_validate_fail and c.revalidate_budget > 0,
+    "fix_noop_after_validate_fail_revalidate_spent":
+        lambda c: c.kind == KIND_FIX and c.noop and c.after_validate_fail and c.revalidate_budget <= 0,
+    "revalidating": lambda c: c.revalidating,
     "kind_fix_noop_wip_draft": lambda c: c.kind == KIND_FIX and c.noop and c.wip_draft,
     "kind_fix_noop": lambda c: c.kind == KIND_FIX and c.noop,
     "kind_fix_budget_left": lambda c: c.kind == KIND_FIX and c.fix_budget > 0,
@@ -113,8 +125,9 @@ class Edge:
     to: str
     kind: str = ""        # AGENT session kind
     reason: str = ""      # FAILED / REFUSED reason
-    consume: str = ""     # "fix" | "resolve" | "validator_retry"
+    consume: str = ""     # "fix" | "resolve" | "validator_retry" | "revalidate"
     sets_synced: bool = False
+    after_validate_fail: bool = False  # this AGENT(fix) entry answers a VALIDATE failure
 
 
 TABLE = {
@@ -134,6 +147,11 @@ TABLE = {
     # SNAPSHOT ------------------------------------------------------------
     (SNAPSHOT, "unchanged"): [
         Edge("kind_implement", FAILED, reason="zero_work"),
+        # A fix session that answered a VALIDATE failure could not reproduce it:
+        # re-validate the same tree once rather than discard validated work.
+        Edge("fix_noop_after_validate_fail_revalidate_left", VALIDATE, consume="revalidate"),
+        Edge("fix_noop_after_validate_fail_revalidate_spent", FAILED,
+             reason="validation_unreproducible"),
         Edge("kind_fix_noop_wip_draft", VALIDATE),
         Edge("kind_fix_noop", NO_OP),
         Edge("kind_fix_budget_left", AGENT, kind=KIND_FIX, consume="fix"),
@@ -157,7 +175,8 @@ TABLE = {
         Edge("synced", PUBLISH),
     ],
     (VALIDATE, "fail"): [
-        Edge("fix_budget_left", AGENT, kind=KIND_FIX, consume="fix"),
+        Edge("revalidating", FAILED, reason="validation_unreproducible"),
+        Edge("fix_budget_left", AGENT, kind=KIND_FIX, consume="fix", after_validate_fail=True),
         Edge("fix_budget_spent", FAILED, reason="validation"),
     ],
     (VALIDATE, "infra_error"): [
@@ -199,6 +218,7 @@ class Result:
     guard: str = ""
     consume: str = ""
     sets_synced: bool = False
+    after_validate_fail: bool = False
 
 
 def transition(state, event, ctx):
@@ -211,7 +231,7 @@ def transition(state, event, ctx):
     for edge in edges:
         if GUARDS[edge.guard](ctx):
             return Result(edge.to, edge.kind, edge.reason, edge.guard, edge.consume,
-                          edge.sets_synced)
+                          edge.sets_synced, edge.after_validate_fail)
     raise InvalidTransition(
         f"({state}, {event!r}): no guard holds (tried {[e.guard for e in edges]})"
     )
@@ -227,9 +247,17 @@ def apply(result, ctx):
         ctx.resolve_rounds += 1
     elif result.consume == "validator_retry":
         ctx.validator_retries -= 1
+    elif result.consume == "revalidate":
+        ctx.revalidate_budget -= 1
     if result.sets_synced:
         ctx.synced = True
+    # `revalidating` lasts while the run stays in VALIDATE (an infra retry keeps it).
+    if result.consume == "revalidate":
+        ctx.revalidating = True
+    elif result.state != VALIDATE:
+        ctx.revalidating = False
     if result.state == "AGENT":
         ctx.kind = result.kind
         ctx.noop = False
+        ctx.after_validate_fail = result.after_validate_fail
     return ctx

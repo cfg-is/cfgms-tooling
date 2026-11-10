@@ -162,6 +162,57 @@ class TestIssueMode(Base):
         self.assertIn("moved", self.f.remote_show(head, "README.md"))
         self.assertIn("func N", self.f.remote_show(head, "src/new.go"))
 
+    # validate pass -> SYNC rebased -> validate fail (load-related, unreproducible)
+    # -> fix session changes nothing and writes out/noop.txt
+    UNREPRODUCIBLE = [{"op": "out", "name": "noop.txt",
+                       "content": "could not reproduce the failure; nothing to change"}]
+
+    def test_unreproducible_failure_revalidated_then_published(self):
+        hooks = {"0": [{"path": "README.md", "content": "# fixture moved\n"}]}
+        rc, out, rid = self.run_issue([GOOD, self.UNREPRODUCIBLE], validate=[0, 2, 0],
+                                      validate_hooks=hooks)
+        self.assertEqual(rc, 0, out)
+        path = self.f.path_states(rid)
+        self.assertEqual(path[-6:], [("SYNC", "rebased", "VALIDATE"),
+                                     ("VALIDATE", "fail", "AGENT"),
+                                     ("AGENT", "session_ended", "SNAPSHOT"),
+                                     ("SNAPSHOT", "unchanged", "VALIDATE"),
+                                     ("VALIDATE", "pass", "PUBLISH"),
+                                     ("PUBLISH", "published", "REPORT")])
+        self.assertNotIn("NO_OP", [to for (_, _, to) in path])
+        v = self.validates()
+        self.assertEqual([r["exit"] for r in v], [0, 2, 0])
+        self.assertEqual(v[1]["validated_tree"], v[2]["validated_tree"])   # same tree re-validated
+        head = self.f.remote_head(BRANCH)
+        self.assertEqual(self.f.remote_tree(head), v[2]["validated_tree"])
+        self.assertEqual(L.git(self.f.remote, "rev-parse", f"{head}^"), self.f.remote_head("develop"))
+        pr = self.f.gh()["prs"][0]
+        self.assertEqual((pr["title"], pr["isDraft"]), ("src: add N (Issue #42)", False))
+        m = self.f.manifest(rid)
+        self.assertEqual((m["validation_passed"], m["fsm_final_state"], m["fix_rounds"]),
+                         (True, "REPORT", 1))
+        self.assert_common(rid)
+
+    def test_unreproducible_failure_fails_again_wip(self):
+        hooks = {"0": [{"path": "README.md", "content": "# fixture moved\n"}]}
+        rc, out, rid = self.run_issue([GOOD, self.UNREPRODUCIBLE], validate=[0, 2, 2],
+                                      validate_hooks=hooks)
+        self.assertEqual(rc, 1, out)
+        path = self.f.path_states(rid)
+        self.assertEqual(path[-2:], [("SNAPSHOT", "unchanged", "VALIDATE"),
+                                     ("VALIDATE", "fail", "FAILED")])
+        self.assertEqual(self.f.manifest(rid)["fsm_reason"], "validation_unreproducible")
+        self.assertEqual(len(self.validates()), 3)
+        self.assertEqual([a["kind"] for a in self.f.records("docker-agent")], ["implement", "fix"])
+        # FAILED keeps the candidate as a WIP draft PR
+        pr = self.f.gh()["prs"][0]
+        self.assertTrue(pr["isDraft"])
+        self.assertEqual(pr["title"], f"WIP: {BRANCH} (agent failed)")
+        self.assertIn("FSM-Reason: validation_unreproducible", pr["body"])
+        head = self.f.remote_head(BRANCH)
+        self.assertIn("func N", self.f.remote_show(head, "src/new.go"))
+        self.assert_common(rid)
+
     def test_conflict_with_develop_resolve(self):
         mine = [{"op": "write", "path": "src/util.go",
                  "content": "package src\n\nfunc U() int {\n\treturn 2\n}\n"},
