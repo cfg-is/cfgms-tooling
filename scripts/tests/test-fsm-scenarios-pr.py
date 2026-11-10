@@ -65,6 +65,27 @@ class TestFixPr(Base):
         ctx = self.f.run_dir(rid) / "context"
         self.assertTrue((ctx / "pr.md").is_file() and (ctx / "reviews.md").is_file())
 
+    def test_fix_pr_two_sessions_subject_from_first(self):
+        self.make_pr()
+        first = [{"op": "write", "path": "src/new.go", "content": "package src\n// FAIL_VALIDATION\n"},
+                 {"op": "out", "name": "summary.md", "content": "Addressed the review finding."},
+                 {"op": "out", "name": "commit-subject.txt",
+                  "content": "src: address the review finding (Issue #42)"}]
+        second = [{"op": "write", "path": "src/new.go", "content": "package src\n// v2 fixed\n"},
+                  {"op": "out", "name": "summary.md", "content": "Fixed the validation failure."},
+                  {"op": "out", "name": "commit-subject.txt",
+                   "content": "src: fix the validation failure (Issue #42)"}]
+        rc, out, rid = self.run_mode("fix-pr", 50, [first, second])
+        self.assertEqual(rc, 0, out)
+        head = self.f.remote_head(BRANCH)
+        msg = L.git(self.f.remote, "log", "-1", "--format=%B", head)
+        self.assertEqual(msg.splitlines()[0], "src: address the review finding (Issue #42)")
+        pr = self.f.gh()["prs"][0]
+        self.assertEqual(pr["title"], "src: add N (Issue #42)")
+        comment = pr["comments"][0]["body"]
+        self.assertLess(comment.index("Addressed the review finding."),
+                        comment.index("- Fix round 1: Fixed the validation failure."))
+
     def test_fix_pr_noop(self):
         head0 = self.make_pr()
         sess = [[{"op": "out", "name": "noop.txt", "content": "the finding is already addressed"}]]

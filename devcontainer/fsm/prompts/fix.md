@@ -28,6 +28,11 @@ Read the context in this order:
 Not every file exists in every fix session: a fix inside the supervisor's own
 validation loop has `failure.md` and `spec.md` only.
 
+When `failure.md` is present, an earlier session of this run already wrote the
+commit subject and the summary that leads the pull request text. Your
+`commit-subject.txt` is ignored, and only the first line of your `summary.md`
+is published, as `Fix round N: <first line>`.
+
 ## Phase 1: Understand and fix
 
 1. Read the code at every location the context names.
