@@ -106,6 +106,8 @@ AGENT ─session ended (any exit)───────▶ SNAPSHOT
       ─container timeout/error─────────▶ SNAPSHOT        (work may still be salvageable; reason recorded)
 
 SNAPSHOT ─tree == start tree, kind=implement───────────────▶ FAILED(zero_work)
+         ─tree == start tree, kind=fix, out/noop.txt, fix answered VALIDATE fail
+                                                            ▶ VALIDATE(revalidate) if revalidate_budget else FAILED(validation_unreproducible)
          ─tree == start tree, kind=fix, out/noop.txt───────▶ NO_OP
          ─tree == start tree, kind=fix, no noop────────────▶ AGENT(fix) if fix_budget else FAILED(no_change)
          ─filter or scan violation, fix_budget left────────▶ AGENT(fix)   context = violation list
@@ -116,6 +118,7 @@ SNAPSHOT ─tree == start tree, kind=implement───────────�
 VALIDATE ─cache hit (same BASE, same tree already passed)──▶ (next as below)
          ─pass, not yet synced─────────────────────────────▶ SYNC
          ─pass, synced─────────────────────────────────────▶ PUBLISH
+         ─fail, re-validating an unchanged tree────────────▶ FAILED(validation_unreproducible)
          ─fail, fix_budget left────────────────────────────▶ AGENT(fix)   context = log tail
          ─fail, spent──────────────────────────────────────▶ FAILED(validation)
          ─validator timeout/infra error (1 retry)──────────▶ VALIDATE | FAILED(validator_error)
@@ -135,6 +138,16 @@ resolution is validated like any other change. The single `fix_budget` (default
 3) counts every AGENT(fix) entry; `resolve_budget` defaults to 2. Every loop
 consumes a budget, so each run terminates. A cross-run cap (§10) stops the
 WIP-resume loop between runs.
+
+A validation failure the fix session cannot reproduce (it changes nothing and
+writes `out/noop.txt`) does not end the run in NO_OP: the same tree is
+validated once more, counted against `revalidate_budget` (default 1, recorded in
+the state context with the `after_validate_fail` / `revalidating` flags). Only
+passing results are cached, so the re-validation runs the validator again. A
+pass continues to SYNC or PUBLISH as usual; a second failure ends
+FAILED(validation_unreproducible), which keeps the candidate as a WIP draft
+(§10). NO_OP remains the outcome for a fix session with nothing actionable that
+did not answer a VALIDATE failure (for example the first fix-pr session).
 
 ### 5.2 Mode specifics
 - **issue / branch:** branch = today's names (`feature/story-N-agent`,

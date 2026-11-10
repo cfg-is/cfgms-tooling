@@ -24,12 +24,14 @@ KINDS = ("", T.KIND_IMPLEMENT, T.KIND_FIX, T.KIND_RESOLVE)
 
 
 def all_ctxs():
-    for (mode, kind, fb, rb, vr, synced, noop, wip, secret, att) in itertools.product(
+    for (mode, kind, fb, rb, vr, synced, noop, wip, secret, att, rv, avf, rving) in itertools.product(
             T.MODES, KINDS, (0, 1), (0, 1), (0, 1), (False, True), (False, True),
-            (False, True), (False, True), (0, T.DEFAULT_CROSS_RUN_CAP)):
+            (False, True), (False, True), (0, T.DEFAULT_CROSS_RUN_CAP), (0, 1),
+            (False, True), (False, True)):
         yield T.Ctx(mode=mode, kind=kind, fix_budget=fb, resolve_budget=rb, validator_retries=vr,
                     synced=synced, noop=noop, wip_draft=wip, secret=secret,
-                    cross_run_attempts=att)
+                    cross_run_attempts=att, revalidate_budget=rv, after_validate_fail=avf,
+                    revalidating=rving)
 
 
 class TestTable(unittest.TestCase):
@@ -100,8 +102,48 @@ class TestTable(unittest.TestCase):
         self.assertEqual((r.kind, c.resolve_budget, c.synced), (T.KIND_RESOLVE, 1, True))
 
     def test_defaults_match_design(self):
-        self.assertEqual((T.DEFAULT_FIX_BUDGET, T.DEFAULT_RESOLVE_BUDGET, T.DEFAULT_CROSS_RUN_CAP),
-                         (3, 2, 2))
+        self.assertEqual((T.DEFAULT_FIX_BUDGET, T.DEFAULT_RESOLVE_BUDGET, T.DEFAULT_CROSS_RUN_CAP,
+                          T.DEFAULT_REVALIDATE_BUDGET), (3, 2, 2, 1))
+
+    def test_unchanged_after_validate_fail_revalidates_once(self):
+        c = T.Ctx(mode="issue", synced=True)
+        r = T.transition(T.VALIDATE, "fail", c)
+        T.apply(r, c)
+        self.assertEqual((r.state, r.kind, c.after_validate_fail), (T.AGENT, T.KIND_FIX, True))
+        c.noop = True                       # the fix session could not reproduce the failure
+        r = T.transition(T.SNAPSHOT, "unchanged", c)
+        T.apply(r, c)
+        self.assertEqual((r.state, c.revalidate_budget, c.revalidating), (T.VALIDATE, 0, True))
+        # an infra retry keeps the re-validation; a second failure is unreproducible
+        T.apply(T.transition(T.VALIDATE, "infra_error", c), c)
+        self.assertTrue(c.revalidating)
+        r = T.transition(T.VALIDATE, "fail", c)
+        self.assertEqual((r.state, r.reason), (T.FAILED, "validation_unreproducible"))
+        # a passing re-validation continues as normal and clears the flag
+        r = T.transition(T.VALIDATE, "pass", c)
+        T.apply(r, c)
+        self.assertEqual((r.state, c.revalidating), (T.PUBLISH, False))
+        # the budget is spent: a later unreproducible failure ends FAILED, not NO_OP
+        c2 = T.Ctx(mode="issue", kind=T.KIND_FIX, noop=True, after_validate_fail=True,
+                   revalidate_budget=0)
+        r = T.transition(T.SNAPSHOT, "unchanged", c2)
+        self.assertEqual((r.state, r.reason), (T.FAILED, "validation_unreproducible"))
+
+    def test_noop_without_validate_fail_still_no_op(self):
+        # fix-pr: the first fix session finds nothing actionable
+        c = T.Ctx(mode="fix-pr")
+        T.apply(T.transition(T.PREPARE, "gates_ok", c), c)
+        self.assertFalse(c.after_validate_fail)
+        c.noop = True
+        self.assertEqual(T.transition(T.SNAPSHOT, "unchanged", c).state, T.NO_OP)
+        # a fix session that answered a snapshot violation, not a VALIDATE failure
+        c = T.Ctx(mode="issue", kind=T.KIND_FIX, after_validate_fail=True)
+        T.apply(T.transition(T.SNAPSHOT, "violation", c), c)
+        c.noop = True
+        self.assertEqual(T.transition(T.SNAPSHOT, "unchanged", c).state, T.NO_OP)
+        # implement session with no change keeps FAILED(zero_work)
+        r = T.transition(T.SNAPSHOT, "unchanged", T.Ctx(mode="issue", kind=T.KIND_IMPLEMENT))
+        self.assertEqual((r.state, r.reason), (T.FAILED, "zero_work"))
 
     def test_mode_entry_edges(self):
         for mode, want in (("issue", (T.AGENT, T.KIND_IMPLEMENT)), ("item", (T.AGENT, T.KIND_IMPLEMENT)),
@@ -118,7 +160,7 @@ class TestTermination(unittest.TestCase):
 
     def key(self, state, c):
         return (state, c.mode, c.kind, c.fix_budget, c.resolve_budget, c.validator_retries,
-                c.synced)
+                c.synced, c.revalidate_budget, c.after_validate_fail, c.revalidating)
 
     def successors(self, state, c):
         out = []
