@@ -108,7 +108,11 @@ you write to. Write regular files only (no symlinks).
 ### `/fsm/out/summary.md`
 
 Markdown for the pull request body (implementation) or the round comment
-(fix, resolve): what you changed and why, the files and tests you added or
+(fix, resolve). Only the first session of a run supplies the full text; a
+later session in the same run (a fix after the supervisor rejected or failed
+the candidate, a conflict resolution) is listed with the **first line** of its
+summary only, so start with one line that says what that session changed.
+Cover what you changed and why, the files and tests you added or
 changed, which review findings or failures you addressed, the checks you ran
 yourself and their results (labelled as your own, advisory runs), and
 anything left unresolved. The supervisor adds its own validation section.
@@ -127,7 +131,10 @@ Exactly one line, at most 200 characters:
 `<scope>` is lowercase letters, digits and `/_.-` (for example `steward` or
 `controller/api`). No closing keyword, `@mention` or HTML comment. The
 supervisor adds `Fixes #N` and the trailers; an invalid subject is replaced
-with the story title.
+with the story title. Only the first session of a run sets the subject (it
+becomes the commit subject and the pull request title, and describes the
+change as a whole); a later session's subject is ignored, so do not reword it
+to describe a fix round.
 
 ### `/fsm/out/followups.json`
 

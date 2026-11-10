@@ -275,8 +275,8 @@ class TestSymlinkedOutputNotRead(Base):
         rc, out, rid = self.run_issue(sess)
         self.assertEqual(rc, 0, out)
         self.assertNotIn("HOST-PRIVATE-CONTENT-7f3a", self.f.published_texts())
-        self.assertNotIn("HOST-PRIVATE-CONTENT-7f3a", (self.f.run_dir(rid) / "summary.md").read_text()
-                         if (self.f.run_dir(rid) / "summary.md").exists() else "")
+        for kept in self.f.run_dir(rid).glob("summary*.md"):
+            self.assertNotIn("HOST-PRIVATE-CONTENT-7f3a", kept.read_text())
         notes = [r for r in self.f.state_records(rid, "note") if "output_problems" in r]
         self.assertEqual(notes[0]["output_problems"], {"summary": "symlink"})
 

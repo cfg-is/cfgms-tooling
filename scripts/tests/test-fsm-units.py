@@ -325,6 +325,26 @@ class TestOutputs(unittest.TestCase):
         self.assertTrue(probs)
         self.assertEqual(outputs.parse_followups(data, epic=None)[0], [])
 
+    def test_first_line(self):
+        self.assertEqual(outputs.first_line("\n\n## Split  the\thelper\nrest"), "Split the helper")
+        self.assertEqual(outputs.first_line("- item"), "item")
+        self.assertEqual(outputs.first_line(""), "")
+        long = outputs.first_line("x" * 500)
+        self.assertEqual(len(long), outputs.FIRST_LINE_MAX)
+        self.assertTrue(long.endswith("..."))
+
+    def test_compose_summary(self):
+        c = outputs.compose_summary
+        self.assertEqual(c("lead text", []), "lead text")
+        got = c("lead", [(1, "fix", "fixed it\nmore"), (2, "resolve", ""), (3, "fix", "again")])
+        self.assertEqual(got, "lead\n\n## Later sessions in this run\n\n"
+                              "- Fix round 1: fixed it\n- Resolve round 2: (no summary written)\n"
+                              "- Fix round 3: again")
+        # later text is sanitised and the result is size-capped
+        self.assertNotIn("@x", c("", [(1, "fix", "cc @x <!-- m -->")]))
+        big = c("y" * (outputs.SUMMARY_MAX + 10), [(1, "fix", "z")])
+        self.assertLessEqual(len(big), outputs.SUMMARY_MAX + len("\n\n[truncated]"))
+
 
 class TestValidatorAndAgentArgv(RepoCase):
     def test_clone_layout(self):

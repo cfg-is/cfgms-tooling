@@ -156,6 +156,41 @@ def validate_subject(subject, issue=None, item_last12=None):
     return s
 
 
+# --- PR body from the run's sessions (§9) ---------------------------------------
+
+FIRST_LINE_MAX = 200
+SUMMARY_MAX = 60000
+
+
+def first_line(text, max_len=FIRST_LINE_MAX):
+    """The first non-empty line of a summary, without Markdown heading/list
+    markers, whitespace-collapsed and capped."""
+    for ln in (text or "").splitlines():
+        s = " ".join(ln.strip().lstrip("#>*-+ \t").split())
+        if s:
+            return s if len(s) <= max_len else s[:max_len - 3].rstrip() + "..."
+    return ""
+
+
+def compose_summary(lead, later):
+    """The run's summary text for the PR body / round comment.
+
+    `lead` is the summary of the run's first session (the implement session in
+    implement modes): it describes the change. `later` lists the later sessions
+    in order as (round_number, kind, summary); each contributes one line, so a
+    fix or resolve session can never replace the lead. Inputs are already
+    sanitised; the result is sanitised again to enforce the size cap.
+    """
+    parts = [lead.strip()] if (lead or "").strip() else []
+    lines = []
+    for n, kind, text in later:
+        label = "Resolve round" if kind == "resolve" else "Fix round"
+        lines.append(f"- {label} {n}: {first_line(text) or '(no summary written)'}")
+    if lines:
+        parts.append("## Later sessions in this run\n\n" + "\n".join(lines))
+    return sanitize("\n\n".join(parts), max_len=SUMMARY_MAX)
+
+
 def parse_followups(text, epic=None):
     """Follow-up stories from out/followups.json, sanitised and capped.
 

@@ -229,6 +229,86 @@ class TestIssueMode(Base):
         self.assertEqual(self.f.records("docker-agent"), [])
 
 
+class TestPrTextFromImplementSession(Base):
+    """The PR title, commit subject and body lead come from the implement
+    session; a later fix session adds one line and cannot replace them."""
+
+    IMPL_SUBJECT = "src: add N (Issue #42)"
+    FIX_SUBJECT = "src: split N to satisfy the complexity gate (Issue #42)"
+
+    def published(self, rid):
+        prs = self.f.gh()["prs"]
+        self.assertEqual(len(prs), 1)
+        head = self.f.remote_head(BRANCH)
+        return prs[0], L.git(self.f.remote, "log", "-1", "--format=%B", head)
+
+    def test_implement_then_fix(self):
+        impl = [{"op": "write", "path": "src/new.go", "content": "package src\n// FAIL_VALIDATION\n"},
+                {"op": "out", "name": "summary.md",
+                 "content": "## Add N\n\nAdds N to src so the story's callers can use it."},
+                {"op": "out", "name": "commit-subject.txt", "content": self.IMPL_SUBJECT}]
+        fix = [{"op": "write", "path": "src/new.go", "content": "package src\n"},
+               {"op": "out", "name": "summary.md",
+                "content": "Split N to satisfy the complexity gate.\n\nMore detail."},
+               {"op": "out", "name": "commit-subject.txt", "content": self.FIX_SUBJECT}]
+        rc, out, rid = self.run_issue([impl, fix])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([a["kind"] for a in self.f.records("docker-agent")], ["implement", "fix"])
+        pr, msg = self.published(rid)
+        self.assertEqual(pr["title"], self.IMPL_SUBJECT)
+        self.assertEqual(msg.splitlines()[0], self.IMPL_SUBJECT)
+        self.assertNotIn(self.FIX_SUBJECT, pr["title"] + msg)
+        body = pr["body"]
+        self.assertTrue(body.startswith("## Add N\n\nAdds N to src"), body)
+        lead = body.index("Adds N to src")
+        line = body.index("- Fix round 1: Split N to satisfy the complexity gate.")
+        self.assertLess(lead, line)
+        self.assertNotIn("More detail.", body)
+        self.assertLess(line, body.index("## Validation (supervisor)"))
+        notes = [r for r in self.f.state_records(rid, "note")
+                 if "only the first session sets it" in str(r.get("info", ""))]
+        self.assertEqual(len(notes), 1, notes)
+
+    def test_fix_session_cannot_set_a_missing_subject(self):
+        impl = [{"op": "write", "path": "src/new.go", "content": "package src\n// FAIL_VALIDATION\n"},
+                {"op": "out", "name": "summary.md", "content": "Adds N."}]
+        fix = [{"op": "write", "path": "src/new.go", "content": "package src\n"},
+               {"op": "out", "name": "commit-subject.txt", "content": self.FIX_SUBJECT}]
+        rc, out, rid = self.run_issue([impl, fix])
+        self.assertEqual(rc, 0, out)
+        pr, msg = self.published(rid)
+        # no implement subject: the story title, never the fix session's
+        self.assertEqual(pr["title"], "src: add N")
+        self.assertEqual(msg.splitlines()[0], "src: add N")
+        self.assertIn("- Fix round 1: (no summary written)", pr["body"])
+
+    def test_implement_outputs_kept_when_its_tree_is_rejected(self):
+        impl = [{"op": "write", "path": "src/new.go", "content": "package src\n"},
+                {"op": "bytes", "path": "src/blob.dat", "size": 6 * 1024 * 1024},
+                {"op": "out", "name": "summary.md", "content": "Adds N."},
+                {"op": "out", "name": "commit-subject.txt", "content": self.IMPL_SUBJECT}]
+        fix = [{"op": "out", "name": "summary.md", "content": "Dropped the oversized file."},
+               {"op": "out", "name": "commit-subject.txt", "content": self.FIX_SUBJECT}]
+        rc, out, rid = self.run_issue([impl, fix])
+        self.assertEqual(rc, 0, out)
+        self.assertIn(("SNAPSHOT", "violation", "AGENT"), self.f.path_states(rid))
+        pr, msg = self.published(rid)
+        self.assertEqual(pr["title"], self.IMPL_SUBJECT)
+        self.assertEqual(msg.splitlines()[0], self.IMPL_SUBJECT)
+        self.assertTrue(pr["body"].startswith("Adds N."), pr["body"])
+        self.assertIn("- Fix round 1: Dropped the oversized file.", pr["body"])
+
+    def test_single_session_unchanged(self):
+        rc, out, rid = self.run_issue([GOOD])
+        self.assertEqual(rc, 0, out)
+        pr, msg = self.published(rid)
+        self.assertEqual(pr["title"], self.IMPL_SUBJECT)
+        self.assertEqual(msg.splitlines()[0], self.IMPL_SUBJECT)
+        self.assertTrue(pr["body"].startswith("Added N."), pr["body"])
+        self.assertNotIn("Later sessions", pr["body"])
+        self.assertNotIn("round", pr["body"].lower())
+
+
 class TestItemAndBranch(Base):
     def test_item_mode(self):
         item = "PVTI_lADOBxyz_abcDEF123456"

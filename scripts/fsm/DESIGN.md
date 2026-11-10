@@ -224,6 +224,16 @@ cap). Text published by the supervisor is sanitised: `Fixes/Closes/Resolves #N`,
 `@mentions` and HTML comments (including `<!-- cfgms-* -->` markers) are
 stripped; the supervisor adds its own `Fixes #N`.
 
+`out/` is emptied before every session. After each session whose texts pass
+the secret scan (§6.4), the supervisor keeps its sanitised summary per session
+(`summary-s<seq>.md` in the run dir), whether or not the tree passed the
+export filters. Only the run's **first** session sets the commit subject
+(`subject.txt`): the implement session in issue/item/branch runs, the first
+fix session in fix-pr runs, the first resolve session in resolve-conflict runs.
+A later fix or resolve session's subject is ignored (a `note` in
+`state.jsonl`), so it cannot replace the subject, and does not fill a missing
+one either; the fallback is the story title.
+
 ## 7. VALIDATE
 
 The validator gets a **private standalone clone in tmpfs** built by the
@@ -279,17 +289,23 @@ Cache key: `(BASE, tree)`. A passing key is never re-validated.
 
 1. **Commit:** `git commit-tree <validated tree> -p <expected parent>` in `R`
    (issue/branch: parent = synced `BASE`; fix-pr: `pr_head0`), message =
-   validated subject (`^[a-z0-9/_.-]+: .+ \((Issue|Item) #[0-9A-Za-z]+\)$`,
-   else story title) + `Fixes #N` + attribution trailers.
+   the first session's validated subject (§6.5;
+   `^[a-z0-9/_.-]+: .+ \((Issue|Item) #[0-9A-Za-z]+\)$`, else story title) +
+   `Fixes #N` + attribution trailers. A squash merge of a one-commit PR uses
+   this message, so it must describe the story's change, not a fix round.
 2. **Push:** `git push <fixed URL> <sha>:refs/heads/<branch>` with the
    supervisor token; force-with-lease against the head recorded at PREPARE for
    any pre-existing branch; skip if the remote already has `<sha>`.
 3. **PR:** find open PR for the branch; issue/branch create if none (title =
-   story title convention, body = sanitised summary + supervisor "Validation"
-   section: base, tree, validator run, log link; CI evidence lives in checks);
-   if the PR is a draft from an earlier FAILED run, retitle and mark ready;
-   fix-pr/resolve post one round comment carrying a
-   `<!-- cfgms-fsm-round:<run-id> -->` idempotency marker.
+   the commit subject; body = the first session's sanitised summary, then a
+   "Later sessions in this run" list with one `Fix round N: <first line of its
+   summary>` (or `Resolve round N`) per later session, then the supervisor
+   "Validation" section: base, tree, validator run, log link; CI evidence
+   lives in checks);
+   if the PR is a draft from an earlier FAILED run, retitle (to the commit
+   subject) and mark ready; on an existing PR (fix-pr/resolve, or a branch run
+   onto an open PR) post one round comment with the same summary text,
+   carrying a `<!-- cfgms-fsm-round:<run-id> -->` idempotency marker.
 4. **Landed check:** `git ls-remote` head == `<sha>` == PR `headRefOid`
    (retry for propagation).
 

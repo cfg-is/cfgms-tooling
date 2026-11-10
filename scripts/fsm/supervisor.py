@@ -697,7 +697,14 @@ class Supervisor:
         sc = self.scanner()
         findings = sc.scan_candidate(self.repo, base_tree, snap.tree, snap.entries,
                                      scan_dir=self.run.p("scan"))
-        findings += sc.scan_texts({k: v for k, v in texts.items() if v}, scan_dir=self.run.p("scan"))
+        text_findings = sc.scan_texts({k: v for k, v in texts.items() if v},
+                                      scan_dir=self.run.p("scan"))
+        findings += text_findings
+        if not text_findings:
+            # Kept even when the tree is rejected: the session's summary and
+            # subject passed the scan, and the first session's subject is the
+            # PR title however many fix sessions follow it.
+            self._keep_outputs(outs)
         x["candidate_tree"] = snap.tree
         ignored_note = ""
         if snap.ignored:
@@ -719,7 +726,6 @@ class Supervisor:
         # clean candidate (filters + scan passed)
         x["last_clean_tree"] = snap.tree
         x["last_clean_base"] = x["base"]
-        self._keep_outputs(outs)
         if snap.markers:
             lines = ["# Unresolved conflict markers", ""]
             lines += [f"- `{p}` line {n}" for p, n in snap.markers[:100]]
@@ -741,15 +747,28 @@ class Supervisor:
             return "unchanged", {"noop": self.ctx.noop}
         return "ok", {"tree": snap.tree}
 
+    def _primary_seq(self):
+        """seq of the run's first agent session: implement in issue/item/branch
+        runs, the first fix (resolve) session in fix-pr (resolve-conflict) runs."""
+        sessions = self.x.get("sessions") or []
+        return sessions[0].get("seq") if sessions else None
+
     def _keep_outputs(self, outs):
+        """Keep one session's outputs. Summaries are kept per session; only the
+        run's first session sets the commit subject (= PR title), so a later fix
+        or resolve session cannot replace it."""
+        seq = self.x.get("seq")
         if outs.get("summary"):
-            self.wtext("summary.md", outputs.sanitize(outs["summary"]))
+            self.wtext(f"summary-s{seq}.md", outputs.sanitize(outs["summary"]))
         subj = outputs.validate_subject(outs.get("commit_subject"), issue=self.x.get("issue")
                                         if self.mode != "item" else None,
                                         item_last12=last12(self.x.get("item_id") or "")
                                         if self.mode == "item" else None)
-        if subj:
+        if subj and seq == self._primary_seq():
             self.wtext("subject.txt", subj)
+        elif subj:
+            self.run.append("note", info=f"commit subject from session {seq} ignored: only the "
+                                         "first session sets it")
         elif outs.get("commit_subject"):
             self.run.append("note", warning="commit subject rejected by the subject rule")
         if outs.get("followups"):
@@ -837,6 +856,17 @@ class Supervisor:
         s = self.rtext("subject.txt").strip()
         return s or self.x.get("title") or f"Agent work on {self.x.get('branch')}"
 
+    def _summary(self):
+        """The first session's summary, then one line per later session."""
+        sessions = self.x.get("sessions") or []
+        texts = [self.rtext(f"summary-s{s.get('seq')}.md").strip() for s in sessions]
+        legacy = self.rtext("summary.md").strip()
+        if legacy and not any(texts):
+            # a run resumed across the upgrade kept only the legacy file
+            return legacy
+        later = [(i, s.get("kind"), texts[i]) for i, s in enumerate(sessions) if i > 0]
+        return outputs.compose_summary(texts[0] if texts else "", later)
+
     def _validation_section(self):
         v = self.x.get("validated") or {}
         return ("## Validation (supervisor)\n\n"
@@ -858,7 +888,7 @@ class Supervisor:
         tree, base = v["tree"], v["base"]
         if tree != x["candidate_tree"] or base != x["base"]:
             raise RuntimeError("validated (base, tree) differs from the current candidate")
-        summary = self.rtext("summary.md")
+        summary = self._summary()
         subject = self._subject()
         issue = self._issue_ref()
         body = summary.strip() + "\n\n" + self._validation_section()
