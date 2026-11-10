@@ -26,6 +26,10 @@
 #   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
 #                                   missing so GitHub auto-closes the issue on merge.
+#                                   ENQUEUED only when the PR is in the queue or
+#                                   auto-merge is armed with SQUASH; MERGE/REBASE
+#                                   auto-merge is re-armed as SQUASH once
+#                                   (AUTOMERGE_METHOD_FIXED:) else ENQUEUE_FAILED.
 #   dequeue <PR_NUM>                Remove PR from merge queue
 #   diagnose <PR_NUM>               Extract FAIL/panic lines from PR's failed CI jobs
 #   rerun <PR_NUM> [comment_body]   Rerun failed CI jobs; optional audit comment
@@ -1433,26 +1437,57 @@ except Exception: print('')" 2>/dev/null || echo "")
     # Retry up to 3 times with 5s backoff; transient enqueue rejections happen
     # when GitHub's gate sees CI re-runs, stale branch-protection cache, or
     # queue saturation. After the call, verify the PR is actually in flight —
-    # `gh pr merge --squash` exiting 0 is necessary but not sufficient.
-    for attempt in 1 2 3; do
-      out=$(gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head_sha" 2>&1) && break
-      echo "$out" | grep -qi "already queued" && { echo "ALREADY_QUEUED:$pr"; exit 0; }
-      [ "$attempt" -lt 3 ] && sleep 5
-    done
-    # Verify-after: success state is "in merge queue" OR "auto-merge armed".
-    # Both are valid landing paths (queue picks up green PRs immediately;
-    # auto-merge waits for CI and then enqueues). Failure state is when
-    # neither is true after the retries — the merge call silently dropped.
-    in_queue=$(gh api graphql \
-      -f query='query { repository(owner: "cfg-is", name: "cfgms") { mergeQueue(branch: "develop") { entries(first: 50) { nodes { pullRequest { number } } } } } }' \
-      --jq "[.data.repository.mergeQueue.entries.nodes[].pullRequest.number] | any(. == $pr)" 2>/dev/null || echo "false")
-    auto_merge=$(gh pr view "$pr" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null || echo "false")
-    if [ "$in_queue" = "true" ] || [ "$auto_merge" = "true" ]; then
-      echo "ENQUEUED:$pr"
-    else
-      echo "ENQUEUE_FAILED:$pr (not in merge queue, no auto-merge after 3 attempts)" >&2
-      exit 1
-    fi
+    # `gh pr merge --squash` exiting 0 is necessary but not sufficient: a PR
+    # whose auto-merge was armed with MERGE stayed that way after this call
+    # and was never admitted to the queue (cfg-is/cfgms#5998).
+    squash_enqueue() {
+      local attempt out
+      for attempt in 1 2 3; do
+        out=$(gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head_sha" 2>&1) && return 0
+        echo "$out" | grep -qi "already queued" && { echo "ALREADY_QUEUED:$pr"; exit 0; }
+        [ "$attempt" -lt 3 ] && sleep 5
+      done
+      return 0
+    }
+    # Verify-after state, from ONE GraphQL read of the PR: "queued" when it
+    # has a mergeQueueEntry, else the armed auto-merge method (SQUASH, MERGE,
+    # REBASE), else "none". Only "queued" and "SQUASH" are landing paths.
+    # develop's merge queue accepts SQUASH only, so auto-merge armed with
+    # MERGE or REBASE is never admitted to the queue — GitHub does not say so.
+    enqueue_state() {
+      gh api graphql \
+        -f query='query($pr: Int!) { repository(owner: "cfg-is", name: "cfgms") { pullRequest(number: $pr) { mergeQueueEntry { position } autoMergeRequest { mergeMethod } } } }' \
+        -F pr="$pr" \
+        --jq '.data.repository.pullRequest | if .mergeQueueEntry != null then "queued" elif .autoMergeRequest != null then (.autoMergeRequest.mergeMethod // "unknown") else "none" end' \
+        2>/dev/null || echo "unreadable"
+    }
+    squash_enqueue
+    state=$(enqueue_state)
+    case "$state" in
+      MERGE|REBASE|unknown)
+        # Auto-merge armed with a method the queue rejects: disarm it, arm
+        # SQUASH once, and re-verify.
+        wrong_method="$state"
+        gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
+        squash_enqueue
+        state=$(enqueue_state)
+        if [ "$state" = "queued" ] || [ "$state" = "SQUASH" ]; then
+          echo "AUTOMERGE_METHOD_FIXED:${pr}:${wrong_method}->SQUASH"
+        else
+          echo "ENQUEUE_FAILED:$pr (auto-merge method ${wrong_method} not accepted by the SQUASH-only merge queue; still ${state} after disable and squash retry)" >&2
+          exit 1
+        fi
+        ;;
+    esac
+    case "$state" in
+      queued|SQUASH) echo "ENQUEUED:$pr" ;;
+      none)
+        echo "ENQUEUE_FAILED:$pr (not in merge queue, no auto-merge after 3 attempts)" >&2
+        exit 1 ;;
+      *)
+        echo "ENQUEUE_FAILED:$pr (enqueue state ${state})" >&2
+        exit 1 ;;
+    esac
     ;;
 
   dequeue)
