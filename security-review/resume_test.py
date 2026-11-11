@@ -583,6 +583,126 @@ def test_the_binding_check_is_skipped_when_plan_dir_is_none():
         )
 
 
+def _output_cap_sweep(sweep_dir: str) -> tuple:
+    """A sweep with one ollama lane: step-001 stopped at the output cap,
+    step-002 failed with a generic non-transient exit, step-003 complete."""
+    plan_dir = os.path.join(sweep_dir, "plan")
+    source = "ollama-glm-5.3-flash-cloud"
+    source_dir = os.path.join(sweep_dir, "lanes", source)
+    os.makedirs(plan_dir)
+    os.makedirs(source_dir)
+    for step_id in ("step-001", "step-002", "step-003"):
+        write_plan_step(plan_dir, step_id)
+    write(
+        os.path.join(source_dir, "step-001.status.json"),
+        status_envelope("step-001", "failed", stop_reason_raw=resume.OUTPUT_CAP_STOP_REASON),
+    )
+    write(
+        os.path.join(source_dir, "step-002.status.json"),
+        status_envelope("step-002", "failed", stop_reason_raw="harness_exit_1"),
+    )
+    write(os.path.join(source_dir, "step-003.findings.json"), complete_envelope("step-003"))
+    return plan_dir, source, source_dir
+
+
+def test_an_output_cap_step_is_scheduled_on_the_fallback_lane_only():
+    # REQUIRED: with the fallback variable set, the capped step goes to the
+    # fallback lane and nowhere else; a step failed for any other
+    # non-transient reason is not scheduled anywhere.
+    fallback = "opencode_agent-glm-5.3-flash-cloud"
+    environ = {
+        resume.OUTPUT_CAP_FALLBACK_ENV: "opencode_agent:glm-5.3-flash:cloud",
+        "CFGMS_SECURITY_REVIEW_LANES": "ollama:glm-5.3-flash:cloud",
+    }
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir, source, source_dir = _output_cap_sweep(sweep_dir)
+        result = resume.schedule_output_cap_fallback(sweep_dir, environ)
+        check(result is not None and result["lane"] == fallback, "fallback: lane named for the pair", repr(result))
+        check(
+            result["steps"] == {"step-001": [source]},
+            "fallback: only the output_cap step is assigned, with its source lane",
+            repr(result["steps"]),
+        )
+        check(result["outstanding"] == ["step-001"], "fallback: the step is outstanding", repr(result))
+        check(
+            resume.fallback_steps_for_lane(plan_dir, fallback) == {"step-001"},
+            "fallback: the fallback lane reads exactly its assigned step from the plan",
+        )
+        check(
+            resume.fallback_steps_for_lane(plan_dir, source) is None,
+            "fallback: the source lane has no assignment and keeps its whole plan",
+        )
+        missing = resume.missing_steps(source_dir, ["step-001", "step-002", "step-003"])
+        check(
+            missing == [],
+            "fallback: the source lane re-runs neither the capped nor the generically failed step",
+            repr(missing),
+        )
+        missing_fb = resume.missing_steps(
+            os.path.join(sweep_dir, "lanes", fallback), sorted(result["steps"]), plan_dir=plan_dir
+        )
+        check(missing_fb == ["step-001"], "fallback: the fallback lane runs the capped step", repr(missing_fb))
+
+        # Once the fallback completed it, nothing is outstanding -> no dispatch.
+        fb_dir = os.path.join(sweep_dir, "lanes", fallback)
+        os.makedirs(fb_dir)
+        write(os.path.join(fb_dir, "step-001.findings.json"), complete_envelope("step-001"))
+        again = resume.schedule_output_cap_fallback(sweep_dir, environ)
+        check(again["outstanding"] == [], "fallback: a completed fallback step is not outstanding", repr(again))
+        check(
+            again["steps"] == {"step-001": [source]},
+            "fallback: the fallback's own lane is never treated as a source",
+            repr(again["steps"]),
+        )
+
+
+def test_an_output_cap_step_stays_failed_without_the_fallback_variable():
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir, _source, source_dir = _output_cap_sweep(sweep_dir)
+        check(resume.schedule_output_cap_fallback(sweep_dir, {}) is None, "no fallback: nothing scheduled")
+        check(
+            not os.path.exists(os.path.join(plan_dir, resume.OUTPUT_CAP_FALLBACK_FILENAME)),
+            "no fallback: no assignment file is written",
+        )
+        check(
+            resume.missing_steps(source_dir, ["step-001"], plan_dir=plan_dir) == [],
+            "no fallback: the output_cap step stays failed (not retried)",
+        )
+        check(
+            not resume.is_transient_failure(resume.OUTPUT_CAP_STOP_REASON),
+            "no fallback: output_cap is not a transient failure",
+        )
+
+
+def test_a_fallback_that_is_already_a_roster_lane_is_not_restricted():
+    environ = {
+        resume.OUTPUT_CAP_FALLBACK_ENV: "opencode_agent:glm-5.3-flash:cloud",
+        "CFGMS_SECURITY_REVIEW_LANES": "ollama:glm-5.3-flash:cloud,opencode_agent:glm-5.3-flash:cloud",
+    }
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        plan_dir, _source, _source_dir = _output_cap_sweep(sweep_dir)
+        result = resume.schedule_output_cap_fallback(sweep_dir, environ)
+        check(result["skipped"] is not None and result["outstanding"] == [], "roster fallback: skipped", repr(result))
+        check(
+            resume.fallback_steps_for_lane(plan_dir, "opencode_agent-glm-5.3-flash-cloud") is None,
+            "roster fallback: the roster lane keeps its whole plan",
+        )
+
+
+def test_a_malformed_fallback_value_is_rejected():
+    import roster
+
+    with tempfile.TemporaryDirectory() as sweep_dir:
+        _output_cap_sweep(sweep_dir)
+        for value in ("not-a-pair", "ollama:a:cloud,opencode_agent:b:cloud"):
+            try:
+                resume.schedule_output_cap_fallback(sweep_dir, {resume.OUTPUT_CAP_FALLBACK_ENV: value})
+                raised = False
+            except roster.RosterError:
+                raised = True
+            check(raised, f"fallback: malformed value {value!r} raises RosterError")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

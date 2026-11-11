@@ -32,6 +32,7 @@ import terminal_state  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import platform_test_support  # noqa: E402
+import resume  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HARNESS_RUNNER_PATH = REPO_ROOT / ".claude/tooling/security-review/lanes/harness_runner.py"
@@ -2923,6 +2924,58 @@ def test_run_lane_concurrent_workers_never_share_a_step_workspace():
     titles = {e["step_id"]: [f["title"] for f in e.get("findings") or []] for e in written}
     check(titles == {i: [f"answer-for-{i}"] for i in ids},
           "run_lane(workers): each step's envelope holds its own answer", repr(titles))
+
+
+def _write_fake_plan(plan_dir: str, ids: list) -> None:
+    for step_id in ids:
+        with open(os.path.join(plan_dir, f"{step_id}.json"), "w") as f:
+            json.dump({
+                "step_id": step_id, "sweep_id": "2026-09-25T0000Z-abc1234",
+                "commit_sha": "abc1234def5678", "scope": "pkg/example", "description": "d",
+                "hypotheses": [{"id": "h1", "objective": "o", "required_evidence": "e", "planner": "p1"}],
+                "files": [], "planners": ["p1"],
+            }, f)
+
+
+def test_run_lane_on_an_output_cap_fallback_lane_runs_only_its_assigned_steps():
+    called: list = []
+
+    def _call(model, prompt, raw_path):
+        called.append(os.path.basename(raw_path).split(".")[1])
+        with open(raw_path, "w") as f:
+            json.dump({"findings": [], "dispositions": [
+                {"hypothesis_id": "h1", "disposition": "refuted", "reason": "r"}]}, f)
+        return 0, False, ""
+
+    spec = harness_runner.LaneSpec("fake", _call, lambda step, files, path: "p")
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        _write_fake_plan(plan_dir, ["step-001", "step-002", "step-003"])
+        with open(os.path.join(plan_dir, resume.OUTPUT_CAP_FALLBACK_FILENAME), "w") as f:
+            json.dump({"lanes": {"fallback-lane": {"step-002": ["ollama-lane"]}}}, f)
+        harness_runner.run_lane(spec, plan_dir, out_dir, "/workspace", "fallback-lane", "m")
+        check(called == ["step-002"], "fallback lane: runs only its assigned step", repr(called))
+        called.clear()
+        with tempfile.TemporaryDirectory() as other_out:
+            harness_runner.run_lane(spec, plan_dir, other_out, "/workspace", "roster-lane", "m")
+        check(sorted(called) == ["step-001", "step-002", "step-003"],
+              "fallback lane: a lane with no assignment runs every step", repr(called))
+
+
+def test_run_lane_records_a_classified_stop_reason_before_a_generic_exit():
+    def _call(model, prompt, raw_path):
+        return 1, False, "tail\n[cap]"
+
+    spec = harness_runner.LaneSpec(
+        "fake", _call, lambda step, files, path: "p",
+        classified_stop_reason=lambda tail: "output_cap" if tail.endswith("[cap]") else None,
+        transient_stop_reason=lambda tail: "transient_provider_error:x",
+    )
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        _write_fake_plan(plan_dir, ["step-001"])
+        written = harness_runner.run_lane(spec, plan_dir, out_dir, "/workspace", "lane", "m")
+    check(written[0].get("stop_reason_raw") == "output_cap",
+          "classified stop reason: wins over transient and harness_exit_N",
+          repr(written[0].get("stop_reason_raw")))
 
 
 def main() -> int:

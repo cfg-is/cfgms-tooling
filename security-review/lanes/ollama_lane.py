@@ -390,14 +390,38 @@ def _looks_not_signed_in(text: str) -> bool:
 
 
 
+# Ollama Cloud ends every response at 65,536 output tokens, thinking included,
+# and a request's `num_predict` cannot raise it (measured: `num_predict:
+# 131072` still stopped at 65,536 with `done_reason=length`). Measured over
+# 588 calls of one sweep, the model spent a median 40% of a capped call's
+# thinking numbering file lines itself so it could cite them. Handing it the
+# numbers, and telling it once not to restate the files, let all five capped
+# prompts of that sweep finish, and cut mean output on prompts that already
+# finished from about 45,000 to about 31,500 tokens without changing what
+# was found beyond run-to-run variation. This lane only: the other lanes
+# read files through tools or were not measured.
+NUMBERED_LINES_INSTRUCTION = (
+    "Every file below is shown with its lines pre-numbered as `<line>| <text>`, "
+    "counting from 1. Cite those numbers in each finding's `line`. Do not copy, "
+    "renumber or restate file contents in your reasoning; refer to a line by its "
+    "number instead."
+)
+
+
+def number_lines(content: str) -> str:
+    """`content` with each line prefixed by its right-aligned 1-based number:
+    `f"{n:>5}| {line}"`. A trailing newline does not add an empty last line."""
+    return "\n".join(f"{n:>5}| {line}" for n, line in enumerate(content.splitlines(), start=1))
+
+
 def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
     """Assemble the full prompt handed to the `ollama` harness for one step:
     the shared preamble -- system prompt, review methodology core, this
     step's severity anchors, output-schema description
     (`harness_runner.shared_preamble`, C4, never a second copy), the step's
     own scope and hypotheses list, every readable
-    file's content, and an explicit instruction to emit the findings JSON on
-    standard output.
+    file's content with numbered lines (see `NUMBERED_LINES_INSTRUCTION`),
+    and an explicit instruction to emit the findings JSON on standard output.
 
     Unlike the other three lanes' `build_prompt`, this does NOT tell the
     model to write `output_path` to disk -- `ollama run` has no file-writing
@@ -416,8 +440,12 @@ def build_prompt(step: dict, file_contents: dict, output_path: str) -> str:
         scope_text = ""
     description = step.get("description", "")
     hypotheses_text = harness_runner.render_hypotheses(step.get("hypotheses") or [])
-    sections = [f"## {path}\n```\n{content}\n```" for path, content in file_contents.items()]
+    sections = [
+        f"## {path}\n```\n{number_lines(content)}\n```" for path, content in file_contents.items()
+    ]
     body = "\n\n".join(sections)
+    if sections:
+        body = f"{NUMBERED_LINES_INSTRUCTION}\n\n{body}"
     return (
         f"{harness_runner.shared_preamble(step)}\n\n"
         f"Print that JSON object, and only that JSON object, to standard "
@@ -576,8 +604,26 @@ def _is_transient_exception(exc: BaseException) -> bool:
     return isinstance(exc, (ConnectionError, http.client.IncompleteRead))
 
 
+# Written after the answer when the provider stopped the response at its
+# output cap (`done_reason=length`) and no findings object could be read.
+# Harness-written and defanged inside the model's own text, exactly like
+# `_TRANSPORT_MARKER`, so an answer cannot claim a cap it did not hit.
+_OUTPUT_CAP_MARKER = "[ollama stop: output_cap]"
+
+
 def _defang_transport_marker(text: str) -> str:
-    return text.replace(_TRANSPORT_MARKER, "[ollama-transport (model text): ")
+    return text.replace(_TRANSPORT_MARKER, "[ollama-transport (model text): ").replace(
+        _OUTPUT_CAP_MARKER, "[ollama-stop (model text): output_cap]"
+    )
+
+
+def _output_cap_stop_reason(output_tail: str) -> "str | None":
+    """`resume.OUTPUT_CAP_STOP_REASON` when the tail ends with this module's
+    own output-cap marker. Not transient: the same prompt hits the same cap,
+    so `resume` sends it to a fallback lane instead of retrying it here."""
+    if (output_tail or "").rstrip().endswith(_OUTPUT_CAP_MARKER):
+        return resume.OUTPUT_CAP_STOP_REASON
+    return None
 
 
 def _transient_stop_reason(output_tail: str) -> "str | None":
@@ -899,6 +945,12 @@ def call_ollama_harness(
     output_tail = harness_runner.sanitize_harness_output_tail(combined)
 
     extracted = _extract_json_object(stdout)
+    if extracted is None and http_status == 200 and metrics.get("done_reason") == "length":
+        # Appended last so it is the end of the tail `_output_cap_stop_reason`
+        # reads, however long the thinking before it was.
+        stderr = "{}\n{}".format(stderr, _OUTPUT_CAP_MARKER)
+        combined = "{}\n{}".format(stdout, stderr)
+        output_tail = harness_runner.sanitize_harness_output_tail(combined)
     # Meta is written for EVERY call, not only failures -- including the
     # transport-failure path above, which returns before reaching this.
     #
@@ -994,6 +1046,7 @@ LANE_SPEC = harness_runner.LaneSpec(
     build_prompt=build_prompt,
     fatal_stop_reason=_fatal_stop_reason,
     transient_stop_reason=_transient_stop_reason,
+    classified_stop_reason=_output_cap_stop_reason,
     # Issue #4261: eight steps at once. Measured, not chosen: eight concurrent
     # workers against Ollama Cloud drew no rate limit at 1/2/4/8 on the
     # verifier (#4249), and this lane's own before/after run is recorded on

@@ -1285,6 +1285,55 @@ check_contains "consolidated report picked up the claude lane of the two-harness
 check_contains "consolidated report picked up the codex lane of the two-harness roster" "$report_twoharness" "codex-model-y"
 
 echo ""
+echo "== REQUIRED TEST — resume with CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK runs"
+echo "   a lane's output_cap step on the fallback lane, in its own lane directory,"
+echo "   and only that step =="
+SUB_OUTCAP="${SANDBOX}/case-output-cap-fallback"
+setup_sub_sandbox "$SUB_OUTCAP"
+mkdir -p "${SUB_OUTCAP}/HOME/.codex"
+echo '{"tokens":{}}' > "${SUB_OUTCAP}/HOME/.codex/auth.json"
+outcap_out=$(CFGMS_SECURITY_REVIEW_LANES="claude:model-x" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
+  STUB_CLAUDE_BIN_DIR="$TWOHARNESS_BIN_DIR" \
+  run_cli "$SUB_OUTCAP" launch HEAD "${FIXTURE_SCOPE[@]}" 2>"${SUB_OUTCAP}/stderr.log")
+check_eq "output-cap fallback: initial launch exits 0" "$?" "0"
+SWEEP_DIR_OUTCAP="$(dirname "$(dirname "$outcap_out")")"
+# Turn the claude lane's step-002 into an output_cap failure, as the ollama
+# lane records it.
+python3 - "${SWEEP_DIR_OUTCAP}/lanes/claude-model-x" <<'PYEOF'
+import json, os, sys
+lane = sys.argv[1]
+src = os.path.join(lane, "step-002.findings.json")
+env = json.load(open(src))
+for key in ("findings", "dispositions"):
+    env.pop(key, None)
+env["state"] = "failed"
+env["stop_reason_raw"] = "output_cap"
+json.dump(env, open(os.path.join(lane, "step-002.status.json"), "w"))
+os.remove(src)
+PYEOF
+CFGMS_SECURITY_REVIEW_LANES="claude:model-x" \
+  CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK="codex:model-y" \
+  CFGMS_SECURITY_REVIEW_LANE_ENTRYPOINT_DIR="$TWOHARNESS_ENTRYPOINT_DIR" \
+  STUB_CLAUDE_BIN_DIR="$TWOHARNESS_BIN_DIR" \
+  run_cli "$SUB_OUTCAP" resume "$(basename "$SWEEP_DIR_OUTCAP")" >/dev/null 2>"${SUB_OUTCAP}/resume-stderr.log"
+check_eq "output-cap fallback: resume exits 0" "$?" "0"
+[[ -f "${SWEEP_DIR_OUTCAP}/lanes/codex-model-y/step-002.findings.json" ]] \
+  && ok "output-cap fallback: the fallback lane completed the capped step in its own lane directory" \
+  || bad "output-cap fallback: the fallback lane completed the capped step" "not found"
+[[ ! -e "${SWEEP_DIR_OUTCAP}/lanes/codex-model-y/step-001.findings.json" ]] \
+  && ok "output-cap fallback: the fallback lane did not run a step that was not capped" \
+  || bad "output-cap fallback: the fallback lane ran only the capped step" "step-001 findings present"
+[[ ! -e "${SWEEP_DIR_OUTCAP}/lanes/claude-model-x/step-002.findings.json" ]] \
+  && ok "output-cap fallback: the capped lane did not re-run its own capped step" \
+  || bad "output-cap fallback: the capped lane did not re-run its own capped step" "findings present"
+outcap_dispatch="$(cat "${SWEEP_DIR_OUTCAP}/dispatch_report.json" 2>/dev/null || true)"
+check_contains "output-cap fallback: dispatch_report.json records the fallback lane under its own key" "$outcap_dispatch" '"output_cap_fallback_lanes"'
+check_contains "output-cap fallback: the roster lane entry is kept beside it" "$outcap_dispatch" '"requested_harness": "claude"'
+outcap_report="$(cat "${SWEEP_DIR_OUTCAP}/report/consolidated.md" 2>/dev/null || true)"
+check_contains "output-cap fallback: consolidated.md names the step the fallback completed" "$outcap_report" 'Step `step-002` on lane `claude-model-x`: completed by fallback lane `codex-model-y`.'
+
+echo ""
 echo "== REQUIRED TEST — a codex lane that fails to launch (no ~/.codex/auth.json on"
 echo "   the host) is recorded as a credential-unavailable skip, the claude lane"
 echo "   still dispatches, and the consolidator still runs (Issue #3935; C5's"

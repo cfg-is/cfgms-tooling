@@ -1238,6 +1238,49 @@ def test_partial_sweep_coverage_shows_incompleteness():
         check("1/2" in md, "consolidate.md: the coverage table visibly shows partial completion (1/2)", md)
 
 
+def test_output_cap_steps_are_counted_separately_and_fallback_completions_named():
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sweep:
+        sha = init_repo_with_commit(repo, {"pkg/example/thing.go": "package example\n"})
+        for step_id in ("step-001", "step-002", "step-003"):
+            write_plan_step(sweep, step_id, sha)
+        src, fb = "ollama-m-cloud", "opencode_agent-m-cloud"
+        write(os.path.join(sweep, "lanes", src, "step-001.findings.json"), complete_envelope(sha, src, "step-001", []))
+        for step_id in ("step-002", "step-003"):
+            capped = status_envelope(sha, src, step_id, "failed")
+            capped["stop_reason_raw"] = resume.OUTPUT_CAP_STOP_REASON
+            write(os.path.join(sweep, "lanes", src, f"{step_id}.status.json"), capped)
+        write(
+            os.path.join(sweep, "plan", resume.OUTPUT_CAP_FALLBACK_FILENAME),
+            {"lanes": {fb: {"step-002": [src], "step-003": [src]}}},
+        )
+        write(os.path.join(sweep, "lanes", fb, "step-002.findings.json"), complete_envelope(sha, fb, "step-002", []))
+
+        report = consolidate.consolidate(sweep, repo)
+        rows = {row["lane"]: row for row in report["coverage"]}
+        check(rows[src]["output_cap"] == 2 and rows[src]["failed"] == 0,
+              "output cap: counted in its own bucket, not as failed", str(rows[src]))
+        check(rows[src]["output_cap_resolved"] == [{"step_id": "step-002", "fallback_lane": fb}],
+              "output cap: the fallback completion is named", str(rows[src]))
+        check(rows[fb]["total_steps"] == 2 and rows[fb]["not_started"] == 1 and rows[fb].get("fallback"),
+              "output cap: the fallback lane's denominator is its assigned steps only", str(rows[fb]))
+        md = consolidate.render_markdown(report)
+        coverage = _section(md, "## Coverage")
+        check("| Output cap |" in coverage and "2/3 (1 by fallback)" in coverage,
+              "consolidated.md: the coverage table has an output-cap column", coverage)
+        check(f"Step `step-002` on lane `{src}`: completed by fallback lane `{fb}`." in coverage,
+              "consolidated.md: coverage names the step the fallback completed", coverage)
+        incomplete = _section(md, "## Incomplete")
+        check("1/3 step(s) stopped at the provider's output cap" in incomplete,
+              "consolidated.md: the unresolved capped step keeps the sweep incomplete", incomplete)
+
+        # The fallback finishes the last capped step: no output_cap gap remains.
+        write(os.path.join(sweep, "lanes", fb, "step-003.findings.json"), complete_envelope(sha, fb, "step-003", []))
+        report = consolidate.consolidate(sweep, repo)
+        check(consolidate._sweep_complete(report),
+              "output cap: every capped step completed by the fallback leaves the sweep complete",
+              str(report["coverage"]))
+
+
 def test_frozen_plan_denominator_not_started_for_untouched_steps():
     # REQUIRED TEST: 10 plan/step-*.json files exist; exactly one lane
     # completes exactly one of them. The coverage denominator must come from
