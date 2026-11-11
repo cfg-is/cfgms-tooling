@@ -2784,6 +2784,12 @@ class LaneSpec:
     `resume` then re-attempts under its transient-retry cap. It must match
     harness-written text only, never the model's answer.
 
+    `classified_stop_reason(output_tail)` names a failure that is neither
+    lane-fatal nor transient but must not read as a generic exit -- the
+    provider's output cap, say -- or returns `None`. It is consulted for a
+    failed, non-fatal call before `transient_stop_reason`, and like it must
+    match harness-written text only.
+
     `workers` (Issue #4261) is how many steps this lane may run at once. `1`
     means the lane is not safe to run concurrently -- a CLI whose session store
     is shared across invocations, say -- and no override raises it. A lane that
@@ -2791,12 +2797,13 @@ class LaneSpec:
     """
 
     def __init__(self, harness: str, call_harness, build_prompt, fatal_stop_reason=None,
-                 transient_stop_reason=None, workers: int = 1):
+                 transient_stop_reason=None, workers: int = 1, classified_stop_reason=None):
         self.harness = harness
         self.call_harness = call_harness
         self.build_prompt = build_prompt
         self._fatal_stop_reason = fatal_stop_reason
         self._transient_stop_reason = transient_stop_reason
+        self._classified_stop_reason = classified_stop_reason
         self.workers = workers
 
     def raw_output_path(self, out_dir: str, step_id: str) -> str:
@@ -2814,6 +2821,11 @@ class LaneSpec:
         if self._transient_stop_reason is None:
             return None
         return self._transient_stop_reason(output_tail)
+
+    def classified_stop_reason(self, output_tail: str) -> "str | None":
+        if self._classified_stop_reason is None:
+            return None
+        return self._classified_stop_reason(output_tail)
 
 
 # Issue #4261: the ceiling on `CFGMS_SECURITY_REVIEW_LANE_WORKERS`. Not a
@@ -3165,6 +3177,12 @@ def run_lane(
     os.makedirs(out_dir, exist_ok=True)
     call_harness_fn = call_harness_fn or spec.call_harness
     step_ids = discover_step_ids(plan_dir)
+    # A lane named as the output-cap fallback runs only the steps `resume`
+    # assigned it -- the ones another lane stopped at its provider's output
+    # cap -- never the whole plan. `None` means no assignment: every step.
+    assigned = resume.fallback_steps_for_lane(plan_dir, lane_id)
+    if assigned is not None:
+        step_ids = [step_id for step_id in step_ids if step_id in assigned]
 
     # Issue #3962 added two resume-time binding checks here; since Issue #4136
     # there is ONE. `plan_hash` still binds, because a changed plan means
@@ -3523,6 +3541,7 @@ def run_lane(
                             # step up again instead of writing it off.
                             stop_reason_raw = (
                                 stop_reason_raw
+                                or spec.classified_stop_reason(output_tail)
                                 or spec.transient_stop_reason(output_tail)
                                 or f"harness_exit_{exit_code}"
                             )

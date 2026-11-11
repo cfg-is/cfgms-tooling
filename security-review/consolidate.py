@@ -1587,9 +1587,11 @@ def build_coverage_table(
     step_ids: list[str],
     lane_step_state: dict[str, dict[str, str]],
     lane_step_files: dict[str, dict[str, dict]] | None = None,
+    lane_output_cap: dict[str, list[str]] | None = None,
+    fallback_assignments: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[dict]:
-    """One row per lane. The four `STEP_STATES` buckets plus `not_started`
-    always sum to `total_steps` exactly: a `(lane, step_id)` pair with
+    """One row per lane. The four `STEP_STATES` buckets plus `output_cap`
+    and `not_started` always sum to `total_steps` exactly: a `(lane, step_id)` pair with
     neither a `.findings.json` nor a `.status.json` file is counted as
     `not_started` rather than contributing to no bucket at all (Issue
     #3953) -- a step nobody touched must remain visible as an explicit gap,
@@ -1605,17 +1607,43 @@ def build_coverage_table(
     case exactly as it should be. A step with no entry in `lane_step_files`
     at all (an envelope written before this story, or that never validated)
     contributes nothing to `files_short` -- there is no data to judge a gap
-    from, so it is never assumed to be one."""
+    from, so it is never assumed to be one.
+
+    `output_cap` counts the steps a lane's provider stopped at its fixed
+    output ceiling (`resume.OUTPUT_CAP_STOP_REASON`), separately from
+    `failed`: those steps are excluded from `failed`. `output_cap_resolved`
+    names each of them a fallback lane (`fallback_assignments`, from
+    `plan/output_cap_fallback.json`) completed. A fallback lane's own row
+    counts only the steps assigned to it -- it was never meant to run the
+    rest -- and carries `fallback: true`."""
     lane_step_files = lane_step_files or {}
-    total = len(step_ids)
+    lane_output_cap = lane_output_cap or {}
+    fallback_assignments = fallback_assignments or {}
     rows = []
     for lane in lanes:
+        is_fallback = lane in fallback_assignments
+        lane_steps = (
+            [s for s in step_ids if s in fallback_assignments[lane]] if is_fallback else step_ids
+        )
+        total = len(lane_steps)
+        capped = set(lane_output_cap.get(lane, []))
         counts = {state: 0 for state in STEP_STATES}
         not_started = 0
         files_short = 0
-        for step_id in step_ids:
+        output_cap = 0
+        output_cap_resolved = []
+        for step_id in lane_steps:
             state = lane_step_state.get(lane, {}).get(step_id)
-            if state in counts:
+            if state == "failed" and step_id in capped:
+                output_cap += 1
+                for fb_lane in sorted(fallback_assignments):
+                    if (
+                        step_id in fallback_assignments[fb_lane]
+                        and lane_step_state.get(fb_lane, {}).get(step_id) == "complete"
+                    ):
+                        output_cap_resolved.append({"step_id": step_id, "fallback_lane": fb_lane})
+                        break
+            elif state in counts:
                 counts[state] += 1
             else:
                 not_started += 1
@@ -1632,6 +1660,10 @@ def build_coverage_table(
         row.update(counts)
         row[NOT_STARTED] = not_started
         row["files_short"] = files_short
+        row["output_cap"] = output_cap
+        row["output_cap_resolved"] = output_cap_resolved
+        if is_fallback:
+            row["fallback"] = True
         rows.append(row)
     return rows
 
@@ -1837,7 +1869,14 @@ def consolidate(sweep_dir: str, repo_root: str) -> dict:
     lanes, step_ids, lane_step_state, lane_step_files, findings, plan_failed, lane_step_tail = load_sweep(sweep_dir)
     groups = _group_findings(findings, repo_root)
     consolidated_findings = _finalize_findings(groups, lane_step_state)
-    coverage = build_coverage_table(lanes, step_ids, lane_step_state, lane_step_files)
+    lane_output_cap = {
+        lane: resume.output_cap_steps(os.path.join(sweep_dir, "lanes", lane), step_ids)
+        for lane in lanes
+    }
+    fallback_assignments = resume.load_fallback_assignments(os.path.join(sweep_dir, "plan"))
+    coverage = build_coverage_table(
+        lanes, step_ids, lane_step_state, lane_step_files, lane_output_cap, fallback_assignments
+    )
     scanner_coverage = build_scanner_coverage(lanes, step_ids, load_scan_summaries(sweep_dir, lanes, step_ids))
     provenance = build_provenance(sweep_dir, lanes, step_ids)
     sweep_id = os.path.basename(os.path.normpath(sweep_dir))
@@ -1984,6 +2023,11 @@ def _dispatch_identity(entry: dict) -> str:
     return harness or "unknown"
 
 
+def _unresolved_output_cap(row: dict) -> int:
+    """A lane's `output_cap` steps that no fallback lane completed."""
+    return row.get("output_cap", 0) - len(row.get("output_cap_resolved") or [])
+
+
 def _sweep_complete(report: dict) -> bool:
     """Whether every lane finished every planned step cleanly enough that an
     empty findings list can be trusted to mean "nothing found" rather than
@@ -2028,6 +2072,7 @@ def _sweep_complete(report: dict) -> bool:
             or row.get("failed", 0) > 0
             or row.get("parked", 0) > 0
             or row.get("refused", 0) > 0
+            or _unresolved_output_cap(row) > 0
         ):
             return False
     dispatch = report.get("dispatch") or {}
@@ -2206,6 +2251,13 @@ def _incomplete_lines(report: dict) -> list[str]:
                 f"- Lane `{lane}`: {row['files_short']} step(s) read fewer "
                 "files than declared (`files_short`)."
             )
+        unresolved = _unresolved_output_cap(row)
+        if unresolved > 0:
+            lines.append(
+                f"- Lane `{lane}`: {unresolved}/{total} step(s) stopped at the provider's "
+                "output cap with no fallback lane completion "
+                "(set `CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK` and resume)."
+            )
 
     tails = report.get("failed_step_tails") or []
     if tails:
@@ -2325,26 +2377,52 @@ def render_markdown(report: dict) -> str:
     else:
         lines.append(f"Steps discovered across the sweep: {len(report['steps_discovered'])}")
         lines.append("")
-        lines.append("| Lane | Complete | Parked | Refused | Failed | Not started | Files short |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append(
+            "| Lane | Complete | Parked | Refused | Failed | Output cap | Not started | Files short |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
         if report["coverage"]:
             for row in report["coverage"]:
                 total = row["total_steps"]
+                resolved = row.get("output_cap_resolved") or []
+                output_cap = "{}/{}".format(row.get("output_cap", 0), total)
+                if resolved:
+                    output_cap += f" ({len(resolved)} by fallback)"
+                lane_label = _md_escape_inline(row["lane"])
+                if row.get("fallback"):
+                    lane_label += " (output-cap fallback)"
                 lines.append(
-                    "| {lane} | {c}/{t} | {p}/{t} | {r}/{t} | {f}/{t} | {n}/{t} | {fs} |".format(
-                        lane=_md_escape_inline(row["lane"]),
+                    "| {lane} | {c}/{t} | {p}/{t} | {r}/{t} | {f}/{t} | {oc} | {n}/{t} | {fs} |".format(
+                        lane=lane_label,
                         c=row["complete"],
                         p=row["parked"],
                         r=row["refused"],
                         f=row["failed"],
+                        oc=output_cap,
                         n=row["not_started"],
                         t=total,
                         fs=row["files_short"],
                     )
                 )
         else:
-            lines.append("| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0 |")
+            lines.append(
+                "| _(no lane output found for this sweep)_ | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0 |"
+            )
         lines.append("")
+        resolved_lines = [
+            "- Step `{}` on lane `{}`: completed by fallback lane `{}`.".format(
+                _md_escape_inline(entry["step_id"]),
+                _md_escape_inline(row["lane"]),
+                _md_escape_inline(entry["fallback_lane"]),
+            )
+            for row in report["coverage"] or []
+            for entry in row.get("output_cap_resolved") or []
+        ]
+        if resolved_lines:
+            lines.append("Output-cap steps a fallback lane completed:")
+            lines.append("")
+            lines.extend(resolved_lines)
+            lines.append("")
 
     lines.append("## Provenance")
     lines.append("")

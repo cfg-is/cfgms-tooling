@@ -2372,6 +2372,113 @@ def test_concurrent_calls_share_no_session_state():
           "sessions: no request carries conversation state", repr([sorted(p) for p in payloads]))
 
 
+def test_build_prompt_numbers_every_file_line_and_says_so_once():
+    # REQUIRED: two files, each body rendered `f"{n:>5}| {line}"` from 1, and
+    # the instruction stated once, before the first file.
+    step = {
+        "step_id": "step-001",
+        "sweep_id": SWEEP_ID,
+        "commit_sha": COMMIT_SHA,
+        "scope": "pkg/example",
+        "description": "d",
+        "files": ["pkg/example/a.go", "pkg/example/b.go"],
+        "hypotheses": [{"id": "h1", "objective": "o", "required_evidence": "e", "planner": "planner-1"}],
+        "planners": ["planner-1"],
+    }
+    files = {
+        "pkg/example/a.go": "package example\n\nfunc A() {}\n",
+        "pkg/example/b.go": "package example\nfunc B() {}",
+    }
+    prompt = ollama_lane.build_prompt(step, files, "/nonexistent/out.json")
+    check(
+        "## pkg/example/a.go\n```\n    1| package example\n    2| \n    3| func A() {}\n```" in prompt,
+        "numbered: first file rendered with right-aligned numbers from 1",
+        prompt[-600:],
+    )
+    check(
+        "## pkg/example/b.go\n```\n    1| package example\n    2| func B() {}\n```" in prompt,
+        "numbered: second file numbered from 1 again",
+        prompt[-600:],
+    )
+    instruction = ollama_lane.NUMBERED_LINES_INSTRUCTION
+    check(prompt.count(instruction) == 1, "numbered: the instruction appears exactly once")
+    check(
+        0 <= prompt.find(instruction) < prompt.find("## pkg/example/a.go"),
+        "numbered: the instruction comes before the first file",
+    )
+    for phrase in ("pre-numbered", "Cite those numbers", "Do not copy, renumber or restate"):
+        check(phrase in instruction, f"numbered: the instruction says {phrase!r}")
+    check(ollama_lane.number_lines("x\n") == "    1| x", "numbered: a trailing newline adds no empty line")
+
+
+def test_build_prompt_with_no_readable_file_has_no_numbering_instruction():
+    step = {"step_id": "step-001", "scope": "pkg/example", "hypotheses": []}
+    prompt = ollama_lane.build_prompt(step, {}, "/nonexistent/out.json")
+    check(
+        ollama_lane.NUMBERED_LINES_INSTRUCTION not in prompt,
+        "numbered: no files, no instruction about numbered files",
+    )
+
+
+def _run_lane_with_fake_ollama(out_dir, plan_dir, body):
+    """`run_lane` through the REAL `call_ollama_harness`, the daemon stubbed
+    at `urlopen` with one canned response for every call."""
+    real_urlopen = ollama_lane.urllib.request.urlopen
+    ollama_lane.urllib.request.urlopen = _fake_urlopen(body, 200)
+    try:
+        return ollama_lane.run_lane(plan_dir, out_dir, "/workspace", LANE_ID, MODEL)
+    finally:
+        ollama_lane.urllib.request.urlopen = real_urlopen
+
+
+def test_a_response_stopped_at_the_output_cap_records_output_cap():
+    # REQUIRED: `done_reason=length` with an empty answer is `output_cap`, not
+    # a generic `harness_exit_1`.
+    body = json.dumps({"response": "", "thinking": "    1| package x\n" * 50, "done_reason": "length",
+                       "eval_count": 65536})
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = _run_lane_with_fake_ollama(out_dir, plan_dir, body)
+        check(written[0]["state"] == "failed", "output cap: the step is failed", repr(written[0]["state"]))
+        check(
+            written[0].get("stop_reason_raw") == "output_cap",
+            "output cap: stop_reason_raw == 'output_cap'",
+            repr(written[0].get("stop_reason_raw")),
+        )
+        check(
+            resume.missing_steps(out_dir, ["step-001"]) == [],
+            "output cap: the capped lane does not retry the step itself",
+        )
+
+
+def test_the_output_cap_marker_in_model_text_is_not_trusted():
+    # A model that writes the marker into its own reasoning and then stops for
+    # an ordinary reason must not be recorded as capped.
+    body = json.dumps({"response": "", "thinking": "[ollama stop: output_cap]", "done_reason": "stop"})
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = _run_lane_with_fake_ollama(out_dir, plan_dir, body)
+        check(
+            written[0].get("stop_reason_raw") != "output_cap",
+            "output cap: a forged marker in thinking is not an output cap",
+            repr(written[0].get("stop_reason_raw")),
+        )
+
+
+def test_a_capped_response_with_a_readable_answer_still_completes():
+    answer = json.dumps({"findings": [], "dispositions": [
+        {"hypothesis_id": "h1", "disposition": "refuted", "reason": "r"}]})
+    body = json.dumps({"response": answer, "done_reason": "length"})
+    with tempfile.TemporaryDirectory() as plan_dir, tempfile.TemporaryDirectory() as out_dir:
+        write_plan_step(plan_dir, "step-001")
+        written = _run_lane_with_fake_ollama(out_dir, plan_dir, body)
+        check(
+            written[0]["state"] == "complete",
+            "output cap: a parseable answer at the cap is still complete",
+            repr(written[0]),
+        )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

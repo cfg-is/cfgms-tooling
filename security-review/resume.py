@@ -255,6 +255,30 @@ MAX_TRANSIENT_RETRIES = 2
 TRANSIENT_PROVIDER_STOP_REASON = "transient_provider_error"
 
 
+# The stop reason a finder lane writes when its provider ended the response at
+# a fixed output cap and no findings object could be read -- Ollama Cloud's
+# 65,536-token ceiling, thinking included, which no request option raises.
+# Harness-written, like TRANSIENT_PROVIDER_STOP_REASON. NOT transient: the same
+# prompt hits the same cap, so retrying it on the same lane spends a full call
+# to learn nothing. When CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK names a
+# `harness:model` pair, `schedule_output_cap_fallback` assigns these steps to
+# that lane instead; unset, they stay `failed`.
+OUTPUT_CAP_STOP_REASON = "output_cap"
+
+#: The environment variable naming the fallback lane for `output_cap` steps.
+OUTPUT_CAP_FALLBACK_ENV = "CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK"
+
+#: Where the fallback assignment lives: under the frozen plan, which a lane
+#: container mounts read-only, so a lane cannot widen its own assignment.
+#: `{"lanes": {<fallback lane_dir_name>: {<step_id>: [<source lane>, ...]}}}`.
+OUTPUT_CAP_FALLBACK_FILENAME = "output_cap_fallback.json"
+
+
+def is_output_cap_failure(stop_reason: object) -> bool:
+    """True when a `failed` step stopped at its provider's output cap."""
+    return stop_reason == OUTPUT_CAP_STOP_REASON
+
+
 def is_transient_failure(stop_reason: object) -> bool:
     """True when a `failed` step's stop reason is one a later attempt can clear."""
     if isinstance(stop_reason, str) and stop_reason.startswith(TRANSIENT_PROVIDER_STOP_REASON):
@@ -412,3 +436,178 @@ def missing_steps(
         missing.append(step_id)
 
     return missing
+
+
+def output_cap_steps(lane_dir: str, step_ids: list[str]) -> list[str]:
+    """The steps in `step_ids` this lane recorded `failed` with
+    `stop_reason_raw == OUTPUT_CAP_STOP_REASON`, in the given order. A step
+    with a `.findings.json` is never one: that file means the lane finished
+    it, whatever an older `.status.json` beside it says."""
+    capped: list[str] = []
+    for step_id in step_ids:
+        if os.path.isfile(os.path.join(lane_dir, f"{step_id}.findings.json")):
+            continue
+        envelope = _load_json(os.path.join(lane_dir, f"{step_id}.status.json"))
+        if (
+            isinstance(envelope, dict)
+            and envelope.get("state") == "failed"
+            and is_output_cap_failure(envelope.get("stop_reason_raw"))
+        ):
+            capped.append(step_id)
+    return capped
+
+
+def load_fallback_assignments(plan_dir: str) -> dict:
+    """`{fallback_lane: {step_id: [source_lane, ...]}}` from the plan's
+    fallback file, or `{}` when it is absent or malformed. Entries that are
+    not the expected shape are dropped rather than trusted."""
+    data = _load_json(os.path.join(plan_dir, OUTPUT_CAP_FALLBACK_FILENAME))
+    lanes = data.get("lanes") if isinstance(data, dict) else None
+    if not isinstance(lanes, dict):
+        return {}
+    result: dict = {}
+    for lane, steps in lanes.items():
+        if not isinstance(lane, str) or not isinstance(steps, dict):
+            continue
+        result[lane] = {
+            step_id: [src for src in sources if isinstance(src, str)]
+            for step_id, sources in steps.items()
+            if isinstance(step_id, str) and isinstance(sources, list)
+        }
+    return result
+
+
+def fallback_steps_for_lane(plan_dir: str, lane_id: str) -> "set[str] | None":
+    """The step ids assigned to `lane_id` as the output-cap fallback, or
+    `None` when `lane_id` is not a fallback lane (it then runs every step)."""
+    steps = load_fallback_assignments(plan_dir).get(lane_id)
+    return None if steps is None else set(steps)
+
+
+def _has_complete_envelope(lane_dir: str, step_id: str) -> bool:
+    envelope = _load_json(os.path.join(lane_dir, f"{step_id}.findings.json"))
+    return (
+        isinstance(envelope, dict)
+        and envelope.get("state") == "complete"
+        and not schema.validate_step_envelope(envelope)
+    )
+
+
+def schedule_output_cap_fallback(sweep_dir: str, environ=None) -> "dict | None":
+    """Assign every `output_cap` step of the sweep to the fallback lane named
+    by `CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK`, and record it in
+    `<sweep_dir>/plan/output_cap_fallback.json`.
+
+    Returns `None` when the variable is unset -- nothing is written and
+    `output_cap` steps stay `failed`. Otherwise
+    `{"harness", "model", "lane", "steps", "outstanding", "skipped"}`:
+    `steps` maps each capped step to the lanes it was capped on, and
+    `outstanding` lists those the fallback lane has not completed yet, which
+    is what decides whether it is dispatched at all.
+
+    The fallback writes under its OWN lane directory, so its findings are
+    attributed to the harness and model that produced them and stay
+    independent of the capped lane's. A fallback that is also a roster lane
+    already runs every step, so it is not assigned anything (`skipped`
+    says why) -- restricting it would cut that roster lane's coverage.
+
+    Only `output_cap` steps are assigned. A step failed for any other
+    non-transient reason keeps `failed`'s ordinary meaning. Raises
+    `roster.RosterError` when the variable is not exactly one valid pair.
+
+    Reads lane artifacts only; it never calls `missing_steps`, whose
+    transient-retry bookkeeping must run once per lane run, not here too.
+    """
+    import roster  # local: only this entry point needs the parser
+
+    environ = os.environ if environ is None else environ
+    value = (environ.get(OUTPUT_CAP_FALLBACK_ENV) or "").strip()
+    if not value:
+        return None
+    parsed = roster.parse_roster(value)
+    if len(parsed) != 1:
+        raise roster.RosterError(
+            f"{OUTPUT_CAP_FALLBACK_ENV} must name exactly one harness:model pair, got {value!r}"
+        )
+    fallback = parsed[0]
+    roster_value = (environ.get("CFGMS_SECURITY_REVIEW_LANES") or "").strip()
+    roster_lanes = (
+        {lane.lane_dir_name for lane in roster.parse_roster(roster_value)} if roster_value else set()
+    )
+
+    plan_dir = os.path.join(sweep_dir, "plan")
+    lanes_dir = os.path.join(sweep_dir, "lanes")
+    assignments = load_fallback_assignments(plan_dir)
+    result = {
+        "harness": fallback.harness,
+        "model": fallback.model,
+        "lane": fallback.lane_dir_name,
+        "steps": {},
+        "outstanding": [],
+        "skipped": None,
+    }
+
+    if fallback.lane_dir_name in roster_lanes:
+        assignments.pop(fallback.lane_dir_name, None)
+        result["skipped"] = "the fallback lane is already a roster lane and runs every step"
+    else:
+        step_ids = sorted(
+            name[: -len(".json")]
+            for name in (os.listdir(plan_dir) if os.path.isdir(plan_dir) else [])
+            if name.startswith("step-") and name.endswith(".json")
+        )
+        # Every lane except a fallback lane: a fallback's own capped step is
+        # not re-assigned to itself or to another fallback.
+        sources = sorted(
+            name
+            for name in (os.listdir(lanes_dir) if os.path.isdir(lanes_dir) else [])
+            if os.path.isdir(os.path.join(lanes_dir, name))
+            and name != fallback.lane_dir_name
+            and name not in assignments
+        )
+        steps: dict = {}
+        for lane in sources:
+            for step_id in output_cap_steps(os.path.join(lanes_dir, lane), step_ids):
+                steps.setdefault(step_id, []).append(lane)
+        result["steps"] = steps
+        fallback_dir = os.path.join(lanes_dir, fallback.lane_dir_name)
+        result["outstanding"] = [
+            step_id for step_id in sorted(steps) if not _has_complete_envelope(fallback_dir, step_id)
+        ]
+        assignments[fallback.lane_dir_name] = steps
+
+    atomic_write.write_json_atomic(
+        os.path.join(plan_dir, OUTPUT_CAP_FALLBACK_FILENAME), {"lanes": assignments}
+    )
+    schema.log_event(
+        "output_cap_fallback_scheduled",
+        lane=fallback.lane_dir_name,
+        steps=len(result["steps"]),
+        outstanding=len(result["outstanding"]),
+        skipped=result["skipped"],
+    )
+    return result
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    """`resume.py output-cap-fallback <sweep_dir>`: schedule the fallback and
+    print `harness<TAB>model<TAB>lane_dir_name<TAB>outstanding` -- nothing
+    when the variable is unset. Exit 2 on a malformed value."""
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 2 or argv[0] != "output-cap-fallback":
+        print("usage: resume.py output-cap-fallback <sweep_dir>", file=sys.stderr)
+        return 2
+    import roster
+
+    try:
+        result = schedule_output_cap_fallback(argv[1])
+    except roster.RosterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if result is not None:
+        print(f"{result['harness']}\t{result['model']}\t{result['lane']}\t{len(result['outstanding'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

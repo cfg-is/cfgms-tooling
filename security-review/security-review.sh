@@ -459,20 +459,22 @@ PYEOF
 # credential-unavailable skip is recorded here exactly like a dispatched
 # lane is, never silently omitted. passed_harness/passed_model equal
 # requested_harness/requested_model, matching record_planner_dispatch_outcome
-# above for the same reason.
+# above for the same reason. LANE_DISPATCH_REPORT_KEY (default "lanes")
+# names the array written, so the output-cap fallback lane is recorded
+# under its own key without replacing the roster's entries.
 record_lane_dispatch_outcomes() {
   local sweep_dir="$1"; shift
-  python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" "$@" <<'PYEOF'
+  python3 - "$SECURITY_REVIEW_DIR" "$sweep_dir" "${LANE_DISPATCH_REPORT_KEY:-lanes}" "$@" <<'PYEOF'
 import json
 import os
 import sys
 
-sec_dir, sweep_dir = sys.argv[1], sys.argv[2]
+sec_dir, sweep_dir, report_key = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, sec_dir)
 import atomic_write  # noqa: E402
 
 entries = []
-for raw in sys.argv[3:]:
+for raw in sys.argv[4:]:
     harness, model, outcome = raw.split("\t")
     entries.append({
         "requested_harness": harness,
@@ -491,7 +493,7 @@ try:
 except (OSError, ValueError):
     report = {}
 report.setdefault("planners", [])
-report["lanes"] = entries
+report[report_key] = entries
 atomic_write.write_json_atomic(report_path, report)
 PYEOF
 }
@@ -809,6 +811,33 @@ dispatch_all_lanes() {
   dispatch_roster_lanes "$sweep_dir" "$CFGMS_SECURITY_REVIEW_LANES"
 }
 
+# dispatch_output_cap_fallback <sweep_dir>
+# Runs after the roster lanes. When CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK
+# names a harness:model pair, `resume.py output-cap-fallback` assigns every
+# step a lane recorded as `output_cap` (its provider's fixed output ceiling)
+# to that pair, in plan/output_cap_fallback.json, and the pair is dispatched
+# as its own lane -- its own lane directory, so findings stay attributed to
+# the harness that produced them -- running only those steps. Unset: no-op,
+# and `output_cap` steps stay failed. Nothing outstanding: no dispatch.
+dispatch_output_cap_fallback() {
+  local sweep_dir="$1"
+  [[ -n "${CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK:-}" ]] || return 0
+
+  local schedule
+  if ! schedule=$(python3 "${SECURITY_REVIEW_DIR}/resume.py" output-cap-fallback "$sweep_dir"); then
+    echo "ERROR: could not schedule the output-cap fallback lane" >&2
+    return 1
+  fi
+  local harness model lane_dir_name outstanding
+  IFS=$'\t' read -r harness model lane_dir_name outstanding <<<"$schedule"
+  if [[ -z "$lane_dir_name" || "${outstanding:-0}" -eq 0 ]]; then
+    return 0
+  fi
+  echo "output-cap fallback: ${outstanding} step(s) on lane ${lane_dir_name}" >&2
+  LANE_DISPATCH_REPORT_KEY=output_cap_fallback_lanes \
+    dispatch_roster_lanes "$sweep_dir" "$CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK"
+}
+
 # record_adjudicator_dispatch_outcome <sweep_dir> <harness> <model> <outcome>
 # Writes dispatch_report.json's `adjudicator` entry (Issue #3984), preserving
 # the `planners`/`lanes` entries the two recorders above own. consolidate.py
@@ -1054,6 +1083,7 @@ cmd_launch() {
   local dispatch_failed=0
   dispatch_planner "$sweep_dir" "$commit_sha" "$scope_file" "${scope_paths[@]:-}" || dispatch_failed=1
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
+  dispatch_output_cap_fallback "$sweep_dir" || dispatch_failed=1
   dispatch_verifier "$sweep_dir"
   dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 
@@ -1136,6 +1166,7 @@ cmd_resume() {
   fi
 
   dispatch_all_lanes "$sweep_dir" || dispatch_failed=1
+  dispatch_output_cap_fallback "$sweep_dir" || dispatch_failed=1
   dispatch_verifier "$sweep_dir"
   dispatch_adjudicator "$sweep_dir" || dispatch_failed=1
 

@@ -189,6 +189,20 @@ The prefix rule alone would still loop on a mis-detected `harness_exit_1`, whose
 the CLI's error output. The cap alone would still burn two full step runs on every finding that
 mentions authentication.
 
+**`output_cap` is neither transient nor generic.** Ollama Cloud ends every response at 65,536
+output tokens, thinking included, and no request option raises it. When an `ollama` call stops
+there (`done_reason=length`) with no readable findings object, the lane appends a harness-written
+marker (defanged inside model text, like the transport marker) and `LaneSpec.classified_stop_reason`
+records `stop_reason_raw: output_cap`. The same prompt hits the same cap, so the lane never retries
+it. When `CFGMS_SECURITY_REVIEW_OUTPUT_CAP_FALLBACK` names one `harness:model` pair,
+`security-review.sh` calls `resume.schedule_output_cap_fallback()` after the roster lanes. It writes
+`plan/output_cap_fallback.json` (`{"lanes": {<fallback lane>: {<step>: [<capped lanes>]}}}`) and
+dispatches the pair as its own lane when any assigned step is outstanding. The plan directory is
+read-only inside a lane container, so a lane cannot widen its own assignment. `run_lane` on that
+lane runs only the assigned steps. `consolidate.py` counts `output_cap` apart from `failed`, gives
+the fallback lane a denominator of its assigned steps, names each capped step a fallback completed,
+and treats a capped step as a gap until a fallback completes it.
+
 ### The shared terminal-state classifier (epic #3927's contract C3)
 
 `lanes/terminal_state.py::classify()` (Issue #3928) is a shared classifier every future lane
