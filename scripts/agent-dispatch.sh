@@ -452,10 +452,18 @@ print(json.dumps(rec, separators=(",", ":")))
 # container's --cpus limit.
 # ---------------------------------------------------------------------------
 _capacity_compute() {
-  # _capacity_compute <line|json>
+  # _capacity_compute <line|json> [launch|review]
   # Prints CAPACITY_OK:slots=<n> / CAPACITY_FULL:<reason>:slots=0 (line mode) or a
   # JSON object (json mode). Returns 0 when at least one slot is free, else 1.
-  local mode="${1:-line}" running docker_root
+  #
+  # Review slot reserve: a `launch` (dev story, fix, resolve-conflict, resume —
+  # the default kind, used by po-act.sh and the FSM supervisor) is admitted only
+  # while CFGMS_AGENT_REVIEW_RESERVE slots (default 1) stay free after it, so an
+  # acceptance review for a PR that is already green never waits behind long
+  # dev/fix runs. A `review` (review-pr) needs only one free slot. The reserve
+  # is not applied on an idle host (running == 0), so a host whose total
+  # capacity is a single slot can still start dev work.
+  local mode="${1:-line}" kind="${2:-launch}" running docker_root
   # Where docker is absent (CI lint/test containers, a non-Docker host) there are
   # by definition zero agent containers running. Guard the probe: without the
   # guard the missing binary exits 127 mid-pipeline and `set -e` aborts the whole
@@ -479,7 +487,11 @@ _capacity_compute() {
   reserved=$(python3 "$FSM_RUNINDEX_PY" reserved --running-run-ids "${running_ids}" 2>/dev/null || echo 0)
   [[ "$reserved" =~ ^[0-9]+$ ]] || reserved=0
   running=$(( ${running:-0} + reserved ))
-  CAP_MODE="$mode" CAP_RUNNING="${running:-0}" CAP_DOCKER_ROOT="$docker_root" \
+  # Test seam: pin the running count so the slot math is host-independent.
+  if [[ "${CFGMS_TEST_CAPACITY_RUNNING:-}" =~ ^[0-9]+$ ]]; then
+    running="$CFGMS_TEST_CAPACITY_RUNNING"
+  fi
+  CAP_MODE="$mode" CAP_KIND="$kind" CAP_RUNNING="${running:-0}" CAP_DOCKER_ROOT="$docker_root" \
   CAP_WORKTREE="$WORKTREE_BASE" CAP_FSM_RUNS="${CFGMS_FSM_RUNS_DIR:-${HOME}/.cache/cfgms-fsm-runs}" \
   python3 - <<'PY'
 import os
@@ -570,12 +582,23 @@ slots["cpu"] = max(0, slots_for(cpu_ceil * ncpu, used_cpu, per_cpu_load))
 # Runaway backstop: never more than 2×ncpu agents regardless of headroom.
 slots["count"] = max(0, int(2 * ncpu) - running)
 
-free = min(slots.values()) if slots else 0
+raw_free = min(slots.values()) if slots else 0
 reason = min(slots, key=slots.get) if slots else "unknown"
+# Review slot reserve (see _capacity_compute header).
+kind = os.environ.get("CAP_KIND", "launch")
+reserve = max(0, int(f("CFGMS_AGENT_REVIEW_RESERVE", 1)))
+reserve_applied = kind != "review" and running >= 1 and reserve > 0
+free = raw_free
+if reserve_applied:
+    free = max(0, raw_free - reserve)
+    if free < 1 and raw_free >= 1:
+        reason = "review_reserve"
 if os.environ.get("CAP_MODE") == "json":
     import json
     print(json.dumps({"can_launch": free >= 1, "free_slots": free,
-                      "binding": reason, "running": running, "per_slot": slots}))
+                      "binding": reason, "running": running, "per_slot": slots,
+                      "kind": kind, "review_reserve": reserve,
+                      "reserve_applied": reserve_applied, "raw_free_slots": raw_free}))
 else:
     if free >= 1:
         print(f"CAPACITY_OK:slots={free}")
@@ -585,15 +608,16 @@ raise SystemExit(0 if free >= 1 else 1)
 PY
 }
 
-# _capacity_gate <skip_label> <emit_prefix>
+# _capacity_gate <skip_label> <emit_prefix> [launch|review]
 #   Admission gate for a launch path. On capacity, returns 0 silently. When full,
 #   prints "<emit_prefix>:<label>:resources (<reason>)" and returns 1 — the caller
-#   should exit cleanly (defer to a later cycle/host). Bypass with
+#   should exit cleanly (defer to a later cycle/host). The kind (default launch)
+#   selects whether the review slot reserve applies. Bypass with
 #   CFGMS_AGENT_CAPACITY_GATE=off (e.g. tests).
 _capacity_gate() {
-  local label="$1" prefix="$2" out
+  local label="$1" prefix="$2" kind="${3:-launch}" out
   [[ "${CFGMS_AGENT_CAPACITY_GATE:-on}" == "off" ]] && return 0
-  out=$(_capacity_compute line 2>/dev/null) || {
+  out=$(_capacity_compute line "$kind" 2>/dev/null) || {
     echo "${prefix}:${label}:resources (${out:-capacity full})"
     return 1
   }
@@ -2181,7 +2205,8 @@ Commands:
   cleanup-stale                             Remove containers/clones for closed, blocked, or failed stories,
                                             exited validators and finished FSM run dirs (never an unfinished run's)
   list-running                              List running agent containers
-  capacity [--json]                         Resource admission gate: CAPACITY_OK:slots=<n> (rc0) / CAPACITY_FULL:<binding>:slots=0 (rc1)
+  capacity [--json] [--kind launch|review]  Resource admission gate: CAPACITY_OK:slots=<n> (rc0) / CAPACITY_FULL:<binding>:slots=0 (rc1);
+                                            launch (default) keeps CFGMS_AGENT_REVIEW_RESERVE slots (default 1) free for reviews
   list-exited                               List exited agent containers
   inspect-exit    <NUM>                     Print exit code of container
   inspect-detail  <NUM>                     Print stats + last 30 log lines
@@ -3225,11 +3250,23 @@ else:
     # CAPACITY_FULL:<binding>:slots=0 (rc1). `capacity --json` → full detail for
     # the preflight. Used by every launch path to bound host resource use without
     # a hand-tuned container count (RAM/disk 90%, CPU 90%, 2×ncpu backstop).
-    if [[ "${1:-}" == "--json" ]]; then
-      _capacity_compute json
-    else
-      _capacity_compute line
-    fi
+    # `--kind review` asks for a review slot; the default kind `launch` keeps
+    # CFGMS_AGENT_REVIEW_RESERVE slots free for reviews.
+    cap_mode=line cap_kind=launch
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --json) cap_mode=json; shift ;;
+        --kind)
+          cap_kind="${2:-}"
+          case "$cap_kind" in
+            launch|review) ;;
+            *) echo "capacity: --kind must be launch or review" >&2; exit 2 ;;
+          esac
+          shift 2 ;;
+        *) echo "capacity: unknown argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    _capacity_compute "$cap_mode" "$cap_kind"
     ;;
 
   list-exited)
@@ -3729,7 +3766,7 @@ for i in items:
     fi
 
     # Resource admission gate before claiming the lease / cloning.
-    if ! _capacity_gate "${pr_num}" "REVIEW_REFUSED"; then
+    if ! _capacity_gate "${pr_num}" "REVIEW_REFUSED" review; then
       exit 3
     fi
 

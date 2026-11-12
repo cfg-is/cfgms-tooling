@@ -358,7 +358,9 @@ A crash between sub-steps resumes at the first incomplete one (§11).
 - **Start:** `po-act.sh dispatch|dispatch-fix|resolve-conflict` and
   `dispatch --branch` are the one launch path for all modes. Before any side
   effect they apply, in order: the author gate (fix-pr, resolve-conflict,
-  `--branch`), the capacity gate, the image staleness gate (refuse, exit 3,
+  `--branch`), the capacity gate (as a `launch`, which leaves
+  `CFGMS_AGENT_REVIEW_RESERVE` slots, default 1, free for `review-pr` whenever
+  anything is running), the image staleness gate (refuse, exit 3,
   when `cfg-agent:latest`'s `cfgms.build_inputs_hash` label is not this
   checkout's `devcontainer` tree; this path never rebuilds or retags the
   image, while review / interactive / investigator launches keep their
