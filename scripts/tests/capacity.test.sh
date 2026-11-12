@@ -95,6 +95,72 @@ check_contains "0% cpu ceiling -> CAPACITY_FULL:cpu" "$out" "CAPACITY_FULL:cpu"
 check_rc "cpu-forced-full exits 1" "$rc" "1"
 
 # ---------------------------------------------------------------------------
+# T3c: review slot reserve. Every dimension except the 2xncpu count backstop is
+# neutralized, and the running count is pinned through the test seam, so the raw
+# free-slot count is exactly 2*ncpu - running.
+#   - A launch (dev/fix/resolve/resume, the default kind) needs 1 + reserve free
+#     slots, so one slot always stays open for an acceptance review.
+#   - A review needs only 1.
+#   - The reserve does not apply on an idle host (running == 0), so a host whose
+#     total capacity is one slot can still start dev work.
+#   - CFGMS_AGENT_REVIEW_RESERVE=0 restores the old behavior.
+# ---------------------------------------------------------------------------
+NCPU="$(python3 -c 'import os; print(os.cpu_count() or 1)')"
+abundant=(CFGMS_AGENT_MEM_MB=0 CFGMS_AGENT_DISK_GB=0 CFGMS_AGENT_CPU_LOAD=0
+          CFGMS_AGENT_MEM_CEIL=1.0 CFGMS_AGENT_DISK_CEIL=1.0 CFGMS_AGENT_CPU_CEIL=1.0)
+one_left=$(( 2 * NCPU - 1 ))
+two_left=$(( 2 * NCPU - 2 ))
+
+rc=0
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING="$one_left" \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+check_contains "1 raw slot: launch refused, binding review_reserve" "$out" "CAPACITY_FULL:review_reserve"
+check_rc "1 raw slot: launch exits 1" "$rc" "1"
+
+rc=0
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING="$one_left" \
+       bash "$DISPATCH" capacity --kind review 2>/dev/null)" || rc=$?
+check_contains "1 raw slot: review admitted" "$out" "CAPACITY_OK:slots=1"
+check_rc "1 raw slot: review exits 0" "$rc" "0"
+
+rc=0
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING="$two_left" \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+check_contains "2 raw slots: launch admitted with 1 usable" "$out" "CAPACITY_OK:slots=1"
+check_rc "2 raw slots: launch exits 0" "$rc" "0"
+
+rc=0
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING="$one_left" CFGMS_AGENT_REVIEW_RESERVE=0 \
+       bash "$DISPATCH" capacity 2>/dev/null)" || rc=$?
+check_contains "reserve=0: launch admitted on the last slot" "$out" "CAPACITY_OK:slots=1"
+check_rc "reserve=0: launch exits 0" "$rc" "0"
+
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING=0 \
+       bash "$DISPATCH" capacity --json 2>/dev/null)" || true
+check_contains "idle host: reserve not applied" "$out" '"reserve_applied": false'
+check_contains "json reports the configured reserve" "$out" '"review_reserve": 1'
+check_contains "json reports the kind" "$out" '"kind": "launch"'
+
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING="$one_left" \
+       bash "$DISPATCH" capacity --json 2>/dev/null)" || true
+check_contains "json: reserve applied when busy" "$out" '"reserve_applied": true'
+check_contains "json: raw slots reported" "$out" '"raw_free_slots": 1'
+check_contains "json: launch cannot launch" "$out" '"can_launch": false'
+
+out="$(env "${abundant[@]}" CFGMS_TEST_CAPACITY_RUNNING="$one_left" \
+       bash "$DISPATCH" capacity --json --kind review 2>/dev/null)" || true
+check_contains "json: review kind can launch" "$out" '"can_launch": true'
+check_contains "json: review kind reported" "$out" '"kind": "review"'
+
+rc=0
+out="$(env "${abundant[@]}" bash "$DISPATCH" capacity --kind bogus 2>&1)" || rc=$?
+check_rc "unknown --kind exits 2" "$rc" "2"
+
+# review-pr is the only launch path that passes the review kind.
+src="$(cat "$DISPATCH")"
+check_contains "review-pr gate uses the review kind" "$src" '_capacity_gate "${pr_num}" "REVIEW_REFUSED" review'
+
+# ---------------------------------------------------------------------------
 # T4: po-act dispatch-fix defers when the host is out of capacity (before lease).
 # Mock dispatch: trusted author + capacity reports FULL. Any other call fails.
 # ---------------------------------------------------------------------------
