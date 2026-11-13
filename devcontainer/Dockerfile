@@ -102,9 +102,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # golang.org/x/tools that can read this Go's export data. A plain `go install`
 # of the pinned releases cannot read Go 1.27.3 export data ("export data version
 # 5 is greater than maximum supported version 4") and fails on every package.
+# The script fetches through its sibling scripts/go-fetch-retry.sh (cfgms #6216),
+# resolved next to itself, so both are copied into the same directory.
 COPY scripts/install-go-analyzers.sh /tmp/install-go-analyzers.sh
+COPY scripts/go-fetch-retry.sh /tmp/go-fetch-retry.sh
 RUN bash /tmp/install-go-analyzers.sh \
-    && rm /tmp/install-go-analyzers.sh \
+    && rm /tmp/install-go-analyzers.sh /tmp/go-fetch-retry.sh \
     && go install github.com/zricethezav/gitleaks/v8@v8.30.1 \
     && go install github.com/google/go-licenses/v2@v2.0.1
 
