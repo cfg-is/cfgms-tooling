@@ -9,7 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from selector import FAILED, GREEN, NOT_GREEN, PENDING, GitHubSource, check_state, select_revision  # noqa: E402
+from selector import (FAILED, GREEN, NOT_GREEN, PENDING, GitHubSource, SourceError,  # noqa: E402
+                      check_state, select_revision)
 
 # newest first
 C = ["c6", "c5", "c4", "c3", "c2", "c1"]
@@ -79,10 +80,23 @@ class CheckStateTest(unittest.TestCase):
         runs = [run("unit-tests", conclusion="failure", suite=1), run("unit-tests", suite=2), run("Build Gate")]
         self.assertEqual(check_state(runs, self.REQ), FAILED)
 
-    def test_failed_then_rerun_success_stays_failed(self):
+    def test_failure_beside_a_later_same_name_success_is_failed(self):
+        # filter=latest drops superseded re-run attempts, so this pair is two
+        # distinct jobs sharing a name (a real job and its stub), not a re-run.
         runs = [run("unit-tests", conclusion="failure", started="2026-11-13T00:00:00Z"),
                 run("unit-tests", started="2026-11-13T01:00:00Z"), run("Build Gate")]
         self.assertEqual(check_state(runs, self.REQ), FAILED, "conservative: any failure blocks this commit")
+
+    def test_every_failure_conclusion_fails(self):
+        for conclusion in ("failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"):
+            with self.subTest(conclusion=conclusion):
+                runs = [run("unit-tests", conclusion=conclusion), run("unit-tests"), run("Build Gate")]
+                self.assertEqual(check_state(runs, self.REQ), FAILED)
+
+    def test_running_real_job_beside_stub_success_is_pending(self):
+        runs = [run("unit-tests", status="in_progress", conclusion=None, suite=1),
+                run("unit-tests", suite=2), run("Build Gate")]
+        self.assertEqual(check_state(runs, self.REQ), PENDING, "a stub success never stands in for a running job")
 
     def test_skipped_only_is_not_green(self):
         runs = [run("unit-tests", conclusion="skipped"), run("Build Gate")]
@@ -117,7 +131,29 @@ class GitHubSourceTest(unittest.TestCase):
     REQ = ["unit-tests"]
 
     def page(self, sha, page, runs):
-        return f"repos/o/r/commits/{sha}/check-runs?per_page=100&page={page}", {"check_runs": runs}
+        return f"repos/o/r/commits/{sha}/check-runs?filter=latest&per_page=100&page={page}", {"check_runs": runs}
+
+    def test_check_runs_ask_for_latest_attempts_only(self):
+        src = FakeSource(dict([self.page("s", 1, [run("unit-tests")])]))
+        src.check_runs("s")
+        self.assertIn("filter=latest", src.calls[0])
+
+    def test_unexpected_response_shapes_are_source_errors(self):
+        cases = [
+            ("commits", "repos/o/r/commits?sha=develop&per_page=30", [{"no_sha": 1}]),
+            ("commits", "repos/o/r/commits?sha=develop&per_page=30", {"message": "Not Found"}),
+            ("check_runs", self.page("s", 1, [])[0], ["not", "a", "dict"]),
+            ("check_runs", self.page("s", 1, [])[0], {"check_runs": "nope"}),
+            ("check_runs", self.page("s", 1, [])[0], {"check_runs": [1, 2]}),
+            ("is_ahead", "repos/o/r/compare/a...b", ["x"]),
+        ]
+        for method, path, body in cases:
+            with self.subTest(method=method, body=body):
+                src = FakeSource({path: body})
+                fn = {"commits": lambda: src.commits(), "check_runs": lambda: src.check_runs("s"),
+                      "is_ahead": lambda: src.is_ahead("a", "b")}[method]
+                with self.assertRaises(SourceError):
+                    fn()
 
     def test_check_runs_paginate(self):
         full = [run(f"x{i}") for i in range(100)]

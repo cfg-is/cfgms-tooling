@@ -235,6 +235,19 @@ class DeployPlanTest(CLITest):
         self.assertEqual(rc, 3)
         self.assertEqual(plan["kill_switch"]["by"], "me")
 
+    def test_engaged_kill_switch_exits_3_even_when_github_fails(self):
+        class Broken(FakeGitHub):
+            def _api(self, path):
+                raise SourceError("gh api failed (exit 1): HTTP 502")
+        testcell.GitHubSource = Broken
+        self.run_cli("kill", "on", "--by", "me", "--reason", "test")
+        rc, out, _ = self.run_cli("deploy", "plan")
+        self.assertEqual(rc, 3)
+        self.assertIn("KILL SWITCH ENGAGED", out)
+        rc, out, _ = self.run_cli("deploy", "plan", "--json")
+        self.assertEqual(rc, 3)
+        self.assertEqual(json.loads(out)["kill_switch"]["by"], "me")
+
     def test_plan_github_failure_is_an_error_not_a_traceback(self):
         class Broken(FakeGitHub):
             def _api(self, path):

@@ -196,15 +196,28 @@ def cmd_kill(args) -> int:
 def cmd_deploy_plan(args) -> int:
     cfg = load_config(args.config)
     ks = KillSwitch(cfg.kill_switch_path)
+    # Read the switch before GitHub: an engaged switch exits 3 even when GitHub
+    # cannot be read.
+    killed = ks.engaged()
+    kill_reason = ks.reason() if killed else None
+    if killed and not args.json:
+        print(f"KILL SWITCH ENGAGED: {kill_reason}")
     state = DeployState(cfg.state_path).load()
     running = state["running"].get("controller", {}).get("revision")
     src = GitHubSource(cfg.repo, cfg.branch, cfg.history_window)
-    commits = src.commits()
-    states = src.states(commits, cfg.required_contexts, running=running, no_retry=state["no_retry"])
-    sel = select_revision(commits, states, running, state["no_retry"], is_ahead=src.is_ahead)
-    killed = ks.engaged()
+    try:
+        commits = src.commits()
+        states = src.states(commits, cfg.required_contexts, running=running, no_retry=state["no_retry"])
+        sel = select_revision(commits, states, running, state["no_retry"], is_ahead=src.is_ahead)
+    except SourceError:
+        if killed:
+            if args.json:
+                _print_json({"cell": cfg.cell, "kill_switch": kill_reason, "selected": None,
+                             "reason": "GitHub could not be read"})
+            return EXIT_KILLED
+        raise
     plan = {"cell": cfg.cell, "running": running, "selected": sel.revision, "reason": sel.reason,
-            "skipped": sel.skipped, "kill_switch": ks.reason() if killed else None, "mode": cfg.mode}
+            "skipped": sel.skipped, "kill_switch": kill_reason, "mode": cfg.mode}
     if args.json:
         _print_json(plan)
     else:
@@ -213,8 +226,6 @@ def cmd_deploy_plan(args) -> int:
         print(f"selected: {sel.revision or 'nothing'}  ({sel.reason})")
         if sel.skipped:
             print(f"skipped:  {len(sel.skipped)} newer commit(s) not green or marked no-retry")
-        if killed:
-            print(f"KILL SWITCH ENGAGED: {plan['kill_switch']}")
     return EXIT_KILLED if killed else EXIT_OK
 
 
