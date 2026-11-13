@@ -85,14 +85,16 @@ class AlertSink:
         if not self.path.exists():
             return []
         events = []
-        with self.path.open("r", encoding="utf-8") as f:
-            for lineno, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
+        # Read bytes and decode per line, so one line with an invalid byte is
+        # damaged on its own instead of making the whole sink unreadable.
+        with self.path.open("rb") as f:
+            for lineno, raw in enumerate(f, 1):
+                raw = raw.strip()
+                if not raw:
                     continue
                 try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
+                    ev = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     # A line torn by a crash mid-write. It is skipped, never
                     # rewritten, and reported so it is not silently lost.
                     self.damaged_lines.append(lineno)

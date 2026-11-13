@@ -74,13 +74,15 @@ def select_revision(commits_newest_first: list[str], states: dict[str, str],
 def check_state(check_runs: list[dict], required: list[str]) -> str:
     """Reduce a commit's check runs to GREEN, PENDING, FAILED or NOT_GREEN.
 
-    Several runs can report under one required name (a real job and its stub,
-    or reruns), and the name alone does not say which is which. So the rule is
-    conservative:
+    Runs are read with filter=latest, so a superseded re-run attempt never
+    reaches this function. Several runs can still report under one required
+    name (a real job and its stub, in the same or another workflow), and the
+    name alone does not say which is which. So the rule is conservative:
     - FAILED if any run of a required name has a failure conclusion, even if a
-      later or sibling run of that name passed;
+      sibling run of that name passed;
     - PENDING if any run of a required name has not completed, or a required
-      name has no run yet;
+      name has no run. PENDING also covers a name that will never report (a
+      misconfigured context): it is never chosen either way;
     - NOT_GREEN if a required name never concluded success (skipped or neutral
       only);
     - GREEN otherwise: every required name has at least one success and no
@@ -124,13 +126,19 @@ class GitHubSource:
 
     def commits(self) -> list[str]:
         data = self._api(f"repos/{self.repo}/commits?sha={self.branch}&per_page={self.window}")
-        return [c["sha"] for c in data]
+        try:
+            return [str(c["sha"]) for c in data]
+        except (KeyError, TypeError) as e:
+            raise SourceError(f"unexpected commits response from GitHub: {e!r}") from e
 
     def check_runs(self, sha: str) -> list[dict]:
         runs, page = [], 1
         while True:
-            data = self._api(f"repos/{self.repo}/commits/{sha}/check-runs?per_page=100&page={page}")
-            batch = data.get("check_runs", [])
+            data = self._api(f"repos/{self.repo}/commits/{sha}/check-runs"
+                             f"?filter=latest&per_page=100&page={page}")
+            batch = data.get("check_runs") if isinstance(data, dict) else None
+            if not isinstance(batch, list) or not all(isinstance(r, dict) for r in batch):
+                raise SourceError(f"unexpected check-runs response from GitHub for {sha}")
             runs.extend(batch)
             if len(batch) < 100:
                 return runs
@@ -139,6 +147,8 @@ class GitHubSource:
     def is_ahead(self, base: str, head: str) -> bool:
         """True when head is strictly ahead of base (base is an ancestor of head)."""
         data = self._api(f"repos/{self.repo}/compare/{base}...{head}")
+        if not isinstance(data, dict):
+            raise SourceError(f"unexpected compare response from GitHub for {base}...{head}")
         return data.get("status") == "ahead"
 
     def states(self, shas: list[str], required: list[str], *, running: str | None = None,

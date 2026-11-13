@@ -42,8 +42,10 @@ testcell deploy plan [--json]
 ```
 
 The config path is `--config`, then `$TESTCELL_CONFIG`, then
-`/etc/cfgms-testcell/cell.json`. Exit codes: 0 ok, 1 a check failed or a gate
-blocked, 2 usage or configuration error, 3 the kill switch is engaged.
+`/etc/cfgms-testcell/cell.json`. Exit codes: 0 ok; 1 a check failed, a gate
+blocked, or GitHub or Prometheus could not be read; 2 usage or configuration
+error; 3 the kill switch is engaged (checked before GitHub is read, so an
+engaged switch exits 3 even when GitHub is down).
 
 ## Alert sink
 
@@ -95,10 +97,12 @@ and the test suite.
 
 `deploy plan` picks the newest develop commit whose required checks are green.
 It never picks a commit older than the one running, and it never picks one
-recorded as no-retry. Several runs can report under one required check name (a
-real job and its stub, or a rerun), so a required name counts as green only if
-at least one of its runs succeeded and none failed. A name that was only ever
-skipped is not green.
+recorded as no-retry. Check runs are read with `filter=latest`, so a
+superseded re-run attempt is never seen. Several runs can still report under
+one required check name (a real job and its stub), so a required name counts as
+green only if at least one of its runs succeeded and none failed. A name that
+was only ever skipped is not green, and one still running, or never reported,
+is pending.
 
 When the running revision is outside the window, for example because it is not
 on develop, a candidate is accepted only if GitHub's compare reports it as

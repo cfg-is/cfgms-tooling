@@ -99,6 +99,14 @@ class AlertSinkTest(unittest.TestCase):
         self.assertEqual(ids, [a.id, b.id])
         self.assertEqual(self.sink.damaged_lines, [2])
 
+    def test_invalid_utf8_damages_only_its_line(self):
+        a, _ = raise_one(self.sink, key="first")
+        with self.path.open("ab") as f:
+            f.write(b'{"type":"alert","id":"\xff\xfe"}\n')
+        b, _ = raise_one(self.sink, key="second")
+        self.assertEqual([x.id for x in self.sink.alerts()], [a.id, b.id])
+        self.assertEqual(self.sink.damaged_lines, [2])
+
     def test_malformed_events_are_reported_not_fatal(self):
         a, _ = raise_one(self.sink, key="good")
         with self.path.open("a", encoding="utf-8") as f:
