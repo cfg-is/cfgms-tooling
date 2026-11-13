@@ -335,7 +335,7 @@ check_contains "health-check (no label): reports 'unknown', not an empty value" 
 check_not_contains "health-check (no label): does not warn on a missing label" "$hc2_out" \
   "WARN:claude_code_version"
 
-# T9: `cfg version` prints to stderr. health-check must read it, not report
+# T8b: `cfg version` prints to stderr. health-check must read it, not report
 # "unknown" (and a false WARN:cfg_version) for a working binary.
 printf '\n== health-check: reads the cfg version from stderr ==\n'
 hc3_out=$(STUB_CFG_VERSION="1.2.3" STUB_CLAUDE_CODE_LABEL="2.1.286" run_health_check) || true
