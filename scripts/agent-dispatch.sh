@@ -3470,8 +3470,9 @@ PYEOF
       --format '{{index .Config.Labels "cfgms.claude_code_version"}}' 2>/dev/null || true)
     echo "INFO:claude_code_version:${claude_code_label:-unknown}"
 
-    # cfg CLI version check
-    cfg_version=$(docker run --rm --entrypoint cfg cfg-agent:latest version 2>/dev/null \
+    # cfg CLI version check. `cfg version` prints to stderr, so stderr is read
+    # too; discarding it made this report "unknown" for a working binary.
+    cfg_version=$(docker run --rm --entrypoint cfg cfg-agent:latest version 2>&1 \
       | grep -oP '(?<=Version: )\S+(?=,)' || echo "unknown")
     echo "INFO:cfg_version:${cfg_version}"
     if [[ "$cfg_version" == "unknown" ]]; then

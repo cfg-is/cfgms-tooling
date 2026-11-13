@@ -292,6 +292,12 @@ if [[ "$1" == "inspect" ]]; then
     esac
   done
 fi
+# `cfg version` inside the image writes its version line to stderr, as the
+# real binary does.
+if [[ "$1" == "run" && " $* " == *" --entrypoint cfg "* && -n "${STUB_CFG_VERSION-}" ]]; then
+  printf 'cfg Version: %s, Commit: unknown, Built: 2026-01-01T00:00:00Z, Go: go1.27.4\n' "$STUB_CFG_VERSION" >&2
+  exit 0
+fi
 exit 0
 STUB
 cat > "${STUB_BIN}/claude" <<'STUB'
@@ -328,6 +334,15 @@ check_contains "health-check (no label): reports 'unknown', not an empty value" 
 # (WARN:image_inputs_stale already covers a stale .claude/tooling/devcontainer tree).
 check_not_contains "health-check (no label): does not warn on a missing label" "$hc2_out" \
   "WARN:claude_code_version"
+
+# T9: `cfg version` prints to stderr. health-check must read it, not report
+# "unknown" (and a false WARN:cfg_version) for a working binary.
+printf '\n== health-check: reads the cfg version from stderr ==\n'
+hc3_out=$(STUB_CFG_VERSION="1.2.3" STUB_CLAUDE_CODE_LABEL="2.1.286" run_health_check) || true
+check_contains "health-check: reports INFO:cfg_version from stderr" "$hc3_out" "INFO:cfg_version:1.2.3"
+check_not_contains "health-check: no false WARN:cfg_version" "$hc3_out" "WARN:cfg_version"
+hc4_out=$(STUB_CLAUDE_CODE_LABEL="2.1.286" run_health_check) || true
+check_contains "health-check (no cfg output): still reports unknown" "$hc4_out" "INFO:cfg_version:unknown"
 
 # ---------------------------------------------------------------------------
 # T9: the Dockerfile end of the contract — the build-arg this shell passes has
