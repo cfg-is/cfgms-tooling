@@ -1,0 +1,9 @@
+{
+  "name": "gate.leadership_changes",
+  "version": 1,
+  "kind": "gate",
+  "description": "Cluster leadership did not change during the window (evaluate over the bake window).",
+  "promql": "sum(increase(cfgms_leadership_changes_total{job=\"${job}\"}[${window}]))",
+  "op": "<=",
+  "threshold": 0
+}

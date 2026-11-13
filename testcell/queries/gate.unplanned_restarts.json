@@ -1,0 +1,9 @@
+{
+  "name": "gate.unplanned_restarts",
+  "version": 1,
+  "kind": "gate",
+  "description": "No controller process restarted during the window (evaluate over the bake window, after the last node was replaced).",
+  "promql": "sum(changes(cfgms_process_start_time_seconds{job=\"${job}\"}[${window}]))",
+  "op": "<=",
+  "threshold": 0
+}

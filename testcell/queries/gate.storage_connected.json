@@ -1,0 +1,9 @@
+{
+  "name": "gate.storage_connected",
+  "version": 1,
+  "kind": "gate",
+  "description": "Every controller node's last storage probe reached the database.",
+  "promql": "min(cfgms_storage_connected{job=\"${job}\"})",
+  "op": "==",
+  "threshold": 1
+}

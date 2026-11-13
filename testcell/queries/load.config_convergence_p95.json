@@ -1,0 +1,10 @@
+{
+  "name": "load.config_convergence_p95",
+  "version": 1,
+  "kind": "load",
+  "description": "p95 configuration convergence time over the window, in seconds. Threshold is provisional while thresholds are measure-only.",
+  "promql": "histogram_quantile(0.95, sum by (le) (rate(cfgms_config_convergence_seconds_bucket{job=\"${job}\"}[${window}])))",
+  "op": "<=",
+  "threshold": 300,
+  "no_data": "pass"
+}

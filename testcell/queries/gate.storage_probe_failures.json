@@ -1,0 +1,9 @@
+{
+  "name": "gate.storage_probe_failures",
+  "version": 1,
+  "kind": "gate",
+  "description": "No storage probe failed during the window.",
+  "promql": "sum(increase(cfgms_storage_probe_failures_total{job=\"${job}\"}[${window}]))",
+  "op": "<=",
+  "threshold": 0
+}

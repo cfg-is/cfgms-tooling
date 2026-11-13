@@ -1,0 +1,15 @@
+{
+  "cell": "example-cell",
+  "repo": "cfg-is/cfgms",
+  "branch": "develop",
+  "required_contexts": ["unit-tests", "Build Gate"],
+  "prometheus_url": "http://127.0.0.1:9090",
+  "state_dir": "/var/lib/cfgms-testcell",
+  "mode": "measure",
+  "history_window": 30,
+  "query_params": {
+    "job": "cfgms-controller",
+    "window": "15m",
+    "min_stewards": 1
+  }
+}

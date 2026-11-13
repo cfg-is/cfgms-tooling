@@ -1,0 +1,9 @@
+{
+  "name": "gate.controllers_up",
+  "version": 1,
+  "kind": "gate",
+  "description": "Every controller node is being scraped.",
+  "promql": "min(up{job=\"${job}\"})",
+  "op": ">=",
+  "threshold": 1
+}

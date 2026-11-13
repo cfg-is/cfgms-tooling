@@ -1,0 +1,9 @@
+{
+  "name": "gate.revision_converged",
+  "version": 1,
+  "kind": "gate",
+  "description": "Every controller node runs the target revision.",
+  "promql": "count(cfgms_build_info{job=\"${job}\",revision!=\"${revision}\"}) or vector(0)",
+  "op": "==",
+  "threshold": 0
+}

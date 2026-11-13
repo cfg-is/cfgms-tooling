@@ -7,6 +7,7 @@ part of the cfgms product.
 - `devcontainer/`: the isolated agent image and its entrypoints
 - `security-review/`: the multi-lane security-review harness
 - `metrics/`, `bench/`: usage reporting and agent model benchmarks
+- `testcell/`: the test-cell deploy agent, signal queries and alert sink
 
 ## How cfgms uses it
 

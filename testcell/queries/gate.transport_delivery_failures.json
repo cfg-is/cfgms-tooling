@@ -1,0 +1,9 @@
+{
+  "name": "gate.transport_delivery_failures",
+  "version": 1,
+  "kind": "gate",
+  "description": "No control-plane message delivery failed during the window.",
+  "promql": "sum(increase(cfgms_transport_delivery_failures_total{job=\"${job}\"}[${window}]))",
+  "op": "<=",
+  "threshold": 0
+}
