@@ -75,7 +75,35 @@ class CatalogTest(unittest.TestCase):
         kinds = {x.kind for x in cat.values()}
         self.assertEqual(kinds, {"gate", "load", "chaos"}, "every kind has at least one query")
         for x in cat.values():
-            x.render({"job": "j", "window": "5m", "revision": "abc1234", "min_stewards": 1})
+            x.render({"job": "j", "window": "5m", "revision": "abc1234", "min_stewards": 1,
+                      "expected_controllers": 3})
+
+    def test_revision_converged_requires_expected_controllers(self):
+        q2 = load_catalog()["gate.revision_converged"]
+        self.assertGreaterEqual(q2.version, 2)
+        self.assertIn("expected_controllers", q2.params())
+        rendered = q2.render({"job": "j", "revision": "a" * 40, "expected_controllers": 3})
+        self.assertIn('revision="' + "a" * 40 + '"', rendered)
+        self.assertIn("clamp_min(3 -", rendered)
+
+    def test_parameter_values_are_validated(self):
+        q = load_catalog()["gate.revision_converged"]
+        good = {"job": "cfgms-controller", "revision": "0123abc", "expected_controllers": 3}
+        q.render(good)
+        bad = [
+            {"revision": 'x"} or vector(0) #'},
+            {"revision": "ABCDEF1"},
+            {"revision": "abc12"},
+            {"job": 'j",revision!="'},
+            {"expected_controllers": "3 or vector(1)"},
+        ]
+        for change in bad:
+            with self.subTest(change=change), self.assertRaisesRegex(CatalogError, "invalid form"):
+                q.render({**good, **change})
+        w = load_catalog()["gate.storage_probe_failures"]
+        w.render({"job": "j", "window": "15m"})
+        with self.assertRaisesRegex(CatalogError, "invalid form"):
+            w.render({"job": "j", "window": "15m]) or vector(0"})
 
     def _copy(self):
         d = tempfile.mkdtemp()
@@ -174,6 +202,19 @@ class EvaluateTest(unittest.TestCase):
         v = evaluate(q(no_data="pass"), dead, {"job": "j"}, "measure")
         self.assertFalse(v.passed)
         self.assertTrue(v.error)
+
+    def test_malformed_responses_are_errors_not_crashes(self):
+        self.srv.answers["s1"] = {"status": "success", "data": {"resultType": "scalar", "result": None}}
+        self.srv.answers["s2"] = {"status": "success", "data": {"resultType": "vector", "result": [{"value": []}]}}
+        self.srv.answers["s3"] = {"status": "success", "data": None}
+        self.srv.answers["s4"] = ["not", "an", "object"]
+        for query in ("s1", "s2", "s3", "s4"):
+            with self.subTest(query=query), self.assertRaises(PromError):
+                self.prom.query_value(query)
+
+    def test_only_http_urls(self):
+        with self.assertRaises(PromError):
+            Prometheus("file:///etc/passwd")
 
     def test_measure_mode_caps_alert_severity(self):
         self.srv.vector('min(up{job="j"})', 0)

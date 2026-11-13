@@ -113,13 +113,18 @@ class KillSwitch:
         return self.path.exists()
 
     def reason(self) -> dict | None:
+        """None when released. When engaged, always a non-empty dict: a file that
+        cannot be read or holds anything else still means stop (fail closed).
+        Decide on engaged(), not on this value."""
         if not self.path.exists():
             return None
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # Unreadable still means engaged: fail closed.
-            return {"by": "unknown", "reason": "kill switch file present but unreadable"}
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and data:
+            return data
+        return {"by": "unknown", "reason": "kill switch file present but unreadable or empty"}
 
     def engage(self, by: str, reason: str) -> None:
         if not by or not reason:

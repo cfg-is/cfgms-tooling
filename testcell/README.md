@@ -68,15 +68,45 @@ The ops owner works the sink with `testcell alerts list`, reads evidence with
 
 `queries/<name>.json` holds one query per file, with name, version, kind
 (`gate`, `load` or `chaos`), description, PromQL, comparison and the no-data
-verdict. Placeholders such as `${job}`, `${window}`, `${revision}` and
-`${min_stewards}` are filled from the cell config's `query_params` and the run.
-Every query must aggregate to at most one value.
+verdict. Placeholders such as `${job}`, `${window}`, `${revision}`,
+`${min_stewards}` and `${expected_controllers}` are filled from the cell
+config's `query_params` and the run. Every query must aggregate to at most one
+value.
+
+Parameter values are checked before substitution:
+- `revision` must be lowercase hex, 7 to 64 characters;
+- `window` must be a PromQL duration;
+- `job` must use label-safe characters;
+- counts must be integers;
+- anything else may use only `[A-Za-z0-9_.:-]`.
+
+`${revision}` must be the commit id exactly as the controller build embeds it
+in `cfgms_build_info`. The build step embeds the full 40-character id, so a
+short or `-dirty` value never converges.
 
 `queries/catalog.lock.json` records the content hash of every `name@version`.
 To change a query, bump its `version` and run `testcell queries lock`. Old
-versions stay in the lock file, so a verdict that names `name@version` always
-refers to one exact query. Changing a query without bumping its version fails
-`queries check` and the test suite.
+versions keep their hash in the lock file, so a verdict naming `name@version`
+can be matched to one exact query. The old query text itself comes from git
+history. Changing a query without bumping its version fails `queries check`
+and the test suite.
+
+## Choosing a revision
+
+`deploy plan` picks the newest develop commit whose required checks are green.
+It never picks a commit older than the one running, and it never picks one
+recorded as no-retry. Several runs can report under one required check name (a
+real job and its stub, or a rerun), so a required name counts as green only if
+at least one of its runs succeeded and none failed. A name that was only ever
+skipped is not green.
+
+When the running revision is outside the window, for example because it is not
+on develop, a candidate is accepted only if GitHub's compare reports it as
+`ahead` of the running revision.
+
+`required_contexts` should hold the ruleset's required checks plus
+`Post-merge build check`, the post-merge develop-sanity run that epic #5980
+requires. The config loader warns if that check is missing.
 
 ## Modes
 

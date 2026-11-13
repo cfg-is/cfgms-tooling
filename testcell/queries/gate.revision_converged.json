@@ -1,9 +1,9 @@
 {
   "name": "gate.revision_converged",
-  "version": 1,
+  "version": 2,
   "kind": "gate",
-  "description": "Every controller node runs the target revision.",
-  "promql": "count(cfgms_build_info{job=\"${job}\",revision!=\"${revision}\"}) or vector(0)",
+  "description": "Every controller node that reports runs the target revision, and at least expected_controllers nodes report it. The value is the number of nodes off the revision plus the shortfall. revision must be the commit id exactly as the controller build embeds it.",
+  "promql": "(count(cfgms_build_info{job=\"${job}\",revision!=\"${revision}\"}) or vector(0)) + clamp_min(${expected_controllers} - (count(cfgms_build_info{job=\"${job}\",revision=\"${revision}\"}) or vector(0)), 0)",
   "op": "==",
   "threshold": 0
 }

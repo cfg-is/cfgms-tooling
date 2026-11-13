@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from cellstate import atomic_write_json
 from prom import Prometheus, PromError
 
 KINDS = ("gate", "load", "chaos")
@@ -41,6 +42,19 @@ OPS = {"<": operator.lt, "<=": operator.le, "==": operator.eq, ">=": operator.ge
 REQUIRED = ("name", "version", "kind", "description", "promql", "op", "threshold")
 NAME_RE = re.compile(r"^(gate|load|chaos)\.[a-z0-9_]+$")
 PARAM_RE = re.compile(r"\$\{([a-z_][a-z0-9_]*)\}")
+
+# Parameter values are substituted into PromQL text, so each must match a
+# strict shape: a value that could close a string or a selector is refused.
+# revision is a lowercase hex commit id, exactly as the controller build embeds
+# it in cfgms_build_info.
+PARAM_RULES = {
+    "revision": re.compile(r"^[0-9a-f]{7,64}$"),
+    "window": re.compile(r"^[0-9]+(ms|s|m|h|d|w|y)$"),
+    "job": re.compile(r"^[A-Za-z_][A-Za-z0-9_:.-]*$"),
+    "min_stewards": re.compile(r"^[0-9]+$"),
+    "expected_controllers": re.compile(r"^[0-9]+$"),
+}
+DEFAULT_PARAM_RULE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 QUERIES_DIR = Path(__file__).resolve().parent / "queries"
 LOCK_FILE = "catalog.lock.json"
@@ -72,6 +86,10 @@ class Query:
         missing = self.params() - set(params)
         if missing:
             raise CatalogError(f"{self.ref}: missing parameters {sorted(missing)}")
+        for name in self.params():
+            value = str(params[name])
+            if not PARAM_RULES.get(name, DEFAULT_PARAM_RULE).match(value):
+                raise CatalogError(f"{self.ref}: parameter {name}={value!r} has an invalid form")
         return PARAM_RE.sub(lambda m: str(params[m.group(1)]), self.promql)
 
 
@@ -143,7 +161,7 @@ def update_lock(directory: str | Path = QUERIES_DIR) -> list[str]:
         if q.ref not in lock:
             lock[q.ref] = h
             added.append(q.ref)
-    lock_path.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(lock_path, lock)
     return added
 
 

@@ -5,6 +5,7 @@
   "gate.controllers_up@1": "b27b0db360b3126948a9e4687b79a2171dc8deba57e5c0a22fae2aa7b357a251",
   "gate.leadership_changes@1": "73ccd21c3c34c76d53e7fcf7e4073567c20bc9f9954de8428c816e7b878e2398",
   "gate.revision_converged@1": "0e430e956964bded529ef5018989dda63240637abf1b251f1c8b159c4aa1fa82",
+  "gate.revision_converged@2": "30aa482472a81c0cd97ce7755cc986fb2f98fd5a157dc35fec0477f6c381ccaf",
   "gate.stewards_heartbeat_fresh@1": "da4f0c14adc0f5ace3924dccd70780a8468b9d5e29cf7728f16d19c3d940181a",
   "gate.storage_connected@1": "430038c37661da07f9e6159d5d6a25dc10cef44c28395e134939590681003b79",
   "gate.storage_probe_failures@1": "0b887ae04ec2717441f24ac3312526734cb7c687688c3c47f162cd5908ae1553",

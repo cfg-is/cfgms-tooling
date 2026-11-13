@@ -11,8 +11,9 @@
     testcell deploy plan [--json]
 
 The cell config comes from --config, $TESTCELL_CONFIG or
-/etc/cfgms-testcell/cell.json. Exit codes: 0 ok, 1 a check failed or a gate
-blocked, 2 usage or configuration error, 3 the kill switch is engaged.
+/etc/cfgms-testcell/cell.json. Exit codes: 0 ok, 1 a check failed, a gate
+blocked or GitHub/Prometheus could not be read, 2 usage or configuration
+error, 3 the kill switch is engaged.
 """
 
 from __future__ import annotations
@@ -26,12 +27,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from alerts import AlertError, AlertSink  # noqa: E402
 from cellstate import DeployState, KillSwitch  # noqa: E402
-from config import ConfigError, load_config  # noqa: E402
-from prom import Prometheus  # noqa: E402
+from config import ConfigError  # noqa: E402
+from config import load_config as _load_config  # noqa: E402
+from prom import Prometheus, PromError  # noqa: E402
 from queries import CatalogError, alert_severity, evaluate, load_catalog, update_lock  # noqa: E402
-from selector import GitHubSource, select_revision  # noqa: E402
+from selector import GitHubSource, SourceError, select_revision  # noqa: E402
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_KILLED = 0, 1, 2, 3
+
+
+def load_config(path=None):
+    cfg = _load_config(path)
+    for w in cfg.warnings:
+        print(f"testcell: warning: {w}", file=sys.stderr)
+    return cfg
 
 
 def _print_json(obj) -> None:
@@ -175,9 +184,10 @@ def cmd_kill(args) -> int:
         ks.release()
         print("kill switch released")
     else:
-        r = ks.reason()
-        print("ENGAGED " + json.dumps(r, sort_keys=True) if r else "released")
-        return EXIT_KILLED if r else EXIT_OK
+        if ks.engaged():
+            print("ENGAGED " + json.dumps(ks.reason(), sort_keys=True))
+            return EXIT_KILLED
+        print("released")
     return EXIT_OK
 
 
@@ -191,9 +201,10 @@ def cmd_deploy_plan(args) -> int:
     src = GitHubSource(cfg.repo, cfg.branch, cfg.history_window)
     commits = src.commits()
     states = src.states(commits, cfg.required_contexts, running=running, no_retry=state["no_retry"])
-    sel = select_revision(commits, states, running, state["no_retry"])
+    sel = select_revision(commits, states, running, state["no_retry"], is_ahead=src.is_ahead)
+    killed = ks.engaged()
     plan = {"cell": cfg.cell, "running": running, "selected": sel.revision, "reason": sel.reason,
-            "skipped": sel.skipped, "kill_switch": ks.reason(), "mode": cfg.mode}
+            "skipped": sel.skipped, "kill_switch": ks.reason() if killed else None, "mode": cfg.mode}
     if args.json:
         _print_json(plan)
     else:
@@ -202,9 +213,9 @@ def cmd_deploy_plan(args) -> int:
         print(f"selected: {sel.revision or 'nothing'}  ({sel.reason})")
         if sel.skipped:
             print(f"skipped:  {len(sel.skipped)} newer commit(s) not green or marked no-retry")
-        if plan["kill_switch"]:
+        if killed:
             print(f"KILL SWITCH ENGAGED: {plan['kill_switch']}")
-    return EXIT_KILLED if plan["kill_switch"] else EXIT_OK
+    return EXIT_KILLED if killed else EXIT_OK
 
 
 # -- parser -----------------------------------------------------------------
@@ -274,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, CatalogError, AlertError, ValueError) as e:
         print(f"testcell: {e}", file=sys.stderr)
         return EXIT_USAGE
+    except (SourceError, PromError, OSError) as e:
+        print(f"testcell: {e}", file=sys.stderr)
+        return EXIT_FAIL
 
 
 if __name__ == "__main__":

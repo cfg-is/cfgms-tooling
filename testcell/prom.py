@@ -15,6 +15,11 @@ class PromError(Exception):
 
 class Prometheus:
     def __init__(self, base_url: str, timeout: float = 15.0):
+        # The agent queries its own Prometheus, normally on loopback; the HTTPS
+        # scrape of the controllers' private metrics listener is Prometheus's
+        # job, not this client's.
+        if urllib.parse.urlparse(base_url).scheme not in ("http", "https"):
+            raise PromError(f"prometheus_url must be http or https, got {base_url!r}")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -31,20 +36,26 @@ class Prometheus:
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:  # noqa: S310 - operator-configured URL
                 body = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        except urllib.error.HTTPError as e:
+            e.close()
             raise PromError(f"query failed: {e}") from e
-        if body.get("status") != "success":
-            raise PromError(f"query error: {body.get('errorType')}: {body.get('error')}")
-        data = body.get("data", {})
-        rtype, result = data.get("resultType"), data.get("result")
-        if rtype == "scalar":
-            return _num(result[1])
-        if rtype == "vector":
-            if not result:
-                return None
-            if len(result) > 1:
-                raise PromError(f"query returned {len(result)} series; catalog queries must aggregate to one")
-            return _num(result[0]["value"][1])
+        except (OSError, ValueError) as e:  # URLError, RemoteDisconnected, timeouts, bad JSON
+            raise PromError(f"query failed: {e}") from e
+        try:
+            if body.get("status") != "success":
+                raise PromError(f"query error: {body.get('errorType')}: {body.get('error')}")
+            data = body.get("data") or {}
+            rtype, result = data.get("resultType"), data.get("result")
+            if rtype == "scalar":
+                return _num(result[1])
+            if rtype == "vector":
+                if not result:
+                    return None
+                if len(result) > 1:
+                    raise PromError(f"query returned {len(result)} series; catalog queries must aggregate to one")
+                return _num(result[0]["value"][1])
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as e:
+            raise PromError(f"malformed query response: {e}") from e
         raise PromError(f"unsupported result type {rtype!r}")
 
 

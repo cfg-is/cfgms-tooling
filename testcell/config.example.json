@@ -2,7 +2,20 @@
   "cell": "example-cell",
   "repo": "cfg-is/cfgms",
   "branch": "develop",
-  "required_contexts": ["unit-tests", "Build Gate"],
+  "required_contexts": [
+    "unit-tests",
+    "integration-tests",
+    "Build Gate",
+    "security-deployment-gate",
+    "Controller Integration Tests (Linux)",
+    "zizmor",
+    "CLA signature check",
+    "trivy-scan",
+    "CodeQL",
+    "frontend-checks",
+    "fleet-e2e-tests",
+    "Post-merge build check"
+  ],
   "prometheus_url": "http://127.0.0.1:9090",
   "state_dir": "/var/lib/cfgms-testcell",
   "mode": "measure",
@@ -10,6 +23,7 @@
   "query_params": {
     "job": "cfgms-controller",
     "window": "15m",
-    "min_stewards": 1
+    "min_stewards": 1,
+    "expected_controllers": 3
   }
 }

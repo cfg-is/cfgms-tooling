@@ -80,11 +80,11 @@ class AlertSink:
 
     # -- reading ---------------------------------------------------------
 
-    def _events(self) -> list[dict]:
+    def _events(self) -> list[tuple[int, dict]]:
+        self.damaged_lines = []
         if not self.path.exists():
             return []
         events = []
-        self.damaged_lines = []
         with self.path.open("r", encoding="utf-8") as f:
             for lineno, line in enumerate(f, 1):
                 line = line.strip()
@@ -98,7 +98,7 @@ class AlertSink:
                     self.damaged_lines.append(lineno)
                     continue
                 if isinstance(ev, dict):
-                    events.append(ev)
+                    events.append((lineno, ev))
                 else:
                     self.damaged_lines.append(lineno)
         return events
@@ -107,20 +107,30 @@ class AlertSink:
         """All alerts, oldest first, with their acknowledgements applied."""
         by_id: dict[str, Alert] = {}
         order: list[str] = []
-        for ev in self._events():
+        for lineno, ev in self._events():
             kind = ev.get("type")
             if kind == "alert":
-                a = Alert(
-                    id=ev["id"], key=ev["key"], ts=ev["ts"], cell=ev.get("cell", ""),
-                    severity=ev["severity"], source=ev["source"], title=ev["title"],
-                    revisions=list(ev.get("revisions", [])), evidence=dict(ev.get("evidence", {})),
-                )
+                try:
+                    a = Alert(
+                        id=str(ev["id"]), key=str(ev["key"]), ts=str(ev["ts"]), cell=str(ev.get("cell", "")),
+                        severity=str(ev["severity"]), source=str(ev["source"]), title=str(ev["title"]),
+                        revisions=list(ev.get("revisions") or []), evidence=dict(ev.get("evidence") or {}),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    # An event missing a field cannot be an alert; report it like a
+                    # torn line instead of making the whole sink unreadable.
+                    self.damaged_lines.append(lineno)
+                    continue
+                if a.id not in by_id:
+                    order.append(a.id)
                 by_id[a.id] = a
-                order.append(a.id)
             elif kind == "ack":
-                a = by_id.get(ev.get("id", ""))
+                a = by_id.get(str(ev.get("id", "")))
                 if a is not None:
                     a.acks.append({k: ev.get(k) for k in ("ts", "by", "note")})
+            else:
+                self.damaged_lines.append(lineno)
+        self.damaged_lines.sort()
         return [by_id[i] for i in order]
 
     def unacknowledged(self) -> list[Alert]:

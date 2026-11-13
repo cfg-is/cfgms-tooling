@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -97,6 +98,35 @@ class AlertSinkTest(unittest.TestCase):
         ids = [x.id for x in self.sink.alerts()]
         self.assertEqual(ids, [a.id, b.id])
         self.assertEqual(self.sink.damaged_lines, [2])
+
+    def test_malformed_events_are_reported_not_fatal(self):
+        a, _ = raise_one(self.sink, key="good")
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"type":"alert","id":"x1"}\n')            # missing fields
+            f.write('{"type":"alert","id":"x2","key":"k","ts":"t","severity":"info",'
+                    '"source":"s","title":"t","evidence":"not-an-object"}\n')
+            f.write('{"type":"mystery"}\n')                   # unknown event type
+            f.write('[1, 2]\n')                               # not an object
+        b, _ = raise_one(self.sink, key="after")
+        self.assertEqual([x.id for x in self.sink.alerts()], [a.id, b.id])
+        self.assertEqual(self.sink.damaged_lines, [2, 3, 4, 5])
+
+    def test_writers_in_separate_processes_never_interleave(self):
+        script = ("import sys; sys.path.insert(0, sys.argv[1]); from alerts import AlertSink\n"
+                  "s = AlertSink(sys.argv[2])\n"
+                  "for i in range(20):\n"
+                  "    s.raise_alert(key=f'{sys.argv[3]}-{i}', cell='c', severity='info', source='s',\n"
+                  "                  title='t', revisions=[], evidence={'pad': 'x' * 2000})\n")
+        lib = str(Path(__file__).resolve().parents[1])
+        procs = [subprocess.Popen([sys.executable, "-c", script, lib, str(self.path), f"p{n}"])
+                 for n in range(4)]
+        for p in procs:
+            self.assertEqual(p.wait(timeout=120), 0)
+        lines = self.lines()
+        self.assertEqual(len(lines), 80)
+        for line in lines:
+            json.loads(line)
+        self.assertEqual(self.sink.damaged_lines, [])
 
     def test_concurrent_writers_never_interleave(self):
         def worker(n):
