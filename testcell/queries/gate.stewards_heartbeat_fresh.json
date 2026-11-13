@@ -1,0 +1,9 @@
+{
+  "name": "gate.stewards_heartbeat_fresh",
+  "version": 1,
+  "kind": "gate",
+  "description": "At least min_stewards stewards have a fresh heartbeat across the cluster.",
+  "promql": "sum(cfgms_stewards_heartbeat_fresh{job=\"${job}\"}) - ${min_stewards}",
+  "op": ">=",
+  "threshold": 0
+}

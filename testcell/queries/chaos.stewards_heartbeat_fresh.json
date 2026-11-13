@@ -1,0 +1,9 @@
+{
+  "name": "chaos.stewards_heartbeat_fresh",
+  "version": 1,
+  "kind": "chaos",
+  "description": "Steady state: at least min_stewards stewards keep a fresh heartbeat during the experiment.",
+  "promql": "sum(cfgms_stewards_heartbeat_fresh{job=\"${job}\"}) - ${min_stewards}",
+  "op": ">=",
+  "threshold": 0
+}

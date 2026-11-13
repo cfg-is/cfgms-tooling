@@ -518,6 +518,39 @@ test_security_review_harness() {
     fi
 }
 
+# Test-cell deploy agent, signals and alert sink (cfgms epics #5979, #5980).
+# Each module under .claude/tooling/testcell/tests/ is a stdlib-only
+# <module>_test.py that exits 0 on all-pass, the same convention as the
+# security-review harness above.
+test_testcell() {
+    log_test "Testing testcell (alert sink, query catalog, selector, deploy state, CLI)..."
+
+    local dir=".claude/tooling/testcell/tests"
+    if [[ ! -d "$dir" ]]; then
+        log_fail "testcell: ${dir} not found"
+        return
+    fi
+
+    local suite out_file rc found=0
+    while IFS= read -r suite; do
+        found=$((found + 1))
+        out_file=$(mktemp)
+        rc=0
+        python3 "$suite" >"$out_file" 2>&1 || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            log_pass "testcell/$(basename "$suite"): All checks passed"
+        else
+            log_fail "testcell/$(basename "$suite"): Checks failed (exit $rc)"
+            sed 's/^/    /' "$out_file" >&2
+        fi
+        rm -f "$out_file"
+    done < <(find "$dir" -name '*_test.py' | sort)
+
+    if [[ $found -eq 0 ]]; then
+        log_fail "testcell: no *_test.py suites found under ${dir}"
+    fi
+}
+
 # Tests for the security-review CLI wrapper's own shell test (Issue #4299). This
 # suite lives beside security-review.sh under .claude/tooling/security-review/,
 # deliberately outside .claude/tooling/scripts/tests/, so test_claude_pipeline_suites'
@@ -3313,6 +3346,7 @@ TOOLING_TABLE=(
     "test_create_clone_duplicate_pr_gate:claude-tooling"
     "test_refresh_pins_discovery:claude-tooling"
     "test_security_review_harness:security-review"
+    "test_testcell:devinfra"
     "test_security_review_cli:security-review"
     "test_bench_suite:claude-tooling"
     "test_token_report_suite:claude-tooling"

@@ -1,0 +1,9 @@
+{
+  "name": "chaos.storage_connected_majority",
+  "version": 1,
+  "kind": "chaos",
+  "description": "Steady state: a majority of controller nodes can reach the database during the experiment.",
+  "promql": "sum(cfgms_storage_connected{job=\"${job}\"}) / count(cfgms_storage_connected{job=\"${job}\"})",
+  "op": ">",
+  "threshold": 0.5
+}

@@ -1,0 +1,16 @@
+{
+  "chaos.stewards_heartbeat_fresh@1": "e8a9d9eef432933d7ce4491c50fe9b10504514f84f8efdcbd2462c7a4b41ebb0",
+  "chaos.storage_connected_majority@1": "8a2a206fa308be69d647263759468fa709cc82adc773b426b8245bffe3f2d2ab",
+  "gate.command_failure_ratio@1": "6eed4da3de34586687073000f44acbc422d324006197917c40fe4e92775a9020",
+  "gate.controllers_up@1": "b27b0db360b3126948a9e4687b79a2171dc8deba57e5c0a22fae2aa7b357a251",
+  "gate.leadership_changes@1": "73ccd21c3c34c76d53e7fcf7e4073567c20bc9f9954de8428c816e7b878e2398",
+  "gate.revision_converged@1": "0e430e956964bded529ef5018989dda63240637abf1b251f1c8b159c4aa1fa82",
+  "gate.revision_converged@2": "30aa482472a81c0cd97ce7755cc986fb2f98fd5a157dc35fec0477f6c381ccaf",
+  "gate.stewards_heartbeat_fresh@1": "da4f0c14adc0f5ace3924dccd70780a8468b9d5e29cf7728f16d19c3d940181a",
+  "gate.storage_connected@1": "430038c37661da07f9e6159d5d6a25dc10cef44c28395e134939590681003b79",
+  "gate.storage_probe_failures@1": "0b887ae04ec2717441f24ac3312526734cb7c687688c3c47f162cd5908ae1553",
+  "gate.transport_delivery_failures@1": "695d51c8ff4ec1a8441117fe7b6e28097a9fe49fd0c47b930ef94a792e09dbcd",
+  "gate.unplanned_restarts@1": "c55044f73c05a86991d3e2ae2041c0de342c46f39e084d9bf1c4972aff11f7e6",
+  "load.command_completion_p95@1": "66efce05091699030ab1cd0030cb3483331e4c22a917857c1c5379fc652c99a9",
+  "load.config_convergence_p95@1": "2a051a4d29933f78d22a4e3d7e4870581f8a578a29a9888a789befd23ea5fda0"
+}

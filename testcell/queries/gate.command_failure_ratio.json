@@ -1,0 +1,10 @@
+{
+  "name": "gate.command_failure_ratio",
+  "version": 1,
+  "kind": "gate",
+  "description": "At most 5% of commands that finished during the window failed or timed out. No commands in the window passes.",
+  "promql": "sum(rate(cfgms_command_completion_seconds_count{job=\"${job}\",outcome!=\"completed\"}[${window}])) / sum(rate(cfgms_command_completion_seconds_count{job=\"${job}\"}[${window}]))",
+  "op": "<=",
+  "threshold": 0.05,
+  "no_data": "pass"
+}
