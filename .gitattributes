@@ -1,0 +1,20 @@
+# Check out every text file with LF line endings, on every platform.
+#
+# Everything in this repository runs on Linux or inside Linux containers:
+# shell and Python scripts, the devcontainer Dockerfile and the files it COPYs
+# (scanner pins, rule sources, dnsmasq allowlists), and the fake binaries the
+# FSM tests put on PATH. On a Windows host with core.autocrlf=true, a CRLF
+# checkout makes the kernel read "bash\r" from the shebang, so an image build
+# fails with exit 127 (seen at fetch-semgrep-rules.sh) and pinned values gain a
+# trailing \r.
+#
+# cfgms's own .gitattributes cannot cover this: Git does not apply a parent
+# repository's attributes inside a submodule.
+* text=auto eol=lf
+
+# Binary files are never rewritten.
+*.png  binary
+*.jpg  binary
+*.gz   binary
+*.zip  binary
+*.exe  binary
