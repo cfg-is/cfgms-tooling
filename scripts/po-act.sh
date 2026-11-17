@@ -690,7 +690,7 @@ FSM_LAST_STATUS=""
 #   image: the refusal names the condition and an operator rebuilds.
 _fsm_image_gate() {
   local label="$1" prefix="$2" checkout image
-  if ! command -v docker >/dev/null 2>&1; then
+  if ! command -v "$CFGMS_CONTAINER_RUNTIME" >/dev/null 2>&1; then
     echo "${prefix}:${label}:image_unavailable (docker not found)"
     return 1
   fi

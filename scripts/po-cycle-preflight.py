@@ -1129,11 +1129,20 @@ def auto_close_merged_items(degraded_reasons=None):
     return count
 
 
+def _container_binary():
+    """docker or podman, as selected by scripts/fsm/runtime.py."""
+    path = Path(__file__).resolve().parent / "fsm" / "runtime.py"
+    spec = importlib.util.spec_from_file_location("fsm_runtime", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.binary()
+
+
 def running_containers():
     """Return list of running cfg-agent-* container names, or None if docker unavailable."""
     try:
         result = subprocess.run(
-            ["docker", "ps", "--filter", "name=cfg-agent-", "--format", "{{.Names}}"],
+            [_container_binary(), "ps", "--filter", "name=cfg-agent-", "--format", "{{.Names}}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=10,
         )
         return [n for n in result.stdout.splitlines() if n.strip()]
