@@ -116,6 +116,7 @@ def main():
                 head = head_oid(p["headRefName"])
                 print(json.dumps({"data": {"repository": {"pullRequest": {
                     "state": p["state"], "headRefOid": head, "isInMergeQueue": bool(p.get("inQueue")),
+                    "mergeable": p.get("mergeable", "MERGEABLE"),
                     "commits": {"nodes": [{"commit": {"oid": p.get("rollupOid", head),
                                                       "statusCheckRollup": {"state": p.get("rollup", "PENDING")}}}]},
                     "comments": {"nodes": [{"createdAt": c.get("createdAt", ""), "body": c.get("body", ""),

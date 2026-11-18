@@ -263,13 +263,14 @@ class EpicSupervisor(sup.Supervisor):
         self.heads = {}           # slice -> the commit that is its pull request's head
         self.pushed_at = {}       # slice -> when that commit was pushed
         self._trusted = {}        # GitHub login -> may post a review verdict
+        self._publish_started = {}  # (slice, round) -> when its publish began
         self.containers = 0       # owner containers started in this run
         for rec in run.records():
             if rec.get("type") == "slice_validated":
                 self.validated[(rec["slice"], rec["round"])] = rec
             elif rec.get("type") == "slice_published":
                 self.heads[rec["slice"]] = rec["sha"]
-                self.pushed_at[rec["slice"]] = rec["ts"]
+                self.pushed_at[rec["slice"]] = rec.get("started") or rec["ts"]
             elif rec.get("type") == "owner_container":
                 self.containers += 1
         self._turn = None         # {"turn", "kind", "thread", "result", "submits"}
@@ -594,14 +595,17 @@ class EpicSupervisor(sup.Supervisor):
             parent = S.resolve_parent(self.book, n, req.base, req.builds_on, self.on_develop)
         except S.BadRequest as exc:
             bad = str(exc)
-        if parent is not None and s is not None and s.state not in S.OWNER_TURN and s.candidates:
-            # A round of this slice is on its way. A request that brings the
-            # same tree on the same parent changes nothing: the round stays.
+        if parent is not None and s is not None and s.candidates:
+            # A request that brings the same tree on the same parent changes
+            # nothing. It uses no round: a round in flight goes on, a pull
+            # request stays as it is, a rejected round stays rejected.
             last = s.candidates[max(s.candidates)]
             if last["parent"] == parent.commit and self.same_tree(last["tree"], parent.commit):
+                what = (f"Round {s.ctx.round} goes on." if s.state not in S.OWNER_TURN
+                        else f"Slice {n} stays {s.state}.")
                 self.answer(req, False, round_no=s.ctx.round,
                             reason=f"the workspace has no change since this slice's last "
-                                   f"snapshot. Round {s.ctx.round} goes on.")
+                                   f"snapshot. {what}")
                 return "no_change"
         res = self.stake(n, "submitted", builds_on=parent.builds_on if parent else 0)
         s = self.book.get(n)
@@ -935,6 +939,10 @@ class EpicSupervisor(sup.Supervisor):
             raise RuntimeError("validated (base, tree) differs from the slice's candidate")
         rid = f"{self.run.run_id}.s{n}r{rnd}"
         branch = slice_branch(self.epic, n)
+        # What happens on GitHub after this moment is about this round. The
+        # time is taken before the push (and kept across the retries of one
+        # publish), so nothing that follows the push is older than it.
+        started = self._publish_started.setdefault((n, rnd), statemod.now_iso())
         claim = self.rtext(f"slice-{n}-r{rnd}-claim.md").strip()
         title = f"{self.rtext(f'slice-{n}-subject.txt').strip()} (Issue #{self.epic})"
         round_subject = f"{self.rtext(f'slice-{n}-r{rnd}-subject.txt').strip()} (Issue #{self.epic})"
@@ -1002,9 +1010,10 @@ class EpicSupervisor(sup.Supervisor):
                 return
             self.stake(n, "step_failed", info={"step": step})
             return
-        rec = self.run.append("slice_published", slice=n, round=rnd, sha=sha, pr=number, url=url)
+        self.run.append("slice_published", slice=n, round=rnd, sha=sha, pr=number, url=url,
+                        started=started)
         self.heads[n] = sha
-        self.pushed_at[n] = rec["ts"]
+        self.pushed_at[n] = started
         self.book.set_pr(n, number, branch)
         self._landing_due[n] = time.time() + LANDING_POLL_SECS
         self.stake(n, "published", info={"sha": sha, "pr": number})
@@ -1094,20 +1103,39 @@ class EpicSupervisor(sup.Supervisor):
             self.stake(s.number, "merged", info={"merge_commit": st["merge_commit"], "pr": s.pr})
         elif st["state"] == "CLOSED":
             self.stake(s.number, "closed", info={"pr": s.pr})
-        elif s.state == S.LANDING:
-            sig = landing.signal(self.svc.gh.pr_signals(s.pr), head=self.heads.get(s.number),
+        elif s.state in (S.LANDING, S.NEEDS_OWNER):
+            view = self.svc.gh.pr_signals(s.pr)
+            if view is None:
+                # no read, no answer: neither a wake nor "it has gone away"
+                self.note_once(("signals", s.number), warning=f"slice {s.number}: the signals of "
+                               f"pull request #{s.pr} cannot be read; the owner is not woken for "
+                               "checks, review or queue until they can")
+                return
+            sig = landing.signal(view, head=self.heads.get(s.number),
                                  since=self.pushed_at.get(s.number), trusted=self.trusted_login)
-            if sig:
-                self.stake(s.number, sig, info={"pr": s.pr})
+            if s.state == S.LANDING and sig:
+                if s.ctx.wakes > 0:
+                    self.stake(s.number, sig, info={"pr": s.pr})
+                else:
+                    self.note_once(("wakes", s.number, s.ctx.round), info=f"slice {s.number} round "
+                                   f"{s.ctx.round}: {sig}, and no wake is left for this round")
+            elif s.state == S.NEEDS_OWNER and not sig and view.get("head") == self.heads.get(s.number):
+                # what the owner was woken for has gone away without a new round
+                self.stake(s.number, "cleared", info={"pr": s.pr})
         else:
             self.close_moved(s)
 
     def trusted_login(self, login):
-        """True when `login` may write to the repository: its review verdict counts."""
+        """True when `login` may write to the repository: its review verdict
+        counts. Only an answer GitHub gave is remembered: a lookup that failed
+        is asked again at the next poll."""
         if not login:
             return False
         if login not in self._trusted:
-            self._trusted[login] = self.svc.gh.permission(login) in sup.TRUSTED_PERMS
+            perm = self.svc.gh.permission(login)
+            if not perm:
+                return False
+            self._trusted[login] = perm in sup.TRUSTED_PERMS
         return self._trusted[login]
 
     # --- 5. the owner ---------------------------------------------------------------------

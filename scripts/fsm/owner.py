@@ -57,8 +57,12 @@ NUDGE = "nudge"
 DONE_REFUSED = "done_refused"
 
 #: The supervisor is working on the slice, or waits for GitHub or its parent.
-#: Something will happen to it without the owner.
-IN_FLIGHT = frozenset(S.ACTIVE | {S.WAIT_PARENT, S.LANDING})
+#: Something can happen to it without the owner. NEEDS_OWNER is in the set:
+#: its pull request is open, and what the owner was woken for is often
+#: repaired by someone else (measured on cfgms: 32 of 35 removals from the
+#: merge queue were answered by a plain re-enqueue, with no push). The owner
+#: gets its event turn; when it decides to wait, the run waits with it.
+IN_FLIGHT = frozenset(S.ACTIVE | {S.WAIT_PARENT, S.LANDING, S.NEEDS_OWNER})
 
 #: Nudge turns in a row that the owner may end without progress. A turn that
 #: ends with no event waiting and nothing in flight earns one nudge turn; when
@@ -132,7 +136,11 @@ _REASON_TEXT = {
     "parent_closed": "the slice it builds on has ended without a merge. Submit this slice again, without --builds-on",
     "checks_failed": "the checks on its pull request finished with failures",
     "review_findings": "the review on its pull request has findings",
-    "queue_kicked": "the merge queue removed its pull request",
+    "queue_kicked": ("the merge queue removed its pull request. Read why on the pull request. "
+                     "A new round is needed only when the cause is in this slice; a re-enqueue "
+                     "is done by the pipeline, not by you"),
+    "conflicting": ("its pull request conflicts with develop. Fetch origin/develop, merge it, "
+                    "and submit the slice again with the new --base"),
     "interrupted": "the supervisor restarted while it took the snapshot. Submit this slice again",
     "branch_moved": "its branch on GitHub is not what the supervisor pushed. Read {dir}/rejected.md",
     "withdrawn": "slice-submit gave up waiting before the snapshot was done. Submit this slice again",

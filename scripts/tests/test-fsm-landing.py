@@ -36,7 +36,7 @@ PASS = "<!-- cfgms-acceptance-review -->\n## Acceptance Review — PASS\n"
 
 def view(**over):
     v = {"state": "OPEN", "head": HEAD, "rollup": "PENDING", "in_queue": False, "removed_at": "",
-         "removed_reason": "", "comments": []}
+         "removed_reason": "", "mergeable": "MERGEABLE", "comments": []}
     v.update(over)
     return v
 
@@ -55,6 +55,12 @@ class TestSignal(unittest.TestCase):
                   view(in_queue=True), view(comments=[comment(PASS)]),
                   view(comments=[comment("looks good")])):
             self.assertEqual(sig(v), "", v)
+
+    def test_conflicting(self):
+        self.assertEqual(sig(view(mergeable="CONFLICTING")), L.CONFLICTING)
+        self.assertEqual(sig(view(mergeable="CONFLICTING", rollup="FAILURE")), L.CONFLICTING)
+        for other in ("MERGEABLE", "UNKNOWN", ""):
+            self.assertEqual(sig(view(mergeable=other)), "")
 
     def test_checks_failed(self):
         self.assertEqual(sig(view(rollup="FAILURE")), L.CHECKS_FAILED)
@@ -89,11 +95,16 @@ class TestSignal(unittest.TestCase):
         self.assertEqual(L.review_verdict(FAIL), "FAIL")
         self.assertEqual(L.review_verdict(PASS), "PASS")
         self.assertEqual(L.review_verdict("\n" + FAIL), "FAIL")
+        # forms seen in real review comments
+        self.assertEqual(L.review_verdict(FAIL.replace("FAIL\n", "FAIL (round 2)\n", 1)), "FAIL")
+        self.assertEqual(L.review_verdict(PASS.replace("PASS", "PASS (re-review after the fix)")), "PASS")
         for body in ("", None, "## Acceptance Review — FAIL",                  # no marker
                      "text\n" + FAIL,                                          # marker not first
                      "<!-- cfgms-acceptance-review -->\n## Acceptance Review\n\nFAIL below",
                      "<!-- cfgms-acceptance-review -->\nquote: > ## Acceptance Review — FAIL",
-                     "<!-- cfgms-acceptance-review -->\n## Acceptance Review — FAILED"):
+                     "<!-- cfgms-acceptance-review -->\n## Acceptance Review — FAILED",
+                     "<!-- cfgms-acceptance-review -->\n## Acceptance Review — HOLD (the earlier FAIL is resolved)",
+                     "<!-- cfgms-acceptance-review -->\n## Acceptance Review — NOT A FAIL, just a note"):
             self.assertEqual(L.review_verdict(body), "", repr(body))
 
     def test_queue_kicked(self):
@@ -136,7 +147,7 @@ class TestPrSignals(unittest.TestCase):
         return adapters.GhCLI("cfg-is/cfgms", token="t", binary=str(p))
 
     def pr(self, **over):
-        pr = {"state": "OPEN", "headRefOid": HEAD, "isInMergeQueue": False,
+        pr = {"state": "OPEN", "headRefOid": HEAD, "isInMergeQueue": False, "mergeable": "CONFLICTING",
               "commits": {"nodes": [{"commit": {"oid": HEAD, "statusCheckRollup": {"state": "FAILURE"}}}]},
               "comments": {"nodes": [{"createdAt": AFTER, "body": "x" * 2000, "author": {"login": "r"}},
                                      {"createdAt": AFTER, "body": FAIL, "author": None}]},
@@ -147,9 +158,14 @@ class TestPrSignals(unittest.TestCase):
     def test_view(self):
         v = self.gh(self.pr()).pr_signals(77)
         self.assertEqual({k: v[k] for k in ("state", "head", "rollup", "in_queue", "removed_at",
-                                            "removed_reason")},
+                                            "removed_reason", "mergeable")},
                          {"state": "OPEN", "head": HEAD, "rollup": "FAILURE", "in_queue": False,
-                          "removed_at": AFTER, "removed_reason": "merged"})
+                          "removed_at": AFTER, "removed_reason": "merged", "mergeable": "CONFLICTING"})
+        # the newest of each: the query must ask for the last ones
+        q = adapters.GhCLI._SIGNALS_QUERY
+        for part in ("commits(last:1)", "comments(last:30)", "REMOVED_FROM_MERGE_QUEUE_EVENT],last:1)",
+                     "isInMergeQueue", "mergeable"):
+            self.assertIn(part, q)
         self.assertEqual([(c["author"], len(c["body"])) for c in v["comments"]], [("r", 500), ("", len(FAIL))])
         argv = (self.tmp / "argv").read_text().splitlines()
         self.assertEqual(argv[:2], ["api", "graphql"])

@@ -81,6 +81,12 @@ NON_TERMINAL = tuple(s for s in STATES if s not in TERMINAL)
 WAKES_OWNER = frozenset({REJECTED, STALE, NEEDS_OWNER, MERGED, CLOSED})
 
 DEFAULT_ROUND_BUDGET = 3
+#: Times one round of a published slice may wake the owner for its pull
+#: request (failed checks, review findings, a queue removal, a conflict). What
+#: woke the owner can go away and come back without a new round; each wake is
+#: an owner turn, so the number is bounded. After the last one the round only
+#: waits: for a merge, a close, or a new round.
+DEFAULT_WAKE_BUDGET = 5
 MAX_SLICE = 999
 #: Sent only by the book, to the slices that build on a slice that changed.
 PARENT_EVENTS = frozenset({"parent_merged", "parent_new_round", "parent_closed"})
@@ -100,6 +106,7 @@ class SliceCtx:
     parent_merged: bool = False    # the slice in `builds_on` has merged
     synced: bool = False           # candidate is on the develop tip it will be published on
     published: bool = False        # a PR exists for this slice
+    wakes: int = DEFAULT_WAKE_BUDGET  # wakes for the pull request left in this round
 
     def to_dict(self):
         return asdict(self)
@@ -124,6 +131,7 @@ GUARDS = {
     "validator_retry_left": lambda c: c.validator_retries > 0,
     "validator_retry_spent": lambda c: c.validator_retries <= 0,
     "published": lambda c: c.published,
+    "wake_left": lambda c: c.wakes > 0,
 }
 
 
@@ -132,7 +140,7 @@ class Edge:
     guard: str
     to: str
     reason: str = ""
-    consume: str = ""          # "round" | "validator_retry"
+    consume: str = ""          # "round" | "validator_retry" | "wake"
     sets_synced: bool = False
     sets_published: bool = False
     sets_parent_merged: bool = False
@@ -205,13 +213,21 @@ TABLE = {
     (PUBLISH, "lease_lost"): [Edge("always", FAILED, reason="lease_lost")],
 
     # LANDING -------------------------------------------------------------
-    (LANDING, "checks_failed"): [Edge("always", NEEDS_OWNER, reason="checks_failed")],
-    (LANDING, "review_findings"): [Edge("always", NEEDS_OWNER, reason="review_findings")],
-    (LANDING, "queue_kicked"): [Edge("always", NEEDS_OWNER, reason="queue_kicked")],
+    (LANDING, "checks_failed"): [Edge("wake_left", NEEDS_OWNER, reason="checks_failed", consume="wake")],
+    (LANDING, "review_findings"): [Edge("wake_left", NEEDS_OWNER, reason="review_findings", consume="wake")],
+    (LANDING, "queue_kicked"): [Edge("wake_left", NEEDS_OWNER, reason="queue_kicked", consume="wake")],
     (LANDING, "merged"): [Edge("always", MERGED)],
     (LANDING, "closed"): [Edge("always", CLOSED)],
 
-    # NEEDS_OWNER: the PR is still open and can still merge or be closed.
+    # The branch conflicts with develop: no workflow runs on it, so no check
+    # will ever report. Only the owner can repair that.
+    (LANDING, "conflicting"): [Edge("wake_left", NEEDS_OWNER, reason="conflicting", consume="wake")],
+
+    # NEEDS_OWNER: the PR is still open and can still merge or be closed. And
+    # what the owner was woken for can go away without the owner: a check that
+    # is run again and passes, a pull request that is put back in the merge
+    # queue. Then the slice is in LANDING again, and the owner is not woken.
+    (NEEDS_OWNER, "cleared"): [Edge("always", LANDING)],
     (NEEDS_OWNER, "merged"): [Edge("always", MERGED)],
     (NEEDS_OWNER, "closed"): [Edge("always", CLOSED)],
 }
@@ -276,12 +292,15 @@ def apply(result, ctx, *, builds_on=0, parent_merged=False, parent_round=0):
         ctx.round_budget -= 1
         ctx.round += 1
         ctx.validator_retries = DEFAULT_VALIDATOR_RETRIES
+        ctx.wakes = DEFAULT_WAKE_BUDGET
         ctx.synced = False
         ctx.builds_on = int(builds_on or 0)
         ctx.parent_merged = bool(parent_merged)
         ctx.parent_round = int(parent_round or 0) if ctx.builds_on else 0
     elif result.consume == "validator_retry":
         ctx.validator_retries -= 1
+    elif result.consume == "wake":
+        ctx.wakes -= 1
     if result.sets_synced:
         ctx.synced = True
     if result.sets_published:

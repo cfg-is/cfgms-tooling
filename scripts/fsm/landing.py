@@ -11,6 +11,12 @@ answers it from one read of the pull request:
     checks_failed     the checks of the head commit have a failure
     review_findings   the acceptance review posted a FAIL verdict
     queue_kicked      the merge queue removed the pull request
+    conflicting       the branch conflicts with develop
+
+The same question is asked again while the slice waits for the owner: when
+the answer is "" then, what the owner was woken for has gone away (a check
+was run again and passed, the pull request is back in the queue) and the
+slice goes back to LANDING without a new wake.
 
 (merged and closed are read by the driver before this is asked.)
 
@@ -28,6 +34,7 @@ from datetime import datetime, timezone
 CHECKS_FAILED = "checks_failed"
 REVIEW_FINDINGS = "review_findings"
 QUEUE_KICKED = "queue_kicked"
+CONFLICTING = "conflicting"
 
 #: statusCheckRollup.state of a commit with at least one failed check.
 FAILED_ROLLUP = frozenset({"FAILURE", "ERROR"})
@@ -36,7 +43,10 @@ FAILED_ROLLUP = frozenset({"FAILURE", "ERROR"})
 REVIEW_MARKER = "<!-- cfgms-acceptance-review -->"
 #: RemovedFromMergeQueueEvent.reason of a pull request that left the queue by merging.
 MERGED_REASON = "merged"
-_VERDICT_RE = re.compile(r"\A\s*<!-- cfgms-acceptance-review -->\s*\n\s*#+\s*Acceptance Review\b[^\n]*?\b(PASS|FAIL)\b")
+#: "## Acceptance Review — PASS", "… — FAIL (round 2)". The verdict is the
+#: word right after the dash: "— HOLD (the earlier FAIL is resolved)" is none.
+_VERDICT_RE = re.compile(
+    r"\A\s*<!-- cfgms-acceptance-review -->\s*\n\s*#+\s*Acceptance Review\s*[\u2014\u2013:-]+\s*(PASS|FAIL)\b")
 
 
 def parse_time(text):
@@ -60,7 +70,7 @@ def review_verdict(body):
 def signal(view, *, head, since, trusted):
     """The signal for a slice in LANDING, or "".
 
-    view     {"state", "head", "rollup", "in_queue", "removed_at", "removed_reason",
+    view     {"state", "head", "rollup", "mergeable", "in_queue", "removed_at", "removed_reason",
               "comments": [{"author", "created_at", "body"}]}
     head     the commit the supervisor pushed for the slice
     since    when it pushed it (a timestamp text)
@@ -73,6 +83,8 @@ def signal(view, *, head, since, trusted):
     start = parse_time(since)
     if start is None:
         return ""
+    if view.get("mergeable") == "CONFLICTING":
+        return CONFLICTING
     if view.get("rollup") in FAILED_ROLLUP:
         return CHECKS_FAILED
     # the newest verdict of a trusted account after the push decides

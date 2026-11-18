@@ -121,6 +121,21 @@ class TestRunIndex(unittest.TestCase):
         self.assertEqual(runindex.describe("f", base=self.base)["container"], "cfg-owner-900")
         self.assertEqual(runindex.container_for("epic", "epic-900"), "")
 
+    def test_a_crashed_epic_run_stays_resumable_for_as_long_as_its_work_is_kept(self):
+        day = 24 * 3600
+        make_run(self.base, "epic-crashed", {"mode": "epic", "target": "epic-901", "epic": 901,
+                                             "key": "epic-901"},
+                 [("PREPARE", "gates_ok", "OWNER")], age=3 * day)
+        make_run(self.base, "story-crashed", {"key": "story-7"}, [("PREPARE", "gates_ok", "AGENT")],
+                 age=3 * day)
+        got = {r["run_id"]: r["status"] for r in runindex.list_runs(self.base)}
+        self.assertEqual(got, {"epic-crashed": "crashed", "story-crashed": "abandoned"})
+        self.assertEqual([r["run_id"] for r in runindex.find_unfinished(runindex.list_runs(self.base),
+                                                                        key="epic-901")], ["epic-crashed"])
+        import time as _t
+        late = {r["run_id"]: r["status"] for r in runindex.list_runs(self.base, now=_t.time() + 12 * day)}
+        self.assertEqual(late["epic-crashed"], "abandoned")
+
     def test_gc_keeps_a_failed_epic_run_longer(self):
         epic = {"mode": "epic", "target": "epic-900", "epic": 900, "key": "epic-900"}
         day = 24 * 3600

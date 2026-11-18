@@ -224,7 +224,7 @@ class GhCLI:
 
     _SIGNALS_QUERY = (
         "query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){"
-        "pullRequest(number:$n){state headRefOid isInMergeQueue "
+        "pullRequest(number:$n){state headRefOid isInMergeQueue mergeable "
         "commits(last:1){nodes{commit{oid statusCheckRollup{state}}}} "
         "comments(last:30){nodes{createdAt body author{login}}} "
         "timelineItems(itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{"
@@ -248,6 +248,7 @@ class GhCLI:
                 "head": str(pr.get("headRefOid", "")),
                 "rollup": str((commit.get("statusCheckRollup") or {}).get("state", "")).upper()
                 if commit.get("oid") == pr.get("headRefOid") else "",
+                "mergeable": str(pr.get("mergeable") or "").upper(),
                 "in_queue": bool(pr.get("isInMergeQueue")),
                 "removed_at": removed.get("createdAt") or "",
                 "removed_reason": str(removed.get("reason") or "")[:100],

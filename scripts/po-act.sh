@@ -1135,6 +1135,7 @@ case "$cmd" in
         epic_label="epic-${epic}"
         if [[ "${3:-}" == "--item-id" ]]; then
           epic_item="${4:?--item-id needs an item id}"
+          [[ "$epic_item" =~ ^PVTI_[A-Za-z0-9_-]+$ ]] || { echo "ERROR: --item-id must be a project item id (PVTI_...)"; exit 2; }
         else
           epic_item=$(_item_for_issue "$epic" || true)
         fi

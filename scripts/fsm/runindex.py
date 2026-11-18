@@ -160,7 +160,10 @@ def describe(run_id, base=None, now=None):
         status = "live" if (hb is not None and hb < stale_secs()) else "hung"
     elif hb is None and now - created < start_grace_secs():
         status = "starting"
-    elif now - last >= crashed_ttl_secs():
+    elif now - last >= (failed_epic_retention_secs() if params.get("mode") == "epic"
+                        else crashed_ttl_secs()):
+        # An epic run lives for days and its owner's work is in its run dir: a
+        # host that was down over a weekend must find it resumable.
         status = "abandoned"
         state, reason = "ABANDONED", "crashed_ttl"
     else:
