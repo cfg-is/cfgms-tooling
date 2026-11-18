@@ -67,7 +67,10 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(a[-1], agent_session.IMAGE)
         self.assertIn("NET_ADMIN", a)
         agent_session.assert_no_github_credentials(a, {})
-        OS.assert_private_mounts(a, "/h/cfgms-canon", "/h/cfgms-memory")
+        OS.assert_owner_argv(a, "/h/cfgms-canon", "/h/cfgms-memory")
+        OS.assert_owner_argv(argv(metrics_dir="/t/metrics"), "/h/cfgms-canon", "/h/cfgms-memory")
+        OS.assert_owner_argv(argv(cred_args=["-v", f"/c/creds.json:{OS.CREDENTIALS_MOUNT}"]),
+                             "/h/cfgms-canon", "/h/cfgms-memory")
 
     def test_no_model_session_or_prompt_in_the_run_argv(self):
         joined = " ".join(argv())
@@ -86,23 +89,72 @@ class TestArgv(unittest.TestCase):
         with self.assertRaises(agent_session.CredentialLeak):
             agent_session.assert_no_github_credentials(argv(), {"GITHUB_TOKEN": "x"})
 
-    def test_private_mount_rules(self):
+    def test_the_argv_holds_only_what_is_on_the_list(self):
         C, M = "/h/cfgms-canon", "/h/cfgms-memory"
+
+        def plus(*words):                       # extra words before the image
+            a = argv()
+            return a[:-1] + list(words) + a[-1:]
+
         bad = [
-            argv(canon_dir="/h/other") ,                                    # canon not mounted
-            argv() + ["-v", f"{C}:/workspace/canon:ro"],                     # inside the workspace
-            argv() + ["-v", "/x:/workspace/sub"],                            # any mount inside it
-            argv() + ["-v", f"{C}/decisions:/opt/d:ro"],                     # a part of canon elsewhere
-            argv() + ["-v", "/h:/host"],                                     # a parent of canon
-            argv() + ["-v", f"{M}:/mnt/memory"],                             # memory twice
-            argv() + ["--mount", f"type=bind,src={C},dst=/c"],               # unchecked form
-            argv() + [f"--volume={C}:/c"],
+            argv(canon_dir="/h/other"),                                     # canon not mounted
+            plus("-v", f"{C}:/workspace/canon:ro"),                          # inside the workspace
+            plus("-v", "/x:/workspace/sub"),                                 # any mount inside it
+            plus("-v", "/x://workspace/sub"),
+            plus(f"-v{C}:/workspace/canon"),                                 # one-word form
+            plus("-v", f"{C}/decisions:/opt/d:ro"),                          # a part of canon elsewhere
+            plus("-v", "/h:/host"),                                          # a parent of canon
+            plus("-v", f"{M}:/mnt/memory"),                                  # memory twice
+            plus("-v", f"{M}:/agent-sessions"),                              # memory at a known place
+            plus("--mount", f"type=bind,src={C},dst=/c"),
+            plus(f"--volume={C}:/c"),
+            plus("--volumes-from", "other"),
+            plus("--privileged"),
+            plus("--device", "/dev/sda"),
+            plus("--cap-add", "SYS_ADMIN"),
+            plus("-v", "/var/run/docker.sock:/var/run/docker.sock"),
+            plus("-v", "/home/u/.ssh:/home/agent/.ssh:ro"),
+            plus("-eGH_TOKEN"),
+            plus("-e", "MY_TOKEN"),                                          # a name from the host
+            plus("-e", "MY_TOKEN=abc"),                                      # an unknown name
+            plus("-e", "CFGMS_FSM_KIND"),                                    # known name, no value
+            plus("--entrypoint", "/bin/sh"),
+            plus("--user", "0"),
             [x.replace(f"{C}:/canon:ro", f"{C}:/canon") for x in argv()],    # canon writable
+            [x.replace(f"{C}:/canon:ro", f"{C}:/canon:rw") for x in argv()],
+            [x.replace("/r/context:/fsm/context:ro", "/r/context:/fsm/context") for x in argv()],
             [x for x in argv() if x != f"{M}:/memory"],                      # memory missing
+            [x.replace("cfgms-go-mod-cache:", "/var/run:") for x in argv()], # a host path as the cache
+            argv()[:-1],                                                     # no image
+            plus("-v", f"/h/./cfgms-canon:{agent_session.METRICS_MOUNT}:ro"),  # canon, other spelling
         ]
         for i, a in enumerate(bad):
-            with self.assertRaises(agent_session.CredentialLeak, msg=f"case {i}"):
-                OS.assert_private_mounts(a, C, M)
+            with self.assertRaises(agent_session.CredentialLeak, msg=f"case {i}: {a[-4:]}"):
+                OS.assert_owner_argv(a, C, M)
+
+    def test_private_paths_are_compared_as_real_paths(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fsm-owner-argv-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        ws, canon, memory = tmp / "A", tmp / "canon", tmp / "memory"
+        for d in (ws, canon, memory):
+            d.mkdir()
+        ok = argv(workspace=str(ws), canon_dir=str(canon), memory_dir=str(memory))
+        OS.assert_owner_argv(ok, canon, memory)
+        OS.assert_owner_argv(argv(workspace=str(ws), canon_dir=f"{tmp}/./canon",
+                                  memory_dir=f"{tmp}//memory"), canon, memory)
+        # a memory directory that is a link into the workspace
+        (ws / "notes").mkdir()
+        link = tmp / "mem-link"
+        link.symlink_to(ws / "notes")
+        with self.assertRaises(agent_session.CredentialLeak):
+            OS.assert_owner_argv(argv(workspace=str(ws), canon_dir=str(canon),
+                                      memory_dir=str(link)), canon, link)
+        # canon inside the workspace
+        inner = ws / "canon"
+        inner.mkdir()
+        with self.assertRaises(agent_session.CredentialLeak):
+            OS.assert_owner_argv(argv(workspace=str(ws), canon_dir=str(inner),
+                                      memory_dir=str(memory)), inner, memory)
 
     def test_turn_argv_passes_only_the_turn_number(self):
         self.assertEqual(OS.turn_argv("cfg-owner-900", 7),
@@ -248,6 +300,27 @@ class TestStartAndTurn(unittest.TestCase):
             OS.start(d, argv(), "cfg-owner-900", {"GH_TOKEN": "ghp_x"}, **self.KW)
         self.assertEqual(d.calls, [])
 
+    def test_start_refuses_the_supervisor_token_value_in_the_argv(self):
+        a = argv()
+        a = a[:-1] + ["-e", "CFGMS_FSM_KIND=ghp_supervisortokenvalue"] + a[-1:]
+        OS.assert_owner_argv(a, **self.KW)          # the argv itself is on the list
+        d = FakeDocker()
+        with self.assertRaises(agent_session.CredentialLeak):
+            OS.start(d, a, "cfg-owner-900", self.ENV, gh_token="ghp_supervisortokenvalue", **self.KW)
+        self.assertEqual(d.calls, [])
+
+    def test_run_turn_checks_the_turn_number(self):
+        for bad in (0, "1", True, 100000):
+            d = FakeDocker()
+            with self.assertRaises(ValueError):
+                OS.run_turn(d, "cfg-owner-900", bad, 5)
+            self.assertEqual(d.calls, [])
+
+    def test_run_turn_cuts_long_lines(self):
+        r = OS.run_turn(FakeDocker(turn=(0, "a" * 100000 + "\nshort\n")), "cfg-owner-900", 1, 5)
+        self.assertEqual([len(ln) for ln in r["output_tail"].splitlines()],
+                         [OS.OUTPUT_LINE_MAX, 5])
+
     def test_run_turn_exit_codes(self):
         cases = [
             ((0, "ok\n"), dict(ok=True, timed_out=False, busy=False, exit_code=0)),
@@ -310,6 +383,29 @@ class TestDockerExec(FilesCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(out), 1000)
         self.assertTrue(out.endswith("END\n"))
+
+    def test_memory_does_not_grow_with_the_output(self):
+        # the process in the container can print without end: only a tail is kept
+        import tracemalloc
+        d = self.stub("head -c 200000000 /dev/zero | tr '\\0' 'a'; echo END\n")
+        tracemalloc.start()
+        try:
+            code, out = d.exec("c", ["x"], max_output=100000)
+            _now, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((code, len(out)), (0, 100000))
+        self.assertTrue(out.endswith("END\n"))
+        self.assertLess(peak, 8 * 1024 * 1024)
+
+    def test_timeout_does_not_wait_for_a_process_that_keeps_the_pipe(self):
+        import time
+        d = self.stub("echo started; (sleep 20 &) ; sleep 20\n")
+        t0 = time.time()
+        code, out = d.exec("c", ["x"], timeout_secs=1)
+        self.assertIsNone(code)
+        self.assertIn("started", out)
+        self.assertLess(time.time() - t0, 10)
 
 
 if __name__ == "__main__":

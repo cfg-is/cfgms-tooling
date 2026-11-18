@@ -62,6 +62,8 @@ def main(argv=None):
     subject = args.subject.strip()
     if "\n" in subject or not re.fullmatch(r"[a-z0-9/_.-]+: \S.*", subject):
         fail(2, '--subject must be one line of the form "<scope>: <what changed>"')
+    if any(not 32 <= ord(c) < 127 for c in subject):
+        fail(2, "--subject must be printable ASCII text")
     if len(subject) > SUBJECT_MAX_CHARS:
         fail(2, f"--subject is longer than {SUBJECT_MAX_CHARS} characters")
     try:
@@ -123,8 +125,16 @@ def main(argv=None):
                   file=sys.stderr)
             return 1
         time.sleep(1)
-    fail(3, f"no answer from the supervisor after {args.wait} seconds. The request stays in "
-            f"{final}; do not submit it again before the next turn tells you its result.")
+    # Withdraw the request: a supervisor that comes back later must not take a
+    # snapshot of a workspace that has moved on.
+    withdrawn = os.path.join(submit_dir, f".{os.path.basename(final)}-{request_id}.withdrawn")
+    try:
+        os.rename(final, withdrawn)
+        state = "The request was withdrawn"
+    except OSError:
+        state = f"The request could not be withdrawn and stays in {final}"
+    fail(3, f"no answer from the supervisor after {args.wait} seconds. {state}. Read "
+            f"{os.path.dirname(answer_file)}/status.json before you submit this slice again.")
 
 
 if __name__ == "__main__":

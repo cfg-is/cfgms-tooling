@@ -127,7 +127,10 @@ test_turn_text() {
     local ctx="$WORK/ctx" out
     mkdir -p "$ctx/turns"
     out=$( source_turn; fot_turn_text "$ctx" 1; echo "rc=$?" )
-    assert_equals "$out" "rc=0" "a missing turn file is an empty turn"
+    assert_equals "$out" "rc=1" "a missing turn file is refused"
+    : > "$ctx/turns/6.md"
+    out=$( source_turn; fot_turn_text "$ctx" 6; echo "rc=$?" )
+    assert_equals "$out" "rc=0" "an empty turn file is an empty turn"
     printf 'Events since your last turn:\n- slice 1: MERGED\n' > "$ctx/turns/2.md"
     out=$( source_turn; fot_turn_text "$ctx" 2 )
     assert_contains "$out" "- slice 1: MERGED" "the turn text is read"
@@ -141,6 +144,24 @@ test_turn_text() {
     head -c 65537 /dev/zero | tr '\0' 'a' > "$ctx/turns/5.md"
     out=$( source_turn; fot_turn_text "$ctx" 5; echo "rc=$?" )
     assert_equals "$out" "rc=1" "an oversized turn file is refused and not read"
+}
+
+test_exit_code() {
+    local out
+    # <session exit code> <seconds run> <limit in seconds> -> the turn's exit code
+    local -a cases=(
+        "0 10 600 0"  "1 10 600 1"  "2 600 600 2"
+        "124 600 600 124"  "137 601 600 124"      # the limit: TERM, or KILL after TERM
+        "124 10 600 1"  "75 10 600 1"  "75 600 600 1"   # the session's own 124 / 75
+        "137 10 600 137"                           # killed before the limit (out of memory)
+    )
+    local c
+    for c in "${cases[@]}"; do
+        # shellcheck disable=SC2086
+        set -- $c
+        out=$( source_turn; fot_exit_code "$1" "$2" "$3" )
+        assert_equals "$out" "$4" "session exit $1 after $2 s of $3 s -> $4"
+    done
 }
 
 test_first_prompt() {
@@ -177,6 +198,11 @@ test_scripts_wait_and_run_as_designed() {
     assert_contains "$ep" "exec runuser -u agent" "the entrypoint drops to agent"
     assert_contains "$ep" "trap 'exit 0' TERM INT" "the entrypoint ends on a stop request"
     assert_contains "$turn" "flock -n 9" "one turn at a time"
+    assert_contains "$turn" 'exec 9<"$FOT_LOCK"' "the lock is opened read-only"
+    assert_contains "$turn" "FOT_LOCK=/run/fsm-owner/turn.lock" "the lock is not in a directory the owner writes"
+    assert_contains "$ep" 'install -m 0444 -o root -g root /dev/null "${FSO_RUN_DIR}/turn.lock"' "the entrypoint makes the lock as root"
+    assert_contains "$ep" 'rm -f "$FSO_READY_FILE"' "a restarted container is not ready before its firewall"
+    assert_contains "$turn" 'exit "$(fot_exit_code "$rc" "$SECONDS"' "the exit code goes through fot_exit_code"
     assert_contains "$turn" 'timeout --signal=TERM --kill-after=60 "${timeout_min}m"' "the turn has a time limit"
     assert_contains "$turn" '--agents "${FOT_CONTEXT_DIR}/agents.json" --agent "$FOT_OWNER_AGENT"' "agent definitions come from the read-only context"
     assert_not_contains "$turn" 'CFGMS_FSM_MODEL' "the model does not come from the environment"
@@ -195,6 +221,7 @@ run_test "A3 — turn number" test_turn_number
 run_test "B1 — first turn or resume" test_first_turn_or_resume
 run_test "B2 — turn text" test_turn_text
 run_test "B3 — first prompt" test_first_prompt
+run_test "B4 — exit code of a turn" test_exit_code
 run_test "C1 — epic prompt content" test_epic_prompt_content
 run_test "C2 — scripts: wait, lock, limit, harness agent" test_scripts_wait_and_run_as_designed
 

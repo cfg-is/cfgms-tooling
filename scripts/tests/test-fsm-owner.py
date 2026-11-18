@@ -238,6 +238,26 @@ class TestEpicRun(RunCase):
         self.turn(O.EVENTS, ok=False)
         self.assertEqual(self.step(), O.Step(O.FAILED, reason="owner_turn_failed"))
 
+    def test_an_unpublished_slice_the_owner_gave_up_does_not_block_done(self):
+        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
+        self.take(2, "submitted", "ok", "fail")              # REJECTED, no pull request
+        self.done = True
+        self.assertEqual(self.step().step, O.REPORT)
+        # a rejected slice WITH a pull request is still open work
+        self.take(3, "submitted", "ok", "pass", "up_to_date", "pass", "published",
+                  "checks_failed", "submitted", "ok", "fail")
+        self.assertEqual(self.book.get(3).state, S.REJECTED)
+        self.assertNotEqual(self.step().step, O.REPORT)
+        # and a given-up slice alone, with nothing merged, is not a delivery
+        other = state.RunDir("epic-903-test", base=self.tmp / "runs")
+        other.create({"mode": "epic"})
+        book, log = S.SliceBook(other), O.OwnerLog(other)
+        book.take(1, "submitted")
+        book.take(1, "violation")
+        log.begin_turn(O.START)
+        log.end_turn(ok=True, progress=False)
+        self.assertNotEqual(O.next_step(log.facts(book, done=True, blocked=False)).step, O.REPORT)
+
     def test_blocked_ends_the_run(self):
         self.turn(O.START)
         self.blocked = True
@@ -287,10 +307,52 @@ class TestQueue(RunCase):
         self.assertEqual(again.open_turn, {"turn": 1, "kind": O.START, "upto": 1})
         with self.assertRaises(RuntimeError):
             again.begin_turn(O.EVENTS)
-        again.abandon_open_turn()
-        self.assertEqual(again.turns, 1)
-        self.assertEqual(again.pending(), ["a", O.TURN_FAILED_TEXT])
+        self.log.push("b")                          # queued after the turn began
+        again = O.OwnerLog(self.run)
+        before = len(self.run.records())
+        # the same turn again, with the events it was started with; not a failure
+        self.assertEqual(again.resume_turn(), (1, O.START, ["a"]))
+        self.assertEqual(len(self.run.records()), before)
+        self.assertEqual((again.turns, again.failed_turns), (0, 0))
+        again.end_turn(ok=True, progress=False)
+        self.assertEqual((again.turns, again.failed_turns, again.pending()), (1, 0, ["b"]))
+        self.assertIsNone(again.resume_turn())
         self.assertEqual(again.begin_turn(O.EVENTS)[0], 2)
+
+    def test_a_nudge_that_fails_or_times_out_is_counted_as_idle(self):
+        # an owner that lets every nudge run into the time limit must not get
+        # a new nudge each time
+        self.log.begin_turn(O.START)
+        self.log.end_turn(ok=True, progress=False)
+        turns = 1
+        while turns < 50:
+            step = O.next_step(self.log.facts(self.book, done=False, blocked=False))
+            if step.step != O.TURN:
+                break
+            self.log.begin_turn(step.kind)
+            self.log.end_turn(ok=step.kind != O.NUDGE, progress=False, timed_out=step.kind == O.NUDGE)
+            turns += 1
+        self.assertEqual((step.step, step.reason), (O.FAILED, "owner_idle"))
+        self.assertEqual(turns, 3)                  # start, nudge (timed out), the events turn
+
+    def test_every_run_of_turns_without_progress_ends(self):
+        # whatever mix of ended, failed and timed-out turns: no accepted
+        # submit means the run ends after a few turns
+        import itertools
+        for pattern in itertools.product((True, False), repeat=6):
+            run = state.RunDir(f"epic-9{sum(1 << i for i, p in enumerate(pattern) if p):02d}-t",
+                               base=self.tmp / "runs")
+            run.create({"mode": "epic"})
+            log, n = O.OwnerLog(run), 0
+            while n < 40:
+                step = O.next_step(log.facts(S.SliceBook(run), done=False, blocked=False))
+                if step.step != O.TURN:
+                    break
+                log.begin_turn(step.kind)
+                log.end_turn(ok=pattern[n % 6], progress=False)
+                n += 1
+            self.assertEqual(step.step, O.FAILED, pattern)
+            self.assertLessEqual(n, 6, pattern)
 
     def test_end_turn_needs_an_open_turn(self):
         with self.assertRaises(RuntimeError):

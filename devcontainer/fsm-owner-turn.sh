@@ -4,16 +4,19 @@
 #   fsm-owner-turn.sh <turn>
 #
 # Started by the host supervisor with `exec` in the running owner container,
-# as user `agent`. It runs ONE `claude -p` session turn in /workspace and exits
-# with claude's exit code (124: the turn reached its time limit; 75: another
-# turn is still running; 64: bad input).
+# as user `agent`. It runs ONE `claude -p` session turn in /workspace.
+#
+# Exit code: 0 the session ended; 124 the turn reached its time limit; 75
+# another turn is still running; 64 bad input or the container is not ready;
+# any other value is the session's own. A session that itself exits 75 or 124
+# is reported as 1, so those two values always mean what this script says.
 #
 # Everything this script acts on comes from files the supervisor wrote, under
 # the read-only /fsm/context mount -- never from its arguments or environment,
 # apart from the turn number:
 #
 #   /fsm/context/owner.json      {"epic", "session_id", "model", "effort", "timeout_min"}
-#   /fsm/context/turns/<turn>.md the events of this turn (may be empty)
+#   /fsm/context/turns/<turn>.md the events of this turn (may be empty; must exist)
 #   /fsm/context/agents.json     optional: agent definitions from the harness
 #
 # First turn or later turn: when the session's transcript exists, the turn
@@ -27,7 +30,9 @@ set -euo pipefail
 FOT_WORKSPACE=/workspace
 FOT_CONTEXT_DIR=/fsm/context
 FOT_PROMPT=/usr/local/share/cfgms-agent/fsm/prompts/epic.md
-FOT_LOCK=/tmp/fsm-owner-turn.lock
+# Made by the entrypoint as root, read-only for `agent`: the owner cannot
+# replace the lock with something that blocks.
+FOT_LOCK=/run/fsm-owner/turn.lock
 FOT_READY_FILE=/tmp/fsm-owner-ready
 FOT_TURN_MAX_BYTES=65536
 FOT_OWNER_AGENT=owner
@@ -74,14 +79,29 @@ fot_session_exists() {
 }
 
 # fot_turn_text <context_dir> <turn>
-# Prints the events of the turn. A missing file is an empty turn; a link, a
-# non-regular file or an oversized file is refused (returns 1).
+# Prints the events of the turn. The supervisor writes the file for every
+# turn, also when it is empty: a missing file, a link, a non-regular file or
+# an oversized file is refused (returns 1). A turn without its file would
+# count as "events delivered" with nothing delivered.
 fot_turn_text() {
     local f="$1/turns/$2.md"
-    [[ -e "$f" || -L "$f" ]] || return 0
     [[ -f "$f" && ! -L "$f" ]] || return 1
     (( $(wc -c < "$f") <= FOT_TURN_MAX_BYTES )) || return 1
     cat "$f"
+}
+
+# fot_exit_code <session exit code> <seconds run> <limit in seconds>
+# The exit code of the turn. `timeout` reports 124, or 137 when the session
+# ignored TERM and was killed; both mean "time limit" only when the time is up.
+fot_exit_code() {
+    local rc="$1"
+    if (( $2 >= $3 )) && [[ "$rc" == 124 || "$rc" == 137 ]]; then
+        echo 124
+    elif [[ "$rc" == 124 || "$rc" == 75 ]]; then
+        echo 1
+    else
+        echo "$rc"
+    fi
 }
 
 # fot_first_prompt <template> <epic> <turn text>
@@ -122,12 +142,15 @@ fi
 epic="${owner[0]}" session_id="${owner[1]}" model="${owner[2]}" effort="${owner[3]}" timeout_min="${owner[4]}"
 
 if ! text=$(fot_turn_text "$FOT_CONTEXT_DIR" "$turn"); then
-    echo "ERROR: fsm-owner-turn: ${FOT_CONTEXT_DIR}/turns/${turn}.md is not a plain file within the size limit" >&2
+    echo "ERROR: fsm-owner-turn: ${FOT_CONTEXT_DIR}/turns/${turn}.md is missing, or not a plain file within the size limit" >&2
     exit 64
 fi
 
 # One turn at a time.
-exec 9>"$FOT_LOCK"
+if [[ ! -f "$FOT_LOCK" || -L "$FOT_LOCK" ]] || ! exec 9<"$FOT_LOCK"; then
+    echo "ERROR: fsm-owner-turn: the turn lock ${FOT_LOCK} is missing (the entrypoint makes it)" >&2
+    exit 64
+fi
 if ! flock -n 9; then
     echo "ERROR: fsm-owner-turn: another turn is still running" >&2
     exit 75
@@ -168,7 +191,8 @@ echo "Owner turn ${turn} (${mode}, epic=${epic}, model=${model}, effort=${effort
 # ended. 9>&- keeps the lock out of the session, so a helper process it leaves
 # behind cannot hold the lock after the turn.
 rc=0
+SECONDS=0
 timeout --signal=TERM --kill-after=60 "${timeout_min}m" \
     claude --dangerously-skip-permissions --model "$model" "${effort_args[@]}" \
-    "${agent_args[@]}" "${session_args[@]}" -p "$prompt" 9>&- || rc=$?
-exit "$rc"
+    "${agent_args[@]}" "${session_args[@]}" -p "$prompt" 9<&- || rc=$?
+exit "$(fot_exit_code "$rc" "$SECONDS" "$(( timeout_min * 60 ))")"

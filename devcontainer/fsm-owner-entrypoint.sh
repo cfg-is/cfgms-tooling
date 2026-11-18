@@ -20,6 +20,7 @@ set -euo pipefail
 
 FSO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FSO_READY_FILE=/tmp/fsm-owner-ready
+FSO_RUN_DIR=/run/fsm-owner
 
 # The shared checks live in the agent entrypoint (refusal of GitHub
 # credentials, firewall post-conditions, Claude credential handling).
@@ -40,6 +41,12 @@ fi
 
 # --- 2. Firewall as root, then a one-way drop to `agent` --------------------
 if [[ "$(id -u)" -eq 0 ]]; then
+    rm -f "$FSO_READY_FILE"
+    # The turn lock: owned by root, read-only for `agent`. A turn takes the
+    # lock on a read-only descriptor; the owner cannot put a pipe in its place.
+    rm -rf "$FSO_RUN_DIR"
+    install -d -m 0755 -o root -g root "$FSO_RUN_DIR"
+    install -m 0444 -o root -g root /dev/null "${FSO_RUN_DIR}/turn.lock"
     init-firewall.sh
     exec runuser -u agent -- "$0" "$@"
 fi

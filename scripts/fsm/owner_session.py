@@ -12,8 +12,12 @@ login and then waits. Each turn is one
 The turn script takes only the turn number. Everything else it acts on --
 session id, model, effort, time limit, the events of the turn -- it reads from
 files this module writes into the run's context directory, which the
-container mounts read-only. So the owner cannot change its own model, its
-session or its events, and no text chosen by the owner reaches an argv.
+container mounts read-only. So the owner cannot change what the supervisor
+starts or the events of a turn, and no text chosen by the owner reaches an
+argv. This is not a sandbox against the owner: the container holds the Claude
+credential and the session files are writable there, so a process in it can
+start another session of its own or change a transcript. It gains nothing on
+the host by that: the supervisor reads only the workspace and /fsm/out.
 
 Credentials: the same as an agent session. The Claude credential by name, and
 no GitHub credential, gh config or git credential helper:
@@ -23,7 +27,13 @@ GitHub token later; that change is not in this module.)
 
 Canon is mounted read-only at /canon and memory read-write at /memory, never
 inside /workspace: the snapshot of the workspace must not be able to pick
-them up.
+them up. (The owner can still copy a file from /canon into /workspace; the
+supervisor's check of every snapshot is what keeps private text out of a
+push.)
+
+`assert_owner_argv` checks the whole `run` argv against what this module
+builds: every option, every mount target and every environment name must be
+one it knows. A thing that is not on the list stops the launch.
 """
 
 import json
@@ -50,6 +60,20 @@ READY_TIMEOUT_SECS = 120
 TURN_TIMED_OUT = 124
 TURN_BUSY = 75
 TURN_TEXT_CAP = 60000
+OUTPUT_LINE_MAX = 2000
+
+#: Options of the owner `run` argv that take a value, and the options and
+#: option prefixes that take none. Nothing else may be in the argv.
+_VALUE_OPTIONS = ("--name", "--label", "-v", "-e", "--cap-add", "--entrypoint")
+_PLAIN_OPTIONS = ("-d",)
+_PREFIX_OPTIONS = ("--memory=", "--cpus=", "--stop-timeout=")
+_ENV_NAMES = ("CFGMS_AUTONOMOUS", "CFGMS_AGENT_MODE", "CFGMS_FSM_RUN_ID", "CFGMS_FSM_KIND",
+              "CFGMS_FSM_EPIC", "CFGMS_FSM_CONTEXT", "CFGMS_FSM_OUT",
+              "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
+              "CLAUDE_CODE_OAUTH_TOKEN")
+_NAMED_VOLUMES = {"cfgms-go-build-cache": "/home/agent/.cache/go-build",
+                  "cfgms-go-mod-cache": "/home/agent/go/pkg/mod"}
+CREDENTIALS_MOUNT = "/home/agent/.claude/.credentials.json"
 
 _SESSION_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]*")
@@ -153,37 +177,95 @@ def turn_argv(name, turn):
     return ["exec", "--user", "agent", name, OWNER_TURN, str(turn)]
 
 
-def assert_private_mounts(argv, canon_dir, memory_dir):
-    """Canon and memory go to /canon (read-only) and /memory and nowhere else,
-    and nothing is mounted inside /workspace: the snapshot copies the
-    workspace, and private text must never be in it."""
-    canon, memory = str(canon_dir).rstrip("/"), str(memory_dir).rstrip("/")
-    seen = set()
-    for i, a in enumerate(argv):
-        if a == "--mount" or a.startswith("--mount=") or a.startswith("--volume="):
-            raise agent_session.CredentialLeak("owner argv uses a mount form that is not checked")
-        if a not in ("-v", "--volume") or i + 1 >= len(argv):
+def _real(path):
+    return os.path.realpath(str(path))
+
+
+def _inside(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def assert_owner_argv(argv, canon_dir, memory_dir):
+    """The owner `run` argv holds only what `docker_argv` builds.
+
+      * every option is on the list above (so no --privileged, --device,
+        --volumes-from, --mount, and no `-vSRC:DST` or `-eNAME` written as
+        one word);
+      * every mount goes to a known place, once; canon is read-only at /canon
+        and memory is at /memory, compared as real paths;
+      * canon, memory and the workspace do not hold one another;
+      * every environment entry is a known name, and only the Claude token is
+        passed by name alone.
+    """
+    def stop(why):
+        raise agent_session.CredentialLeak(f"owner argv: {why}")
+
+    if len(argv) < 3 or argv[0] != "run":
+        stop("not a run argv")
+    canon, memory = _real(canon_dir), _real(memory_dir)
+    mounts, envs, entry = {}, [], None
+    i, last = 1, len(argv) - 1          # the last word is the image
+    while i < last:
+        a = argv[i]
+        if a in _PLAIN_OPTIONS or a.startswith(_PREFIX_OPTIONS):
+            i += 1
             continue
-        parts = argv[i + 1].split(":")
-        if len(parts) < 2:
-            continue
-        source, target, opts = parts[0].rstrip("/"), parts[1].rstrip("/"), parts[2:]
-        if target.startswith("/workspace/"):
-            raise agent_session.CredentialLeak(f"a mount inside the workspace: {target}")
-        for private, want in ((canon, CANON_MOUNT), (memory, MEMORY_MOUNT)):
-            inside = source == private or source.startswith(private + "/") \
-                or private.startswith(source + "/")
-            if inside and (source != private or target != want):
-                raise agent_session.CredentialLeak(
-                    f"canon or memory reaches the container at {target}, not only at {want}")
-        if source == canon:
-            if "ro" not in opts:
-                raise agent_session.CredentialLeak("canon is not mounted read-only")
-            seen.add("canon")
-        if source == memory:
-            seen.add("memory")
-    if seen != {"canon", "memory"}:
-        raise agent_session.CredentialLeak("canon and memory must both be mounted")
+        if a not in _VALUE_OPTIONS or i + 1 >= last:
+            stop(f"option {a!r} is not allowed")
+        val = argv[i + 1]
+        i += 2
+        if a == "-v":
+            parts = val.split(":")
+            if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "ro"):
+                stop(f"mount {val!r} has an unknown form")
+            target = parts[1]
+            if target in mounts:
+                stop(f"{target} is mounted twice")
+            mounts[target] = (parts[0], len(parts) == 3)
+        elif a == "-e":
+            envs.append(val)
+        elif a == "--cap-add" and val != "NET_ADMIN":
+            stop(f"capability {val!r} is not allowed")
+        elif a == "--entrypoint":
+            entry = val
+    if entry != OWNER_ENTRYPOINT:
+        stop("the entrypoint is not the owner entrypoint")
+    if argv[last].startswith("-"):
+        stop("no image")
+
+    known = {"/workspace", agent_session.CONTEXT_MOUNT, agent_session.OUT_MOUNT,
+             agent_session.SESSIONS_MOUNT, "/home/agent/.claude.json", CANON_MOUNT, MEMORY_MOUNT,
+             agent_session.METRICS_MOUNT, CREDENTIALS_MOUNT} | set(_NAMED_VOLUMES.values())
+    for target in mounts:
+        if target not in known:
+            stop(f"mount target {target} is not allowed")
+    for need in ("/workspace", agent_session.CONTEXT_MOUNT, agent_session.OUT_MOUNT,
+                 CANON_MOUNT, MEMORY_MOUNT):
+        if need not in mounts:
+            stop(f"{need} is not mounted")
+    for vol, target in _NAMED_VOLUMES.items():
+        if target in mounts and mounts[target][0] != vol:
+            stop(f"{target} is not the volume {vol}")
+    host = {t: _real(src) for t, (src, _ro) in mounts.items() if src.startswith("/")}
+    for t, (src, _ro) in mounts.items():
+        if not src.startswith("/") and src not in _NAMED_VOLUMES:
+            stop(f"mount source {src!r} is not an absolute path")
+    if host.get(CANON_MOUNT) != canon or not mounts[CANON_MOUNT][1]:
+        stop("canon is not mounted read-only at /canon")
+    if host.get(MEMORY_MOUNT) != memory:
+        stop("memory is not mounted at /memory")
+    if not mounts[agent_session.CONTEXT_MOUNT][1]:
+        stop("the context directory is not mounted read-only")
+    for t, src in host.items():
+        for private, own in ((canon, CANON_MOUNT), (memory, MEMORY_MOUNT)):
+            if t != own and (_inside(src, private) or _inside(private, src)):
+                stop(f"canon or memory also reaches the container at {t}")
+    for e in envs:
+        name, sep, _value = e.partition("=")
+        if name not in _ENV_NAMES:
+            stop(f"environment name {name!r} is not allowed")
+        if not sep and name != "CLAUDE_CODE_OAUTH_TOKEN":
+            stop(f"environment name {name!r} is passed from the host")
 
 
 def start(docker, argv, name, env_extra, *, canon_dir, memory_dir, gh_token=None,
@@ -200,7 +282,7 @@ def start(docker, argv, name, env_extra, *, canon_dir, memory_dir, gh_token=None
     if gh_token:
         check_env["_FSM_GH_TOKEN_VALUE"] = gh_token
     agent_session.assert_no_github_credentials(argv, check_env)
-    assert_private_mounts(argv, canon_dir, memory_dir)
+    assert_owner_argv(argv, canon_dir, memory_dir)
     docker.rm_force(name)
     try:
         cid = docker.run_detached(argv, env_extra=env_extra)
@@ -227,6 +309,10 @@ def run_turn(docker, name, turn, timeout_min, env_extra=None):
     Returns {"exit_code", "ok", "timed_out", "busy", "error", "duration_seconds",
     "output_tail"}. `ok` means exit code 0 inside the time limit. The output
     tail has every value of `env_extra` (the Claude token) redacted.
+
+    The output tail is text the owner chose. It is for a log on the host. It
+    must not go into a prompt, a pull request or a comment: the redaction
+    finds only the exact token value.
     """
     turn_argv(name, turn)       # validates the turn number
     started = time.time()
@@ -243,7 +329,8 @@ def run_turn(docker, name, turn, timeout_min, env_extra=None):
     return {"exit_code": code, "ok": code == 0, "timed_out": timed_out,
             "busy": code == TURN_BUSY, "error": error,
             "duration_seconds": int(time.time() - started),
-            "output_tail": "\n".join(output.splitlines()[-agent_session.LOG_TAIL_LINES:])}
+            "output_tail": "\n".join(ln[:OUTPUT_LINE_MAX] for ln in
+                                     output.splitlines()[-agent_session.LOG_TAIL_LINES:])}
 
 
 def stop(docker, name):

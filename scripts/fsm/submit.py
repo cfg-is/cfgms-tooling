@@ -58,7 +58,12 @@ _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 #: "<scope>: <what changed>". The supervisor adds the issue reference.
 _SUBJECT_RE = re.compile(r"^[a-z0-9/_.-]+: \S.*$")
-_ISSUE_REF_RE = re.compile(r"\((?:Issue|Item|Epic) #[0-9A-Za-z]+\)\s*$")
+#: The subject becomes a commit subject and a pull request title on GitHub,
+#: where some text acts: a reference links or closes an issue, a mention
+#: notifies a person, a skip marker switches the checks off.
+_REFERENCE_RE = re.compile(r"#[0-9]|[A-Za-z0-9]/[A-Za-z0-9_.-]+#|https?://", re.I)
+_MENTION_RE = re.compile(r"@[A-Za-z0-9]")
+_SKIP_RE = re.compile(r"\[[^\]]*\b(?:skip|no)\b[^\]]*\]|\bskip-checks\b|\[[^\]]*\bci\b[^\]]*\]", re.I)
 
 
 @dataclass(frozen=True)
@@ -129,8 +134,8 @@ def validate_subject(text):
     if "\n" in line or "\r" in line:
         raise ValueError("the subject must be one line")
     line = line.strip()
-    if any(ord(c) < 32 or ord(c) == 127 for c in line):
-        raise ValueError("the subject has a control character")
+    if any(not 32 <= ord(c) < 127 for c in line):
+        raise ValueError("the subject must be printable ASCII text")
     if not line:
         raise ValueError("the subject is empty")
     if len(line) > SUBJECT_MAX_CHARS:
@@ -138,9 +143,14 @@ def validate_subject(text):
     if not _SUBJECT_RE.fullmatch(line):
         raise ValueError('the subject must have the form "<scope>: <what changed>" '
                          "with a lower-case scope")
-    if _ISSUE_REF_RE.search(line):
-        raise ValueError("the subject must not end with an issue reference; "
-                         "the supervisor adds it")
+    if _REFERENCE_RE.search(line):
+        raise ValueError("the subject must not have an issue or pull request reference "
+                         "or a link; the supervisor adds the reference")
+    if _MENTION_RE.search(line):
+        raise ValueError("the subject must not mention an account (@name)")
+    if _SKIP_RE.search(line):
+        raise ValueError("the subject must not have a marker in square brackets that "
+                         "names skip, no or ci")
     return line
 
 
@@ -151,7 +161,7 @@ def _parse(dirname, slice_no, dfd):
         return None, f"request.json: {problem}"
     try:
         req = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):      # deep nesting, on older Pythons
         return None, "request.json: not JSON"
     if not isinstance(req, dict):
         return None, "request.json: not an object"
@@ -222,8 +232,10 @@ def scan(out_dir, seen=()):
             for name in names:
                 m = _DIR_RE.fullmatch(name)
                 if not m:
-                    if not name.startswith("."):      # ".<name>.tmp": still being written
-                        result.ignored.append((name, "not a request directory name"))
+                    # ".<name>.tmp": still being written; ".<name>.withdrawn":
+                    # slice-submit gave up waiting
+                    if not name.startswith("."):
+                        result.ignored.append((_shown(name), "not a request directory name"))
                     continue
                 try:
                     dfd = _open_dir_at(sfd, name)
@@ -231,20 +243,26 @@ def scan(out_dir, seen=()):
                     result.ignored.append((name, f"not a plain directory ({exc.strerror})"))
                     continue
                 try:
-                    mtime = os.fstat(dfd).st_mtime_ns
                     parsed, why = _parse(name, int(m.group(1)), dfd)
                 finally:
                     os.close(dfd)
                 if parsed is None:
                     result.ignored.append((name, why))
                 elif (name, parsed.request_id) not in seen:
-                    found.append((mtime, int(m.group(1)), int(m.group(2)), parsed))
-            result.requests = [p for *_k, p in sorted(found, key=lambda t: t[:3])]
+                    found.append((int(m.group(2)), int(m.group(1)), parsed))
+            # Oldest first: slice-submit takes the lowest free <k> of its
+            # slice. File times are set by the owner and are not read.
+            result.requests = [p for *_k, p in sorted(found, key=lambda t: t[:2])]
             return result
         finally:
             os.close(sfd)
     finally:
         os.close(ofd)
+
+
+def _shown(name):
+    """A directory entry name as it may be written to a log: ASCII, capped."""
+    return name.encode("ascii", "backslashreplace").decode("ascii")[:80]
 
 
 # --- answers ----------------------------------------------------------------

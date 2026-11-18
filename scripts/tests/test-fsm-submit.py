@@ -250,9 +250,75 @@ class TestReaderIsSafe(Case):
         self.assertEqual(ok, "controller/api: persist the hostname")
         for bad in (None, "", "   ", "fsm: a\nFixes #12", "fsm: a\r\nb", "Fsm: upper scope",
                     "no colon here", "fsm:", "fsm: " + "x" * 150, "fsm: bell\x07",
-                    "fsm: add the thing (Issue #12)", "fsm: add the thing (Epic #900)"):
+                    "fsm: add the thing (Issue #12)", "fsm: add the thing (Epic #900)",
+                    # text that acts on GitHub
+                    "fsm: x [skip ci]", "fsm: x [ci skip]", "fsm: x [no ci]", "fsm: x [skip actions]",
+                    "fsm: x [CI Skip]", "fsm: x skip-checks: true",
+                    "fsm: x fixes #1", "fsm: x (issue #5)", "fsm: x (#5)", "fsm: see org/repo#7",
+                    "fsm: see https://github.com/o/r/issues/7", "fsm: @everyone look",
+                    # not printable ASCII
+                    "fsm: a\u202eevil", "fsm: a\x85b", "fsm: a\x9bb", "fsm: \ufeffx", "fsm: caf\u00e9",
+                    "fsm: a\u2028b", "fsm: a\x7fb"):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 submit.validate_subject(bad)
+        for good in ("fsm: handle list[0] and a/b paths", "docs: say what C# is not",
+                     "api: keep e-mail user@ unchanged"):
+            self.assertEqual(submit.validate_subject(good), good)
+
+    def test_deeply_nested_json_is_not_a_crash(self):
+        self.request_dir("1-1", request="[" * 3900)
+        s = submit.scan(self.out)
+        self.assertEqual((s.requests, s.ignored), ([], [("1-1", "request.json: not JSON")]))
+
+    def test_a_file_that_grows_after_the_size_check_is_cut_off(self):
+        # the size is checked first; the read stops at the cap whatever the size said
+        (self.out / "big").mkdir(parents=True)
+        (self.out / "big" / "f").write_bytes(b"x" * 5000)
+        real = os.fstat
+
+        class Small:
+            st_mode = 0o100644
+            st_size = 10
+        os.fstat = lambda fd: Small()
+        try:
+            dfd = os.open(self.out / "big", os.O_RDONLY)
+            try:
+                self.assertEqual(submit._read_at(dfd, "f", 4096), (None, "too_large"))
+            finally:
+                os.close(dfd)
+        finally:
+            os.fstat = real
+
+    def test_request_id_must_be_exactly_32_hex(self):
+        self.request_dir("1-1", request=self.req(request_id="a" * 32 + "\n"))
+        self.request_dir("1-2", request=self.req(request_id="a" * 33))
+        s = submit.scan(self.out)
+        self.assertEqual((s.requests, sorted(n for n, _ in s.ignored)), ([], ["1-1", "1-2"]))
+
+    def test_seen_is_a_pair_of_directory_and_request_id(self):
+        self.request_dir("1-1", request=self.req(request_id="a" * 32))
+        self.request_dir("1-2", request=self.req(request_id="a" * 32))    # an old id, a new directory
+        s = submit.scan(self.out, {("1-1", "a" * 32)})
+        self.assertEqual([r.dirname for r in s.requests], ["1-2"])
+
+    def test_empty_claim_is_refused(self):
+        self.request_dir("1-1", request=self.req(), claim="  \n")
+        (r,) = submit.scan(self.out).requests
+        self.assertIsInstance(r, submit.Refused)
+        self.assertIn("claim.md is empty", r.reason)
+
+    def test_odd_names_are_shown_as_plain_text(self):
+        (self.out / "submit").mkdir()
+        name = "a\nb\udcff" + "x" * 300
+        try:
+            os.mkdir(os.path.join(str(self.out), "submit", name[:120]))
+        except OSError:
+            self.skipTest("this file system refuses the name")
+        ((shown, _why),) = submit.scan(self.out).ignored
+        shown.encode("ascii")                       # no exception
+        self.assertLessEqual(len(shown), 80)
+        import json
+        json.dumps({"n": shown}, ensure_ascii=False).encode()
 
     def test_requests_that_cannot_be_answered_are_ignored_with_a_reason(self):
         self.request_dir("1-1", request="not json")
@@ -276,12 +342,14 @@ class TestReaderIsSafe(Case):
         self.assertEqual(s.requests, [])
         self.assertIn("more than", s.problem)
 
-    def test_oldest_first(self):
-        for i, name in enumerate(("2-1", "1-1", "3-1")):
+    def test_order_does_not_read_file_times(self):
+        # <k> first (slice-submit takes the lowest free one), then the slice
+        # number. The owner sets file times; they decide nothing.
+        for i, name in enumerate(("2-1", "1-2", "3-1", "1-1")):
             d = self.request_dir(name, request=self.req(int(name[0]), request_id=f"{i:032x}"))
-            os.utime(d, ns=(10 ** 9 * (i + 1), 10 ** 9 * (i + 1)))
+            os.utime(d, ns=(10 ** 9 * (9 - i), 10 ** 9 * (9 - i)))
         self.assertEqual([r.dirname for r in submit.scan(self.out).requests],
-                         ["2-1", "1-1", "3-1"])
+                         ["1-1", "2-1", "3-1", "1-2"])
 
 
 class TestInboxAndAnswer(Case):

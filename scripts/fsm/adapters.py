@@ -14,9 +14,11 @@ through `-e VAR` pass-through. `GhCLI` passes the supervisor's token to `gh`
 via the environment of that one call only.
 """
 
+import collections
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 TOOLING_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -88,18 +90,41 @@ class DockerCLI:
         timed out: the process may still run in the container. No environment
         is passed to the process beyond the container's own. Output is the
         last `max_output` bytes of stdout and stderr.
+
+        The process in the container is not trusted: it can print without
+        end. The output is read as it comes and only its tail is kept, so the
+        memory this call uses does not grow with what the process prints.
         """
         argv = [self.binary, "exec"]
         if user:
             argv += ["--user", user]
         argv += [name] + list(cmd)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, env=scrubbed_env())
+        tail = collections.deque()
+        size = [0]
+
+        def pump():
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    return
+                tail.append(chunk)
+                size[0] += len(chunk)
+                while size[0] - len(tail[0]) >= max_output:
+                    size[0] -= len(tail.popleft())
+
+        reader = threading.Thread(target=pump, name="docker-exec-output", daemon=True)
+        reader.start()
         try:
-            proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  stdin=subprocess.DEVNULL, env=scrubbed_env(),
-                                  timeout=timeout_secs)
-        except subprocess.TimeoutExpired as exc:
-            return None, (exc.stdout or b"")[-max_output:].decode("utf-8", "replace")
-        return proc.returncode, proc.stdout[-max_output:].decode("utf-8", "replace")
+            code = proc.wait(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            code = None
+        # A process left behind can hold the pipe open: do not wait for it.
+        reader.join(5 if code is None else 30)
+        return code, b"".join(list(tail))[-max_output:].decode("utf-8", "replace")
 
     def kill(self, name):
         self._run(["kill", name], timeout=60)

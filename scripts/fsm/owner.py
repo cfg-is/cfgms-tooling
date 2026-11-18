@@ -10,13 +10,20 @@ is a pure function; it starts nothing and reads no file.
     blocked.md                                   -> FAILED(owner_blocked)
     a slice is FAILED                            -> FAILED(<the slice's reason>)
     done.md, every slice ended, one is MERGED    -> REPORT
+    two turns in a row failed                    -> FAILED(owner_turn_failed)
     no turn yet                                  -> TURN(start)
     done.md, but not acceptable, nothing in flight -> TURN(done_refused) once
     events are waiting                           -> TURN(events)
     a slice is in flight                         -> WAIT
     nothing waits, nothing is in flight          -> TURN(nudge), then
                                                     FAILED(owner_idle)
-    two turns in a row failed                    -> FAILED(owner_turn_failed)
+
+Every run ends. A turn is started only for the first turn, for waiting
+events, for one refusal of done.md, or as a nudge. Events come from slices,
+whose rounds are bounded, and from failed turns. A nudge turn that brings no
+accepted submit -- it ended, it failed or it timed out -- is counted, and the
+count is reset only by an accepted submit. So after one nudge without
+progress the next quiet moment ends the run.
 
 An event is a short text the supervisor writes itself, from its own records:
 a state name, a reason code, a path. It never carries text from the owner or
@@ -24,9 +31,12 @@ from GitHub, so a turn prompt cannot be used to inject instructions.
 
 `OwnerLog` keeps the event queue and the turn history in state.jsonl
 (`owner_event`, `owner_turn_start`, `owner_turn_end`) and rebuilds them on
-resume. An event is delivered when its turn has ENDED: a supervisor crash in
-the middle of a turn delivers the same events again in the next turn. At
-least once, never zero times.
+resume. An event is delivered when its turn has ENDED. A supervisor that
+restarts in the middle of a turn finds the turn open (`open_turn`) and runs
+the same turn again, with the same events (`resume_turn`): at least once,
+never zero times. The turn that was running may still hold the turn lock in
+the container; the supervisor waits for it and does not count that wait as a
+failed turn.
 """
 
 from dataclasses import dataclass
@@ -67,7 +77,7 @@ class Facts:
     failed_reason: str = ""    # the reason of a FAILED slice, when there is one
     done: bool = False         # out/done.md is there
     blocked: bool = False      # out/blocked.md is there
-    idle_turns: int = 0        # nudge turns in a row without progress
+    idle_turns: int = 0        # nudge turns without progress since the last progress
     failed_turns: int = 0      # turns in a row that ended in error or timeout
     done_refused: bool = False  # the owner was already told that done.md is refused
 
@@ -88,10 +98,10 @@ def next_step(f):
         return Step(FAILED, reason="owner_blocked")
     if S.FAILED in f.states:
         return Step(FAILED, reason=f.failed_reason or "slice_failed")
-    if f.failed_turns >= TURN_FAILURE_LIMIT:
-        return Step(FAILED, reason="owner_turn_failed")
     if f.done and not unfinished and S.MERGED in f.states:
         return Step(REPORT)
+    if f.failed_turns >= TURN_FAILURE_LIMIT:
+        return Step(FAILED, reason="owner_turn_failed")
     if f.turns == 0:
         return Step(TURN, kind=START)
     if f.done and not f.done_refused and not in_flight:
@@ -144,6 +154,12 @@ def slice_event_text(number, rnd, state, reason="", pr=0, commit=""):
         return f"{head}. Read {d}/status.json"
     where = f" (pull request #{int(pr)})" if pr and state == S.NEEDS_OWNER else ""
     return f"{head}{where}: {text.format(dir=d)}."
+
+
+def given_up(s):
+    """A slice the owner may leave behind: it waits for the owner and has no
+    pull request."""
+    return s.state in (S.REJECTED, S.STALE) and not s.ctx.published
 
 
 def _is_sha(text):
@@ -234,12 +250,15 @@ class OwnerLog:
         if ok:
             self.delivered = max(self.delivered, upto)
             self.failed_turns = 0
-            if kind == NUDGE and not progress:
-                self.idle_turns += 1
             if kind == DONE_REFUSED:
                 self.done_refused = True
         else:
             self.failed_turns += 1
+        # A nudge turn without progress counts whether it ended, failed or
+        # timed out: an owner that lets every nudge run into the time limit
+        # must not get a new nudge each time.
+        if kind == NUDGE and not progress:
+            self.idle_turns += 1
         if progress:
             self.idle_turns = 0
             self.done_refused = False
@@ -282,8 +301,8 @@ class OwnerLog:
         """Record the end of the open turn.
 
         ok        the session ended with exit code 0 inside its time limit
-        progress  a submit request arrived during the turn. done.md and
-                  blocked.md are not progress: they end the run or are refused.
+        progress  the supervisor accepted a snapshot during the turn. A
+                  refused request, done.md and blocked.md are not progress.
 
         A turn that did not end ok queues one event that says so, so the next
         turn tells the owner.
@@ -298,15 +317,30 @@ class OwnerLog:
         if not ok:
             self.push(TURN_TIMEOUT_TEXT if timed_out else TURN_FAILED_TEXT)
 
-    def abandon_open_turn(self):
-        """After a supervisor crash: the open turn's outcome is unknown. It is
-        recorded as failed, and its events are delivered again."""
-        if self.open_turn is not None:
-            self.end_turn(ok=False, progress=False)
+    def resume_turn(self):
+        """After a supervisor restart: the turn that was open, to run again.
+
+        Returns (turn number, kind, event texts) -- the same events the turn
+        was started with -- or None when no turn is open. Nothing is recorded:
+        the turn is still the open turn and `end_turn` closes it.
+        """
+        if self.open_turn is None:
+            return None
+        t = self.open_turn
+        texts = [e["text"] for e in self.events[self.delivered:t["upto"]]]
+        return t["turn"], t["kind"], texts
 
     def facts(self, book, *, done, blocked):
-        """The Facts for `next_step`, from this log and a slices.SliceBook."""
-        states = tuple(s.state for s in book.slices.values() if s.state != S.NEW)
+        """The Facts for `next_step`, from this log and a slices.SliceBook.
+
+        A slice that waits for the owner in REJECTED or STALE and never had a
+        pull request is not counted: nothing of it is on GitHub, and the owner
+        may give it up (for example, deliver the change in another slice). It
+        has no way to an end state other than a new round, so counting it
+        would make done.md impossible to accept.
+        """
+        states = tuple(s.state for s in book.slices.values()
+                       if s.state != S.NEW and not given_up(s))
         failed = next((s.reason for s in book.slices.values() if s.state == S.FAILED), "")
         return Facts(turns=self.turns, pending=len(self.events) - self.delivered,
                      states=states, failed_reason=failed, done=done, blocked=blocked,
