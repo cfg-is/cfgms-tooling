@@ -39,6 +39,9 @@ chmod +x "$TMP/bin/docker"
 
 # Source only the prune functions so no subcommand dispatch runs.
 FUNCS="$(sed -n '/^_docker_prune_age()/,/^# gate_image_staleness_for_launch/p' "$DISPATCH" | sed '$d')"
+# The prune functions call the container program through the runtime library
+# (the `docker` function, CFGMS_CONTAINER_RUNTIME, container_runtime_root).
+FUNCS="source '$(dirname "$DISPATCH")/lib/container-runtime.sh'"$'\n'"$FUNCS"
 
 run_prune() {
   # run_prune <disk-frac> [extra env...] — prints stdout; log in $DOCKER_LOG
