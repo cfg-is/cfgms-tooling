@@ -359,7 +359,8 @@ class TestParentRule(BookCase):
                 self.resolve(1, bad)
 
     def test_base_must_be_a_full_commit_id(self):
-        for bad in ("", "develop", self.on_develop[:12], "origin/develop", self.on_develop.upper()):
+        for bad in ("", "develop", self.on_develop[:12], "origin/develop", self.on_develop.upper(),
+                    self.on_develop + "\n"):
             with self.assertRaisesRegex(S.BadRequest, "40-character"):
                 self.resolve(1, bad)
 
