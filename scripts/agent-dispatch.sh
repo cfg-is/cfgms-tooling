@@ -56,6 +56,11 @@ init_tooling_submodule() {
 # shellcheck source=lib/atomic-lock.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/atomic-lock.sh"
 
+# Container runtime selection (docker or rootless podman); defines the
+# `docker` function that every call below goes through.
+# shellcheck source=lib/container-runtime.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/container-runtime.sh"
+
 # Base directory for per-agent API key tmpfs files.
 # Override CFGMS_TEST_CRED_BASE in hermetic tests.
 AGENT_CRED_BASE="${CFGMS_TEST_CRED_BASE:-/run/cfgms/agent-cred}"
@@ -470,9 +475,9 @@ _capacity_compute() {
   # function before it prints a CAPACITY_ line, turning "no docker" into "no
   # answer" for every caller of `agent-dispatch.sh capacity`.
   local running_ids reserved=0
-  if command -v docker >/dev/null 2>&1; then
+  if command -v "$CFGMS_CONTAINER_RUNTIME" >/dev/null 2>&1; then
     running=$(docker ps --filter "label=cfg-agent=true" -q 2>/dev/null | wc -l | tr -d ' ')
-    docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+    docker_root=$(container_runtime_root)
     running_ids=$(docker ps --filter "label=cfg-agent=true" --format '{{.Label "run_id"}}' 2>/dev/null \
       | sort -u | paste -sd, - || true)
   else
@@ -1912,7 +1917,7 @@ _docker_prune_disk_frac() {
     echo "$CFGMS_TEST_DOCKER_PRUNE_DISK_FRAC"; return
   fi
   local root
-  root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+  root=$(container_runtime_root)
   CAP_ROOT="$root" python3 -c '
 import os, shutil
 p = os.path.abspath(os.environ["CAP_ROOT"])
@@ -1945,7 +1950,7 @@ _docker_prune_body() {
 }
 
 _docker_prune_reclaim() {
-  command -v docker >/dev/null 2>&1 || return 0
+  command -v "$CFGMS_CONTAINER_RUNTIME" >/dev/null 2>&1 || return 0
   local at frac image_age cache_age
   at="${CFGMS_AGENT_DOCKER_PRUNE_AT:-0.80}"
   frac=$(_docker_prune_disk_frac)
@@ -1989,7 +1994,7 @@ _docker_prune_reclaim() {
 # this gate for real against a disposable git fixture and a stubbed `docker`,
 # opts back in with CFGMS_TEST_IMAGE_STALENESS_CHECK=1.
 gate_image_staleness_for_launch() {
-  command -v docker >/dev/null 2>&1 || return 0
+  command -v "$CFGMS_CONTAINER_RUNTIME" >/dev/null 2>&1 || return 0
   if [[ -n "${CFGMS_TEST_REPO_ROOT:-}" && -z "${CFGMS_TEST_IMAGE_STALENESS_CHECK:-}" ]]; then
     return 0
   fi
@@ -2086,10 +2091,10 @@ start_investigator_log_capture() {
   # property this actually needs -- outliving the dispatch shell's exit --
   # even without setsid's full session detachment.
   if command -v setsid >/dev/null 2>&1; then
-    setsid nohup docker logs -f --timestamps "$container_id" \
+    setsid nohup "$CFGMS_CONTAINER_RUNTIME" logs -f --timestamps "$container_id" \
       > "${log_dir}/${mode_safe}.log" 2>&1 < /dev/null &
   else
-    nohup docker logs -f --timestamps "$container_id" \
+    nohup "$CFGMS_CONTAINER_RUNTIME" logs -f --timestamps "$container_id" \
       > "${log_dir}/${mode_safe}.log" 2>&1 < /dev/null &
   fi
   disown 2>/dev/null || true
@@ -2852,7 +2857,7 @@ case "$cmd" in
     host_claude_dir="$HOME/.claude"
     host_claude_json="$HOME/.claude.json"
 
-    exec docker run -it --rm \
+    exec "${CFGMS_CONTAINER_RUN[@]}" -it --rm \
       --name "$container_name" \
       --label "cfg-agent=true" \
       --label "mode=live" \
@@ -3026,7 +3031,7 @@ case "$cmd" in
 
     # Pass the resolved claude args via bash -c positional args ("$@") to avoid
     # shell-quote escaping pain when args contain special characters.
-    exec docker run -it --rm \
+    exec "${CFGMS_CONTAINER_RUN[@]}" -it --rm \
       --name "$container_name" \
       --label "cfg-agent=true" \
       --label "mode=po-live" \

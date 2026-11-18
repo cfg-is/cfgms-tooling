@@ -8,6 +8,11 @@
 # Usage: ./.claude/tooling/scripts/pipeline-helper.sh <command> [args...]
 set -euo pipefail
 
+# Container runtime selection (docker or rootless podman); defines the
+# `docker` function that every call below goes through.
+# shellcheck source=lib/container-runtime.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/container-runtime.sh"
+
 REPO="cfg-is/cfgms"
 
 usage() {
@@ -854,7 +859,7 @@ PYEOF
     # plain TTL behaviour where docker is absent (GC may run off-host).
     owner="${REPO%%/*}"; name="${REPO##*/}"
     have_docker=false
-    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && have_docker=true
+    command -v "$CFGMS_CONTAINER_RUNTIME" >/dev/null 2>&1 && docker info >/dev/null 2>&1 && have_docker=true
     gced=0; skipped=0
     while IFS=$'\t' read -r key holder exp expired; do
       [ "$expired" = "True" ] || [ "$expired" = "true" ] || continue

@@ -27,6 +27,8 @@ import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+import runtime
+
 #: Credential basename globs (from the removed headless entrypoint's salvage).
 CREDENTIAL_NAME_GLOBS = (
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", ".netrc", ".npmrc", ".pypirc",
@@ -243,10 +245,14 @@ def _finish(proc, found, warnings):
 TRUFFLEHOG_ARGS = ("--json", "--no-update", "--no-verification")
 
 
-def image_scanner_hook(image=None, docker="docker", timeout=600):
+def image_scanner_hook(image=None, docker=None, timeout=600):
     """trufflehog from the cfg-agent image: `docker run --rm --network none`,
     scan dir mounted read-only, no credential, no other mount."""
     image = image or os.environ.get("CFGMS_FSM_IMAGE", "cfg-agent:latest")
+    # No keep-id options (runtime.agent_run_args) here: the scan runs as the
+    # container's root with every capability dropped. In rootless podman that
+    # root is the host user, the owner of the scan folder, so it can read it.
+    docker = docker or runtime.binary()
 
     def run(root, warnings):
         argv = [docker, "run", "--rm", "--network", "none", "--cap-drop", "ALL",

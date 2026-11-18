@@ -17,6 +17,11 @@
 
 set -euo pipefail
 
+# Container runtime selection (docker or rootless podman); defines the
+# `docker` function that every call below goes through.
+# shellcheck source=lib/container-runtime.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/container-runtime.sh"
+
 # Ensure Docker is running
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: Docker is not running. Start Docker and retry."
@@ -35,7 +40,7 @@ docker volume create claude-creds >/dev/null 2>&1 || true
 echo "Refreshing Claude Code credentials for agent containers..."
 echo ""
 
-exec docker run --rm -it \
+exec "${CFGMS_CONTAINER_RUN[@]}" --rm -it \
   -v claude-creds:/persist \
   -w /workspace \
   --cap-add NET_ADMIN \

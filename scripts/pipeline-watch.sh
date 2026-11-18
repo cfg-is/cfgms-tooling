@@ -40,6 +40,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 # shellcheck source=lib/atomic-lock.sh
 source "${SCRIPT_DIR}/lib/atomic-lock.sh"
+# Container runtime selection (docker or rootless podman); defines `docker`.
+# shellcheck source=lib/container-runtime.sh
+source "${SCRIPT_DIR}/lib/container-runtime.sh"
 
 FAST_INTERVAL="${PIPELINE_WATCH_FAST:-60}"
 SLOW_INTERVAL="${PIPELINE_WATCH_SLOW:-300}"

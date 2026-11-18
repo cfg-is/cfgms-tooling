@@ -20,6 +20,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+import runtime
+
 TOOLING_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: Never present in the environment of a `docker` client call.
@@ -41,8 +43,9 @@ class DockerError(RuntimeError):
 class DockerCLI:
     """Thin wrapper over the docker client."""
 
-    def __init__(self, binary="docker"):
-        self.binary = binary
+    def __init__(self, binary=None, runtime_name=None):
+        self.runtime = runtime_name or runtime.name()
+        self.binary = binary or self.runtime
 
     def _run(self, args, timeout=120, env_extra=None, check=False):
         proc = subprocess.run([self.binary] + list(args), capture_output=True,
@@ -56,7 +59,8 @@ class DockerCLI:
         """argv starts with `run`. Returns the container id."""
         if not argv or argv[0] != "run" or "-d" not in argv:
             raise ValueError("run_detached needs a `run -d ...` argv")
-        proc = self._run(argv, timeout=300, env_extra=env_extra, check=True)
+        proc = self._run(runtime.with_agent_run_args(argv, self.runtime), timeout=300,
+                         env_extra=env_extra, check=True)
         return proc.stdout.decode().strip()
 
     def wait(self, name, timeout_secs):
