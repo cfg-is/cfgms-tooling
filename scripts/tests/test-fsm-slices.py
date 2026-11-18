@@ -2,8 +2,11 @@
 """
 Tests: the per-slice state machine of `epic` mode (scripts/fsm/slices.py).
 
+  * the table is equal to a table written out here, edge by edge;
   * every edge in the table is taken under its guard, and every (state, event)
     pair not in the table raises InvalidTransition;
+  * a slice enters PUBLISH only from a passed VALIDATE, synced, with no
+    unmerged parent;
   * the round budget makes every slice terminate: the reachable configuration
     graph from NEW has no cycle;
   * SliceBook writes records keyed by slice and round to a real state.jsonl
@@ -32,13 +35,132 @@ import transitions as T  # noqa: E402
 
 
 def all_ctxs():
-    for rb, vr, builds_on, merged, synced in itertools.product(
-            (0, 1), (0, 1), (0, 1), (False, True), (False, True)):
+    for rb, vr, builds_on, merged, synced, published in itertools.product(
+            (0, 1), (0, 1), (0, 1), (False, True), (False, True), (False, True)):
         yield S.SliceCtx(slice=2, round_budget=rb, validator_retries=vr, builds_on=builds_on,
-                         parent_merged=merged, synced=synced)
+                         parent_merged=merged, synced=synced, published=published)
+
+
+_SUBMIT = [("round_left", "SNAPSHOT", "", "round"), ("round_spent", "FAILED", "slice_budget", "")]
+_MERGED = [("published", "MERGED", "earlier_round_merged", "")]
+_CLOSED = [("published", "CLOSED", "earlier_round_closed", "")]
+_ON = "on_unmerged_parent"
+
+#: The whole table, written out: (state, event) -> [(guard, target, reason, consume)].
+#: A change to slices.TABLE must be made here too.
+EXPECTED = {
+    ("NEW", "submitted"): _SUBMIT,
+    ("REJECTED", "submitted"): _SUBMIT,
+    ("STALE", "submitted"): _SUBMIT,
+    ("NEEDS_OWNER", "submitted"): _SUBMIT,
+    ("WAIT_PARENT", "submitted"): _SUBMIT,
+    ("LANDING", "submitted"): _SUBMIT,
+    ("VALIDATE", "submitted"): _SUBMIT,
+
+    ("SNAPSHOT", "ok"): [("always", "VALIDATE", "", "")],
+    ("SNAPSHOT", "bad_request"): [("always", "REJECTED", "bad_request", "")],
+    ("SNAPSHOT", "unchanged"): [("always", "REJECTED", "no_change", "")],
+    ("SNAPSHOT", "violation"): [("always", "REJECTED", "export_rejected", "")],
+    ("SNAPSHOT", "parent_merged"): [(_ON, "SNAPSHOT", "", "")],
+    ("SNAPSHOT", "parent_new_round"): [(_ON, "STALE", "parent_new_round", "")],
+    ("SNAPSHOT", "parent_closed"): [(_ON, "STALE", "parent_closed", "")],
+    ("SNAPSHOT", "merged"): _MERGED,
+    ("SNAPSHOT", "closed"): _CLOSED,
+    ("SNAPSHOT", "error"): [("always", "FAILED", "snapshot_error", "")],
+
+    ("VALIDATE", "pass"): [("synced", "PUBLISH", "", ""), (_ON, "WAIT_PARENT", "", ""),
+                           ("ready_for_sync", "SYNC", "", "")],
+    ("VALIDATE", "fail"): [("always", "REJECTED", "validation", "")],
+    ("VALIDATE", "infra_error"): [("validator_retry_left", "VALIDATE", "", "validator_retry"),
+                                  ("validator_retry_spent", "FAILED", "validator_error", "")],
+    ("VALIDATE", "parent_merged"): [(_ON, "VALIDATE", "", "")],
+    ("VALIDATE", "parent_new_round"): [(_ON, "STALE", "parent_new_round", "")],
+    ("VALIDATE", "parent_closed"): [(_ON, "STALE", "parent_closed", "")],
+    ("VALIDATE", "merged"): _MERGED,
+    ("VALIDATE", "closed"): _CLOSED,
+    ("VALIDATE", "error"): [("always", "FAILED", "validate_error", "")],
+
+    ("WAIT_PARENT", "parent_merged"): [("always", "SYNC", "", "")],
+    ("WAIT_PARENT", "parent_new_round"): [("always", "STALE", "parent_new_round", "")],
+    ("WAIT_PARENT", "parent_closed"): [("always", "STALE", "parent_closed", "")],
+    ("WAIT_PARENT", "merged"): _MERGED,
+    ("WAIT_PARENT", "closed"): _CLOSED,
+
+    ("SYNC", "up_to_date"): [("always", "VALIDATE", "", "")],
+    ("SYNC", "rebased"): [("always", "VALIDATE", "", "")],
+    ("SYNC", "conflict"): [("always", "REJECTED", "conflict", "")],
+    ("SYNC", "merged"): _MERGED,
+    ("SYNC", "closed"): _CLOSED,
+    ("SYNC", "error"): [("always", "FAILED", "sync_error", "")],
+
+    ("PUBLISH", "published"): [("always", "LANDING", "", "")],
+    ("PUBLISH", "secret_detected"): [("always", "REJECTED", "secret_detected", "")],
+    ("PUBLISH", "step_failed"): [("always", "FAILED", "publish", "")],
+    ("PUBLISH", "lease_lost"): [("always", "FAILED", "lease_lost", "")],
+    ("PUBLISH", "merged"): _MERGED,
+    ("PUBLISH", "closed"): _CLOSED,
+    ("PUBLISH", "error"): [("always", "FAILED", "publish_error", "")],
+
+    ("LANDING", "checks_failed"): [("always", "NEEDS_OWNER", "checks_failed", "")],
+    ("LANDING", "review_findings"): [("always", "NEEDS_OWNER", "review_findings", "")],
+    ("LANDING", "queue_kicked"): [("always", "NEEDS_OWNER", "queue_kicked", "")],
+    ("LANDING", "merged"): [("always", "MERGED", "", "")],
+    ("LANDING", "closed"): [("always", "CLOSED", "", "")],
+
+    ("NEEDS_OWNER", "merged"): [("always", "MERGED", "", "")],
+    ("NEEDS_OWNER", "closed"): [("always", "CLOSED", "", "")],
+
+    ("REJECTED", "merged"): _MERGED,
+    ("REJECTED", "closed"): _CLOSED,
+    ("STALE", "merged"): _MERGED,
+    ("STALE", "closed"): _CLOSED,
+}
+#: The edges that set a flag: (state, event, target) -> the flag.
+EXPECTED_FLAGS = {
+    ("SYNC", "up_to_date", "VALIDATE"): "synced",
+    ("SYNC", "rebased", "VALIDATE"): "synced",
+    ("PUBLISH", "published", "LANDING"): "published",
+    ("SNAPSHOT", "parent_merged", "SNAPSHOT"): "parent_merged",
+    ("VALIDATE", "parent_merged", "VALIDATE"): "parent_merged",
+    ("WAIT_PARENT", "parent_merged", "SYNC"): "parent_merged",
+}
 
 
 class TestTable(unittest.TestCase):
+    def test_table_is_the_table_written_out_here(self):
+        got = {k: [(e.guard, e.to, e.reason, e.consume) for e in edges]
+               for k, edges in S.TABLE.items()}
+        self.assertEqual(sorted(got), sorted(EXPECTED))
+        for k in EXPECTED:
+            self.assertEqual(got[k], EXPECTED[k], k)
+        flags = {}
+        for (st, ev), edges in S.TABLE.items():
+            for e in edges:
+                for flag, on in (("synced", e.sets_synced), ("published", e.sets_published),
+                                 ("parent_merged", e.sets_parent_merged)):
+                    if on:
+                        flags[(st, ev, e.to)] = flag
+        self.assertEqual(flags, EXPECTED_FLAGS)
+        self.assertEqual(S.TERMINAL, {"MERGED", "CLOSED", "FAILED"})
+
+    def test_terminal_state_takes_no_event(self):
+        for st in ("MERGED", "CLOSED", "FAILED"):
+            for event in S.EVENTS:
+                with self.assertRaises(S.InvalidTransition):
+                    S.transition(st, event, S.SliceCtx(round_budget=3, published=True, builds_on=1))
+
+    def test_a_published_slice_can_merge_or_close_in_every_state(self):
+        for st in S.NON_TERMINAL:
+            if st == S.NEW:
+                continue
+            c = S.SliceCtx(published=True, builds_on=1)
+            self.assertEqual(S.transition(st, "merged", c).state, S.MERGED, st)
+            self.assertEqual(S.transition(st, "closed", c).state, S.CLOSED, st)
+            if st not in (S.LANDING, S.NEEDS_OWNER):
+                for ev in ("merged", "closed"):
+                    with self.assertRaises(S.InvalidTransition, msg=f"{st} {ev} unpublished"):
+                        S.transition(st, ev, S.SliceCtx(published=False))
+
     def test_every_guard_and_target_is_named(self):
         for key, edges in S.TABLE.items():
             self.assertIn(key[0], S.STATES, key)
@@ -140,7 +262,8 @@ class TestTermination(unittest.TestCase):
     """No reachable cycle: every loop in the table consumes a round."""
 
     def key(self, st, c):
-        return (st, c.round_budget, c.validator_retries, c.builds_on, c.parent_merged, c.synced)
+        return (st, c.round_budget, c.validator_retries, c.builds_on, c.parent_merged, c.synced,
+                c.published)
 
     def successors(self, st, c):
         out = []
@@ -149,8 +272,6 @@ class TestTermination(unittest.TestCase):
                 continue
             for builds_on, merged in ((0, False), (1, False), (1, True)):
                 c2 = S.SliceCtx.from_dict(c.to_dict())
-                if event == "parent_merged":
-                    c2.parent_merged = True
                 try:
                     r = S.transition(st, event, c2)
                 except S.InvalidTransition:
@@ -173,6 +294,14 @@ class TestTermination(unittest.TestCase):
                 continue
             s2, c2 = nxt
             seen_states.add(s2)
+            if s2 == S.PUBLISH:
+                # the only way in: a passed VALIDATE of a synced candidate
+                # that stands on no unmerged parent
+                self.assertEqual(st, S.VALIDATE)
+                self.assertTrue(c2.synced)
+                self.assertFalse(c2.builds_on and not c2.parent_merged, c2)
+            if s2 == S.SYNC:
+                self.assertFalse(c2.builds_on and not c2.parent_merged, c2)
             if s2 in S.TERMINAL:
                 continue
             k2 = self.key(s2, c2)
@@ -229,6 +358,8 @@ class TestBook(BookCase):
         self.assertEqual((s1.state, s1.ctx.round, s1.ctx.round_budget, s1.ctx.published, s1.pr),
                          (S.VALIDATE, 2, 1, True, 4242))
         self.assertEqual(s1.candidate, "c" * 40)
+        self.assertEqual((s1.status()["round"], s1.status()["commit"], s1.status()["tree"]),
+                         (2, "c" * 40, "d" * 40))
         self.assertEqual(s1.candidates[1]["commit"], f"{1:040x}")
         self.assertEqual((again.get(2).state, again.get(2).reason), (S.REJECTED, "export_rejected"))
 
@@ -241,7 +372,8 @@ class TestBook(BookCase):
         self.assertEqual(self.book.get(1).state, S.SNAPSHOT)
 
     def test_slice_number_must_be_a_positive_integer(self):
-        for bad in (0, -1, "1", True, None, 1.0):
+        self.book.take(999, "submitted")
+        for bad in (0, -1, "1", True, None, 1.0, 1000, 10 ** 30):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 self.book.take(bad, "submitted")
 
@@ -258,6 +390,49 @@ class TestBook(BookCase):
         res = self.book.take(1, "submitted")
         self.assertEqual((res.state, res.reason), (S.FAILED, "slice_budget"))
         self.assertEqual(self.book.unfinished(), [])
+
+    def test_published_slice_merges_while_a_later_round_is_on_its_way(self):
+        # the pull request of round 1 merges in every state round 2 passes through
+        stops = [("submitted",), ("submitted", "ok"), ("submitted", "ok", "pass"),
+                 ("submitted", "ok", "pass", "up_to_date", "pass"),
+                 ("submitted", "violation")]
+        want = [S.SNAPSHOT, S.VALIDATE, S.SYNC, S.PUBLISH, S.REJECTED]
+        for n, (events, state_) in enumerate(zip(stops, want), start=1):
+            self.to_landing(n)
+            self.walk(n, *events)
+            self.assertEqual(self.book.get(n).state, state_)
+            res = self.book.take(n, "merged")
+            self.assertEqual((res.state, self.book.get(n).reason),
+                             (S.MERGED, "earlier_round_merged"), state_)
+
+    def test_parent_events_are_sent_by_the_book_only(self):
+        self.to_landing(1)
+        self.walk(2, "submitted", "ok", "pass", builds_on=1)
+        before = len(self.run.records())
+        for ev in ("parent_merged", "parent_new_round", "parent_closed"):
+            with self.assertRaisesRegex(S.InvalidTransition, "sent by the book"):
+                self.book.take(2, ev)
+        self.assertEqual(len(self.run.records()), before)
+        self.assertEqual(self.book.get(2).state, S.WAIT_PARENT)
+
+    def test_submitted_takes_the_parent_facts_from_the_book(self):
+        for bad in (99, 2, "1", True):                 # unknown, itself, wrong types
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.book.take(2, "submitted", builds_on=bad)
+        self.assertEqual(self.run.records(), [])               # nothing was recorded
+        self.to_landing(1)
+        self.walk(1, "checks_failed", "submitted", "ok")          # parent is in round 2
+        self.book.take(2, "submitted", builds_on=1)
+        self.assertEqual((self.book.get(2).ctx.builds_on, self.book.get(2).ctx.parent_round), (1, 2))
+        self.to_landing(3)
+        self.book.take(3, "merged")
+        self.book.take(4, "submitted", builds_on=3)                # merged: as if not given
+        self.assertEqual((self.book.get(4).ctx.builds_on, self.book.get(4).ctx.parent_round), (0, 0))
+        self.assertEqual(self.walk(4, "ok", "pass").state, S.SYNC)
+        self.to_landing(5)
+        self.book.take(5, "closed")
+        with self.assertRaises(ValueError):
+            self.book.take(6, "submitted", builds_on=5)
 
 
 class TestParentCascade(BookCase):
@@ -295,11 +470,48 @@ class TestParentCascade(BookCase):
         # parent merges while the children validate: no transition, they go to SYNC on pass
         res = self.book.take(1, "merged")
         self.assertEqual(res.cascade, [])
-        self.assertEqual(self.book.take(2, "pass").state, S.SYNC)
-        self.assertEqual(self.book.take(3, "pass").state, S.SYNC)
-        # and that survives a restart
+        # and that survives a restart, before anything else is recorded
         again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
         self.assertTrue(again.get(2).ctx.parent_merged)
+        self.assertEqual(again.get(2).state, S.VALIDATE)
+        self.assertEqual(self.book.take(2, "pass").state, S.SYNC)
+        self.assertEqual(self.book.take(3, "pass").state, S.SYNC)
+
+    def test_child_in_snapshot_learns_of_its_parent(self):
+        self.to_landing(1)
+        self.walk(2, "submitted", builds_on=1)                    # 2 is in SNAPSHOT
+        self.assertEqual(self.book.take(1, "merged").cascade, [])
+        self.assertTrue(self.book.get(2).ctx.parent_merged)
+        self.assertEqual(self.walk(2, "ok", "pass").state, S.SYNC)
+        self.to_landing(3)
+        self.walk(4, "submitted", builds_on=3)
+        self.book.take(3, "checks_failed")
+        res = self.book.take(3, "submitted")                       # new round of the parent
+        self.assertEqual([(n, r.state) for n, r in res.cascade], [(4, S.STALE)])
+
+    def test_parent_failed_makes_child_stale(self):
+        self.child_waiting()
+        self.walk(1, "checks_failed", "submitted", "ok", "pass", "up_to_date", "pass")
+        self.assertEqual(self.book.get(2).state, S.STALE)          # new round of 1
+        self.book.take(2, "submitted", builds_on=1)
+        res = self.book.take(1, "step_failed")                     # 1 -> FAILED(publish)
+        self.assertEqual(res.state, S.FAILED)
+        self.assertEqual([(n, r.state, r.reason) for n, r in res.cascade],
+                         [(2, S.STALE, "parent_closed")])
+
+    def test_budget_failure_of_parent_makes_child_stale(self):
+        self.walk(1, "submitted", "ok")
+        self.book.set_candidate(1, "a" * 40, "t" * 40, "b" * 40)
+        self.walk(1, "fail", "submitted", "ok")
+        self.book.set_candidate(1, "c" * 40, "t" * 40, "b" * 40)
+        self.walk(1, "fail", "submitted", "ok")
+        self.book.set_candidate(1, "d" * 40, "t" * 40, "b" * 40)
+        self.walk(2, "submitted", "ok", "pass", builds_on=1)       # waits on round 3 of 1
+        self.book.take(1, "fail")
+        res = self.book.take(1, "submitted")                       # no round left
+        self.assertEqual((res.state, res.reason), (S.FAILED, "slice_budget"))
+        self.assertEqual([(n, r.state, r.reason) for n, r in res.cascade],
+                         [(2, S.STALE, "parent_closed")])
 
     def test_new_round_of_parent_stops_validating_child(self):
         self.to_landing(1)
@@ -316,16 +528,87 @@ class TestParentCascade(BookCase):
         self.assertEqual(self.book.get(4).state, S.VALIDATE)
         self.assertFalse(self.book.get(4).ctx.parent_merged)
 
-    def test_chain_goes_stale_one_level_at_a_time(self):
+    def chain(self):
         self.child_waiting()                     # 2 waits on 1
         self.walk(3, "submitted", "ok", builds_on=2)
         self.book.set_candidate(3, "3" * 40, "t" * 40, "2" * 40)
         self.book.take(3, "pass")                # 3 waits on 2
+
+    def test_stale_reaches_the_whole_chain_in_one_step(self):
+        self.chain()
         res = self.book.take(1, "submitted")     # new round of 1
-        self.assertEqual([n for n, _ in res.cascade], [2])
-        self.assertEqual(self.book.get(3).state, S.WAIT_PARENT)
-        res = self.book.take(2, "submitted", builds_on=1)   # owner repairs 2
-        self.assertEqual([(n, r.state) for n, r in res.cascade], [(3, S.STALE)])
+        self.assertEqual([(n, r.state) for n, r in res.cascade], [(2, S.STALE)])
+        self.assertEqual([(n, r.state, r.reason) for n, r in res.cascade[0][1].cascade],
+                         [(3, S.STALE, "parent_new_round")])
+        self.assertEqual(self.book.get(3).state, S.STALE)
+
+    def test_closed_parent_reaches_the_whole_chain(self):
+        self.chain()
+        res = self.book.take(1, "closed")
+        self.assertEqual([(n, r.state, r.reason) for n, r in res.cascade],
+                         [(2, S.STALE, "parent_closed")])
+        self.assertEqual(self.book.get(3).state, S.STALE)
+
+    def cut_records(self, keep_until):
+        """A crash: state.jsonl ends right after the first record that
+        `keep_until` accepts. Returns the book a restarted supervisor builds."""
+        lines = self.run.state_file.read_text().splitlines(keepends=True)
+        import json
+        for i, line in enumerate(lines):
+            if keep_until(json.loads(line)):
+                self.run.state_file.write_text("".join(lines[:i + 1]))
+                break
+        else:
+            self.fail("record not found")
+        return S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
+
+    def test_reconcile_sends_a_parent_merged_that_a_crash_cut_off(self):
+        self.child_waiting()
+        self.walk(3, "submitted", "ok", "pass", builds_on=1)        # 3 waits on 1 too
+        self.book.take(1, "merged")
+        again = self.cut_records(lambda r: r.get("slice") == 1 and r.get("to") == S.MERGED)
+        self.assertEqual([again.get(n).state for n in (1, 2, 3)],
+                         [S.MERGED, S.WAIT_PARENT, S.WAIT_PARENT])
+        out = again.reconcile()
+        self.assertEqual([(n, r.state) for n, r in out], [(2, S.SYNC), (3, S.SYNC)])
+        self.assertTrue(again.get(2).ctx.parent_merged)
+        self.assertEqual(again.reconcile(), [])                     # nothing is sent twice
+
+    def test_reconcile_sends_a_new_round_and_a_closed_parent(self):
+        self.chain()
+        self.book.take(1, "checks_failed")
+        self.book.take(1, "submitted")
+        again = self.cut_records(lambda r: r.get("slice") == 1 and r.get("event") == "submitted"
+                                 and r.get("round") == 2)
+        self.assertEqual([again.get(n).state for n in (2, 3)], [S.WAIT_PARENT, S.WAIT_PARENT])
+        out = again.reconcile()
+        self.assertEqual(sorted((n, r.state, r.reason) for n, r in out),
+                         [(2, S.STALE, "parent_new_round")])
+        self.assertEqual(again.get(3).state, S.STALE)               # through the chain
+        self.assertEqual(again.reconcile(), [])
+
+        self.to_landing(5)
+        self.walk(6, "submitted", "ok", "pass", builds_on=5)
+        self.book.take(5, "closed")
+        again = self.cut_records(lambda r: r.get("slice") == 5 and r.get("to") == S.CLOSED)
+        self.assertEqual([(n, r.state, r.reason) for n, r in again.reconcile()],
+                         [(6, S.STALE, "parent_closed")])
+
+    def test_reconcile_carries_stale_down_a_chain_cut_in_the_middle(self):
+        self.chain()
+        self.book.take(1, "closed")
+        again = self.cut_records(lambda r: r.get("slice") == 2 and r.get("to") == S.STALE)
+        self.assertEqual([again.get(n).state for n in (2, 3)], [S.STALE, S.WAIT_PARENT])
+        self.assertEqual([(n, r.state) for n, r in again.reconcile()], [(3, S.STALE)])
+
+    def test_reconcile_leaves_a_sound_book_alone(self):
+        self.chain()
+        self.to_landing(4)
+        self.walk(4, "checks_failed")                               # a parent that waits for its owner
+        self.walk(5, "submitted", "ok", "pass", builds_on=4)
+        before = len(self.run.records())
+        self.assertEqual(self.book.reconcile(), [])
+        self.assertEqual(len(self.run.records()), before)
 
 
 class TestParentRule(BookCase):
@@ -360,16 +643,36 @@ class TestParentRule(BookCase):
 
     def test_base_must_be_a_full_commit_id(self):
         for bad in ("", "develop", self.on_develop[:12], "origin/develop", self.on_develop.upper(),
-                    self.on_develop + "\n"):
+                    self.on_develop + "\n", self.on_develop + "0"):
             with self.assertRaisesRegex(S.BadRequest, "40-character"):
                 self.resolve(1, bad)
 
     def test_builds_on_unmerged_slice_uses_its_latest_candidate(self):
         self.to_landing(1)
         self.assertEqual(self.resolve(2, self.on_develop, 1), S.Parent(f"{1:040x}", 1))
-        self.walk(1, "checks_failed", "submitted", "ok")
+        self.walk(1, "checks_failed", "submitted")
+        # round 2 of the parent has no snapshot yet: round 1's is not offered
+        with self.assertRaisesRegex(S.BadRequest, "no accepted snapshot of its current round"):
+            self.resolve(2, self.on_develop, 1)
+        self.walk(1, "violation")
+        with self.assertRaisesRegex(S.BadRequest, "no accepted snapshot of its current round"):
+            self.resolve(2, self.on_develop, 1)
+        self.walk(1, "submitted", "ok")
         self.book.set_candidate(1, "e" * 40, "t" * 40, "b" * 40)
         self.assertEqual(self.resolve(2, self.on_develop, 1), S.Parent("e" * 40, 1))
+
+    def test_wrong_types_are_bad_requests(self):
+        self.to_landing(1)
+        for bad in ("abc", [1], float("inf"), 1.9, True, "1", -1, 1000, {}):
+            with self.assertRaisesRegex(S.BadRequest, "--builds-on", msg=repr(bad)):
+                self.resolve(2, self.on_develop, bad)
+        for bad in (5, [self.on_develop], self.on_develop.encode(), None):
+            with self.assertRaisesRegex(S.BadRequest, "40-character", msg=repr(bad)):
+                self.resolve(2, bad)
+        for bad in ("1", True, 0, 1000, None):
+            with self.assertRaisesRegex(S.BadRequest, "slice number", msg=repr(bad)):
+                S.resolve_parent(self.book, bad, self.on_develop, 1, self.is_on_develop)
+        self.assertEqual(self.resolve(2, self.on_develop, None), S.Parent(self.on_develop, 0))
 
     def test_builds_on_merged_slice_is_as_if_not_given(self):
         self.to_landing(1)
@@ -390,6 +693,11 @@ class TestParentRule(BookCase):
         self.book.take(3, "closed")
         with self.assertRaisesRegex(S.BadRequest, "CLOSED"):
             self.resolve(4, self.on_develop, 3)
+        self.walk(5, "submitted", "ok")
+        self.book.set_candidate(5, "5" * 40, "t" * 40, "b" * 40)
+        self.book.take(5, "error")
+        with self.assertRaisesRegex(S.BadRequest, "FAILED"):
+            self.resolve(6, self.on_develop, 5)
 
     def test_loop_is_refused(self):
         self.to_landing(1)
