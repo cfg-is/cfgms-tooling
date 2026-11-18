@@ -1163,6 +1163,10 @@ def drop_run_cache(run):
 
 # --- CLI ---------------------------------------------------------------------------------
 
+def _abs(path):
+    return os.path.abspath(path) if path else path
+
+
 def _params_from_args(a):
     mode = a.mode
     tooling_root = os.environ.get("CFGMS_FSM_TOOLING_ROOT") or str(HERE.parent.parent)
@@ -1201,8 +1205,8 @@ def _params_from_args(a):
         if not t.isdigit() or int(t) < 1:
             raise SystemExit("epic mode needs a numeric epic")
         p.update(epic=int(t), target=f"epic-{t}", key=f"epic-{t}", branch=f"epic-{t}",
-                 canon_dir=a.canon_dir or os.environ.get("CFGMS_CANON_DIR"),
-                 memory_dir=a.memory_dir or os.environ.get("CFGMS_MEMORY_DIR"),
+                 canon_dir=_abs(a.canon_dir or os.environ.get("CFGMS_CANON_DIR")),
+                 memory_dir=_abs(a.memory_dir or os.environ.get("CFGMS_MEMORY_DIR")),
                  turn_timeout_min=int(os.environ.get("CFGMS_FSM_OWNER_TURN_TIMEOUT_MIN", "180")),
                  round_budget=int(os.environ.get("CFGMS_FSM_SLICE_ROUND_BUDGET", "3")))
     else:
@@ -1349,6 +1353,14 @@ def cmd_abandon(run_id, reason, out=None):
             run.append("lease", abandon=lease)
         if params.get("key"):
             run.clear_active(params["key"])
+        if params.get("mode") == EPIC_MODE and params.get("epic"):
+            # the owner container outlives its supervisor: an abandoned run
+            # must not leave one that the next run of the epic would find
+            docker = adapters.DockerCLI()
+            name = f"cfg-owner-{int(params['epic'])}"
+            if docker.label(name, "run_id") == run_id:
+                docker.rm_force(name)
+                run.append("note", owner_container_removed=name)
         run.append("terminal_done", state="ABANDONED")
         drop_run_cache(run)
         print(f"FSM_ABANDONED:{run_id}:{reason}:lease={lease}", file=out, flush=True)

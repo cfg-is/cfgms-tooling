@@ -134,6 +134,7 @@ _REASON_TEXT = {
     "review_findings": "the review on its pull request has findings",
     "queue_kicked": "the merge queue removed its pull request",
     "interrupted": "the supervisor restarted while it took the snapshot. Submit this slice again",
+    "branch_moved": "its branch on GitHub is not what the supervisor pushed. Read {dir}/rejected.md",
     "withdrawn": "slice-submit gave up waiting before the snapshot was done. Submit this slice again",
 }
 

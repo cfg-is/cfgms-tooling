@@ -197,6 +197,10 @@ TABLE = {
     # PUBLISH -------------------------------------------------------------
     (PUBLISH, "published"): [Edge("always", LANDING, sets_published=True)],
     (PUBLISH, "secret_detected"): [Edge("always", REJECTED, reason="secret_detected")],
+    # The slice's branch on GitHub is not what the supervisor pushed (an
+    # earlier run used the name, or someone replaced it). The owner delivers
+    # the change under another slice number; the run goes on.
+    (PUBLISH, "branch_moved"): [Edge("always", REJECTED, reason="branch_moved")],
     (PUBLISH, "step_failed"): [Edge("always", FAILED, reason="publish")],
     (PUBLISH, "lease_lost"): [Edge("always", FAILED, reason="lease_lost")],
 

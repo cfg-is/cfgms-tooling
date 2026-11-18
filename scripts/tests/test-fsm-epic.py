@@ -21,150 +21,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fsm_testlib import Fixture, ITEM, SUPERVISOR, CLAUDE_TOKEN, GH_TOKEN, git  # noqa: E402
+from fsm_testlib import ITEM, CLAUDE_TOKEN, GH_TOKEN, git  # noqa: E402,F401
+from fsm_epiclib import EpicCase, DONE, PRIVATE, submit, write  # noqa: E402,F401
 
-import epic  # noqa: E402
-import owner as O  # noqa: E402
-
-EPIC_BODY = """## Goal
-The service says hello.
-
-## Protected Paths
-- `go.mod`
-"""
-FAST = {"CFGMS_FSM_EPIC_TICK_SECS": "0.05", "CFGMS_FSM_EPIC_LANDING_POLL_SECS": "0.2",
-        "CFGMS_FSM_EPIC_BUSY_RETRY_SECS": "0.2", "CFGMS_FSM_EPIC_CAPACITY_RETRY_SECS": "0.2"}
-PRIVATE = "PRIVATE canon text that must never leave the host. " * 4
-
-
-def write(path, content):
-    return {"op": "write", "path": path, "content": content}
-
-
-def submit(n, **kw):
-    return dict({"op": "submit", "slice": n, "subject": f"src: slice {n}",
-                 "claim": f"Slice {n} delivers its part.\n"}, **kw)
-
-
-DONE = {"op": "out", "name": "done.md", "content": "Every criterion is delivered.\n"}
-
-
-class EpicCase(unittest.TestCase):
-    def setUp(self):
-        self.f = Fixture("fsm-epic")
-        self.addCleanup(self.f.cleanup)
-        self.canon, self.memory = self.f.root / "canon", self.f.root / "memory"
-        self.canon.mkdir()
-        self.memory.mkdir()
-        (self.canon / "principles.md").write_text(PRIVATE)
-        self.f.add_issue(900, "Epic: hello", EPIC_BODY)
-        self.proc = None
-
-    def tearDown(self):
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.kill()
-            self.proc.wait()
-
-    # --- running the supervisor ---------------------------------------------
-    def launch(self, *args, env=None):
-        argv = args or ("run", "epic", "900", "--item-id", ITEM, "--canon-dir", str(self.canon),
-                        "--memory-dir", str(self.memory))
-        self.proc = subprocess.Popen([sys.executable, str(SUPERVISOR)] + list(argv),
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     env=self.f.env(**dict(FAST, **(env or {}))), cwd=str(self.f.root))
-        return self.proc
-
-    def finish(self, timeout=90):
-        try:
-            out, _ = self.proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            out, _ = self.proc.communicate()
-            self.fail("the supervisor did not end:\n" + out.decode()[-3000:] + self.debug())
-        return self.proc.returncode, out.decode()
-
-    def wait_for(self, what, pred, timeout=60):
-        end = time.time() + timeout
-        while time.time() < end:
-            got = pred()
-            if got:
-                return got
-            if self.proc.poll() is not None:
-                break
-            time.sleep(0.05)
-        out = self.proc.stdout.read().decode() if self.proc.poll() is not None else ""
-        self.fail(f"timed out waiting for {what}\n{out[-3000:]}{self.debug()}")
-
-    def debug(self):
-        try:
-            log = (self.run_dir / "logs" / "supervisor.log").read_text()[-3000:]
-        except Exception as exc:
-            log = f"(not read: {exc})"
-        return "\n--- supervisor.log\n" + log
-
-    @property
-    def run_dir(self):
-        return sorted(d for d in self.f.runs.iterdir() if d.name.startswith("epic-"))[0]
-
-    def recs(self, rtype=None):
-        try:
-            return self.f.state_records(self.run_dir.name, rtype)
-        except (OSError, IndexError):
-            return []                     # the run directory is not there yet
-
-    def status(self, n):
-        try:
-            return json.loads((self.run_dir / "context" / "slices" / str(n) / "status.json").read_text())
-        except (OSError, ValueError):
-            return {}
-
-    def wait_state(self, n, state):
-        return self.wait_for(f"slice {n} in {state}", lambda: self.status(n).get("state") == state)
-
-    # --- GitHub side ------------------------------------------------------------
-    def open_pr(self, n):
-        for p in self.f.gh()["prs"]:
-            if p["headRefName"] == f"feature/epic-900-slice-{n}" and p["state"] == "OPEN":
-                return p
-        return None
-
-    def wait_pr(self, n):
-        # the pull request and the supervisor's record of it
-        self.wait_for(f"the pull request of slice {n}", lambda: self.open_pr(n))
-        self.wait_state(n, "LANDING")
-        return self.open_pr(n)
-
-    def merge(self, pr):
-        """GitHub merges the pull request: a squash commit on develop."""
-        s = self.f.seed
-        git(s, "fetch", "-q", "origin")
-        git(s, "checkout", "-q", "-B", "develop", "origin/develop")
-        git(s, "merge", "-q", "--squash", f"origin/{pr['headRefName']}")
-        git(s, "commit", "-qm", f"{pr['title']} (#{pr['number']})")
-        git(s, "push", "-q", "origin", "develop")
-        sha = git(s, "rev-parse", "HEAD")
-        st = self.f.gh()
-        for p in st["prs"]:
-            if p["number"] == pr["number"]:
-                p["state"], p["mergeCommit"] = "MERGED", {"oid": sha}
-        self.f.gh(st)
-        return sha
-
-    def close(self, pr):
-        st = self.f.gh()
-        for p in st["prs"]:
-            if p["number"] == pr["number"]:
-                p["state"] = "CLOSED"
-        self.f.gh(st)
-
-    def turns(self):
-        return self.f.records("docker-owner-turn")
-
-    def submits(self):
-        return self.f.records("slice-submit")
-
-    def changed(self, sha):
-        return sorted(git(self.f.remote, "diff", "--name-only", "refs/heads/develop", sha).split())
+import epic  # noqa: E402,F401
+import owner as O  # noqa: E402,F401
 
 
 class TestEpicRun(EpicCase):
@@ -347,6 +208,45 @@ class TestRefusals(EpicCase):
         self.assertNotIn(PRIVATE[:30], self.f.remote_all_text())
         self.assertEqual((self.run_dir / "owner-blocked.md").read_text().strip(), "I cannot continue.")
 
+    def test_private_text_in_the_claim_or_with_other_line_ends_is_refused(self):
+        note = "".join(f"private line {i} of a canon note\r\n" for i in range(6))
+        (self.canon / "crlf.md").write_bytes(note.encode())
+        self.f.plan({"owner": [
+            [{"op": "copy_private", "from": "canon", "name": "crlf.md", "path": "docs/crlf.md"},
+             submit(1, expect=1),
+             {"op": "delete", "path": "docs/crlf.md"},
+             write("src/a.go", "package src\n"),
+             submit(2, claim="What I did:\n\n" + PRIVATE + "\n", expect=1),
+             write("src/a.go", "package src\n// {SECRET}\n"), submit(3, expect=1)],
+            [{"op": "out", "name": "blocked.md", "content": "stop\n"}],
+        ]})
+        self.launch()
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        rej = [(self.run_dir / "context" / "slices" / str(n) / "rejected.md").read_text() for n in (1, 2, 3)]
+        self.assertIn("`docs/crlf.md`: the content is the same as a file in /canon or /memory", rej[0])
+        self.assertIn("the claim: it holds the content of a file in /canon or /memory", rej[1])
+        self.assertIn("- secret:", rej[2])
+        everything = self.f.remote_all_text() + self.f.published_texts()
+        for private in (PRIVATE[:30], "private line 3 of a canon note", CLAUDE_TOKEN):
+            self.assertNotIn(private, everything)
+        self.assertEqual(self.f.gh()["prs"], [])
+
+    def test_a_slice_number_whose_branch_is_on_github_is_refused_at_submit(self):
+        self.f.commit_on("feature/epic-900-slice-1", {"old.txt": "an earlier run\n"})
+        self.f.plan({"owner": [
+            [write("src/a.go", "package src\n"), submit(1, expect=1), submit(2)],
+            [DONE],
+        ]})
+        self.launch()
+        pr = self.wait_pr(2)
+        self.assertIn("is already on GitHub", self.submits()[0]["output"])
+        self.assertIsNone(self.status(1).get("state"))            # no round was used
+        self.merge(pr)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.f.records("docker-validate")), 1)   # nothing was validated for slice 1
+
     def test_a_base_that_is_not_on_develop_and_an_unchanged_workspace(self):
         self.f.plan({"owner": [
             [write("src/a.go", "package src\n"), submit(1, base="f" * 40, expect=1),
@@ -375,66 +275,6 @@ class TestRefusals(EpicCase):
         self.assertEqual(self.f.records("docker-owner-start"), [])
 
 
-class TestRestart(EpicCase):
-    def stop_while_waiting(self):
-        self.f.plan({"owner": [[write("src/a.go", "package src\n"), submit(1)], [DONE]]})
-        self.launch()
-        pr = self.wait_pr(1)
-        self.wait_for("the end of turn 1", lambda: self.recs("owner_turn_end"))
-        self.proc.send_signal(signal.SIGTERM)
-        rc, out = self.finish()
-        self.assertEqual(rc, 75, out)
-        return pr
-
-    def test_a_stopped_supervisor_resumes_with_the_same_container_and_session(self):
-        pr = self.stop_while_waiting()
-        run_id = self.run_dir.name
-        state = json.loads((self.f.docker_state / "containers.json").read_text())
-        self.assertEqual(state["cfg-owner-900"]["status"], "running")      # the owner lives on
-        self.merge(pr)
-        self.launch("resume", run_id)
-        rc, out = self.finish()
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(len(self.f.records("docker-owner-start")), 1)
-        t = self.turns()
-        self.assertEqual([x["turn"] for x in t], [1, 2])
-        self.assertEqual(len({x["owner"]["session_id"] for x in t}), 1)
-        self.assertNotIn("restarted", t[1]["text"])
-
-    def test_a_lost_container_is_started_again_and_the_owner_is_told(self):
-        pr = self.stop_while_waiting()
-        run_id = self.run_dir.name
-        (self.f.docker_state / "containers.json").write_text("{}")         # a host restart
-        self.merge(pr)
-        self.launch("resume", run_id)
-        rc, out = self.finish()
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(len(self.f.records("docker-owner-start")), 2)
-        t = self.turns()
-        self.assertIn("slice 1: MERGED", t[1]["text"])
-        self.assertIn(O.RESTART_TEXT, t[1]["text"])
-        self.assertEqual(len({x["owner"]["session_id"] for x in t}), 1)
-
-    def test_a_supervisor_killed_inside_a_turn_runs_the_turn_again(self):
-        self.f.plan({"owner": [
-            [write("src/a.go", "package src\n"), submit(1), {"op": "sleep", "secs": 30}],
-            [],
-            [DONE],
-        ]})
-        self.launch()
-        pr = self.wait_pr(1)
-        self.proc.kill()
-        self.proc.wait()
-        run_id = self.run_dir.name
-        self.merge(pr)
-        self.launch("resume", run_id)
-        rc, out = self.finish()
-        self.assertEqual(rc, 0, out)
-        t = self.turns()
-        self.assertEqual([x["turn"] for x in t], [1, 1, 2])              # turn 1 again, then the event
-        self.assertEqual(len([r for r in self.recs("owner_turn_end") if not r["ok"]]), 0)
-
-
 class TestParts(unittest.TestCase):
     def test_agent_definition(self):
         d = epic.parse_agent_definition(
@@ -445,28 +285,52 @@ class TestParts(unittest.TestCase):
         self.assertIsNone(epic.parse_agent_definition("no front matter\n"))
         self.assertIsNone(epic.parse_agent_definition("---\nname: x\nnever closed\n"))
 
-    def test_private_blob_ids_do_not_follow_links_and_skip_small_files(self):
-        import hashlib
+    def test_private_text_does_not_follow_links_and_skips_small_files(self):
         import shutil
         import tempfile
         tmp = Path(tempfile.mkdtemp(prefix="fsm-epic-private-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / "m").mkdir()
         (tmp / "outside.md").write_text("x" * 200)
-        (tmp / "m" / "big.md").write_text("y" * 200)
+        (tmp / "m" / "big.md").write_text("line one of a private note\n" * 8)
         (tmp / "m" / "small.md").write_text("tiny\n")
         (tmp / "m" / "link.md").symlink_to(tmp / "outside.md")
         os.mkfifo(tmp / "m" / "pipe")
         (tmp / "m" / ".git").mkdir()
         (tmp / "m" / ".git" / "packed").write_text("z" * 200)
+        p = epic.PrivateText(tmp / "m")
+        self.assertEqual((len(p.digests), p.truncated), (1, False))
+        note = b"line one of a private note\n" * 8
+        self.assertTrue(p.is_copy(note))
+        self.assertTrue(p.is_copy(note.replace(b"\n", b"\r\n")))       # other line ends
+        self.assertTrue(p.is_copy(b"\n" + note + b"\n\n"))             # white space at the ends
+        self.assertFalse(p.is_copy(note[:-30]))                          # a part is not found
+        for other in (b"x" * 200, b"z" * 200, b"tiny\n"):
+            self.assertFalse(p.is_copy(other))
+        self.assertTrue(p.holds_copy("My claim.\r\n\r\n" + note.decode().replace("\n", "\r\n")))
+        self.assertFalse(p.holds_copy("My claim, in my own words.\n"))
 
-        def blob(data):
-            return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
-        self.assertEqual(epic.private_blob_ids(tmp / "m"), {blob(b"y" * 200)})
-        self.assertEqual(blob(b"y" * 200),
-                         subprocess.run(["/usr/bin/git", "hash-object", str(tmp / "m" / "big.md")],
-                                        capture_output=True).stdout.decode().strip())
+    def test_private_text_says_when_it_did_not_read_everything(self):
+        import shutil
+        import tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="fsm-epic-private-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for i in range(5):
+            (tmp / f"f{i}.md").write_text(f"{i}" * 100)
+        old = epic.PRIVATE_MAX_FILES
+        epic.PRIVATE_MAX_FILES = 3
+        try:
+            p = epic.PrivateText(tmp)
+        finally:
+            epic.PRIVATE_MAX_FILES = old
+        self.assertEqual((len(p.digests), p.truncated), (3, True))
 
+    def test_public_claim(self):
+        text = epic.public_claim("Adds x.\n\nFixes #12 [skip ci] and [CI SKIP]\n"
+                                 "- FSM run: `epic-900-x.s1r2`\n<!-- cfgms-fsm-round:x -->\n")
+        self.assertIn("Adds x.", text)
+        for bad in ("[skip ci]", "[CI SKIP]", "FSM run: `", "<!--", "Fixes #12"):
+            self.assertNotIn(bad, text)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

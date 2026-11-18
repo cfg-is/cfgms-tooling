@@ -52,7 +52,9 @@ def load(name, default):
 
 
 def save(name, data):
-    (STATE / name).write_text(json.dumps(data, indent=1))
+    tmp = STATE / f".{name}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, STATE / name)          # a reader never sees half a file
 
 
 def plan():
@@ -192,6 +194,11 @@ def apply_agent(actions, ws, out, sess=None, ctx=None, private=None):
             code = submit(act, ws, out, ctx) or code
         elif op == "wait_pr":
             wait_pr(act)
+        elif op == "wait_flag":
+            # the test decides when the turn goes on: it writes <state>/flag-<name>
+            end = time.time() + float(act.get("timeout", 60))
+            while not (STATE / f"flag-{act['name']}").exists() and time.time() < end:
+                time.sleep(0.05)
         elif op == "copy_private":
             # the owner copies a private file into the workspace
             src = Path(private[act["from"]]) / act["name"]

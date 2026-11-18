@@ -137,6 +137,13 @@ class DockerCLI:
     def exists(self, name):
         return self._run(["inspect", "--format", "{{.Id}}", name], timeout=60).returncode == 0
 
+    def label(self, name, key):
+        """The value of one label of a container, or "" when it has none or
+        the container is not there."""
+        proc = self._run(["inspect", "--format", '{{index .Config.Labels "%s"}}' % key, name],
+                         timeout=60)
+        return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+
     def inspect_exit(self, name):
         proc = self._run(["inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", name],
                          timeout=60)

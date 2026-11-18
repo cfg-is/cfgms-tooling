@@ -32,7 +32,9 @@ def load():
 
 
 def save(s):
-    STATE.write_text(json.dumps(s, indent=1))
+    tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(s, indent=1))
+    os.replace(tmp, STATE)                 # a reader never sees half a file
 
 
 def opt(argv, name, default=None):
