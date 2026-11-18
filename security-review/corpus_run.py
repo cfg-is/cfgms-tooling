@@ -143,8 +143,18 @@ def score(run_dirs: "list[str]") -> dict:
 LAUNCH_LOG_FILENAME = "corpus-launch.json"
 
 
+def _container_binary() -> str:
+    """docker or podman, as selected by scripts/fsm/runtime.py."""
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "scripts" / "fsm" / "runtime.py"
+    spec = importlib.util.spec_from_file_location("fsm_runtime", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.binary()
+
+
 def _docker_wait(container_id: str) -> "int | None":
-    proc = subprocess.run(["docker", "wait", container_id], capture_output=True, text=True)
+    proc = subprocess.run([_container_binary(), "wait", container_id], capture_output=True, text=True)
     out = proc.stdout.strip()
     return int(out) if proc.returncode == 0 and out.isdigit() else None
 

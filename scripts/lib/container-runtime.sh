@@ -25,6 +25,12 @@
 # the same user; `--user 0` keeps the container starting as its own root, which
 # every entrypoint needs for the firewall setup before it drops to `agent`.
 # Both options are added to every `run` and `create`.
+#
+# Podman and `build`. Podman writes OCI-format images by default, and that
+# format has no SHELL instruction: podman prints a warning and runs every RUN
+# step under /bin/sh. devcontainer/Dockerfile sets a bash `pipefail` SHELL so a
+# failed download in a pipe stops the build. `--format docker` keeps it, and is
+# added to every `build`.
 
 # The uid and gid of `agent` in the cfg-agent image (devcontainer/Dockerfile).
 CFGMS_AGENT_UID=1000
@@ -59,6 +65,10 @@ if [[ "$CFGMS_CONTAINER_RUNTIME" == "podman" ]]; then
         local sub="$1"
         shift
         command podman "$sub" "${CFGMS_CONTAINER_RUN_ARGS[@]}" "$@"
+        ;;
+      build)
+        shift
+        command podman build --format docker "$@"
         ;;
       *) command podman "$@" ;;
     esac

@@ -39,6 +39,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECURITY_REVIEW_DIR="${SCRIPT_DIR}"
 
+# `docker` below is a function over the selected container program (docker or
+# rootless podman) -- the same host setting agent-dispatch.sh launches with.
+# shellcheck source=../scripts/lib/container-runtime.sh
+source "${SCRIPT_DIR}/../scripts/lib/container-runtime.sh"
+
 # REPO_ROOT: CFGMS_TEST_REPO_ROOT lets hermetic tests point this at a
 # throwaway fixture git repository instead of this checkout -- the same
 # override agent-dispatch.sh has always honored (see its own REPO_ROOT

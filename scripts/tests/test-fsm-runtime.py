@@ -156,6 +156,14 @@ class TestRunArgs(Case):
                                             f"{rt} ps -a", f"{rt} rm -f run",
                                             f"{rt} run{extra} -it img"])
 
+    def test_podman_build_keeps_the_dockerfile_shell(self):
+        for rt, extra in (("docker", ""), ("podman", " --format docker")):
+            self.log.unlink(missing_ok=True)
+            self.select(rt)
+            p = self.shell('docker build -t img -f Dockerfile . >/dev/null')
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(self.calls(), [f"{rt} build{extra} -t img -f Dockerfile ."])
+
     def test_shell_and_python_agree_on_the_agent_uid(self):
         p = self.shell('echo "$CFGMS_AGENT_UID $CFGMS_AGENT_GID"')
         self.assertEqual(p.stdout.split(), [str(runtime.AGENT_UID), str(runtime.AGENT_GID)])
