@@ -271,7 +271,7 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
       builds_on m, m not merged     -> the latest candidate commit of slice m
       builds_on m, m already merged -> as if builds_on was not given
     """
-    if not _SHA_RE.match(base or ""):
+    if not _SHA_RE.fullmatch(base or ""):
         raise BadRequest("--base must be a full 40-character commit id")
     builds_on = int(builds_on or 0)
     if builds_on:
