@@ -13,7 +13,10 @@
 #                        (CFGMS_TEST_FSM_SUPERVISOR); logs its argv to
 #                        <dir>/supervisor.log and writes a run dir the real
 #                        runindex.py reads. FAKE_SUP_MODE picks the outcome:
-#                          launched (default)  gates_ok + agent_launched
+#                          launched (default)  gates_ok + agent_launched (an
+#                                              epic run: state OWNER, the
+#                                              owner container)
+#                          gates_only          gates_ok, no agent yet
 #                          agentless           gates_ok -> SYNC, no agent
 #                          refused:<reason>    REFUSED, FSM_REFUSED line, exit 3
 #                          deferred:<reason>   REFUSED, DISPATCH_DEFERRED line, exit 0
@@ -68,13 +71,21 @@ run_mode, target = argv[1], argv[2]
 key = argv[argv.index("--lease-key") + 1]
 rid = "%s-fake-%d" % (key.replace("_", "-")[:60], os.getpid())
 r = state.RunDir(rid)
-r.create({"mode": run_mode, "target": target, "key": key, "lease_key": key,
-          "item_id": argv[argv.index("--item-id") + 1] if "--item-id" in argv else None})
+params = {"mode": run_mode, "target": target, "key": key, "lease_key": key,
+          "item_id": argv[argv.index("--item-id") + 1] if "--item-id" in argv else None}
+if run_mode == "epic":
+    params.update(target="epic-" + target, epic=int(target))
+r.create(params)
 print("FSM_RUN:" + rid, flush=True)
 container = {"fix-pr": "cfg-agent-pr-fix-", "resolve-conflict": "cfg-agent-resolve-conflict-"}.get(
     run_mode, "cfg-agent-") + target
 t = lambda frm, ev, to, reason="": r.append("transition", frm=frm, event=ev, to=to, kind="", reason=reason)
-if mode == "launched":
+if mode == "launched" and run_mode == "epic":
+    t("PREPARE", "gates_ok", "OWNER")
+    r.append("agent_launched", container="cfg-owner-" + target, kind="owner", seq=1)
+elif mode == "gates_only":
+    t("PREPARE", "gates_ok", "OWNER" if run_mode == "epic" else "AGENT")
+elif mode == "launched":
     t("PREPARE", "gates_ok", "AGENT")
     r.append("agent_launched", container=container, kind="implement", seq=1)
 elif mode == "agentless":

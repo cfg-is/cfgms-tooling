@@ -190,8 +190,7 @@ class TestEpicRun(RunCase):
 
     def test_progress_after_an_empty_nudge_gives_the_owner_a_new_nudge(self):
         self.turn(O.START, progress=True)
-        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published")
-        self.take(1, "checks_failed")       # wakes
+        self.take(1, "submitted", "ok", "fail")     # wakes; nothing is in flight
         self.turn(O.EVENTS)                 # did nothing
         self.turn(O.NUDGE)                  # did nothing: idle count is 1
         self.log.push("an event that arrives late")
@@ -201,6 +200,20 @@ class TestEpicRun(RunCase):
         self.turn(O.EVENTS)
         self.turn(O.NUDGE)                  # a new nudge, not FAILED
         self.assertEqual(self.step().reason, "owner_idle")
+
+    def test_a_slice_that_needs_the_owner_with_an_open_pull_request_does_not_idle_the_run(self):
+        # A removal from the merge queue is most often answered by a re-enqueue
+        # with no push. The owner looks, decides to wait, and the run waits.
+        self.turn(O.START, progress=True)
+        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published")
+        self.take(1, "queue_kicked")
+        _n, texts = self.turn(O.EVENTS)                  # the owner did nothing
+        self.assertIn("a re-enqueue is done by the pipeline", texts[0])
+        self.assertEqual(self.step().step, O.WAIT)       # no nudge, no owner_idle
+        self.take(1, "cleared")                          # back in the queue: quiet
+        self.assertEqual((self.log.pending(), self.step().step), ([], O.WAIT))
+        self.take(1, "merged")
+        self.assertEqual(self.step().kind, O.EVENTS)
 
     def test_done_is_refused_once_and_cannot_loop(self):
         self.turn(O.START, progress=True)

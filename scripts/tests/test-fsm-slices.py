@@ -35,10 +35,10 @@ import transitions as T  # noqa: E402
 
 
 def all_ctxs():
-    for rb, vr, builds_on, merged, synced, published in itertools.product(
-            (0, 1), (0, 1), (0, 1), (False, True), (False, True), (False, True)):
+    for rb, vr, builds_on, merged, synced, published, wakes in itertools.product(
+            (0, 1), (0, 1), (0, 1), (False, True), (False, True), (False, True), (0, 1)):
         yield S.SliceCtx(slice=2, round_budget=rb, validator_retries=vr, builds_on=builds_on,
-                         parent_merged=merged, synced=synced, published=published)
+                         parent_merged=merged, synced=synced, published=published, wakes=wakes)
 
 
 _SUBMIT = [("round_left", "SNAPSHOT", "", "round"), ("round_spent", "FAILED", "slice_budget", "")]
@@ -102,12 +102,18 @@ EXPECTED = {
     ("PUBLISH", "closed"): _CLOSED,
     ("PUBLISH", "error"): [("always", "FAILED", "publish_error", "")],
 
-    ("LANDING", "checks_failed"): [("always", "NEEDS_OWNER", "checks_failed", "")],
-    ("LANDING", "review_findings"): [("always", "NEEDS_OWNER", "review_findings", "")],
-    ("LANDING", "queue_kicked"): [("always", "NEEDS_OWNER", "queue_kicked", "")],
+    ("LANDING", "checks_failed"): [("wake_left", "NEEDS_OWNER", "checks_failed", "wake")],
+    ("LANDING", "review_findings"): [("wake_left", "NEEDS_OWNER", "review_findings", "wake")],
+    ("LANDING", "queue_kicked"): [("wake_left", "NEEDS_OWNER", "queue_kicked", "wake")],
+    ("LANDING", "conflicting"): [("wake_left", "NEEDS_OWNER", "conflicting", "wake")],
     ("LANDING", "merged"): [("always", "MERGED", "", "")],
     ("LANDING", "closed"): [("always", "CLOSED", "", "")],
 
+    ("NEEDS_OWNER", "cleared"): [("always", "LANDING", "", "")],
+    ("NEEDS_OWNER", "checks_failed"): [("wake_left", "NEEDS_OWNER", "checks_failed", "wake")],
+    ("NEEDS_OWNER", "review_findings"): [("wake_left", "NEEDS_OWNER", "review_findings", "wake")],
+    ("NEEDS_OWNER", "queue_kicked"): [("wake_left", "NEEDS_OWNER", "queue_kicked", "wake")],
+    ("NEEDS_OWNER", "conflicting"): [("wake_left", "NEEDS_OWNER", "conflicting", "wake")],
     ("NEEDS_OWNER", "merged"): [("always", "MERGED", "", "")],
     ("NEEDS_OWNER", "closed"): [("always", "CLOSED", "", "")],
 
@@ -264,7 +270,7 @@ class TestTermination(unittest.TestCase):
 
     def key(self, st, c):
         return (st, c.round_budget, c.validator_retries, c.builds_on, c.parent_merged, c.synced,
-                c.published)
+                c.published, c.wakes)
 
     def successors(self, st, c):
         out = []
@@ -391,6 +397,32 @@ class TestBook(BookCase):
         res = self.book.take(1, "submitted")
         self.assertEqual((res.state, res.reason), (S.FAILED, "slice_budget"))
         self.assertEqual(self.book.unfinished(), [])
+
+    def test_a_wake_can_go_away_and_come_back_but_not_for_ever(self):
+        self.to_landing(1)
+        for n in range(S.DEFAULT_WAKE_BUDGET):
+            res = self.book.take(1, "queue_kicked")
+            self.assertEqual((res.state, res.wakes_owner), (S.NEEDS_OWNER, True))
+            res = self.book.take(1, "cleared")                  # back in the queue: no wake
+            self.assertEqual((res.state, res.wakes_owner), (S.LANDING, False))
+        self.assertEqual(self.book.get(1).ctx.wakes, 0)
+        before = len(self.run.records())
+        for ev in ("queue_kicked", "checks_failed", "review_findings", "conflicting"):
+            with self.assertRaises(S.InvalidTransition):
+                self.book.take(1, ev)
+        self.assertEqual(len(self.run.records()), before)
+        self.assertEqual(self.book.take(1, "merged").state, S.MERGED)   # it can still end
+        # another signal while the slice waits for the owner: told, and it uses a wake
+        self.to_landing(3)
+        self.book.take(3, "queue_kicked")
+        res = self.book.take(3, "conflicting")
+        self.assertEqual((res.state, res.wakes_owner, self.book.get(3).reason, self.book.get(3).ctx.wakes),
+                         (S.NEEDS_OWNER, True, "conflicting", S.DEFAULT_WAKE_BUDGET - 2))
+        self.assertEqual(self.book.get(3).status()["wakes_left"], S.DEFAULT_WAKE_BUDGET - 2)
+        # a new round has its own wakes
+        self.to_landing(2)
+        self.walk(2, "checks_failed", "submitted")
+        self.assertEqual(self.book.get(2).ctx.wakes, S.DEFAULT_WAKE_BUDGET)
 
     def test_published_slice_merges_while_a_later_round_is_on_its_way(self):
         # the pull request of round 1 merges in every state round 2 passes through

@@ -112,6 +112,55 @@ class TestRunIndex(unittest.TestCase):
         got = {k: runindex.launch_status(k, base=self.base) for k in "abcde"}
         self.assertEqual(got, {"a": "PREPARE", "b": "GATES_OK", "c": "LAUNCHED:cfg-agent-42",
                                "d": "AGENTLESS:SYNC", "e": "TERMINAL:REFUSED:untrusted_author"})
+        # an epic run: OWNER is "gates passed", then the owner container
+        epic = {"mode": "epic", "target": "epic-900", "epic": 900, "key": "epic-900"}
+        ro = make_run(self.base, "f", epic, [("PREPARE", "gates_ok", "OWNER")])
+        self.assertEqual(runindex.launch_status("f", base=self.base), "GATES_OK")
+        ro.append("agent_launched", container="cfg-owner-900", kind="owner", seq=1)
+        self.assertEqual(runindex.launch_status("f", base=self.base), "LAUNCHED:cfg-owner-900")
+        self.assertEqual(runindex.describe("f", base=self.base)["container"], "cfg-owner-900")
+        self.assertEqual(runindex.container_for("epic", "epic-900"), "")
+
+    def test_a_crashed_epic_run_stays_resumable_for_as_long_as_its_work_is_kept(self):
+        day = 24 * 3600
+        make_run(self.base, "epic-crashed", {"mode": "epic", "target": "epic-901", "epic": 901,
+                                             "key": "epic-901"},
+                 [("PREPARE", "gates_ok", "OWNER")], age=3 * day)
+        make_run(self.base, "story-crashed", {"key": "story-7"}, [("PREPARE", "gates_ok", "AGENT")],
+                 age=3 * day)
+        got = {r["run_id"]: r["status"] for r in runindex.list_runs(self.base)}
+        self.assertEqual(got, {"epic-crashed": "crashed", "story-crashed": "abandoned"})
+        self.assertEqual([r["run_id"] for r in runindex.find_unfinished(runindex.list_runs(self.base),
+                                                                        key="epic-901")], ["epic-crashed"])
+        import time as _t
+        late = {r["run_id"]: r["status"] for r in runindex.list_runs(self.base, now=_t.time() + 12 * day)}
+        self.assertEqual(late["epic-crashed"], "abandoned")
+
+    def test_gc_keeps_a_failed_epic_run_longer(self):
+        epic = {"mode": "epic", "target": "epic-900", "epic": 900, "key": "epic-900"}
+        day = 24 * 3600
+        failed = make_run(self.base, "epic-failed", epic, [("PREPARE", "gates_ok", "OWNER"),
+                                                            ("OWNER", "failed", "FAILED")],
+                          done=True, age=3 * day)
+        (failed.path / "A").mkdir()
+        (failed.path / "A" /"unpublished.go").write_text("package x\n")
+        (failed.path / "cache").mkdir()
+        reported = make_run(self.base, "epic-reported", epic, [("PREPARE", "gates_ok", "OWNER"),
+                                                                ("OWNER", "done", "REPORT")],
+                            done=True, age=3 * day)
+        story = make_run(self.base, "story-failed", {"key": "story-1"},
+                         [("PREPARE", "gates_ok", "AGENT"), ("AGENT", "error", "FAILED")],
+                         done=True, age=3 * day)
+        lines = runindex.gc(base=self.base)
+        self.assertTrue((failed.path / "A" /"unpublished.go").exists())      # the only copy of the work
+        self.assertFalse((failed.path / "cache").exists())
+        self.assertFalse(reported.path.exists())
+        self.assertFalse(story.path.exists())
+        self.assertIn("CLEANED:fsm-run-cache:epic-failed:FAILED", lines)
+        # ... and not for ever
+        import time as _t
+        self.assertIn("CLEANED:fsm-run:epic-failed:FAILED",
+                      runindex.gc(base=self.base, now=_t.time() + 15 * day))
         self.assertEqual(runindex.launch_status("missing", base=self.base), "NOREC")
 
     def test_find_unfinished_and_reserved(self):

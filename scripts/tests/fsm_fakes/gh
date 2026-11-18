@@ -108,6 +108,24 @@ def main():
             if p["state"] == "OPEN" and n in p.get("closes", []):
                 print(f"OPEN_PR_EXISTS:{n}:{p['number']}:{p['title'].replace(':', ' ')}")
         return 0
+    if argv[:2] == ["api", "graphql"] and "isInMergeQueue" in " ".join(argv):
+        # GhCLI.pr_signals: a fixture PR may carry "rollup", "inQueue", "removedAt"
+        n = int([a for a in argv if a.startswith("n=")][0][2:])
+        for p in s["prs"]:
+            if p["number"] == n:
+                head = head_oid(p["headRefName"])
+                print(json.dumps({"data": {"repository": {"pullRequest": {
+                    "state": p["state"], "headRefOid": head, "isInMergeQueue": bool(p.get("inQueue")),
+                    "mergeable": p.get("mergeable", "MERGEABLE"),
+                    "commits": {"nodes": [{"commit": {"oid": p.get("rollupOid", head),
+                                                      "statusCheckRollup": {"state": p.get("rollup", "PENDING")}}}]},
+                    "comments": {"nodes": [{"createdAt": c.get("createdAt", ""), "body": c.get("body", ""),
+                                            "author": c.get("author")} for c in p.get("comments", [])]},
+                    "timelineItems": {"nodes": [{"createdAt": p["removedAt"], "reason": p.get("removedReason", "")}]
+                                      if p.get("removedAt") else []},
+                }}}}))
+                return 0
+        return 1
     if argv[:2] == ["pr", "list"] and "--search" in argv:
         # title search fallback: "#N" in an open PR title
         if fail == "search":
@@ -214,6 +232,7 @@ def main():
         for p in s["prs"]:
             if p["number"] == int(argv[2]):
                 p["comments"].append({"body": texts[0] if texts else "",
+                                      "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                       "author": {"login": os.environ.get("FSM_FAKE_GH_LOGIN", "fsm-bot")}})
         save(s)
         return 0

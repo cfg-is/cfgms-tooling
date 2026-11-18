@@ -222,6 +222,45 @@ class GhCLI:
                 "merge_commit": str((mc or {}).get("oid", "")) if isinstance(mc, dict) else "",
                 "head": str(d.get("headRefOid", ""))}
 
+    _SIGNALS_QUERY = (
+        "query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){"
+        "pullRequest(number:$n){state headRefOid isInMergeQueue mergeable "
+        "commits(last:1){nodes{commit{oid statusCheckRollup{state}}}} "
+        "comments(last:30){nodes{createdAt body author{login}}} "
+        "timelineItems(itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{"
+        "... on RemovedFromMergeQueueEvent{createdAt reason}}}}}}")
+
+    def pr_signals(self, number):
+        """One read of what the LANDING watcher needs (landing.signal), or
+        None when it cannot be read. Comment bodies are cut to their first
+        500 characters: only the verdict heading is looked at."""
+        owner, _, repo = self.repo.partition("/")
+        proc = self._gh(["api", "graphql", "-f", f"query={self._SIGNALS_QUERY}", "-F", f"owner={owner}",
+                         "-F", f"repo={repo}", "-F", f"n={int(number)}"], check=False)
+        if proc.returncode != 0:
+            return None
+        try:
+            pr = json.loads(proc.stdout.decode())["data"]["repository"]["pullRequest"]
+            commit = ((pr.get("commits") or {}).get("nodes") or [{}])[-1].get("commit") or {}
+            removed = ((pr.get("timelineItems") or {}).get("nodes") or [{}])[-1] or {}
+            return {
+                "state": str(pr.get("state", "")).upper(),
+                "head": str(pr.get("headRefOid", "")),
+                "rollup": str((commit.get("statusCheckRollup") or {}).get("state", "")).upper()
+                if commit.get("oid") == pr.get("headRefOid") else "",
+                "mergeable": str(pr.get("mergeable") or "").upper(),
+                "in_queue": bool(pr.get("isInMergeQueue")),
+                "removed_at": removed.get("createdAt") or "",
+                "removed_reason": str(removed.get("reason") or "")[:100],
+                "comments": [{"author": str((c.get("author") or {}).get("login") or ""),
+                              "created_at": str(c.get("createdAt") or ""),
+                              "body": str(c.get("body") or "")[:500]}
+                             for c in ((pr.get("comments") or {}).get("nodes") or [])
+                             if isinstance(c, dict)],
+            }
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            return None
+
     def create_pr(self, branch, base, title, body_file, draft=False):
         args = ["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
                 "--title", title, "--body-file", str(body_file)]
@@ -352,6 +391,13 @@ class Helper:
 
     def lease_release(self, key):
         return self._run("lease-release", key).returncode == 0
+
+    def create_fix_issue_defer(self, title, body_file):
+        """A defect outside any epic, kept as a private draft (`--defer`): the
+        text comes from an agent and is not public until a person or the
+        pipeline materialises it."""
+        proc = self._run("create-fix-issue", title, str(body_file), "--defer")
+        return proc.returncode == 0, proc.stdout.decode().strip()[-300:]
 
     def create_story_defer(self, epic, title, body_file):
         proc = self._run("create-story", str(epic), title, str(body_file), "--defer")

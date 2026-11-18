@@ -77,6 +77,16 @@ def fsm_trust_base(trust_base=None):
                 or Path.home() / ".cache" / "cfgms-agent-trust") / "fsm"
 
 
+def failed_epic_retention_secs():
+    """How long the run dir of a FAILED epic run is kept. Its workspace holds
+    the owner's work that no pull request has: a story run pushes that as a
+    WIP draft, an epic run does not do so yet."""
+    try:
+        return float(os.environ.get("CFGMS_FSM_FAILED_EPIC_RETENTION_HOURS", "336")) * 3600
+    except ValueError:
+        return 336 * 3600.0
+
+
 def stale_secs():
     try:
         return float(os.environ.get("CFGMS_FSM_STALE_SECS", "300"))
@@ -91,8 +101,11 @@ def start_grace_secs():
         return 120.0
 
 
-def container_for(mode, target):
-    """Agent container name of a run (agent_session.container_name)."""
+def container_for(mode, target, epic=None):
+    """Agent container name of a run (agent_session.container_name; the owner
+    container of an epic run, owner_session.container_name)."""
+    if mode == "epic":
+        return f"cfg-owner-{epic}" if epic else ""
     if not target:
         return ""
     if mode == "fix-pr":
@@ -147,7 +160,10 @@ def describe(run_id, base=None, now=None):
         status = "live" if (hb is not None and hb < stale_secs()) else "hung"
     elif hb is None and now - created < start_grace_secs():
         status = "starting"
-    elif now - last >= crashed_ttl_secs():
+    elif now - last >= (failed_epic_retention_secs() if params.get("mode") == "epic"
+                        else crashed_ttl_secs()):
+        # An epic run lives for days and its owner's work is in its run dir: a
+        # host that was down over a weekend must find it resumable.
         status = "abandoned"
         state, reason = "ABANDONED", "crashed_ttl"
     else:
@@ -158,7 +174,7 @@ def describe(run_id, base=None, now=None):
         "run_id": run_id, "key": params.get("key") or "", "mode": mode, "target": target,
         "issue": params.get("issue"), "pr": params.get("pr"), "item_id": params.get("item_id"),
         "branch": params.get("branch") or "", "lease_key": params.get("lease_key") or "",
-        "container": container_for(mode, target), "state": state, "from": frm,
+        "container": container_for(mode, target, params.get("epic")), "state": state, "from": frm,
         "reason": reason, "status": status, "locked": locked,
         "heartbeat_age": None if hb is None else round(hb, 1),
         "agent_launched": bool(launched), "sessions": len(launched),
@@ -211,7 +227,9 @@ def launch_status(run_id, base=None):
     if d["state"] in TERMINAL:
         return f"TERMINAL:{d['state']}:{d['reason'] or ''}"
     if d["gates_passed"]:
-        if d["state"] not in ("PREPARE", "AGENT"):
+        # OWNER: an epic run has passed its gates and starts the owner
+        # container before the first turn
+        if d["state"] not in ("PREPARE", "AGENT", "OWNER"):
             return f"AGENTLESS:{d['state']}"
         return "GATES_OK"
     return "PREPARE"
@@ -257,7 +275,9 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
     """Remove only what belongs to finished runs. Returns output lines.
 
     - run dirs: `done` or `abandoned`, not locked, last activity older than
-      retention
+      retention. An epic run that did not end in REPORT is kept for
+      CFGMS_FSM_FAILED_EPIC_RETENTION_HOURS (default 336): its workspace is
+      the only copy of the owner's unpublished work.
     - the `cache/` dir (validator build cache) of a `done` or `abandoned`,
       not locked run still inside retention: the supervisor drops it at the
       terminal state; this covers a supervisor that died before doing so
@@ -277,7 +297,10 @@ def gc(base=None, retention_hours=24.0, trust_retention_hours=24.0, dry_run=Fals
     for r in runs:
         if r["status"] not in FINISHED or r["locked"]:
             continue
-        if now - r["last_activity"] < retention_hours * 3600:
+        keep = retention_hours * 3600
+        if r["mode"] == "epic" and r["state"] != "REPORT":
+            keep = max(keep, failed_epic_retention_secs())
+        if now - r["last_activity"] < keep:
             # retained for diagnosis; its validator cache is not needed for that
             cache = Path(r["path"]) / "cache"
             if os.path.lexists(cache):
