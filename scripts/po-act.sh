@@ -8,6 +8,7 @@
 #   dispatch <STORY_NUM>            Fresh story: gates (image, capacity, Dependencies, unfinished run) +
 #                                   lease + claim (Ready->In Progress) + FSM supervisor run (DESIGN.md §11)
 #   dispatch --branch <BRANCH> [--issue N]   Branch-mode FSM run
+#   dispatch --epic <N> [--item-id ID]       Epic-mode FSM run (one owner session)
 #   dispatch status [RUN_ID]        List FSM runs, or show one
 #   dispatch resume <RUN_ID>        Resume a crashed FSM run after re-running its PREPARE gates;
 #                                   abandons it when its work finished elsewhere
@@ -1123,6 +1124,43 @@ case "$cmd" in
         trap - ERR
         _fsm_outcome "$rc" "$branch" "DISPATCHED_BRANCH:${branch}" DISPATCH_REFUSED DISPATCH_DEFERRED \
           "branch-${sanitized}"
+        ;;
+      --epic)
+        # One owner session for a whole epic (scripts/fsm/epic.py). The epic
+        # text comes from its project item. Canon and memory are host clones,
+        # named by CFGMS_CANON_DIR and CFGMS_MEMORY_DIR: canon is mounted
+        # read-only, memory read-write.
+        epic="${2:?epic number required}"
+        [[ "$epic" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --epic must be numeric"; exit 2; }
+        epic_label="epic-${epic}"
+        if [[ "${3:-}" == "--item-id" ]]; then
+          epic_item="${4:?--item-id needs an item id}"
+        else
+          epic_item=$(_item_for_issue "$epic" || true)
+        fi
+        if [[ -z "${epic_item:-}" ]]; then
+          echo "DISPATCH_REFUSED:${epic_label}:no_epic_item"
+          exit 3
+        fi
+        if [[ -z "${CFGMS_CANON_DIR:-}" || ! -d "${CFGMS_CANON_DIR:-}" \
+              || -z "${CFGMS_MEMORY_DIR:-}" || ! -d "${CFGMS_MEMORY_DIR:-}" ]]; then
+          echo "DISPATCH_REFUSED:${epic_label}:no_canon_or_memory_dir (set CFGMS_CANON_DIR and CFGMS_MEMORY_DIR to the host clones)"
+          exit 3
+        fi
+        if ! cap=$(_capacity_ok); then
+          echo "DISPATCH_DEFERRED:${epic_label}:resources (${cap})"
+          exit 0
+        fi
+        _fsm_image_gate "$epic_label" DISPATCH_REFUSED || exit 3
+        gate_rc=0; _fsm_unfinished_gate "$epic_label" DISPATCH_SKIPPED DISPATCH_REFUSED --key "$epic_label" --item-id "$epic_item" || gate_rc=$?
+        [[ "$gate_rc" == 0 ]] || exit "$(( gate_rc == 3 ? 3 : 0 ))"
+        _acquire_lease "$epic_label" "$LEASE_TTL_STORY" "$epic_label" || exit 0
+        trap '_release_lease "$epic_label"' ERR
+        rc=0; _fsm_launch "$epic_label" epic "$epic" "$epic_label" --item-id "$epic_item" \
+          --canon-dir "$CFGMS_CANON_DIR" --memory-dir "$CFGMS_MEMORY_DIR" || rc=$?
+        trap - ERR
+        _fsm_outcome "$rc" "$epic_label" "DISPATCHED_EPIC:${epic}" DISPATCH_REFUSED DISPATCH_DEFERRED \
+          "$epic_label"
         ;;
     esac
 

@@ -150,6 +150,63 @@ check_eq "T7: exits 1" "$t7_rc" "1"
 check_contains "T7: LAUNCH_FAILED names the run" "$t7_out" "LAUNCH_FAILED:4242:fsm_failed:"
 check_eq "T7: story back to Ready" "$(cat "${SANDBOX}/board-status")" "Ready"
 
+run_epic() {
+  rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"
+  : > "${SANDBOX}/docker.log"; : > "${SANDBOX}/supervisor.log"
+  PATH="${SANDBOX}/bin:${PATH}" \
+  CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" \
+  CFGMS_AGENT_CAPACITY_GATE=off \
+  CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" \
+  bash "$POACT" dispatch --epic "$@" 2>&1
+}
+mkdir -p "${SANDBOX}/canon" "${SANDBOX}/memory"
+
+printf '\n== T8: dispatch --epic -> the supervisor in epic mode, the owner container ==\n'
+t8_rc=0
+t8_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t8_rc=$?
+check_eq "T8: exits 0" "$t8_rc" "0"
+check_contains "T8: the run launched the owner container" "$t8_out" "FSM_LAUNCHED:epic-4242:cfg-owner-4242"
+check_contains "T8: DISPATCHED_EPIC" "$t8_out" "DISPATCHED_EPIC:4242"
+check_eq "T8: supervisor argv" "$(cat "${SANDBOX}/supervisor.log")" \
+  "run epic 4242 --lease-key epic-4242 --lease-handoff --detach --item-id PVTI_fakeitem --canon-dir ${SANDBOX}/canon --memory-dir ${SANDBOX}/memory"
+check_eq "T8: no docker run from po-act itself" "$(grep -c '^run ' "${SANDBOX}/docker.log" || true)" "0"
+
+printf '\n== T9: dispatch --epic gates ==\n'
+t9_rc=0
+t9_out=$(run_epic 4242) || t9_rc=$?
+check_eq "T9a: no canon or memory directory -> exits 3" "$t9_rc" "3"
+check_contains "T9a: refusal names the condition" "$t9_out" "DISPATCH_REFUSED:epic-4242:no_canon_or_memory_dir"
+check_eq "T9a: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+t9_rc=0
+t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 555) || t9_rc=$?
+check_eq "T9b: an epic with no project item -> exits 3" "$t9_rc" "3"
+check_contains "T9b: refusal names the condition" "$t9_out" "DISPATCH_REFUSED:epic-555:no_epic_item"
+t9_rc=0
+t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 555 --item-id PVTI_other) || t9_rc=$?
+check_eq "T9c: --item-id names the item" "$t9_rc" "0"
+check_contains "T9c: item passed on" "$(cat "${SANDBOX}/supervisor.log")" "run epic 555 --lease-key epic-555 --lease-handoff --detach --item-id PVTI_other"
+t9_rc=0
+t9_out=$(FAKE_IMAGE_LABEL="old" CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t9_rc=$?
+check_eq "T9d: stale image -> exits 3" "$t9_rc" "3"
+check_contains "T9d: refusal names the condition" "$t9_out" "DISPATCH_REFUSED:epic-4242:image_stale"
+t9_rc=0
+t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic abc) || t9_rc=$?
+check_eq "T9e: a non-numeric epic -> exits 2" "$t9_rc" "2"
+
+printf '\n== T10: a second dispatch of an epic that runs is skipped ==\n'
+t10_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242)
+: > "${SANDBOX}/supervisor.log"
+t10_rc=0
+t10_out=$(PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=off CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" \
+  bash "$POACT" dispatch --epic 4242 2>&1) || t10_rc=$?
+check_eq "T10: exits 0" "$t10_rc" "0"
+check_contains "T10: skipped, the run is named" "$t10_out" "DISPATCH_SKIPPED:epic-4242:run_"
+check_eq "T10: no second supervisor" "$(cat "${SANDBOX}/supervisor.log")" ""
+
 echo ""
 echo "-----------------------------------------"
 printf 'PASS: %d checks\n' "$ran"

@@ -23,7 +23,9 @@ OWNER is one loop on the supervisor's main thread. Each pass it
   2. moves every slice that needs a supervisor step (VALIDATE, SYNC, PUBLISH),
   3. answers new slice-submit requests (the snapshot is taken here, while
      `slice-submit` waits in the container),
-  4. looks at the pull request of every published slice (merged, closed),
+  4. looks at the pull request of every published slice: merged, closed, and
+     for a slice in LANDING the signals of landing.py (checks failed, review
+     findings, removed from the merge queue),
   5. takes the result of a finished owner turn, and when no turn runs asks
      `owner.next_step` what comes next.
 
@@ -39,10 +41,8 @@ answered "submit again". A turn that was open is run again with the same
 events (at least once, never zero times); the turn script's lock makes that
 wait while the old process still runs.
 
-Not in this module: the checks, review and merge-queue signals of a published
-slice (only merged and closed are seen), the owner's read-only GitHub token,
-follow-ups as fix issues, ledger and board records, and the WIP draft of a
-failed run's unpublished work.
+Not in this module: the owner's read-only GitHub token, ledger and board
+records, and the WIP draft of a failed run's unpublished work.
 """
 
 import hashlib
@@ -59,6 +59,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import landing                       # noqa: E402
 import outputs                       # noqa: E402
 import owner as O                    # noqa: E402
 import owner_session                 # noqa: E402
@@ -260,12 +261,15 @@ class EpicSupervisor(sup.Supervisor):
         self.inbox = submit.Inbox(run)
         self.validated = {}       # (slice, round) -> {"base", "tree", ...}
         self.heads = {}           # slice -> the commit that is its pull request's head
+        self.pushed_at = {}       # slice -> when that commit was pushed
+        self._trusted = {}        # GitHub login -> may post a review verdict
         self.containers = 0       # owner containers started in this run
         for rec in run.records():
             if rec.get("type") == "slice_validated":
                 self.validated[(rec["slice"], rec["round"])] = rec
             elif rec.get("type") == "slice_published":
                 self.heads[rec["slice"]] = rec["sha"]
+                self.pushed_at[rec["slice"]] = rec["ts"]
             elif rec.get("type") == "owner_container":
                 self.containers += 1
         self._turn = None         # {"turn", "kind", "thread", "result", "submits"}
@@ -998,8 +1002,9 @@ class EpicSupervisor(sup.Supervisor):
                 return
             self.stake(n, "step_failed", info={"step": step})
             return
-        self.run.append("slice_published", slice=n, round=rnd, sha=sha, pr=number, url=url)
+        rec = self.run.append("slice_published", slice=n, round=rnd, sha=sha, pr=number, url=url)
         self.heads[n] = sha
+        self.pushed_at[n] = rec["ts"]
         self.book.set_pr(n, number, branch)
         self._landing_due[n] = time.time() + LANDING_POLL_SECS
         self.stake(n, "published", info={"sha": sha, "pr": number})
@@ -1089,8 +1094,21 @@ class EpicSupervisor(sup.Supervisor):
             self.stake(s.number, "merged", info={"merge_commit": st["merge_commit"], "pr": s.pr})
         elif st["state"] == "CLOSED":
             self.stake(s.number, "closed", info={"pr": s.pr})
+        elif s.state == S.LANDING:
+            sig = landing.signal(self.svc.gh.pr_signals(s.pr), head=self.heads.get(s.number),
+                                 since=self.pushed_at.get(s.number), trusted=self.trusted_login)
+            if sig:
+                self.stake(s.number, sig, info={"pr": s.pr})
         else:
             self.close_moved(s)
+
+    def trusted_login(self, login):
+        """True when `login` may write to the repository: its review verdict counts."""
+        if not login:
+            return False
+        if login not in self._trusted:
+            self._trusted[login] = self.svc.gh.permission(login) in sup.TRUSTED_PERMS
+        return self._trusted[login]
 
     # --- 5. the owner ---------------------------------------------------------------------
     def read_claim_file(self, name):
@@ -1137,6 +1155,9 @@ class EpicSupervisor(sup.Supervisor):
         if not res["ok"]:
             self.run.p("logs", f"owner-start-{self.containers}.log").write_text(res["log_tail"] or "")
             raise RuntimeError(res["error"])
+        # the record the run index and po-act's launch wait read
+        self.run.append("agent_launched", container=self.name, kind="owner", seq=self.containers,
+                        container_id=str(res["container_id"])[:80])
         if self.olog.turns > 0 or self.olog.open_turn is not None:
             self.olog.push(O.RESTART_TEXT)
 
@@ -1261,13 +1282,38 @@ class EpicSupervisor(sup.Supervisor):
         if text and not self.scanner().scan_texts({name: text}):
             self.wtext(f"owner-{name}", outputs.sanitize(text))
 
+    def file_followups(self):
+        """out/followups.json -> fix issues with no epic parent (design §6):
+        a defect found beside an epic must not grow that epic. Sanitised,
+        capped and scanned like a story run's follow-ups."""
+        raw, problem = outputs.read_nofollow(self.run.out_dir, "followups.json", DONE_CAP)
+        if problem and problem != "absent":
+            self.run.append("note", followups=f"followups.json: {problem}")
+        fups, probs = outputs.parse_followups(raw or "", epic=self.epic)
+        for pr_ in probs:
+            self.run.append("note", followups=pr_)
+        sc = self.scanner()
+        private = self.private_text() if fups else None
+        for i, f in enumerate(fups):
+            if sc.scan_texts({"followup_title": f["title"], "followup_body": f["body"]}):
+                self.run.append("note", followups=f"follow-up {i} dropped: secret scan hit")
+                continue
+            if private.holds_copy(f["body"]) or private.holds_copy(f["title"]):
+                self.run.append("note", followups=f"follow-up {i} dropped: it holds a private file")
+                continue
+            bf = self.wtext(f"followup-{i}.md", f["body"])
+            ok, _out = self.svc.helper.create_fix_issue_defer(f["title"], bf)
+            self.run.append("note", followup=i, filed=ok)
+
     def fin_report(self):
         self._keep_claim("done.md")
+        self.file_followups()
         merged = sorted(s.number for s in self.book.slices.values() if s.state == S.MERGED)
         self.log(f"Epic #{self.epic}: the owner is done. Merged slices: {merged}")
 
     def fin_failed(self):
         self._keep_claim("blocked.md")
+        self.file_followups()
         self.log(f"Epic #{self.epic} run failed ({self.x.get('final_reason', 'failed')}). "
                  f"The workspace is kept at {self.run.workspace}")
 
