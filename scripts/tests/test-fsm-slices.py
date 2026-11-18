@@ -420,6 +420,9 @@ class TestBook(BookCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 self.book.take(2, "submitted", builds_on=bad)
         self.assertEqual(self.run.records(), [])               # nothing was recorded
+        self.assertEqual(self.book.get(2).state, S.NEW)        # known to the book, never submitted
+        with self.assertRaisesRegex(ValueError, "never submitted"):
+            self.book.take(3, "submitted", builds_on=2)
         self.to_landing(1)
         self.walk(1, "checks_failed", "submitted", "ok")          # parent is in round 2
         self.book.take(2, "submitted", builds_on=1)
@@ -433,6 +436,36 @@ class TestBook(BookCase):
         self.book.take(5, "closed")
         with self.assertRaises(ValueError):
             self.book.take(6, "submitted", builds_on=5)
+        self.walk(7, "submitted", "ok")
+        self.book.take(7, "error")                                 # FAILED
+        with self.assertRaises(ValueError):
+            self.book.take(8, "submitted", builds_on=7)
+        self.walk(9, "submitted", "violation")
+        with self.assertRaises(ValueError):                        # itself, on a later round
+            self.book.take(9, "submitted", builds_on=9)
+        self.assertEqual(self.book.get(9).ctx.round, 1)
+
+    def test_a_stale_slice_is_not_a_parent(self):
+        self.to_landing(1)
+        self.walk(2, "submitted", "ok", builds_on=1)
+        self.book.set_candidate(2, "2" * 40, "t" * 40, f"{1:040x}")
+        self.walk(1, "checks_failed", "submitted")                 # 2 is STALE, with a candidate
+        self.assertEqual(self.book.get(2).state, S.STALE)
+        with self.assertRaisesRegex(S.BadRequest, "STALE"):
+            S.resolve_parent(self.book, 3, "a" * 40, 2, lambda sha: True)
+        with self.assertRaises(ValueError):
+            self.book.take(3, "submitted", builds_on=2)
+
+    def test_a_loop_named_by_the_caller_changes_nothing(self):
+        self.walk(1, "submitted", "unchanged")
+        self.book.take(3, "submitted", builds_on=1)
+        self.book.take(4, "submitted", builds_on=1)
+        before = len(self.run.records())
+        with self.assertRaisesRegex(ValueError, "loop"):
+            self.book.take(1, "submitted", builds_on=3)
+        self.assertEqual(len(self.run.records()), before)
+        self.assertEqual([self.book.get(n).state for n in (1, 3, 4)],
+                         [S.REJECTED, S.SNAPSHOT, S.SNAPSHOT])
 
 
 class TestParentCascade(BookCase):
@@ -600,6 +633,70 @@ class TestParentCascade(BookCase):
         again = self.cut_records(lambda r: r.get("slice") == 2 and r.get("to") == S.STALE)
         self.assertEqual([again.get(n).state for n in (2, 3)], [S.STALE, S.WAIT_PARENT])
         self.assertEqual([(n, r.state) for n, r in again.reconcile()], [(3, S.STALE)])
+
+    def test_an_earlier_round_that_merged_makes_the_child_stale(self):
+        # the child stands on round 2 of its parent; round 1 is what merged
+        self.to_landing(1)
+        self.walk(1, "submitted", "ok")
+        self.book.set_candidate(1, "c" * 40, "t" * 40, "b" * 40)
+        self.walk(2, "submitted", "ok", "pass", builds_on=1)
+        self.assertEqual(self.book.get(2).ctx.parent_round, 2)
+        res = self.book.take(1, "merged")
+        self.assertEqual((res.state, res.reason), (S.MERGED, "earlier_round_merged"))
+        self.assertEqual([(n, r.state, r.reason) for n, r in res.cascade],
+                         [(2, S.STALE, "parent_new_round")])
+        self.assertFalse(self.book.get(2).ctx.parent_merged)
+        # and the same after a crash between the two records
+        self.to_landing(5)
+        self.walk(5, "submitted", "ok")
+        self.book.set_candidate(5, "d" * 40, "t" * 40, "b" * 40)
+        self.walk(6, "submitted", "ok", "pass", builds_on=5)
+        self.book.take(5, "merged")
+        again = self.cut_records(lambda r: r.get("slice") == 5 and r.get("to") == S.MERGED)
+        self.assertEqual([(n, r.state, r.reason) for n, r in again.reconcile()],
+                         [(6, S.STALE, "parent_new_round")])
+
+    def test_a_child_that_waits_for_its_owner_takes_no_parent_event(self):
+        self.to_landing(1)
+        self.walk(2, "submitted", "ok", "fail", builds_on=1)          # REJECTED
+        self.to_landing(3)
+        self.walk(4, "submitted", "ok", "pass", builds_on=3)
+        self.walk(3, "checks_failed", "submitted")                     # 4 is STALE
+        before = len(self.run.records())
+        self.assertEqual(self.book.take(1, "merged").cascade, [])
+        self.assertEqual(self.book.take(3, "closed").cascade, [])
+        self.assertEqual(len(self.run.records()), before + 2)
+        self.assertEqual([self.book.get(n).state for n in (2, 4)], [S.REJECTED, S.STALE])
+        self.assertEqual(self.book.reconcile(), [])
+
+    def test_reconcile_and_children_that_already_know(self):
+        # children in SNAPSHOT and VALIDATE learned that the parent merged: nothing to send
+        self.to_landing(1)
+        self.walk(2, "submitted", builds_on=1)
+        self.walk(3, "submitted", "ok", builds_on=1)
+        self.book.take(1, "merged")
+        before = len(self.run.records())
+        again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
+        self.assertEqual(again.reconcile(), [])
+        self.assertEqual(len(self.run.records()), before)
+        # cut off: reconcile tells them, and reports no state change
+        again = self.cut_records(lambda r: r.get("slice") == 1 and r.get("to") == S.MERGED)
+        self.assertEqual([again.get(n).ctx.parent_merged for n in (2, 3)], [False, False])
+        self.assertEqual(again.reconcile(), [])
+        self.assertEqual([(again.get(n).state, again.get(n).ctx.parent_merged) for n in (2, 3)],
+                         [(S.SNAPSHOT, True), (S.VALIDATE, True)])
+
+    def test_reconcile_sends_a_failed_parent(self):
+        self.to_landing(1)
+        self.walk(2, "submitted", "ok", "pass", builds_on=1)
+        self.walk(1, "checks_failed", "submitted", "ok", "pass", "up_to_date", "pass")
+        self.book.take(2, "submitted", builds_on=1)
+        self.walk(2, "ok", "pass")
+        self.book.take(1, "step_failed")
+        again = self.cut_records(lambda r: r.get("slice") == 1 and r.get("to") == S.FAILED)
+        self.assertEqual(again.get(2).state, S.WAIT_PARENT)
+        self.assertEqual([(n, r.state, r.reason) for n, r in again.reconcile()],
+                         [(2, S.STALE, "parent_closed")])
 
     def test_reconcile_leaves_a_sound_book_alone(self):
         self.chain()

@@ -331,6 +331,9 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
             raise BadRequest(f"--builds-on {builds_on}: no such slice has been submitted")
         if parent.state in (CLOSED, FAILED):
             raise BadRequest(f"--builds-on {builds_on}: that slice is {parent.state}")
+        if parent.state == STALE:
+            # what it stood on is gone; its candidate is not a base for more work
+            raise BadRequest(f"--builds-on {builds_on}: that slice is STALE; submit it again first")
         if parent.state != MERGED:
             # Walk the chain of unmerged parents: a slice may not, through any
             # number of steps, build on itself.
@@ -433,10 +436,16 @@ class SliceBook:
         parent = self.get(builds_on)
         if parent is None or parent.state == NEW:
             raise ValueError(f"slice {number}: builds_on {builds_on} was never submitted")
-        if parent.state in (CLOSED, FAILED):
+        if parent.state in (CLOSED, FAILED, STALE):
             raise ValueError(f"slice {number}: builds_on {builds_on} is {parent.state}")
         if parent.state == MERGED:
             return 0, 0
+        seen, cur = set(), parent
+        while cur is not None and cur.state != MERGED and cur.number not in seen:
+            if cur.number == number:
+                raise ValueError(f"slice {number}: builds_on {builds_on} is a loop")
+            seen.add(cur.number)
+            cur = self.get(cur.ctx.builds_on) if cur.ctx.builds_on else None
         return builds_on, parent.ctx.round
 
     def take(self, number, event, info=None, *, builds_on=0, _from_book=False):
@@ -462,7 +471,11 @@ class SliceBook:
                         wake=res.wakes_owner, info=info, ctx=s.ctx.to_dict())
         # What happens to this slice decides the slices that build on it.
         if res.state == MERGED:
-            res.cascade = self._parent_event(number, "parent_merged")
+            # A dependent stands on this slice's current round. When it is an
+            # earlier round that merged, that round is not on develop and
+            # never will be: the dependent is stale, not ready to sync.
+            res.cascade = self._parent_event(
+                number, "parent_new_round" if res.reason == "earlier_round_merged" else "parent_merged")
         elif res.state in (CLOSED, FAILED):
             res.cascade = self._parent_event(number, "parent_closed")
         elif res.consume == "round" or res.state == STALE:
@@ -500,6 +513,8 @@ class SliceBook:
         """
         out = []
         for s in sorted(self.dependents(number), key=lambda x: x.number):
+            if s not in self.dependents(number):
+                continue            # an event sent a moment ago already moved it
             frm = s.state
             res = self.take(s.number, event, _from_book=True)
             if res.state != frm:
@@ -527,7 +542,8 @@ class SliceBook:
                 if parent is None:
                     continue
                 if parent.state == MERGED:
-                    event = "parent_merged"
+                    event = ("parent_new_round" if parent.reason == "earlier_round_merged"
+                             else "parent_merged")
                 elif parent.state in (CLOSED, FAILED):
                     event = "parent_closed"
                 elif parent.state == STALE or parent.ctx.round != c.parent_round:
