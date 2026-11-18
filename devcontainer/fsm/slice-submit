@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""slice-submit: hand one slice of the epic to the supervisor.
+
+    slice-submit --slice <n> --claim <file> --subject "<scope>: <what changed>" \\
+                 --base <develop commit> [--builds-on <m>]
+
+"Take my workspace as it is now." The command writes a request under
+/fsm/out/submit/ and waits until the supervisor has copied /workspace. Do not
+change /workspace, and let every helper finish, before this command returns.
+
+  --slice      the slice number: 1, 2, 3, ... The same number again is a new
+               round of that slice.
+  --claim      a file that says what this slice delivers (at most 64 KiB)
+  --subject    the commit subject, without an issue reference
+  --base       the full origin/develop commit id the workspace is built on
+  --builds-on  an earlier slice this one needs, while that slice is not merged
+
+Exit code: 0 the supervisor took the snapshot; 1 it refused the request (the
+reason is printed); 2 wrong arguments; 3 no answer inside the time limit.
+
+The snapshot is only the first step. The result of the validator comes later,
+in /fsm/context/slices/<n>/ and as an event at the start of a turn.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import uuid
+
+OUT = os.environ.get("CFGMS_FSM_OUT") or "/fsm/out"
+CONTEXT = os.environ.get("CFGMS_FSM_CONTEXT") or "/fsm/context"
+CLAIM_CAP = 64 * 1024
+SUBJECT_MAX_CHARS = 150
+DEFAULT_WAIT_SECS = 900
+WITHDRAW_GRACE_SECS = 10
+
+
+def fail(code, text):
+    print(f"slice-submit: {text}", file=sys.stderr)
+    sys.exit(code)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="slice-submit", add_help=True,
+                                 description="Hand one slice of the epic to the supervisor.")
+    ap.add_argument("--slice", type=int, required=True)
+    ap.add_argument("--claim", required=True)
+    ap.add_argument("--subject", required=True)
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--builds-on", type=int, default=0)
+    ap.add_argument("--wait", type=int, default=DEFAULT_WAIT_SECS,
+                    help="seconds to wait for the supervisor (default %(default)s)")
+    args = ap.parse_args(argv)
+
+    if not 1 <= args.slice <= 999:
+        fail(2, "--slice must be a number from 1 to 999")
+    if not 0 <= args.builds_on <= 999 or args.builds_on == args.slice:
+        fail(2, "--builds-on must be the number of another slice")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.base):
+        fail(2, "--base must be a full 40-character commit id (git rev-parse origin/develop)")
+    subject = args.subject.strip()
+    if "\n" in subject or not re.fullmatch(r"[a-z0-9][a-z0-9/_.-]*: \S.*", subject):
+        fail(2, '--subject must be one line of the form "<scope>: <what changed>"')
+    if any(not 32 <= ord(c) < 127 for c in subject):
+        fail(2, "--subject must be printable ASCII text")
+    if len(subject) > SUBJECT_MAX_CHARS:
+        fail(2, f"--subject is longer than {SUBJECT_MAX_CHARS} characters")
+    try:
+        with open(args.claim, "rb") as fh:
+            claim = fh.read(CLAIM_CAP + 1)
+    except OSError as exc:
+        fail(2, f"--claim {args.claim}: {exc.strerror}")
+    if len(claim) > CLAIM_CAP:
+        fail(2, f"--claim is larger than {CLAIM_CAP} bytes")
+    if not claim.strip():
+        fail(2, "--claim is empty")
+
+    request_id = uuid.uuid4().hex
+    submit_dir = os.path.join(OUT, "submit")
+    try:
+        os.makedirs(submit_dir, exist_ok=True)
+    except OSError as exc:
+        fail(3, f"cannot create {submit_dir}: {exc.strerror}")
+
+    # Write under a dot name, then rename: the supervisor never sees half a request.
+    tmp = os.path.join(submit_dir, f".{args.slice}-{request_id}.tmp")
+    os.mkdir(tmp, 0o755)
+    with open(os.path.join(tmp, "claim.md"), "wb") as fh:
+        fh.write(claim)
+    with open(os.path.join(tmp, "subject.txt"), "w", encoding="utf-8") as fh:
+        fh.write(subject + "\n")
+    with open(os.path.join(tmp, "request.json"), "w", encoding="utf-8") as fh:
+        json.dump({"slice": args.slice, "request_id": request_id, "base": args.base,
+                   "builds_on": args.builds_on}, fh)
+    final = None
+    for k in range(1, 10000):
+        candidate = os.path.join(submit_dir, f"{args.slice}-{k}")
+        try:
+            os.rename(tmp, candidate)      # fails when the name is taken (a non-empty directory)
+        except OSError:
+            continue
+        final = candidate
+        break
+    if final is None:
+        fail(3, f"no free request name under {submit_dir}")
+
+    print(f"slice-submit: request {os.path.basename(final)} written; "
+          f"waiting for the supervisor to copy /workspace ...", flush=True)
+    answer_file = os.path.join(CONTEXT, "slices", str(args.slice), "submitted.json")
+
+    def answered():
+        """0 or 1 when the supervisor answered this request, else None."""
+        try:
+            with open(answer_file, encoding="utf-8") as fh:
+                answer = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(answer, dict) or answer.get("request_id") != request_id:
+            return None
+        if answer.get("accepted"):
+            print(f"slice-submit: slice {args.slice} round {answer.get('round')}: snapshot "
+                  f"taken ({answer.get('files')} files). You may change /workspace again. "
+                  f"The validator result comes later in {os.path.dirname(answer_file)}/.")
+            return 0
+        print(f"slice-submit: slice {args.slice}: REFUSED: {answer.get('reason')}",
+              file=sys.stderr)
+        return 1
+
+    def remove(path):
+        # handled requests must not pile up: the supervisor reads at most 512 entries
+        shutil.rmtree(path, ignore_errors=True)
+
+    deadline = time.monotonic() + max(1, args.wait)
+    while time.monotonic() < deadline:
+        code = answered()
+        if code is not None:
+            remove(final)
+            return code
+        time.sleep(1)
+    # Withdraw the request: a supervisor that comes back later must not take a
+    # snapshot of a workspace that has moved on.
+    withdrawn = os.path.join(submit_dir, f".{os.path.basename(final)}-{request_id}.withdrawn")
+    try:
+        os.rename(final, withdrawn)
+        state = "The request was withdrawn"
+    except OSError:
+        withdrawn = None
+        state = f"The request could not be withdrawn and stays in {final}"
+    # The supervisor may have read the request a moment before the rename and
+    # be at work on the snapshot. It checks for the directory again when the
+    # snapshot is done; give its answer a short time to come.
+    for _ in range(WITHDRAW_GRACE_SECS):
+        code = answered()
+        if code is not None:
+            break
+        time.sleep(1)
+    if withdrawn:
+        remove(withdrawn)
+    if code is not None:
+        return code
+    fail(3, f"no answer from the supervisor after {args.wait} seconds. {state}. Read "
+            f"{os.path.dirname(answer_file)}/status.json before you submit this slice again.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -17,6 +17,7 @@ via the environment of that one call only.
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import runtime
@@ -84,6 +85,48 @@ class DockerCLI:
         proc = self._run(["logs", "--tail", str(lines), name], timeout=120)
         text = (proc.stdout[-4 * 1024 * 1024:] + proc.stderr[-1024 * 1024:]).decode("utf-8", "replace")
         return "\n".join(ln[:max_line] for ln in text.splitlines())
+
+    def exec(self, name, cmd, user=None, timeout_secs=120, max_output=4 * 1024 * 1024):
+        """Run `cmd` in the running container `name` and wait for it.
+
+        Returns (exit code, output). The exit code is None when the client
+        timed out: the process may still run in the container. No environment
+        is passed to the process beyond the container's own. Output is the
+        last `max_output` bytes of stdout and stderr.
+
+        The process in the container is not trusted: it can print without
+        end. The output is read as it comes and only its tail is kept, so the
+        memory this call uses does not grow with what the process prints.
+        """
+        argv = [self.binary, "exec"]
+        if user:
+            argv += ["--user", user]
+        argv += [name] + list(cmd)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, env=scrubbed_env())
+        max_output = max(1, int(max_output))
+        tail = bytearray()
+
+        def pump():
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    return
+                tail.extend(chunk)
+                if len(tail) > 2 * max_output + 65536:
+                    del tail[:len(tail) - max_output]
+
+        reader = threading.Thread(target=pump, name="docker-exec-output", daemon=True)
+        reader.start()
+        try:
+            code = proc.wait(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            code = None
+        # A process left behind can hold the pipe open: do not wait for it.
+        reader.join(5 if code is None else 30)
+        return code, bytes(tail[-max_output:]).decode("utf-8", "replace")
 
     def kill(self, name):
         self._run(["kill", name], timeout=60)
