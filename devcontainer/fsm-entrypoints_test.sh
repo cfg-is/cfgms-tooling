@@ -270,7 +270,8 @@ PY
 
 test_entrypoints_have_no_git_or_github_writes() {
     local f hits
-    for f in "$AGENT_EP" "$VALIDATE_EP"; do
+    for f in "$AGENT_EP" "$VALIDATE_EP" "$SCRIPT_DIR/fsm-owner-entrypoint.sh" \
+             "$SCRIPT_DIR/fsm-owner-turn.sh"; do
         hits=$(guard_scan "$f")
         assert_equals "$hits" "" "$(basename "$f"): no git write, GitHub CLI call or pipeline side effect"
     done

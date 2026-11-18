@@ -81,6 +81,26 @@ class DockerCLI:
         text = (proc.stdout[-4 * 1024 * 1024:] + proc.stderr[-1024 * 1024:]).decode("utf-8", "replace")
         return "\n".join(ln[:max_line] for ln in text.splitlines())
 
+    def exec(self, name, cmd, user=None, timeout_secs=120, max_output=4 * 1024 * 1024):
+        """Run `cmd` in the running container `name` and wait for it.
+
+        Returns (exit code, output). The exit code is None when the client
+        timed out: the process may still run in the container. No environment
+        is passed to the process beyond the container's own. Output is the
+        last `max_output` bytes of stdout and stderr.
+        """
+        argv = [self.binary, "exec"]
+        if user:
+            argv += ["--user", user]
+        argv += [name] + list(cmd)
+        try:
+            proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, env=scrubbed_env(),
+                                  timeout=timeout_secs)
+        except subprocess.TimeoutExpired as exc:
+            return None, (exc.stdout or b"")[-max_output:].decode("utf-8", "replace")
+        return proc.returncode, proc.stdout[-max_output:].decode("utf-8", "replace")
+
     def kill(self, name):
         self._run(["kill", name], timeout=60)
 

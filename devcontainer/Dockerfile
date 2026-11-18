@@ -409,6 +409,15 @@ COPY .claude/tooling/devcontainer/fsm/prompts/ /usr/local/share/cfgms-agent/fsm/
 RUN chmod 0755 /usr/local/bin/fsm-agent-entrypoint.sh /usr/local/bin/fsm-validate-entrypoint.sh \
     && chmod -R a+rX,go-w /usr/local/share/cfgms-agent/fsm
 
+# FSM `epic` mode: the owner container's entrypoint (it waits), the script
+# that runs one owner turn, and the command the owner hands a slice over with.
+# scripts/fsm/owner_session.py names these paths.
+COPY .claude/tooling/devcontainer/fsm-owner-entrypoint.sh /usr/local/bin/fsm-owner-entrypoint.sh
+COPY .claude/tooling/devcontainer/fsm-owner-turn.sh /usr/local/bin/fsm-owner-turn.sh
+COPY .claude/tooling/devcontainer/fsm/slice-submit /usr/local/bin/slice-submit
+RUN chmod 0755 /usr/local/bin/fsm-owner-entrypoint.sh /usr/local/bin/fsm-owner-turn.sh \
+    /usr/local/bin/slice-submit
+
 # Token reporter (Issue #3028/#3041) — baked into the harness so accounting is a
 # property of the image, never of the branch under dispatch/review. A PR branch
 # that predates this reporter (or edits/deletes it) must not disable its own
