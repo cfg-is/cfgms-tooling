@@ -304,6 +304,8 @@ class TestParts(unittest.TestCase):
         self.assertTrue(p.is_copy(note))
         self.assertTrue(p.is_copy(note.replace(b"\n", b"\r\n")))       # other line ends
         self.assertTrue(p.is_copy(b"\n" + note + b"\n\n"))             # white space at the ends
+        self.assertTrue(p.is_copy(b"\xef\xbb\xbf" + note))             # a byte-order mark
+        self.assertTrue(p.is_copy(note.replace(b"\n", b"  \t\n")))     # white space at line ends
         self.assertFalse(p.is_copy(note[:-30]))                          # a part is not found
         for other in (b"x" * 200, b"z" * 200, b"tiny\n"):
             self.assertFalse(p.is_copy(other))
@@ -323,7 +325,51 @@ class TestParts(unittest.TestCase):
             p = epic.PrivateText(tmp)
         finally:
             epic.PRIVATE_MAX_FILES = old
-        self.assertEqual((len(p.digests), p.truncated), (3, True))
+        self.assertEqual((len(p.digests), p.truncated), (2, True))   # the directory counts as one
+
+    def test_private_text_says_when_a_file_is_too_large_to_compare(self):
+        import shutil
+        import tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="fsm-epic-private-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "big.md").write_text("x" * 5000)
+        (tmp / "ok.md").write_text("y" * 100)
+        old = epic.PRIVATE_MAX_BYTES
+        epic.PRIVATE_MAX_BYTES = 1000
+        try:
+            p = epic.PrivateText(tmp)
+        finally:
+            epic.PRIVATE_MAX_BYTES = old
+        self.assertEqual((len(p.digests), p.truncated), (1, True))
+
+    def test_a_failed_network_step_is_tried_again_with_a_longer_wait_and_not_for_ever(self):
+        class Run:
+            def __init__(self):
+                self.notes = []
+
+            def append(self, kind, **fields):
+                self.notes.append(fields)
+
+        class Stub:
+            net_wait = epic.EpicSupervisor.net_wait
+            net_failed = epic.EpicSupervisor.net_failed
+
+            def __init__(self):
+                self._net_due, self._net_tries, self.run = {}, {}, Run()
+
+        s = Stub()
+        self.assertFalse(s.net_wait(3))
+        waits = []
+        for i in range(1, epic.NET_RETRIES + 1):
+            again = s.net_failed(3, RuntimeError("no route"), "fetch")
+            self.assertEqual(again, i < epic.NET_RETRIES, i)
+            self.assertTrue(s.net_wait(3))                    # no busy loop: a wait after every try
+            self.assertFalse(s.net_wait(4))                   # another slice is not held up
+            waits.append(s._net_due[3] - time.time())
+        self.assertLess(waits[0], epic.NET_RETRY_SECS + 1)
+        self.assertGreater(waits[1], waits[0])
+        self.assertLessEqual(max(waits), epic.NET_RETRY_MAX_SECS + 1)
+        self.assertEqual(len(s.run.notes), epic.NET_RETRIES)
 
     def test_public_claim(self):
         text = epic.public_claim("Adds x.\n\nFixes #12 [skip ci] and [CI SKIP]\n"

@@ -94,10 +94,14 @@ PRIVATE_MIN_BYTES = 64
 PRIVATE_MAX_BYTES = 5 * 1024 * 1024
 PRIVATE_MAX_FILES = 20000
 PRIVATE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
-#: A network step (fetch, ls-remote, push) that fails is tried again after
-#: this long; a slice that fails this often in PUBLISH takes `step_failed`.
+#: A network step of SYNC or PUBLISH (fetch, ls-remote, push, a GitHub call)
+#: that fails is tried again; a slice that fails NET_RETRIES times takes
+#: `error` in SYNC and `step_failed` in PUBLISH.
 NET_RETRY_SECS = float(os.environ.get("CFGMS_FSM_EPIC_NET_RETRY_SECS", "30"))
-NET_RETRIES = 10
+NET_RETRY_MAX_SECS = 600.0
+#: The wait grows with every try (30 s, 60 s, ... at most 10 min): 30 tries
+#: are about four hours.
+NET_RETRIES = 30
 #: Agent definitions passed to the owner session from the harness, when the
 #: cfgms checkout has them. A definition of the same name in the workspace
 #: does not replace them.
@@ -153,10 +157,14 @@ def public_claim(text):
 
 
 def normalise(data):
-    """Bytes as the private-text rule compares them: line ends as LF, no
-    white space at the two ends. A copy with other line ends, or with a line
-    added at the end by an editor, is still a copy."""
-    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").strip()
+    """Bytes as the private-text rule compares them: no byte-order mark, line
+    ends as LF, no white space at the end of a line or at the two ends of the
+    text. A copy that an editor saved with other line ends, a mark at the
+    start or trimmed lines is still a copy."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    lines = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+    return b"\n".join(ln.rstrip() for ln in lines).strip()
 
 
 class PrivateText:
@@ -166,12 +174,16 @@ class PrivateText:
     What the rule gives: a changed file whose content is the same as a whole
     private file (after `normalise`) is found, and so is a claim that holds a
     whole private file. What it does not give: a part of a file, an edited
-    copy, a file under PRIVATE_MIN_BYTES. It is a net for the careless copy,
-    not a guard against an owner that wants to leak.
+    copy, a quoted or indented copy, another encoding, a file under
+    PRIVATE_MIN_BYTES or over PRIVATE_MAX_BYTES (`truncated` is then set). It
+    is a net for the careless copy, not a guard against an owner that wants
+    to leak.
 
     The memory directory is written by the owner: no link is followed, sizes
     are capped, and a file that cannot be read is skipped.
     """
+
+    TOO_LARGE = object()
 
     def __init__(self, *dirs):
         self.digests = set()
@@ -181,6 +193,7 @@ class PrivateText:
         for root in dirs:
             for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
                 dirnames[:] = sorted(d for d in dirnames if d != ".git")
+                files += 1                       # a directory counts: the walk is bounded too
                 for name in sorted(filenames):
                     files += 1
                     if files > PRIVATE_MAX_FILES or total > PRIVATE_MAX_TOTAL_BYTES:
@@ -188,6 +201,9 @@ class PrivateText:
                         return
                     data = self._read(os.path.join(dirpath, name))
                     if data is None:
+                        continue
+                    if data is self.TOO_LARGE:
+                        self.truncated = True    # a private file the rule cannot compare
                         continue
                     total += len(data)
                     norm = normalise(data)
@@ -205,15 +221,17 @@ class PrivateText:
             return None
         try:
             st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_size > PRIVATE_MAX_BYTES:
+            if not stat.S_ISREG(st.st_mode):
                 return None
+            if st.st_size > PRIVATE_MAX_BYTES:
+                return PrivateText.TOO_LARGE
             data = b""
             while len(data) <= PRIVATE_MAX_BYTES:
                 chunk = os.read(fd, 1 << 20)
                 if not chunk:
                     break
                 data += chunk
-            return data if len(data) <= PRIVATE_MAX_BYTES else None
+            return data if len(data) <= PRIVATE_MAX_BYTES else PrivateText.TOO_LARGE
         except OSError:
             return None
         finally:
@@ -354,7 +372,7 @@ class EpicSupervisor(sup.Supervisor):
                 os.path.realpath(str(self.run.path))]
         for i, a_ in enumerate(real):
             for b_ in real[i + 1:]:
-                if a_ == b_ or a_.startswith(b_ + "/") or b_.startswith(a_ + "/"):
+                if a_ == b_ or a_.startswith(b_.rstrip("/") + "/") or b_.startswith(a_.rstrip("/") + "/"):
                     raise sup.Refused("canon_memory_overlap")
 
         if self.run.repo_dir.exists():
@@ -472,6 +490,9 @@ class EpicSupervisor(sup.Supervisor):
     def _after(self, n, res, quiet=False, commit=""):
         s = self.book.get(n)
         self.write_status(n)
+        if s.state not in (S.SYNC, S.PUBLISH):
+            self._net_tries.pop(n, None)
+            self._net_due.pop(n, None)
         if res.wakes_owner and not quiet:
             self.olog.push(O.slice_event_text(n, s.ctx.round, s.state, s.reason, pr=s.pr,
                                               commit=commit))
@@ -835,7 +856,7 @@ class EpicSupervisor(sup.Supervisor):
         tried again later, False when it failed too often."""
         tries = self._net_tries.get(n, 0) + 1
         self._net_tries[n] = tries
-        self._net_due[n] = time.time() + NET_RETRY_SECS
+        self._net_due[n] = time.time() + min(NET_RETRY_SECS * tries, NET_RETRY_MAX_SECS)
         self.run.append("note", warning=f"slice {n}: {step} failed (try {tries}): {str(exc)[:300]}")
         return tries < NET_RETRIES
 
@@ -849,7 +870,6 @@ class EpicSupervisor(sup.Supervisor):
             if self.net_failed(n, exc, "fetch"):
                 return
             raise
-        self._net_tries.pop(n, None)
         cand = s.candidates[rnd]
         base, tree = cand["parent"], cand["tree"]
         if self.repo.is_ancestor(dev, base):
@@ -882,7 +902,12 @@ class EpicSupervisor(sup.Supervisor):
         if s.pr:
             # the pull request of an earlier round may have merged or closed
             # since the last look
-            self.poll_slice(s)
+            try:
+                self.poll_slice(s)
+            except Exception as exc:
+                if self.net_failed(n, exc, "pull request state"):
+                    return
+                raise
             if s.state != S.PUBLISH:
                 return
         key = p.get("lease_key")
@@ -932,10 +957,12 @@ class EpicSupervisor(sup.Supervisor):
                                 base_branch=p["base_branch"], scope=f"s{n}r{rnd}")
         try:
             if head:
-                head = self.adopt_remote_head(n, branch, head)
-                if not head:
-                    return
-                # a later round: one new commit on the pull request's head
+                # A later round: one new commit on the pull request's head.
+                # The push below goes through only when the branch on GitHub
+                # is still the supervisor's last push. A branch with anything
+                # else on it (also a merge of develop from "Update branch") is
+                # left alone: a commit on top of it would carry a tree that
+                # was validated on another base.
                 extra = [] if self.repo.is_ancestor(base, head) else [base]
                 sha = pub.commit(tree, head, message, extra_parents=extra)
             else:
@@ -943,55 +970,49 @@ class EpicSupervisor(sup.Supervisor):
             pub.push(sha, head)
             number, url = pub.pr(title, body_file, round_body_file=round_file)
             pub.landed(sha, number, tree)
-        except publish.PublishError as exc:
+        except (publish.PublishError, gitops.GitError, RuntimeError) as exc:
             self.run.append("note", publish_error=str(exc)[:500], slice=n)
-            if exc.step == "push" and "remote head moved" in str(exc):
+            step = getattr(exc, "step", "network")
+            if step == "push" and "remote head moved" in str(exc):
                 self.branch_moved(n, branch)
                 return
-            self.stake(n, "step_failed", info={"step": exc.step})
-            return
-        except gitops.GitError as exc:
-            # GitHub not reachable: the steps are recorded one by one, so the
-            # same publish goes on from where it stopped
-            if self.net_failed(n, exc, "publish"):
+            # A push, a GitHub call or the landed check that failed: GitHub
+            # may be away for a while. The steps are recorded one by one, so
+            # the same publish goes on from where it stopped. Only a commit
+            # whose tree is not the validated tree is never tried again.
+            if step != "commit" and self.net_failed(n, exc, f"publish ({step})"):
                 return
-            self.stake(n, "step_failed", info={"step": "network"})
+            self.stake(n, "step_failed", info={"step": step})
             return
-        self._net_tries.pop(n, None)
         self.run.append("slice_published", slice=n, round=rnd, sha=sha, pr=number, url=url)
         self.heads[n] = sha
         self.book.set_pr(n, number, branch)
         self._landing_due[n] = time.time() + LANDING_POLL_SECS
         self.stake(n, "published", info={"sha": sha, "pr": number})
 
-    def adopt_remote_head(self, n, branch, head):
-        """The head of the slice's pull request branch to put the next round
-        on. When someone added commits on top of the supervisor's last push
-        (GitHub's "Update branch" does), that newer head is used. When the
-        branch was replaced, the round cannot be published: "" is returned
-        and the slice goes back to the owner."""
-        scope = f"s{n}r{self.book.get(n).ctx.round}"
-        if self.run.publish_steps(scope).get("commit"):
-            return head                       # this round's commit is made: keep its parent
-        current = self.remote.ls_remote(f"refs/heads/{branch}")
-        if current == head:
-            return head
-        if current:
-            self.remote.fetch(f"+refs/heads/{branch}:refs/fsm/slices/{n}/remote")
-            if self.repo.is_ancestor(head, current):
-                self.run.append("note", info=f"slice {n}: the branch has commits on top of the "
-                                             f"supervisor's push; the new round goes on {current[:12]}")
-                self.heads[n] = current
-                return current
-        self.branch_moved(n, branch)
-        return ""
-
     def branch_moved(self, n, branch):
+        """The slice's branch on GitHub is not the supervisor's last push.
+        The round is not published. The supervisor closes the slice's pull
+        request, with a comment that says why, so that it does not stay open
+        with nobody working on it; the owner delivers the change under
+        another slice number."""
+        s = self.book.get(n)
         self.write_rejected(n, "The branch on GitHub is not what the supervisor pushed", [
             f"`{branch}` exists on GitHub with content the supervisor did not push, or it was "
             "replaced or removed. This round was not published.", "",
             "Deliver the change under another slice number."])
         self.stake(n, "branch_moved")
+        if s is not None and s.pr:
+            try:
+                self.svc.gh.comment(s.pr, self.wtext(
+                    f"slice-{n}-branch-moved.md",
+                    f"The supervisor of FSM run `{self.run.run_id}` cannot add a round to this "
+                    f"branch: it holds commits the supervisor did not push. The change will come "
+                    f"in a new pull request. This one is closed.\n"))
+                self.svc.gh.close_pr(s.pr)
+            except Exception as exc:
+                self.run.append("note", warning=f"slice {n}: pull request #{s.pr} not closed: "
+                                                f"{type(exc).__name__}: {str(exc)[:200]}")
 
     # --- 4. published slices --------------------------------------------------------------
     def poll_landing(self):
@@ -1016,7 +1037,7 @@ class EpicSupervisor(sup.Supervisor):
         if not st:
             return
         if st["state"] == "MERGED":
-            self.fetch_develop()
+            self.try_fetch_develop()
             self.stake(s.number, "merged", info={"merge_commit": st["merge_commit"], "pr": s.pr})
         elif st["state"] == "CLOSED":
             self.stake(s.number, "closed", info={"pr": s.pr})

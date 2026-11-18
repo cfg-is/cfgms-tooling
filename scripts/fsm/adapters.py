@@ -240,6 +240,9 @@ class GhCLI:
         self._gh(["api", "--method", "PATCH", f"repos/{self.repo}/pulls/{number}",
                   "-F", f"body=@{body_file}"])
 
+    def close_pr(self, number):
+        self._gh(["pr", "close", str(number), "--repo", self.repo])
+
     def mark_ready(self, number):
         self._gh(["pr", "ready", str(number), "--repo", self.repo])
 

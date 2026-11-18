@@ -193,6 +193,12 @@ def main():
             print("{}")
             return 0
         return 0
+    if argv[:2] == ["pr", "close"]:
+        for p in s["prs"]:
+            if p["number"] == int(argv[2]):
+                p["state"] = "CLOSED"
+        save(s)
+        return 0
     if argv[:2] == ["pr", "ready"]:
         for p in s["prs"]:
             if p["number"] == int(argv[2]):

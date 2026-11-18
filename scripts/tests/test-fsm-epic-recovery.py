@@ -49,15 +49,18 @@ class TestBranch(EpicCase):
         self.assertFalse((self.run_dir / "out" / "done.md").exists())
         self.assertEqual(self.status(1)["state"], "CLOSED")
 
-    def test_commits_that_someone_added_to_the_branch_are_kept(self):
+    def test_a_branch_with_commits_the_supervisor_did_not_push_gets_no_new_round(self):
+        # Someone presses "Update branch", or pushes a fix. A new round on top
+        # would carry a tree validated on another base; it could undo merged
+        # work. The round is not published and the pull request is closed.
         self.f.plan({"owner": [
             [write("src/a.go", "package src\n// v1\n"), submit(1), {"op": "wait_flag", "name": "go"},
              write("src/a.go", "package src\n// v2\n"), submit(1)],
+            [submit(2)],
             [DONE],
         ]})
         self.launch()
         pr = self.wait_pr(1)
-        # someone presses "Update branch": one more commit on top of the supervisor's push
         seed = self.f.seed
         git(seed, "fetch", "-q", "origin")
         git(seed, "checkout", "-q", "-B", "update", "origin/feature/epic-900-slice-1")
@@ -66,12 +69,18 @@ class TestBranch(EpicCase):
         git(seed, "push", "-q", "origin", "update:feature/epic-900-slice-1")      # no force
         added = git(seed, "rev-parse", "HEAD")
         self.flag("go")
-        self.wait_for("round 2", lambda: len(self.recs("slice_published")) == 2)
-        head2 = self.f.remote_head("feature/epic-900-slice-1")
-        self.assertEqual(git(self.f.remote, "rev-parse", f"{head2}^"), added)     # on top, nothing lost
-        self.merge(self.open_pr(1))
+        pr2 = self.wait_pr(2)
+        self.assertEqual(self.f.remote_head("feature/epic-900-slice-1"), added)   # untouched
+        old = [p for p in self.f.gh()["prs"] if p["number"] == pr["number"]][0]
+        self.assertEqual(old["state"], "CLOSED")
+        self.assertIn("cannot add a round to this branch", old["comments"][-1]["body"])
+        self.assertEqual(self.status(1)["state"], "CLOSED")
+        self.assertEqual([r["reason"] for r in self.recs("slice_transition")
+                          if r["slice"] == 1 and r["to"] == "REJECTED"], ["branch_moved"])
+        self.merge(pr2)
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.recs("slice_published")), 2)      # slice 1 round 1, slice 2
 
     def test_a_replaced_branch_goes_back_to_the_owner_and_the_run_goes_on(self):
         self.f.plan({"owner": [
@@ -84,10 +93,8 @@ class TestBranch(EpicCase):
         pr = self.wait_pr(1)
         self.f.commit_on("feature/epic-900-slice-1", {"other.txt": "replaced\n"})   # a force push
         self.flag("go")
-        self.wait_state(1, "REJECTED")
-        self.assertEqual(self.status(1)["reason"], "branch_moved")
-        self.close(pr)
         pr2 = self.wait_pr(2)
+        self.assertEqual(self.status(1)["state"], "CLOSED")       # the supervisor closed it
         self.merge(pr2)
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
@@ -164,6 +171,37 @@ class TestRestart(EpicCase):
         self.merge(pr)
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
+
+    def test_abandon_removes_the_owner_container_and_ends_without_a_runtime(self):
+        self.stop_while_waiting()
+        run_id = self.run_dir.name
+        state = self.f.docker_state / "containers.json"
+        self.assertIn("cfg-owner-900", json.loads(state.read_text()))
+        rc, out, _ = self.f.cli("abandon", run_id, "--reason", "test")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("cfg-owner-900", json.loads(state.read_text()))
+        self.assertEqual(self.recs("terminal_done")[-1]["state"], "ABANDONED")
+
+    def test_abandon_ends_when_the_container_runtime_cannot_be_run(self):
+        self.stop_while_waiting()
+        run_id = self.run_dir.name
+        rc, out, _ = self.f.cli("abandon", run_id, "--reason", "test",
+                                env_extra={"CFGMS_CONTAINER_RUNTIME": "no-such-runtime-binary",
+                                           "PATH": "/usr/bin:/bin"})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.recs("terminal_done")[-1]["state"], "ABANDONED")
+        self.assertTrue(any("not removed" in (r.get("warning") or "") for r in self.recs("note")))
+
+    def test_another_runs_container_is_left_alone_by_abandon(self):
+        self.stop_while_waiting()
+        run_id = self.run_dir.name
+        state = self.f.docker_state / "containers.json"
+        data = json.loads(state.read_text())
+        data["cfg-owner-900"]["labels"]["run_id"] = "epic-900-newer"
+        state.write_text(json.dumps(data))
+        rc, out, _ = self.f.cli("abandon", run_id, "--reason", "test")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("cfg-owner-900", json.loads(state.read_text()))
 
     def test_a_supervisor_killed_inside_a_turn_runs_the_turn_again(self):
         self.f.plan({"owner": [

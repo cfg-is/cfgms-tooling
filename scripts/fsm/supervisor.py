@@ -1356,11 +1356,14 @@ def cmd_abandon(run_id, reason, out=None):
         if params.get("mode") == EPIC_MODE and params.get("epic"):
             # the owner container outlives its supervisor: an abandoned run
             # must not leave one that the next run of the epic would find
-            docker = adapters.DockerCLI()
             name = f"cfg-owner-{int(params['epic'])}"
-            if docker.label(name, "run_id") == run_id:
-                docker.rm_force(name)
-                run.append("note", owner_container_removed=name)
+            try:
+                docker = adapters.DockerCLI()
+                if docker.label(name, "run_id") == run_id:
+                    docker.rm_force(name)
+                    run.append("note", owner_container_removed=name)
+            except Exception as exc:      # no runtime, a timeout: the abandon still ends
+                run.append("note", warning=f"{name} not removed: {type(exc).__name__}")
         run.append("terminal_done", state="ABANDONED")
         drop_run_cache(run)
         print(f"FSM_ABANDONED:{run_id}:{reason}:lease={lease}", file=out, flush=True)
