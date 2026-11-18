@@ -49,6 +49,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -558,6 +559,10 @@ class EpicSupervisor(sup.Supervisor):
         if s is not None and s.state in (S.SNAPSHOT, S.SYNC, S.PUBLISH):
             self.answer(req, False, reason=f"slice {n} is in {s.state}. Submit again in a moment.")
             return "refused"
+        if s is not None and s.state == S.REJECTED and s.reason == "branch_moved":
+            self.answer(req, False, reason=f"the branch of slice {n} on GitHub is not what the "
+                                           f"supervisor pushed. Use another slice number.")
+            return "refused"
         if not self.try_fetch_develop():
             self.answer(req, False, reason="the supervisor cannot reach GitHub now. Submit again "
                                            "in a few minutes.")
@@ -904,6 +909,8 @@ class EpicSupervisor(sup.Supervisor):
             # since the last look
             try:
                 self.poll_slice(s)
+            except sup.Interrupted:
+                raise
             except Exception as exc:
                 if self.net_failed(n, exc, "pull request state"):
                     return
@@ -970,10 +977,17 @@ class EpicSupervisor(sup.Supervisor):
             pub.push(sha, head)
             number, url = pub.pr(title, body_file, round_body_file=round_file)
             pub.landed(sha, number, tree)
-        except (publish.PublishError, gitops.GitError, RuntimeError) as exc:
+        except sup.Interrupted:
+            raise
+        except (publish.PublishError, gitops.GitError, RuntimeError, subprocess.TimeoutExpired) as exc:
             self.run.append("note", publish_error=str(exc)[:500], slice=n)
             step = getattr(exc, "step", "network")
             if step == "push" and "remote head moved" in str(exc):
+                self.branch_moved(n, branch)
+                return
+            if step == "landed" and self.pushed_commit_is_not_the_head(n, rnd, branch):
+                # someone pushed between the supervisor's push and its check:
+                # a moved branch, not an outage
                 self.branch_moved(n, branch)
                 return
             # A push, a GitHub call or the landed check that failed: GitHub
@@ -997,22 +1011,56 @@ class EpicSupervisor(sup.Supervisor):
         with nobody working on it; the owner delivers the change under
         another slice number."""
         s = self.book.get(n)
+        if s is not None and s.pr:
+            # a pull request that merged and whose branch GitHub then removed
+            # looks the same from the push: ask first
+            try:
+                self.poll_slice(s)
+            except sup.Interrupted:
+                raise
+            except Exception:
+                pass
+            if s.state != S.PUBLISH:
+                return
         self.write_rejected(n, "The branch on GitHub is not what the supervisor pushed", [
             f"`{branch}` exists on GitHub with content the supervisor did not push, or it was "
             "replaced or removed. This round was not published.", "",
             "Deliver the change under another slice number."])
         self.stake(n, "branch_moved")
-        if s is not None and s.pr:
-            try:
+        self.close_moved(s)
+
+    def close_moved(self, s):
+        """Close the pull request of a slice that ended in
+        REJECTED(branch_moved). Called again at every look at the pull request
+        until it is closed: a pull request left open would keep the slice, and
+        with it done.md, open for ever. The comment is posted once, after the
+        close worked."""
+        if s is None or not s.pr or s.state != S.REJECTED or s.reason != "branch_moved":
+            return
+        n = s.number
+        try:
+            self.svc.gh.close_pr(s.pr)
+            marker = f"<!-- cfgms-fsm-branch-moved:{self.run.run_id}.s{n} -->"
+            if not any(marker in b for b in self.svc.gh.pr_comment_bodies(s.pr)):
                 self.svc.gh.comment(s.pr, self.wtext(
                     f"slice-{n}-branch-moved.md",
-                    f"The supervisor of FSM run `{self.run.run_id}` cannot add a round to this "
-                    f"branch: it holds commits the supervisor did not push. The change will come "
-                    f"in a new pull request. This one is closed.\n"))
-                self.svc.gh.close_pr(s.pr)
-            except Exception as exc:
-                self.run.append("note", warning=f"slice {n}: pull request #{s.pr} not closed: "
-                                                f"{type(exc).__name__}: {str(exc)[:200]}")
+                    f"{marker}\nThe supervisor of FSM run `{self.run.run_id}` closed this pull "
+                    f"request: its branch holds commits the supervisor did not push, so it cannot "
+                    f"add a round to it. The change will come in a new pull request.\n"))
+        except sup.Interrupted:
+            raise
+        except Exception as exc:
+            self.note_once(("close_moved", n, type(exc).__name__),
+                           warning=f"slice {n}: pull request #{s.pr} not closed yet: "
+                                   f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    def pushed_commit_is_not_the_head(self, n, rnd, branch):
+        done = self.run.publish_steps(f"s{n}r{rnd}").get("commit")
+        try:
+            current = self.remote.ls_remote(f"refs/heads/{branch}")
+        except gitops.GitError:
+            return False
+        return bool(done) and current != done["sha"]
 
     # --- 4. published slices --------------------------------------------------------------
     def poll_landing(self):
@@ -1041,6 +1089,8 @@ class EpicSupervisor(sup.Supervisor):
             self.stake(s.number, "merged", info={"merge_commit": st["merge_commit"], "pr": s.pr})
         elif st["state"] == "CLOSED":
             self.stake(s.number, "closed", info={"pr": s.pr})
+        else:
+            self.close_moved(s)
 
     # --- 5. the owner ---------------------------------------------------------------------
     def read_claim_file(self, name):

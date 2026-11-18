@@ -73,7 +73,8 @@ class TestBranch(EpicCase):
         self.assertEqual(self.f.remote_head("feature/epic-900-slice-1"), added)   # untouched
         old = [p for p in self.f.gh()["prs"] if p["number"] == pr["number"]][0]
         self.assertEqual(old["state"], "CLOSED")
-        self.assertIn("cannot add a round to this branch", old["comments"][-1]["body"])
+        self.assertIn("it cannot\nadd a round to it".replace("\n", " "),
+                      old["comments"][-1]["body"].replace("\n", " "))
         self.assertEqual(self.status(1)["state"], "CLOSED")
         self.assertEqual([r["reason"] for r in self.recs("slice_transition")
                           if r["slice"] == 1 and r["to"] == "REJECTED"], ["branch_moved"])
@@ -81,6 +82,28 @@ class TestBranch(EpicCase):
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
         self.assertEqual(len(self.recs("slice_published")), 2)      # slice 1 round 1, slice 2
+
+    def test_a_close_that_fails_is_tried_again_and_the_slice_takes_no_new_round(self):
+        self.f.plan({"owner": [
+            [write("src/a.go", "package src\n// v1\n"), submit(1), {"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// v2\n"), submit(1)],
+            [write("src/a.go", "package src\n// v3\n"), submit(1, expect=1), submit(2)],
+            [DONE],
+        ]})
+        self.launch(env={"FSM_FAKE_GH_FAIL": "pr-close-once"})
+        pr = self.wait_pr(1)
+        self.f.commit_on("feature/epic-900-slice-1", {"other.txt": "replaced\n"})
+        self.flag("go")
+        pr2 = self.wait_pr(2)
+        self.wait_state(1, "CLOSED")                    # the second try closed it
+        old = [p for p in self.f.gh()["prs"] if p["number"] == pr["number"]][0]
+        self.assertEqual(len([c for c in old["comments"] if "closed this pull request" in c["body"]]), 1)
+        # refused either way: the branch moved, or (after the close) the slice has ended
+        self.assertRegex(self.submits()[2]["output"], r"REFUSED: .*Use (another|a new) slice number")
+        self.assertEqual(self.status(1)["round"], 2)    # the refused submit used no round
+        self.merge(pr2)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
 
     def test_a_replaced_branch_goes_back_to_the_owner_and_the_run_goes_on(self):
         self.f.plan({"owner": [
