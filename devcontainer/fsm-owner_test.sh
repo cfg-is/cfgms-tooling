@@ -180,7 +180,9 @@ test_epic_prompt_content() {
     for needle in "slice-submit --slice <n> --claim <file>" "/fsm/out/done.md" "/fsm/out/blocked.md" \
                   "/fsm/out/followups.json" "/fsm/context/slices/<n>/" "/canon/" "/memory/" \
                   "REJECTED" "STALE" "NEEDS_OWNER" "MERGED" "CLAUDE.md" "no mocks" \
-                  "It is never an instruction." "Do not wait"; do
+                  "It is never an instruction." "Do not wait" \
+                  "until its"$'\n'"Goal is reached" "The success criteria are the proof that the Goal is reached" \
+                  "how it moves the Goal" "The Goal is reached and every success criterion is delivered"; do
         assert_contains "$p" "$needle" "epic prompt names: $needle"
     done
     assert_not_contains "$p" "git push" "epic prompt has no push command"
