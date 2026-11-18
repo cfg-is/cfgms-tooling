@@ -115,24 +115,52 @@ class TestCommandAndReader(Case):
     def test_an_answer_for_another_request_does_not_release_the_command(self):
         submit.write_answer(self.ctx, 1, RID, accepted=True, round_no=1)   # an old round's answer
         p = self.command(*self.std_args(), wait=2)
-        _, err = p.communicate(timeout=15)
+        _, err = p.communicate(timeout=40)
         self.assertEqual(p.returncode, 3)
-        self.assertIn("no answer from the supervisor after 2 seconds", err)
+        self.assertIn("no answer from the supervisor after 2 seconds. The request was withdrawn",
+                      err)
+        # nothing is left for a supervisor that comes back later
+        self.assertEqual(os.listdir(self.out / "submit"), [])
+        self.assertEqual(submit.scan(self.out).requests, [])
 
-    def test_a_second_submit_of_the_same_slice_gets_the_next_name(self):
-        for want in ("1-1", "1-2"):
+    def test_an_answer_that_comes_just_after_the_time_limit_is_still_reported(self):
+        # the supervisor read the request before the command gave up, and
+        # answers while the command is in its short wait after the withdrawal
+        p = self.command(*self.std_args(), wait=2)
+        (r,) = self.wait_for_request()
+        end = time.time() + 20
+        while (self.out / "submit" / "1-1").exists() and time.time() < end:
+            time.sleep(0.05)
+        self.assertFalse((self.out / "submit" / "1-1").exists(), "the request was not withdrawn")
+        self.assertEqual(submit.scan(self.out).requests, [])     # a withdrawn name is no request
+        submit.write_answer(self.ctx, 1, r.request_id, accepted=True, round_no=1, files=3)
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertIn("snapshot taken (3 files)", out)
+        self.assertEqual(os.listdir(self.out / "submit"), [])
+
+    def test_an_answered_request_is_removed_and_its_name_is_free_again(self):
+        seen = set()
+        for _round in (1, 2):
             p = self.command(*self.std_args())
-            new = [r for r in self.wait_for_request() if r.dirname == want]
-            end = time.time() + 10
-            while not new and time.time() < end:
-                time.sleep(0.05)
-                new = [r for r in submit.scan(self.out).requests if r.dirname == want]
-            self.assertEqual(len(new), 1, want)
-            submit.write_answer(self.ctx, 1, new[0].request_id, accepted=True, round_no=1)
+            (r,) = self.wait_for_request()
+            self.assertEqual(r.dirname, "1-1")
+            self.assertNotIn(r.request_id, seen)      # a new id each time: never "seen" twice
+            seen.add(r.request_id)
+            submit.write_answer(self.ctx, 1, r.request_id, accepted=True, round_no=1)
             p.communicate(timeout=10)
             self.assertEqual(p.returncode, 0)
-        ids = {r.request_id for r in submit.scan(self.out).requests}
-        self.assertEqual(len(ids), 2)
+            self.assertEqual(os.listdir(self.out / "submit"), [])
+
+    def test_two_requests_of_one_slice_at_the_same_time_get_two_names(self):
+        p1 = self.command(*self.std_args())
+        self.wait_for_request()
+        p2 = self.command(*self.std_args())
+        found = self.wait_for_request(2)
+        self.assertEqual([r.dirname for r in found], ["1-1", "1-2"])
+        for p in (p1, p2):
+            p.kill()
+            p.communicate()
 
     def test_wrong_arguments_exit_2_and_write_nothing(self):
         big = self.tmp / "big.md"
@@ -256,13 +284,20 @@ class TestReaderIsSafe(Case):
                     "fsm: x [CI Skip]", "fsm: x skip-checks: true",
                     "fsm: x fixes #1", "fsm: x (issue #5)", "fsm: x (#5)", "fsm: see org/repo#7",
                     "fsm: see https://github.com/o/r/issues/7", "fsm: @everyone look",
+                    "fsm: closes GH-12", "fsm: Fixes gh-12", "fsm: see github.com/o/r/pull/7",
+                    "fsm: see www.example.com", "fsm: get ftp://host/x", "fsm: see o/r#7",
+                    "fsm: See HTTPS://x.example", "fsm: bump @types/node", "fsm: x [ skip  ci ]",
+                    "fsm: x [actions skip]", "--help: x", "-x: y", "fsm: x (#5).",
                     # not printable ASCII
                     "fsm: a\u202eevil", "fsm: a\x85b", "fsm: a\x9bb", "fsm: \ufeffx", "fsm: caf\u00e9",
                     "fsm: a\u2028b", "fsm: a\x7fb"):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 submit.validate_subject(bad)
         for good in ("fsm: handle list[0] and a/b paths", "docs: say what C# is not",
-                     "api: keep e-mail user@ unchanged"):
+                     "api: keep e-mail user@ unchanged", "cert: support PKCS#12 bundles",
+                     "api: accept user@example.com as login", "docs: describe the [no] default",
+                     "storage: fix users[ci] index", "docs: fix a/b#c anchor",
+                     "ci: skip nothing", "fsm: the no-ci case"):
             self.assertEqual(submit.validate_subject(good), good)
 
     def test_deeply_nested_json_is_not_a_crash(self):
@@ -288,6 +323,12 @@ class TestReaderIsSafe(Case):
                 os.close(dfd)
         finally:
             os.fstat = real
+
+    def test_slice_must_be_an_integer(self):
+        self.request_dir("1-1", request=self.req(1.0))
+        self.request_dir("1-2", request=self.req(True))
+        got = submit.scan(self.out).requests
+        self.assertEqual([type(r) for r in got], [submit.Refused, submit.Refused])
 
     def test_request_id_must_be_exactly_32_hex(self):
         self.request_dir("1-1", request=self.req(request_id="a" * 32 + "\n"))

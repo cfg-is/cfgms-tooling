@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -34,6 +35,7 @@ CONTEXT = os.environ.get("CFGMS_FSM_CONTEXT") or "/fsm/context"
 CLAIM_CAP = 64 * 1024
 SUBJECT_MAX_CHARS = 150
 DEFAULT_WAIT_SECS = 900
+WITHDRAW_GRACE_SECS = 10
 
 
 def fail(code, text):
@@ -60,7 +62,7 @@ def main(argv=None):
     if not re.fullmatch(r"[0-9a-f]{40}", args.base):
         fail(2, "--base must be a full 40-character commit id (git rev-parse origin/develop)")
     subject = args.subject.strip()
-    if "\n" in subject or not re.fullmatch(r"[a-z0-9/_.-]+: \S.*", subject):
+    if "\n" in subject or not re.fullmatch(r"[a-z0-9][a-z0-9/_.-]*: \S.*", subject):
         fail(2, '--subject must be one line of the form "<scope>: <what changed>"')
     if any(not 32 <= ord(c) < 127 for c in subject):
         fail(2, "--subject must be printable ASCII text")
@@ -108,22 +110,35 @@ def main(argv=None):
     print(f"slice-submit: request {os.path.basename(final)} written; "
           f"waiting for the supervisor to copy /workspace ...", flush=True)
     answer_file = os.path.join(CONTEXT, "slices", str(args.slice), "submitted.json")
-    deadline = time.monotonic() + max(1, args.wait)
-    while time.monotonic() < deadline:
+
+    def answered():
+        """0 or 1 when the supervisor answered this request, else None."""
         try:
             with open(answer_file, encoding="utf-8") as fh:
                 answer = json.load(fh)
         except (OSError, ValueError):
-            answer = None
-        if isinstance(answer, dict) and answer.get("request_id") == request_id:
-            if answer.get("accepted"):
-                print(f"slice-submit: slice {args.slice} round {answer.get('round')}: snapshot "
-                      f"taken ({answer.get('files')} files). You may change /workspace again. "
-                      f"The validator result comes later in {os.path.dirname(answer_file)}/.")
-                return 0
-            print(f"slice-submit: slice {args.slice}: REFUSED: {answer.get('reason')}",
-                  file=sys.stderr)
-            return 1
+            return None
+        if not isinstance(answer, dict) or answer.get("request_id") != request_id:
+            return None
+        if answer.get("accepted"):
+            print(f"slice-submit: slice {args.slice} round {answer.get('round')}: snapshot "
+                  f"taken ({answer.get('files')} files). You may change /workspace again. "
+                  f"The validator result comes later in {os.path.dirname(answer_file)}/.")
+            return 0
+        print(f"slice-submit: slice {args.slice}: REFUSED: {answer.get('reason')}",
+              file=sys.stderr)
+        return 1
+
+    def remove(path):
+        # handled requests must not pile up: the supervisor reads at most 512 entries
+        shutil.rmtree(path, ignore_errors=True)
+
+    deadline = time.monotonic() + max(1, args.wait)
+    while time.monotonic() < deadline:
+        code = answered()
+        if code is not None:
+            remove(final)
+            return code
         time.sleep(1)
     # Withdraw the request: a supervisor that comes back later must not take a
     # snapshot of a workspace that has moved on.
@@ -132,7 +147,20 @@ def main(argv=None):
         os.rename(final, withdrawn)
         state = "The request was withdrawn"
     except OSError:
+        withdrawn = None
         state = f"The request could not be withdrawn and stays in {final}"
+    # The supervisor may have read the request a moment before the rename and
+    # be at work on the snapshot. It checks for the directory again when the
+    # snapshot is done; give its answer a short time to come.
+    for _ in range(WITHDRAW_GRACE_SECS):
+        code = answered()
+        if code is not None:
+            break
+        time.sleep(1)
+    if withdrawn:
+        remove(withdrawn)
+    if code is not None:
+        return code
     fail(3, f"no answer from the supervisor after {args.wait} seconds. {state}. Read "
             f"{os.path.dirname(answer_file)}/status.json before you submit this slice again.")
 

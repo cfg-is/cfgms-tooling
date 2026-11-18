@@ -230,7 +230,7 @@ def assert_owner_argv(argv, canon_dir, memory_dir):
             entry = val
     if entry != OWNER_ENTRYPOINT:
         stop("the entrypoint is not the owner entrypoint")
-    if argv[last].startswith("-"):
+    if not argv[last] or argv[last].startswith("-"):
         stop("no image")
 
     known = {"/workspace", agent_session.CONTEXT_MOUNT, agent_session.OUT_MOUNT,
@@ -260,12 +260,22 @@ def assert_owner_argv(argv, canon_dir, memory_dir):
         for private, own in ((canon, CANON_MOUNT), (memory, MEMORY_MOUNT)):
             if t != own and (_inside(src, private) or _inside(private, src)):
                 stop(f"canon or memory also reaches the container at {t}")
+    # What the supervisor tells the owner must not come from a place the
+    # owner writes: the context directory holds owner.json and the turns.
+    ctx = host.get(agent_session.CONTEXT_MOUNT, "")
+    for writable in ("/workspace", agent_session.OUT_MOUNT, agent_session.SESSIONS_MOUNT,
+                     MEMORY_MOUNT):
+        w = host.get(writable)
+        if w and (_inside(ctx, w) or _inside(w, ctx)):
+            stop(f"the context directory and {writable} hold one another")
     for e in envs:
         name, sep, _value = e.partition("=")
         if name not in _ENV_NAMES:
             stop(f"environment name {name!r} is not allowed")
-        if not sep and name != "CLAUDE_CODE_OAUTH_TOKEN":
-            stop(f"environment name {name!r} is passed from the host")
+        if (name == "CLAUDE_CODE_OAUTH_TOKEN") == bool(sep):
+            # the token by name only, never its value in an argv; every other
+            # name with the value this module gives it
+            stop(f"environment entry {name!r} has the wrong form")
 
 
 def start(docker, argv, name, env_extra, *, canon_dir, memory_dir, gh_token=None,

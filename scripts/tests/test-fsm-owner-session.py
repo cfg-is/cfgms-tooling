@@ -126,6 +126,16 @@ class TestArgv(unittest.TestCase):
             [x for x in argv() if x != f"{M}:/memory"],                      # memory missing
             [x.replace("cfgms-go-mod-cache:", "/var/run:") for x in argv()], # a host path as the cache
             argv()[:-1],                                                     # no image
+            argv()[:-1] + [""],
+            argv()[:-1] + ["--privileged"],                                  # an option as the image
+            plus("-v", "/r/context:/fsm/context:ro"),                        # a target twice
+            plus("-e", "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-value"),              # the token value in an argv
+            argv(context_dir="/r/A/ctx"),                                    # context inside the workspace
+            argv(context_dir="/r/out"),                                      # context is the out directory
+            argv(out_dir="/r/context/out"),                                  # out inside the context
+            argv(memory_dir="/h/cfgms-memory-2"),                            # another directory at /memory
+            [x.replace("cfgms-go-build-cache:", "relative/path:") for x in argv()],
+            plus("-v", f"{C}/decisions:{agent_session.METRICS_MOUNT}:ro"),   # a part of canon, known target
             plus("-v", f"/h/./cfgms-canon:{agent_session.METRICS_MOUNT}:ro"),  # canon, other spelling
         ]
         for i, a in enumerate(bad):
@@ -397,6 +407,19 @@ class TestDockerExec(FilesCase):
         self.assertEqual((code, len(out)), (0, 100000))
         self.assertTrue(out.endswith("END\n"))
         self.assertLess(peak, 8 * 1024 * 1024)
+
+    def test_memory_does_not_grow_with_many_small_writes(self):
+        import tracemalloc
+        d = self.stub("yes ab | head -c 6000000\n")
+        tracemalloc.start()
+        try:
+            code, out = d.exec("c", ["x"], max_output=100000)
+            _now, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((code, len(out)), (0, 100000))
+        self.assertLess(peak, 4 * 1024 * 1024)
+        self.assertEqual(d.exec("c", ["x"], max_output=0)[0], 0)      # no hang on a zero cap
 
     def test_timeout_does_not_wait_for_a_process_that_keeps_the_pipe(self):
         import time

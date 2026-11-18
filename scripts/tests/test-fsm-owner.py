@@ -258,6 +258,62 @@ class TestEpicRun(RunCase):
         log.end_turn(ok=True, progress=False)
         self.assertNotEqual(O.next_step(log.facts(book, done=True, blocked=False)).step, O.REPORT)
 
+    def test_report_comes_before_the_failed_turns_rule(self):
+        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
+        f = self.log.facts(self.book, done=True, blocked=False)
+        import dataclasses
+        f = dataclasses.replace(f, turns=3, failed_turns=O.TURN_FAILURE_LIMIT, pending=0)
+        self.assertEqual(O.next_step(f).step, O.REPORT)
+        f = dataclasses.replace(f, done=False)
+        self.assertEqual(O.next_step(f), O.Step(O.FAILED, reason="owner_turn_failed"))
+
+    def test_done_cannot_be_claimed_for_ever_by_failing_the_refusal_turn(self):
+        # done.md with nothing acceptable; the owner makes every refusal turn fail
+        self.log.begin_turn(O.START)
+        self.log.end_turn(ok=True, progress=False)
+        self.done = True
+        kinds = []
+        for _ in range(30):
+            st = self.step()
+            if st.step != O.TURN:
+                break
+            kinds.append(st.kind)
+            self.log.begin_turn(st.kind)
+            self.log.end_turn(ok=st.kind != O.DONE_REFUSED, progress=False,
+                              timed_out=st.kind == O.DONE_REFUSED)
+        self.assertEqual(st.step, O.FAILED)
+        self.assertEqual(kinds.count(O.DONE_REFUSED), 1)
+        self.assertLessEqual(len(kinds), 4)
+
+    def test_given_up_is_only_rejected_or_stale_without_a_pull_request(self):
+        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
+        self.take(2, "submitted", "ok", "pass", "up_to_date", "pass", "published", "checks_failed")
+        self.assertFalse(O.given_up(self.book.get(2)))                 # NEEDS_OWNER has a pull request
+        self.done = True
+        self.assertNotEqual(self.step().step, O.REPORT)
+        self.take(2, "merged")
+        self.take(3, "submitted", "ok", "pass", "up_to_date", "pass", "published")
+        self.take(4, "submitted", "ok", "pass", builds_on=3)
+        self.take(3, "submitted", "ok")                                # 4 is STALE, no pull request
+        self.assertEqual(self.book.get(4).state, S.STALE)
+        self.assertTrue(O.given_up(self.book.get(4)))
+        self.take(3, "pass", "up_to_date", "pass", "published", "merged")
+        self.assertEqual(self.step().step, O.REPORT)
+
+    def test_a_slice_that_waits_for_a_parent_that_waits_for_the_owner_is_not_in_flight(self):
+        self.take(1, "submitted", "ok")
+        self.take(2, "submitted", "ok", "pass", builds_on=1)           # WAIT_PARENT on 1
+        self.take(3, "submitted", "ok", "pass", builds_on=2)           # WAIT_PARENT on 2
+        self.log.begin_turn(O.START)
+        self.log.end_turn(ok=True, progress=True)
+        self.assertEqual(self.step().step, O.WAIT)                     # 1 is being validated
+        self.take(1, "fail")                                           # 1 waits for the owner
+        self.assertEqual(self.turn(O.EVENTS)[1][0][:25], "slice 1 round 1: REJECTED")
+        # nothing will happen by itself: the owner is asked, the run does not wait for ever
+        self.assertEqual((self.step().step, self.step().kind), (O.TURN, O.NUDGE))
+        self.done = True
+        self.assertNotEqual(self.step().step, O.REPORT)
+
     def test_blocked_ends_the_run(self):
         self.turn(O.START)
         self.blocked = True

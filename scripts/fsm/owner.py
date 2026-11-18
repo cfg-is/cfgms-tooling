@@ -162,6 +162,18 @@ def given_up(s):
     return s.state in (S.REJECTED, S.STALE) and not s.ctx.published
 
 
+def waits_for_owner(book, s):
+    """A slice in WAIT_PARENT whose parent, or a parent further up, waits for
+    the owner: it moves only when the owner submits something."""
+    seen = set()
+    while s is not None and s.state == S.WAIT_PARENT and s.number not in seen:
+        seen.add(s.number)
+        s = book.get(s.ctx.builds_on) if s.ctx.builds_on else None
+        if s is not None and s.state in S.OWNER_TURN:
+            return True
+    return False
+
+
 def _is_sha(text):
     return isinstance(text, str) and len(text) == 40 and all(c in "0123456789abcdef" for c in text)
 
@@ -250,10 +262,12 @@ class OwnerLog:
         if ok:
             self.delivered = max(self.delivered, upto)
             self.failed_turns = 0
-            if kind == DONE_REFUSED:
-                self.done_refused = True
         else:
             self.failed_turns += 1
+        # done.md was refused once, whether that turn ended or failed: an
+        # owner that makes the refusal turn fail must not get it again.
+        if kind == DONE_REFUSED:
+            self.done_refused = True
         # A nudge turn without progress counts whether it ended, failed or
         # timed out: an owner that lets every nudge run into the time limit
         # must not get a new nudge each time.
@@ -338,9 +352,13 @@ class OwnerLog:
         may give it up (for example, deliver the change in another slice). It
         has no way to an end state other than a new round, so counting it
         would make done.md impossible to accept.
+
+        A slice in WAIT_PARENT whose parent waits for the owner is counted as
+        waiting for the owner too (as STALE): nothing will happen to it by
+        itself, so it is not "in flight".
         """
-        states = tuple(s.state for s in book.slices.values()
-                       if s.state != S.NEW and not given_up(s))
+        states = tuple(waits_for_owner(book, s) and S.STALE or s.state
+                       for s in book.slices.values() if s.state != S.NEW and not given_up(s))
         failed = next((s.reason for s in book.slices.values() if s.state == S.FAILED), "")
         return Facts(turns=self.turns, pending=len(self.events) - self.delivered,
                      states=states, failed_reason=failed, done=done, blocked=blocked,

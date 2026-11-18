@@ -41,7 +41,7 @@ fi
 
 # --- 2. Firewall as root, then a one-way drop to `agent` --------------------
 if [[ "$(id -u)" -eq 0 ]]; then
-    rm -f "$FSO_READY_FILE"
+    rm -rf "$FSO_READY_FILE"
     # The turn lock: owned by root, read-only for `agent`. A turn takes the
     # lock on a read-only descriptor; the owner cannot put a pipe in its place.
     rm -rf "$FSO_RUN_DIR"

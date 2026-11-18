@@ -57,13 +57,20 @@ _DIR_RE = re.compile(r"^([1-9][0-9]{0,2})-([1-9][0-9]{0,3})$")
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 #: "<scope>: <what changed>". The supervisor adds the issue reference.
-_SUBJECT_RE = re.compile(r"^[a-z0-9/_.-]+: \S.*$")
+_SUBJECT_RE = re.compile(r"^[a-z0-9][a-z0-9/_.-]*: \S.*$")
 #: The subject becomes a commit subject and a pull request title on GitHub,
 #: where some text acts: a reference links or closes an issue, a mention
 #: notifies a person, a skip marker switches the checks off.
-_REFERENCE_RE = re.compile(r"#[0-9]|[A-Za-z0-9]/[A-Za-z0-9_.-]+#|https?://", re.I)
-_MENTION_RE = re.compile(r"@[A-Za-z0-9]")
-_SKIP_RE = re.compile(r"\[[^\]]*\b(?:skip|no)\b[^\]]*\]|\bskip-checks\b|\[[^\]]*\bci\b[^\]]*\]", re.I)
+#: `#12` and `GH-12` at the start of a word, `owner/repo#12`, a link. (`PKCS#12`
+#: is not a reference: GitHub links `#` only at the start of a word.)
+_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9])#[0-9]|(?<![A-Za-z0-9])GH-[0-9]|[A-Za-z0-9]/[A-Za-z0-9_.-]+#[0-9]"
+    r"|[a-z][a-z0-9+.-]*://|\bwww\.|\bgithub\.com/", re.I)
+#: `@name` at the start of a word (`user@example.com` is not a mention).
+_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])@[A-Za-z0-9]")
+#: The markers that make GitHub skip the workflows of a push.
+_SKIP_RE = re.compile(r"\[\s*(?:skip\s+ci|ci\s+skip|no\s+ci|skip\s+actions|actions\s+skip)\s*\]"
+                      r"|\bskip-checks\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -149,8 +156,8 @@ def validate_subject(text):
     if _MENTION_RE.search(line):
         raise ValueError("the subject must not mention an account (@name)")
     if _SKIP_RE.search(line):
-        raise ValueError("the subject must not have a marker in square brackets that "
-                         "names skip, no or ci")
+        raise ValueError("the subject must not have a marker that skips the checks "
+                         "([skip ci] and the like)")
     return line
 
 
@@ -172,7 +179,7 @@ def _parse(dirname, slice_no, dfd):
     def refuse(reason):
         return Refused(dirname, slice_no, rid, reason), None
 
-    if req.get("slice") != slice_no or isinstance(req.get("slice"), bool):
+    if type(req.get("slice")) is not int or req.get("slice") != slice_no:
         return refuse("request.json names a different slice than its directory")
     base = req.get("base")
     if not isinstance(base, str) or not _SHA_RE.fullmatch(base):

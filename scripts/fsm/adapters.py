@@ -14,7 +14,6 @@ through `-e VAR` pass-through. `GhCLI` passes the supervisor's token to `gh`
 via the environment of that one call only.
 """
 
-import collections
 import json
 import os
 import subprocess
@@ -101,18 +100,17 @@ class DockerCLI:
         argv += [name] + list(cmd)
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, env=scrubbed_env())
-        tail = collections.deque()
-        size = [0]
+        max_output = max(1, int(max_output))
+        tail = bytearray()
 
         def pump():
             while True:
                 chunk = proc.stdout.read1(65536)
                 if not chunk:
                     return
-                tail.append(chunk)
-                size[0] += len(chunk)
-                while size[0] - len(tail[0]) >= max_output:
-                    size[0] -= len(tail.popleft())
+                tail.extend(chunk)
+                if len(tail) > 2 * max_output + 65536:
+                    del tail[:len(tail) - max_output]
 
         reader = threading.Thread(target=pump, name="docker-exec-output", daemon=True)
         reader.start()
@@ -124,7 +122,7 @@ class DockerCLI:
             code = None
         # A process left behind can hold the pipe open: do not wait for it.
         reader.join(5 if code is None else 30)
-        return code, b"".join(list(tail))[-max_output:].decode("utf-8", "replace")
+        return code, bytes(tail[-max_output:]).decode("utf-8", "replace")
 
     def kill(self, name):
         self._run(["kill", name], timeout=60)
