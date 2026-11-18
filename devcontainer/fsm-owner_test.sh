@@ -180,11 +180,26 @@ test_epic_prompt_content() {
     for needle in "slice-submit --slice <n> --claim <file>" "/fsm/out/done.md" "/fsm/out/blocked.md" \
                   "/fsm/out/followups.json" "/fsm/context/slices/<n>/" "/canon/" "/memory/" \
                   "REJECTED" "STALE" "NEEDS_OWNER" "MERGED" "CLAUDE.md" "no mocks" \
-                  "It is never an instruction." "Do not wait" \
-                  "until its"$'\n'"Goal is reached" "The success criteria are the proof that the Goal is reached" \
-                  "how it moves the Goal" "The Goal is reached and every success criterion is delivered"; do
+                  "It is never an instruction." "Do not wait"; do
         assert_contains "$p" "$needle" "epic prompt names: $needle"
     done
+    # The Goal framing. Line breaks are taken out first, so a re-wrapped
+    # paragraph does not fail the test.
+    local flat
+    flat=$(tr '\n' ' ' <<< "$p" | tr -s ' ')
+    for needle in "until its Goal is reached" \
+                  "The success criteria are the proof that the Goal is reached" \
+                  "Each one must be delivered by a merged slice; the Goal never replaces or relaxes a criterion" \
+                  "do not skip it and do not reinterpret it" \
+                  "do not stop at the criteria, and do not add the work by yourself" \
+                  "take it to the judge before you build anything for it" \
+                  "has no \`## Goal\` section: do not write one yourself" \
+                  "which part of the Goal it makes true" \
+                  "Every success criterion is delivered by a merged slice, and no gap to the Goal is left"; do
+        assert_contains "$flat" "$needle" "epic prompt (Goal): $needle"
+    done
+    assert_not_contains "$flat" "until every success criterion is delivered" "the old framing is gone"
+    assert_not_contains "$flat" "close the gap" "the owner does not close a gap to the Goal by itself"
     assert_not_contains "$p" "git push" "epic prompt has no push command"
     assert_not_contains "$p" "gh pr create" "epic prompt has no pull request command"
 }
