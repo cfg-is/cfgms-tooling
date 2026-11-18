@@ -62,6 +62,14 @@ class TestSignal(unittest.TestCase):
         for other in ("MERGEABLE", "UNKNOWN", ""):
             self.assertEqual(sig(view(mergeable=other)), "")
 
+    def test_a_conflict_is_gone_only_when_github_says_mergeable(self):
+        self.assertTrue(L.gone(view(mergeable="MERGEABLE"), L.CONFLICTING))
+        for other in ("UNKNOWN", "", "CONFLICTING"):
+            self.assertFalse(L.gone(view(mergeable=other), L.CONFLICTING), other)
+        self.assertFalse(L.gone(None, L.CONFLICTING))
+        for reason in (L.CHECKS_FAILED, L.REVIEW_FINDINGS, L.QUEUE_KICKED):
+            self.assertTrue(L.gone(view(mergeable="UNKNOWN"), reason))
+
     def test_checks_failed(self):
         self.assertEqual(sig(view(rollup="FAILURE")), L.CHECKS_FAILED)
         self.assertEqual(sig(view(rollup="ERROR")), L.CHECKS_FAILED)
@@ -131,6 +139,36 @@ class TestSignal(unittest.TestCase):
         self.assertEqual(L.parse_time("2026-11-18T12:00:00"), L.parse_time(PUSHED))   # no zone: UTC
         for bad in (None, 5, "", "soon"):
             self.assertIsNone(L.parse_time(bad))
+
+
+class TestTrust(unittest.TestCase):
+    def test_a_failed_permission_lookup_is_asked_again(self):
+        import epic
+
+        class Gh:
+            answers = ["", "", "admin", "read"]
+            asked = []
+
+            def permission(self, login):
+                self.asked.append(login)
+                return self.answers.pop(0)
+
+        class Svc:
+            gh = Gh()
+
+        class Stub:
+            trusted_login = epic.EpicSupervisor.trusted_login
+            svc, _trusted = Svc(), {}
+
+        s = Stub()
+        self.assertFalse(s.trusted_login(""))                 # a deleted account
+        self.assertFalse(s.trusted_login("reviewer"))         # the lookup failed
+        self.assertFalse(s.trusted_login("reviewer"))         # ... again
+        self.assertTrue(s.trusted_login("reviewer"))          # GitHub answered
+        self.assertTrue(s.trusted_login("reviewer"))          # remembered
+        self.assertFalse(s.trusted_login("stranger"))         # "read" is an answer: remembered
+        self.assertFalse(s.trusted_login("stranger"))
+        self.assertEqual(Svc.gh.asked, ["reviewer", "reviewer", "reviewer", "stranger"])
 
 
 class TestPrSignals(unittest.TestCase):

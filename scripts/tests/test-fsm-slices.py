@@ -110,6 +110,10 @@ EXPECTED = {
     ("LANDING", "closed"): [("always", "CLOSED", "", "")],
 
     ("NEEDS_OWNER", "cleared"): [("always", "LANDING", "", "")],
+    ("NEEDS_OWNER", "checks_failed"): [("wake_left", "NEEDS_OWNER", "checks_failed", "wake")],
+    ("NEEDS_OWNER", "review_findings"): [("wake_left", "NEEDS_OWNER", "review_findings", "wake")],
+    ("NEEDS_OWNER", "queue_kicked"): [("wake_left", "NEEDS_OWNER", "queue_kicked", "wake")],
+    ("NEEDS_OWNER", "conflicting"): [("wake_left", "NEEDS_OWNER", "conflicting", "wake")],
     ("NEEDS_OWNER", "merged"): [("always", "MERGED", "", "")],
     ("NEEDS_OWNER", "closed"): [("always", "CLOSED", "", "")],
 
@@ -408,6 +412,13 @@ class TestBook(BookCase):
                 self.book.take(1, ev)
         self.assertEqual(len(self.run.records()), before)
         self.assertEqual(self.book.take(1, "merged").state, S.MERGED)   # it can still end
+        # another signal while the slice waits for the owner: told, and it uses a wake
+        self.to_landing(3)
+        self.book.take(3, "queue_kicked")
+        res = self.book.take(3, "conflicting")
+        self.assertEqual((res.state, res.wakes_owner, self.book.get(3).reason, self.book.get(3).ctx.wakes),
+                         (S.NEEDS_OWNER, True, "conflicting", S.DEFAULT_WAKE_BUDGET - 2))
+        self.assertEqual(self.book.get(3).status()["wakes_left"], S.DEFAULT_WAKE_BUDGET - 2)
         # a new round has its own wakes
         self.to_landing(2)
         self.walk(2, "checks_failed", "submitted")

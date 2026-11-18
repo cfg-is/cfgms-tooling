@@ -228,6 +228,13 @@ TABLE = {
     # is run again and passes, a pull request that is put back in the merge
     # queue. Then the slice is in LANDING again, and the owner is not woken.
     (NEEDS_OWNER, "cleared"): [Edge("always", LANDING)],
+    # Another thing happens to the pull request while the slice waits for the
+    # owner (it was removed from the queue, and now it conflicts): the owner
+    # is told that too. It uses a wake, so this is not a loop.
+    (NEEDS_OWNER, "checks_failed"): [Edge("wake_left", NEEDS_OWNER, reason="checks_failed", consume="wake")],
+    (NEEDS_OWNER, "review_findings"): [Edge("wake_left", NEEDS_OWNER, reason="review_findings", consume="wake")],
+    (NEEDS_OWNER, "queue_kicked"): [Edge("wake_left", NEEDS_OWNER, reason="queue_kicked", consume="wake")],
+    (NEEDS_OWNER, "conflicting"): [Edge("wake_left", NEEDS_OWNER, reason="conflicting", consume="wake")],
     (NEEDS_OWNER, "merged"): [Edge("always", MERGED)],
     (NEEDS_OWNER, "closed"): [Edge("always", CLOSED)],
 }
@@ -403,6 +410,7 @@ class Slice:
             "slice": self.number, "state": self.state, "reason": self.reason,
             "round": self.ctx.round, "rounds_left": self.ctx.round_budget,
             "builds_on": self.ctx.builds_on, "synced": self.ctx.synced,
+            "wakes_left": self.ctx.wakes,
             "commit": cand.get("commit", ""), "tree": cand.get("tree", ""),
             "parent": cand.get("parent", ""), "branch": self.branch, "pr": self.pr,
         }

@@ -1113,13 +1113,19 @@ class EpicSupervisor(sup.Supervisor):
                 return
             sig = landing.signal(view, head=self.heads.get(s.number),
                                  since=self.pushed_at.get(s.number), trusted=self.trusted_login)
-            if s.state == S.LANDING and sig:
+            if sig and (s.state == S.LANDING or sig != s.reason):
+                # LANDING: something needs the owner. NEEDS_OWNER: something
+                # else than what the owner was told needs it now.
                 if s.ctx.wakes > 0:
                     self.stake(s.number, sig, info={"pr": s.pr})
-                else:
-                    self.note_once(("wakes", s.number, s.ctx.round), info=f"slice {s.number} round "
+                elif ("wakes", s.number, s.ctx.round) not in self._noted:
+                    self.note_once(("wakes", s.number, s.ctx.round), warning=f"slice {s.number} round "
                                    f"{s.ctx.round}: {sig}, and no wake is left for this round")
-            elif s.state == S.NEEDS_OWNER and not sig and view.get("head") == self.heads.get(s.number):
+                    self.log(f"slice {s.number}: {sig} on pull request #{s.pr}; the owner was woken "
+                             f"{S.DEFAULT_WAKE_BUDGET} times for this round and is not woken again. "
+                             "The slice waits for a merge, a close or a new round.")
+            elif (s.state == S.NEEDS_OWNER and not sig and view.get("head") == self.heads.get(s.number)
+                  and landing.gone(view, s.reason)):
                 # what the owner was woken for has gone away without a new round
                 self.stake(s.number, "cleared", info={"pr": s.pr})
         else:

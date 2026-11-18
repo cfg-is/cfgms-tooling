@@ -49,6 +49,16 @@ _VERDICT_RE = re.compile(
     r"\A\s*<!-- cfgms-acceptance-review -->\s*\n\s*#+\s*Acceptance Review\s*[\u2014\u2013:-]+\s*(PASS|FAIL)\b")
 
 
+def gone(view, reason):
+    """What the owner was woken for (`reason`) is no longer there, for a view
+    that gives no signal. A conflict is gone only when GitHub says MERGEABLE:
+    while it computes the answer again (UNKNOWN, after every merge to the base
+    branch) nothing is known."""
+    if reason == CONFLICTING:
+        return (view or {}).get("mergeable") == "MERGEABLE"
+    return True
+
+
 def parse_time(text):
     """A GitHub or supervisor timestamp ("2026-11-18T14:03:39Z") as an aware
     datetime, or None."""

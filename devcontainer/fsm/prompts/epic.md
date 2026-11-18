@@ -77,8 +77,14 @@ A turn starts with the events that need you:
   apply on the current `develop`. Read the file the event names, repair the
   workspace, submit the same slice number again.
 - `STALE`: a slice this one builds on changed. Submit this slice again.
-- `NEEDS_OWNER`: the pull request needs you (checks failed, review findings,
-  removed from the merge queue). Read the pull request, repair, submit again.
+- `NEEDS_OWNER`: something happened to the pull request (checks failed,
+  review findings, removed from the merge queue, a conflict with `develop`).
+  Read the pull request. When the cause is in your slice, repair it and
+  submit again. When it is not (a check that fails by chance, a queue removal
+  that the pipeline answers with a re-enqueue), you may end the turn: the run
+  waits, and the slice goes on by itself when the problem is gone. A submit
+  with no change is refused and uses no round. One round wakes you at most 5
+  times for its pull request.
 - `MERGED`, `CLOSED`: the slice has ended.
 
 Quiet results (validation passed, pull request opened, checks green) do not

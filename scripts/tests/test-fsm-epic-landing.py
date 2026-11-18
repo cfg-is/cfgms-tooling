@@ -116,16 +116,39 @@ class TestLanding(EpicCase):
                           if r["slice"] == 1 and r["frm"] in ("LANDING", "NEEDS_OWNER")],
                          ["queue_kicked", "cleared", "merged"])
 
-    def test_a_conflicting_pull_request_wakes_the_owner(self):
-        self.f.plan({"owner": [[write("src/a.go", "package src\n"), submit(1)],
+    def test_a_second_problem_while_the_slice_waits_for_the_owner_is_told_too(self):
+        # removed from the queue (the owner waits, as the event says), and then
+        # the pull request conflicts: only the owner can repair that
+        self.f.plan({"owner": [[write("src/a.go", "package src\n"), submit(1)], [],
                                [{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
         self.launch()
         pr = self.wait_pr(1)
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+        self.set_pr(pr["number"], removedAt=later, removedReason="merge_conflict")
+        self.wait_for("the owner's turn for the kick", lambda: len(self.recs("owner_turn_end")) == 2)
         self.set_pr(pr["number"], mergeable="CONFLICTING")
-        self.wait_state(1, "NEEDS_OWNER")
         rc, out = self.finish()
         self.assertEqual(rc, 1, out)
-        self.assertIn("its pull request conflicts with develop", self.turns()[1]["text"])
+        t = self.turns()
+        self.assertIn("the merge queue removed its pull request", t[1]["text"])
+        self.assertIn("its pull request conflicts with develop", t[2]["text"])
+        self.assertEqual(self.status(1)["wakes_left"], 3)
+
+    def test_a_conflict_is_not_gone_while_github_computes(self):
+        self.f.plan({"owner": [[write("src/a.go", "package src\n"), submit(1)], [], [DONE]]})
+        self.launch()
+        pr = self.wait_pr(1)
+        self.set_pr(pr["number"], mergeable="CONFLICTING")
+        self.wait_for("the owner's turn for the conflict", lambda: len(self.recs("owner_turn_end")) == 2)
+        self.set_pr(pr["number"], mergeable="UNKNOWN")
+        time.sleep(1.5)
+        self.assertEqual(self.status(1)["state"], "NEEDS_OWNER")
+        self.set_pr(pr["number"], mergeable="MERGEABLE")
+        self.wait_state(1, "LANDING")
+        self.merge(pr)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.turns()), 3)                 # start, the conflict, the merge
 
     def test_the_same_tree_again_uses_no_round_and_leaves_the_pull_request(self):
         self.f.plan({"owner": [
