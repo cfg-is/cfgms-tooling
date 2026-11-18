@@ -32,7 +32,9 @@ def load():
 
 
 def save(s):
-    STATE.write_text(json.dumps(s, indent=1))
+    tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(s, indent=1))
+    os.replace(tmp, STATE)                 # a reader never sees half a file
 
 
 def opt(argv, name, default=None):
@@ -190,6 +192,17 @@ def main():
             save(s)
             print("{}")
             return 0
+        return 0
+    if argv[:2] == ["pr", "close"]:
+        once = STATE.with_name("close-failed-once")
+        if os.environ.get("FSM_FAKE_GH_FAIL") == "pr-close-once" and not once.exists():
+            once.write_text("1")
+            print("HTTP 502: Bad Gateway", file=sys.stderr)
+            return 1
+        for p in s["prs"]:
+            if p["number"] == int(argv[2]):
+                p["state"] = "CLOSED"
+        save(s)
         return 0
     if argv[:2] == ["pr", "ready"]:
         for p in s["prs"]:

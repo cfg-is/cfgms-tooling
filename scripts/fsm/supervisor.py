@@ -9,6 +9,7 @@ Usage:
   supervisor.py run branch <BRANCH>        [--issue N] [options]
   supervisor.py run fix-pr <PR>            [options]
   supervisor.py run resolve-conflict <PR>  [options]
+  supervisor.py run epic <N> --item-id ID --canon-dir DIR --memory-dir DIR [options]
   supervisor.py resume <RUN_ID>
   supervisor.py status <RUN_ID>
   supervisor.py abandon <RUN_ID> --reason R   end a crashed run without resuming it
@@ -31,6 +32,9 @@ Options:
   --tooling-src GITDIR     git dir holding the `.claude/tooling` gitlink commit,
                            used to populate it in workspaces and validator clones
   --no-snapshot-tooling    run from this checkout instead of a run-dir copy
+  --canon-dir DIR / --memory-dir DIR   (epic) the host clones mounted at /canon
+                           (read-only) and /memory; default CFGMS_CANON_DIR /
+                           CFGMS_MEMORY_DIR
   --detach                 (run, resume) setsid and close inherited fds >2;
                            po-act.sh starts every run this way
 
@@ -520,11 +524,11 @@ class Supervisor:
         self.repo.update_ref("refs/fsm/candidate", c)
         return c
 
-    def tooling_populate(self):
+    def tooling_populate(self, base=None):
         src = self.params.get("tooling_src")
         if not src:
             return None
-        base_tree = self.repo.tree_of(self.x["base"])
+        base_tree = self.repo.tree_of(base or self.x["base"])
 
         def populate(dest):
             ls = self.repo.out("ls-tree", base_tree, snapshot.TOOLING_PATH)
@@ -1159,6 +1163,10 @@ def drop_run_cache(run):
 
 # --- CLI ---------------------------------------------------------------------------------
 
+def _abs(path):
+    return os.path.abspath(path) if path else path
+
+
 def _params_from_args(a):
     mode = a.mode
     tooling_root = os.environ.get("CFGMS_FSM_TOOLING_ROOT") or str(HERE.parent.parent)
@@ -1193,6 +1201,14 @@ def _params_from_args(a):
         if not t.isdigit():
             raise SystemExit(f"{mode} needs a numeric PR")
         p.update(pr=int(t), target=t, key=f"pr-{t}")
+    elif mode == EPIC_MODE:
+        if not t.isdigit() or int(t) < 1:
+            raise SystemExit("epic mode needs a numeric epic")
+        p.update(epic=int(t), target=f"epic-{t}", key=f"epic-{t}", branch=f"epic-{t}",
+                 canon_dir=_abs(a.canon_dir or os.environ.get("CFGMS_CANON_DIR")),
+                 memory_dir=_abs(a.memory_dir or os.environ.get("CFGMS_MEMORY_DIR")),
+                 turn_timeout_min=int(os.environ.get("CFGMS_FSM_OWNER_TURN_TIMEOUT_MIN", "180")),
+                 round_budget=int(os.environ.get("CFGMS_FSM_SLICE_ROUND_BUDGET", "3")))
     else:
         raise SystemExit(f"unknown mode {mode}")
     if a.container_target:
@@ -1209,8 +1225,12 @@ TOOLING_SNAPSHOT_FILES = (
 )
 #: Directories copied whole (sourced libraries and the supervisor itself).
 TOOLING_SNAPSHOT_DIRS = ("scripts/lib", "scripts/fsm")
-#: cfgms config the helpers read, relative to the cfgms checkout root.
-CFGMS_SNAPSHOT_FILES = (".claude/pipeline.yaml", ".claude/model-routing.yaml")
+#: cfgms config the helpers read, relative to the cfgms checkout root. The
+#: two agent definitions are what an epic run passes to the owner session.
+CFGMS_SNAPSHOT_FILES = (".claude/pipeline.yaml", ".claude/model-routing.yaml",
+                        ".claude/agents/owner.md", ".claude/agents/judge.md")
+#: `run epic <N>`: one owner session and many slices (epic.py).
+EPIC_MODE = "epic"
 
 
 def snapshot_tooling(run, tooling_root):
@@ -1274,7 +1294,11 @@ def cmd_drive(run_id, services=None, out=None):
     # helpers this run calls (the capacity gate) must not count it as a reservation
     os.environ["CFGMS_FSM_RUN_ID"] = run_id
     try:
-        sup = Supervisor(run, services=services, out=out)
+        if run.params().get("mode") == EPIC_MODE:
+            import epic
+            sup = epic.EpicSupervisor(run, services=services, out=out)
+        else:
+            sup = Supervisor(run, services=services, out=out)
         run.start_heartbeat(HEARTBEAT_SECS, on_beat=sup.heartbeat_tick)
         return sup.drive()
     except Interrupted as sig:
@@ -1329,6 +1353,17 @@ def cmd_abandon(run_id, reason, out=None):
             run.append("lease", abandon=lease)
         if params.get("key"):
             run.clear_active(params["key"])
+        if params.get("mode") == EPIC_MODE and params.get("epic"):
+            # the owner container outlives its supervisor: an abandoned run
+            # must not leave one that the next run of the epic would find
+            name = f"cfg-owner-{int(params['epic'])}"
+            try:
+                docker = adapters.DockerCLI()
+                if docker.label(name, "run_id") == run_id:
+                    docker.rm_force(name)
+                    run.append("note", owner_container_removed=name)
+            except Exception as exc:      # no runtime, a timeout: the abandon still ends
+                run.append("note", warning=f"{name} not removed: {type(exc).__name__}")
         run.append("terminal_done", state="ABANDONED")
         drop_run_cache(run)
         print(f"FSM_ABANDONED:{run_id}:{reason}:lease={lease}", file=out, flush=True)
@@ -1358,7 +1393,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="supervisor.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("mode", choices=list(T.MODES))
+    r.add_argument("mode", choices=list(T.MODES) + [EPIC_MODE])
     r.add_argument("target")
     r.add_argument("--item-id")
     r.add_argument("--epic", type=int)
@@ -1372,6 +1407,8 @@ def main(argv=None):
     r.add_argument("--tooling-src")
     r.add_argument("--agent-cred-dir")
     r.add_argument("--tenant")
+    r.add_argument("--canon-dir")
+    r.add_argument("--memory-dir")
     r.add_argument("--no-snapshot-tooling", action="store_true")
     r.add_argument("--detach", action="store_true")
     rs = sub.add_parser("resume")

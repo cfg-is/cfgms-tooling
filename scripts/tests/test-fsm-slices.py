@@ -95,6 +95,7 @@ EXPECTED = {
 
     ("PUBLISH", "published"): [("always", "LANDING", "", "")],
     ("PUBLISH", "secret_detected"): [("always", "REJECTED", "secret_detected", "")],
+    ("PUBLISH", "branch_moved"): [("always", "REJECTED", "branch_moved", "")],
     ("PUBLISH", "step_failed"): [("always", "FAILED", "publish", "")],
     ("PUBLISH", "lease_lost"): [("always", "FAILED", "lease_lost", "")],
     ("PUBLISH", "merged"): _MERGED,

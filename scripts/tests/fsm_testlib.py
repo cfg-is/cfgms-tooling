@@ -138,7 +138,9 @@ class Fixture:
     # --- fakes state -------------------------------------------------------
     def gh(self, state=None):
         if state is not None:
-            self.gh_state.write_text(json.dumps(state))
+            tmp = self.gh_state.with_name(self.gh_state.name + ".test.tmp")
+            tmp.write_text(json.dumps(state))
+            os.replace(tmp, self.gh_state)     # the fake gh reads it at any time
         return json.loads(self.gh_state.read_text())
 
     def add_issue(self, n, title, body, fields=None):

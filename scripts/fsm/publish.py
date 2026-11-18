@@ -113,7 +113,8 @@ AGENT_IDENT = {
 
 class Publisher:
     def __init__(self, run, repo, remote, gh, *, mode, branch, run_id, issue=None,
-                 base_branch=DEFAULT_BASE_BRANCH, landed_retries=5, landed_sleep=None):
+                 base_branch=DEFAULT_BASE_BRANCH, landed_retries=5, landed_sleep=None,
+                 scope=None):
         self.run = run
         self.repo = repo
         self.remote = remote
@@ -123,30 +124,41 @@ class Publisher:
         self.run_id = run_id
         self.issue = issue
         self.base_branch = base_branch
+        #: None in a story run. In an epic run, one slice round ("s2r1").
+        self.scope = scope
         self.landed_retries = landed_retries
         self.landed_sleep = (float(os.environ.get("CFGMS_FSM_LANDED_RETRY_SECS", "5"))
                              if landed_sleep is None else landed_sleep)
 
     def _done(self):
-        return self.run.publish_steps()
+        return self.run.publish_steps(self.scope) if self.scope else self.run.publish_steps()
 
     def _record(self, step, **fields):
+        if self.scope:
+            fields["scope"] = self.scope
         self.run.append("publish_step", step=step, **fields)
 
     # 1 ------------------------------------------------------------------
-    def commit(self, validated_tree, parent, message):
+    def commit(self, validated_tree, parent, message, extra_parents=()):
+        """`extra_parents`: more parents after `parent`. A later round of a
+        published slice uses it to join the develop commit it was validated
+        on, so the pull request's diff is measured against that commit."""
         done = self._done().get("commit")
         if done:
             return done["sha"]
-        if self.repo.tree_of(parent) == validated_tree and self.mode in ("fix-pr", "resolve-conflict"):
+        if self.repo.tree_of(parent) == validated_tree and not extra_parents \
+                and self.mode in ("fix-pr", "resolve-conflict"):
             # promotion of a validated WIP draft: nothing new to commit
             sha = parent
         else:
-            sha = self.repo.commit_tree(validated_tree, [parent], message, ident=AGENT_IDENT)
+            sha = self.repo.commit_tree(validated_tree, [parent] + list(extra_parents), message,
+                                        ident=AGENT_IDENT)
         if self.repo.tree_of(sha) != validated_tree:
             raise PublishError("commit", "commit tree differs from the validated tree")
-        self.repo.update_ref("refs/fsm/publish", sha)
-        self._record("commit", sha=sha, tree=validated_tree, parent=parent)
+        self.repo.update_ref(f"refs/fsm/publish-{self.scope}" if self.scope else "refs/fsm/publish",
+                             sha)
+        self._record("commit", sha=sha, tree=validated_tree, parent=parent,
+                     **({"extra_parents": list(extra_parents)} if extra_parents else {}))
         return sha
 
     # 2 ------------------------------------------------------------------
