@@ -133,6 +133,8 @@ _REASON_TEXT = {
     "checks_failed": "the checks on its pull request finished with failures",
     "review_findings": "the review on its pull request has findings",
     "queue_kicked": "the merge queue removed its pull request",
+    "interrupted": "the supervisor restarted while it took the snapshot. Submit this slice again",
+    "withdrawn": "slice-submit gave up waiting before the snapshot was done. Submit this slice again",
 }
 
 
@@ -144,11 +146,15 @@ def slice_event_text(number, rnd, state, reason="", pr=0, commit=""):
     """
     d = f"{SLICES_DIR}/{int(number)}"
     head = f"slice {int(number)} round {int(rnd)}: {state}"
+    late = (f" Round {int(rnd)} was not published: deliver that change as a new slice."
+            if reason in ("earlier_round_merged", "earlier_round_closed") else "")
     if state == S.MERGED:
         tail = f"merged as {commit[:40]}" if _is_sha(commit) else "merged"
-        return f"slice {int(number)}: MERGED ({tail}). Fetch origin/develop before the next submit."
+        return (f"slice {int(number)}: MERGED ({tail}). Fetch origin/develop before the "
+                f"next submit.{late}")
     if state == S.CLOSED:
-        return f"slice {int(number)}: CLOSED (its pull request #{int(pr)} was closed without a merge)."
+        return (f"slice {int(number)}: CLOSED (its pull request #{int(pr)} was closed "
+                f"without a merge).{late}")
     text = _REASON_TEXT.get(reason)
     if text is None:
         return f"{head}. Read {d}/status.json"

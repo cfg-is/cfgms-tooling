@@ -1,0 +1,1022 @@
+#!/usr/bin/env python3
+"""
+epic: the driver of one `epic` run (epic-mode design §1-§8).
+
+One run holds one owner session and many slices. This module connects the
+parts that exist on their own:
+
+    owner.py          which owner turn comes next, the event queue
+    owner_session.py  the owner container and one turn
+    submit.py         the owner's slice-submit requests and the answers
+    slices.py         the state machine of each slice
+    snapshot / validator / publish   the same code a story run uses
+
+The run has three phases, recorded as `transition` records like a story run:
+
+    PREPARE ─gates_ok─▶ OWNER ─done─▶ REPORT
+       │                  └─failed──▶ FAILED
+       └─gate_refused──▶ REFUSED
+
+OWNER is one loop on the supervisor's main thread. Each pass it
+
+  1. takes the result of a finished validator,
+  2. moves every slice that needs a supervisor step (VALIDATE, SYNC, PUBLISH),
+  3. answers new slice-submit requests (the snapshot is taken here, while
+     `slice-submit` waits in the container),
+  4. looks at the pull request of every published slice (merged, closed),
+  5. takes the result of a finished owner turn, and when no turn runs asks
+     `owner.next_step` what comes next.
+
+Two things run beside the loop, each in one thread that only waits for a
+container: the owner's turn and one validator. Every record is written by the
+main thread. One validator runs at a time; a second slice waits (design §8).
+
+Restart. Everything the loop needs is rebuilt from state.jsonl, and the
+slice book sends the parent events a crash cut off. A slice left
+in SNAPSHOT goes to REJECTED(interrupted): its snapshot would be of a later
+workspace than the one the owner submitted. Requests found at a restart are
+answered "submit again". A turn that was open is run again with the same
+events (at least once, never zero times); the turn script's lock makes that
+wait while the old process still runs.
+
+Not in this module: the checks, review and merge-queue signals of a published
+slice (only merged and closed are seen), the owner's read-only GitHub token,
+follow-ups as fix issues, ledger and board records, and the WIP draft of a
+failed run's unpublished work.
+"""
+
+import hashlib
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import outputs                       # noqa: E402
+import owner as O                    # noqa: E402
+import owner_session                 # noqa: E402
+import publish                       # noqa: E402
+import safefs                        # noqa: E402
+import slices as S                   # noqa: E402
+import snapshot                      # noqa: E402
+import state as statemod             # noqa: E402
+import submit                        # noqa: E402
+import transitions as T              # noqa: E402
+import validator                     # noqa: E402
+import agent_session                 # noqa: E402
+import gitops                        # noqa: E402
+
+# supervisor.py is the program that starts this module. When it runs as a
+# script it is the module `__main__`; a second import under its own name would
+# give two copies of its exception classes (Interrupted, Refused).
+_main = sys.modules.get("__main__")
+if hasattr(_main, "Supervisor") and hasattr(_main, "Interrupted"):
+    sup = _main
+else:
+    import supervisor as sup         # noqa: E402
+
+OWNER = "OWNER"
+TICK_SECS = float(os.environ.get("CFGMS_FSM_EPIC_TICK_SECS", "2"))
+LANDING_POLL_SECS = float(os.environ.get("CFGMS_FSM_EPIC_LANDING_POLL_SECS", "60"))
+CAPACITY_RETRY_SECS = float(os.environ.get("CFGMS_FSM_EPIC_CAPACITY_RETRY_SECS", "30"))
+BUSY_RETRY_SECS = float(os.environ.get("CFGMS_FSM_EPIC_BUSY_RETRY_SECS", "30"))
+DONE_CAP = 64 * 1024
+VALIDATE_LOG_LINES = 200
+#: Files in canon and memory smaller than this are not compared with the
+#: candidate: an empty file or a one-line file is equal to many public files.
+PRIVATE_MIN_BYTES = 64
+PRIVATE_MAX_BYTES = 5 * 1024 * 1024
+PRIVATE_MAX_FILES = 20000
+#: Agent definitions passed to the owner session from the harness, when the
+#: cfgms checkout has them. A definition of the same name in the workspace
+#: does not replace them.
+HARNESS_AGENTS = ("owner", "judge")
+
+
+def slice_branch(epic, number):
+    return f"feature/epic-{int(epic)}-slice-{int(number)}"
+
+
+def protected_allowlist(tooling_root, body):
+    """Paths of the epic's `## Protected Paths` section (design §7)."""
+    try:
+        pf = sup._load_preflight(tooling_root)
+        section = pf.extract_section(body or "", "Protected Paths")
+        return pf.extract_scope_paths(section) if section else []
+    except Exception:
+        return []
+
+
+def parse_agent_definition(text):
+    """{"description", "prompt"[, "model"][, "tools"]} from an agent .md file,
+    or None when it has no front matter."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return None
+    meta = {}
+    for ln in lines[1:end]:
+        key, sep, val = ln.partition(":")
+        if sep and key.strip() and not key.startswith((" ", "\t", "#")):
+            meta[key.strip()] = val.strip().strip('"').strip("'")
+    out = {"description": meta.get("description", ""),
+           "prompt": "\n".join(lines[end + 1:]).strip() + "\n"}
+    if meta.get("model"):
+        out["model"] = meta["model"]
+    if meta.get("tools"):
+        out["tools"] = [t.strip() for t in meta["tools"].split(",") if t.strip()]
+    return out
+
+
+def private_blob_ids(*dirs):
+    """Git blob ids of the regular files under `dirs` (canon, memory).
+
+    The memory directory is written by the owner: nothing is followed, sizes
+    are capped, and a file that cannot be read is skipped.
+    """
+    ids, seen = set(), 0
+    for root in dirs:
+        for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for name in filenames:
+                seen += 1
+                if seen > PRIVATE_MAX_FILES:
+                    return ids
+                try:
+                    fd = os.open(os.path.join(dirpath, name),
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except OSError:
+                    continue
+                try:
+                    st = os.fstat(fd)
+                    import stat as _stat
+                    if not _stat.S_ISREG(st.st_mode) \
+                            or not PRIVATE_MIN_BYTES <= st.st_size <= PRIVATE_MAX_BYTES:
+                        continue
+                    data = b""
+                    while len(data) <= PRIVATE_MAX_BYTES:
+                        chunk = os.read(fd, 1 << 20)
+                        if not chunk:
+                            break
+                        data += chunk
+                except OSError:
+                    continue
+                finally:
+                    os.close(fd)
+                ids.add(hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest())
+    return ids
+
+
+class EpicSupervisor(sup.Supervisor):
+    def __init__(self, run, services=None, out=None):
+        super().__init__(run, services=services, out=out)
+        p = self.params
+        self.epic = int(p["epic"])
+        self.name = owner_session.container_name(self.epic)
+        self.book = S.SliceBook(run, round_budget=int(p.get("round_budget", S.DEFAULT_ROUND_BUDGET)))
+        self.olog = O.OwnerLog(run)
+        self.inbox = submit.Inbox(run)
+        self.validated = {}       # (slice, round) -> {"base", "tree", ...}
+        self.heads = {}           # slice -> the commit that is its pull request's head
+        self.containers = 0       # owner containers started in this run
+        for rec in run.records():
+            if rec.get("type") == "slice_validated":
+                self.validated[(rec["slice"], rec["round"])] = rec
+            elif rec.get("type") == "slice_published":
+                self.heads[rec["slice"]] = rec["sha"]
+            elif rec.get("type") == "owner_container":
+                self.containers += 1
+        self._turn = None         # {"turn", "kind", "thread", "result", "submits"}
+        self._val = None          # {"slice", "round", "tree", "base", "develop", "seq", ...}
+        self._landing_due = {}
+        self._capacity_due = 0.0
+        self._noted = set()
+        self._stop = threading.Event()
+
+    # --- phase records ------------------------------------------------------------
+    def _phase(self, event, to, reason=""):
+        frm = self.state
+        if to in T.TERMINAL:
+            self.x["final_reason"] = reason
+        self.state = to
+        self.run.append("transition", frm=frm, event=event, to=to, kind="", reason=reason,
+                        guard="", info={}, ctx=self.ctx.to_dict())
+        self.log(f"{frm} --{event}--> {to}{' reason=' + reason if reason else ''}")
+
+    def note_once(self, key, **fields):
+        if key not in self._noted:
+            self._noted.add(key)
+            self.run.append("note", **fields)
+
+    # --- main ---------------------------------------------------------------------
+    def drive(self):
+        self.restore()
+        if self.state == T.PREPARE:
+            try:
+                self.prepare()
+            except sup.Interrupted:
+                raise
+            except sup.Refused as r:
+                self.x["refused_deferred"] = r.deferred
+                self.x["refused_exit"] = r.exit_code
+                self._phase("gate_refused", T.REFUSED, r.reason)
+            except Exception as exc:
+                self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
+                                state=self.state)
+                self.log(f"host error in PREPARE: {type(exc).__name__}: {exc}")
+                self._phase("error", T.FAILED, "prepare_error")
+        if self.state == OWNER:
+            try:
+                state, reason = self.loop()
+            except sup.Interrupted:
+                raise
+            except Exception as exc:
+                self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
+                                state=self.state)
+                self.log(f"host error in OWNER: {type(exc).__name__}: {exc}")
+                state, reason = T.FAILED, "owner_error"
+            self.shutdown()
+            self._phase("done" if state == T.REPORT else "failed", state, reason)
+        return self.finish()
+
+    # --- PREPARE --------------------------------------------------------------------
+    def prepare(self):
+        p, x = self.params, self.x
+        x.update({"lease_acquired": bool(p.get("lease_handoff") and p.get("lease_key"))})
+        if not agent_session.uid_matches():
+            self.run.append("note", warning=f"supervisor uid {os.getuid()} != agent uid "
+                                            f"{agent_session.AGENT_UID}: agent files may be unreadable")
+        other = statemod.active_run(p["key"], base=self.run.base)
+        if other and other != self.run.run_id and statemod.RunDir(other, base=self.run.base).is_locked():
+            raise sup.Refused("active_run")
+        key = p.get("lease_key")
+        if not key and os.environ.get("CFGMS_FSM_ALLOW_NO_LEASE") != "1":
+            raise sup.Refused("no_lease")
+        if key:
+            ttl = int(p.get("lease_ttl", sup.LEASE_TTL))
+            if p.get("acquire_lease"):
+                ok, _line = self.svc.helper.lease_acquire(key, ttl)
+                if not ok:
+                    raise sup.Refused("lease_held", deferred=True)
+                x["lease_acquired"] = True
+            else:
+                st, _ = self.svc.helper.lease_status(key)
+                if st != "held_by_me":
+                    raise sup.Refused("lease_not_held")
+                rs, _line = self.svc.helper.lease_renew(key, ttl)
+                if rs == "not_holder":
+                    raise sup.Refused("lease_not_held")
+            self._last_renew = time.time()
+        tok, _why = self.svc.claude_token()
+        if not tok and not os.path.isfile(self.svc.credentials_file()):
+            raise sup.Refused("creds", deferred=True, exit_code=sup.EXIT_CREDS_DEFERRED)
+        ok, why = self.svc.capacity()
+        if not ok:
+            raise sup.Refused(f"capacity:{why}"[:120], deferred=True)
+        # the epic text comes from the project item, never from issue text
+        if not p.get("item_id"):
+            raise sup.Refused("no_epic_item")
+        item = self.svc.board.get_item(p["item_id"])
+        if item is None:
+            raise sup.Refused("epic_item_unreadable")
+        if item.get("issue_num") not in (None, self.epic):
+            raise sup.Refused("item_mismatch")
+        for name in ("canon_dir", "memory_dir"):
+            d = p.get(name)
+            if not d or os.path.islink(d) or not os.path.isdir(d):
+                raise sup.Refused(f"no_{name}")
+
+        if self.run.repo_dir.exists():
+            import shutil
+            shutil.rmtree(self.run.repo_dir)
+        gitops.init_bare(self.run.repo_dir, self.run.path, self.run.gitconfig)
+        publish.write_askpass(self.run.path)
+        develop = self.fetch_develop()
+        if not develop:
+            raise sup.Refused("base_branch_missing")
+        title, body = item.get("title", ""), item.get("body", "")
+        x["title"] = title
+        x["allowlist"] = protected_allowlist(self.svc.tooling_root, body)
+        x["gate_scripts"] = snapshot.makefile_gate_scripts(
+            self.repo.git("cat-file", "blob", f"{develop}:Makefile", check=False)
+            .stdout.decode("utf-8", "replace"))
+        snapshot.materialize_workspace(self.repo, self.run.path, self.run.workspace, develop,
+                                       develop, p["branch"], publish.PUBLIC_URL,
+                                       populate=self.tooling_populate(develop))
+        safefs.fresh_dir(self.run.out_dir)
+        cdir = self.run.context_dir
+        safefs.write_file(cdir, "spec.md", f"# {title}\n\n{body}\n")
+        safefs.write_file(cdir, "session.json", json.dumps({
+            "run_id": self.run.run_id, "mode": "epic", "kind": "owner", "epic": self.epic,
+            "protected_paths": x["allowlist"]}, indent=2))
+        model, effort = p.get("model"), p.get("effort")
+        if not model or not effort:
+            m2, e2 = self.svc.resolve_model("owner")
+            model, effort = model or m2, effort or e2
+        x["model"], x["effort"] = model, effort
+        session_id = owner_session.new_session_id()
+        self.olog.set_session(session_id)
+        owner_session.write_owner_file(cdir, epic=self.epic, session_id=session_id, model=model,
+                                       effort=effort, timeout_min=self.turn_timeout())
+        self.write_agents_file()
+        sdir = agent_session.prepare_session_dir(self.name, 1, {
+            "mode": "epic", "epic": self.epic, "run_id": self.run.run_id, "kind": "owner"})
+        x["session_dir"] = str(sdir)
+        self.run.register_active(p["key"])
+        self._phase("gates_ok", OWNER)
+
+    def turn_timeout(self):
+        return int(self.params.get("turn_timeout_min", owner_session.DEFAULT_TURN_TIMEOUT_MIN))
+
+    def write_agents_file(self):
+        """context/agents.json from the harness copy of the agent definitions."""
+        root = Path(self.svc.tooling_root).parent.parent / ".claude" / "agents"
+        agents = {}
+        for name in HARNESS_AGENTS:
+            try:
+                d = parse_agent_definition((root / f"{name}.md").read_text())
+            except OSError:
+                d = None
+            if d:
+                agents[name] = d
+        if "owner" in agents:
+            safefs.write_file(self.run.context_dir, "agents.json",
+                              json.dumps(agents, indent=1, sort_keys=True) + "\n", mode=0o644)
+        else:
+            safefs.remove_nofollow(self.run.context_dir / "agents.json")
+        self.run.append("note", harness_agents=sorted(agents))
+
+    # --- git helpers ----------------------------------------------------------------
+    def fetch_develop(self):
+        self.remote.fetch(f"+refs/heads/{self.params['base_branch']}:refs/fsm/develop")
+        self.x["develop"] = self.repo.rev("refs/fsm/develop")
+        return self.x["develop"]
+
+    def on_develop(self, sha):
+        dev = self.x.get("develop")
+        return bool(dev) and self.repo.has_object(sha + "^{commit}") \
+            and self.repo.is_ancestor(sha, dev)
+
+    # --- slice files ------------------------------------------------------------------
+    def slice_dir(self, n):
+        d = self.run.context_dir / "slices" / str(int(n))
+        os.makedirs(d, mode=0o755, exist_ok=True)
+        return d
+
+    def write_status(self, n):
+        s = self.book.get(n)
+        if s is None:
+            return
+        data = dict(s.status(), develop=self.x.get("develop", ""), updated=statemod.now_iso())
+        safefs.write_file(self.slice_dir(n), "status.json",
+                          json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o644)
+
+    def write_rejected(self, n, title, lines):
+        text = f"# {title}\n\n" + "\n".join(lines) + "\n"
+        safefs.write_file(self.slice_dir(n), "rejected.md", text[:200000], mode=0o644)
+
+    def answer(self, req, accepted, **kw):
+        submit.write_answer(self.run.context_dir, req.slice, req.request_id, accepted=accepted, **kw)
+
+    # --- one transition of one slice --------------------------------------------------
+    def stake(self, n, event, info=None, quiet=False, **kw):
+        """Take `event` on slice `n`, then do what every transition needs:
+        the status file, the owner's events, and the slices it moved."""
+        res = self.book.take(n, event, info, **kw)
+        s = self.book.get(n)
+        self.log(f"slice {n} round {s.ctx.round}: --{event}--> {res.state}"
+                 f"{' (' + s.reason + ')' if s.reason else ''}")
+        self._after(n, res, quiet, (info or {}).get("merge_commit", ""))
+        return res
+
+    def _after(self, n, res, quiet=False, commit=""):
+        s = self.book.get(n)
+        self.write_status(n)
+        if res.wakes_owner and not quiet:
+            self.olog.push(O.slice_event_text(n, s.ctx.round, s.state, s.reason, pr=s.pr,
+                                              commit=commit))
+        for m, r in res.cascade:
+            self._after(m, r)
+        self._cancel_stale_validation()
+
+    def slice_error(self, n, exc):
+        """A host error while the supervisor worked on slice `n`."""
+        s = self.book.get(n)
+        self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}", slice=n,
+                        slice_state=s.state if s else "")
+        self.log(f"host error on slice {n}: {type(exc).__name__}: {exc}")
+        if s is not None and s.state in S.ACTIVE:
+            self.stake(n, "error")
+
+    # --- 1. submit requests -----------------------------------------------------------
+    def handle_submits(self, stale=False):
+        sc = self.inbox.new(self.run.out_dir)
+        if sc.problem:
+            self.note_once(("submit_problem", sc.problem), warning=f"submit: {sc.problem}")
+        for name, why in sc.ignored:
+            self.note_once(("submit_ignored", name, why), warning=f"submit {name}: {why}"[:300])
+        for req in sc.requests:
+            if isinstance(req, submit.Refused):
+                self.answer(req, False, reason=req.reason)
+                self.inbox.mark(req, "refused")
+                continue
+            if stale:
+                self.answer(req, False, reason="the supervisor restarted before it took this "
+                                               "snapshot. Submit again.")
+                self.inbox.mark(req, "stale")
+                continue
+            try:
+                outcome = self.submit_one(req)
+            except sup.Interrupted:
+                raise
+            except Exception as exc:
+                self.slice_error(req.slice, exc)
+                self.answer(req, False, reason="the supervisor could not take the snapshot "
+                                               "(host error).")
+                outcome = "error"
+            if outcome == "accepted" and self._turn is not None:
+                self._turn["submits"] += 1       # progress: a snapshot was accepted
+            self.inbox.mark(req, outcome)
+
+    def submit_one(self, req):
+        n = req.slice
+        s = self.book.get(n)
+        if s is not None and s.pr and s.state not in S.TERMINAL:
+            self.poll_slice(s)        # it may have merged a moment ago
+        if s is not None and s.state in S.TERMINAL:
+            self.answer(req, False, reason=f"slice {n} is {s.state}. Use a new slice number.")
+            return "refused"
+        if s is not None and s.state in (S.SNAPSHOT, S.SYNC, S.PUBLISH):
+            self.answer(req, False, reason=f"slice {n} is in {s.state}. Submit again in a moment.")
+            return "refused"
+        self.fetch_develop()
+        if not self.request_there(req):
+            # slice-submit gave up while the supervisor was busy: the owner
+            # may have changed the workspace since
+            self.answer(req, False, reason="the request was withdrawn before the snapshot. "
+                                           "Submit again.")
+            return "withdrawn"
+        bad, parent = "", None
+        try:
+            parent = S.resolve_parent(self.book, n, req.base, req.builds_on, self.on_develop)
+        except S.BadRequest as exc:
+            bad = str(exc)
+        if parent is not None and s is not None and s.state not in S.OWNER_TURN and s.candidates:
+            # A round of this slice is on its way. A request that brings the
+            # same tree on the same parent changes nothing: the round stays.
+            last = s.candidates[max(s.candidates)]
+            if last["parent"] == parent.commit and self.same_tree(last["tree"], parent.commit):
+                self.answer(req, False, round_no=s.ctx.round,
+                            reason=f"the workspace has no change since this slice's last "
+                                   f"snapshot. Round {s.ctx.round} goes on.")
+                return "no_change"
+        res = self.stake(n, "submitted", builds_on=parent.builds_on if parent else 0)
+        s = self.book.get(n)
+        if res.state == S.FAILED:
+            self.answer(req, False, reason=f"slice {n} has no round left.")
+            return "budget"
+        rnd = s.ctx.round
+        if bad:
+            self.write_rejected(n, "Submit request refused", [bad])
+            self.stake(n, "bad_request", quiet=True)
+            self.answer(req, False, round_no=rnd, reason=bad)
+            return "bad_request"
+
+        base_tree = self.repo.tree_of(parent.commit)
+        where = f"Read {O.SLICES_DIR}/{n}/rejected.md"
+        try:
+            snap = snapshot.snapshot(self.repo, self.run.path, self.run.workspace, base_tree,
+                                     allowlist=self.x.get("allowlist", []),
+                                     extra_protected=self.x.get("gate_scripts", []))
+        except snapshot.SnapshotTooLarge as exc:
+            self.write_rejected(n, "Snapshot refused", [f"- {exc}", "",
+                                "Remove build output and large generated files from the workspace."])
+            self.stake(n, "violation", quiet=True)
+            self.answer(req, False, round_no=rnd, reason=f"the snapshot was refused. {where}")
+            return "rejected"
+        self.run.append("snapshot", slice=n, round=rnd, **snap.summary())
+        sc = self.scanner()
+        findings = sc.scan_candidate(self.repo, base_tree, snap.tree, snap.entries,
+                                     scan_dir=self.run.p("scan"))
+        findings += sc.scan_texts({"subject": req.subject, "claim": req.claim},
+                                  scan_dir=self.run.p("scan"))
+        private = private_blob_ids(self.params["canon_dir"], self.params["memory_dir"])
+        lines = [f"- `{v.path}`: {v.reason}" for v in snap.violations]
+        lines += [f"- secret: {f.describe()}" for f in findings]
+        lines += [f"- `{e.path}`: the content is the same as a file in /canon or /memory"
+                  for e in snap.entries if e.status != "D" and e.new_sha in private]
+        lines += [f"- `{path}` line {ln}: conflict marker" for path, ln in snap.markers[:100]]
+        if lines:
+            if snap.ignored:
+                lines += ["", "Ignored files (left out by the base ignore rules):"]
+                lines += [f"- `{path}`" for path in snap.ignored[:50]]
+            self.write_rejected(n, "Snapshot refused", lines + [
+                "", "Fix these in the workspace and submit the slice again."])
+            self.stake(n, "violation", quiet=True,
+                       info={"violations": len(snap.violations), "secrets": len(findings)})
+            self.answer(req, False, round_no=rnd, reason=f"the snapshot was refused. {where}")
+            return "rejected"
+        if not self.request_there(req):
+            # withdrawn while the snapshot was taken: the copy may be of a
+            # workspace the owner was already changing again
+            self.stake(n, "bad_request", info={"reason": "withdrawn"})
+            self.answer(req, False, round_no=rnd, reason="the request was withdrawn while the "
+                                                         "snapshot was taken. Submit again.")
+            return "withdrawn"
+        last = s.candidates[max(s.candidates)] if s.candidates else None
+        if snap.tree == base_tree or (last and last["tree"] == snap.tree
+                                      and last["parent"] == parent.commit):
+            self.stake(n, "unchanged", quiet=True)
+            self.answer(req, False, round_no=rnd,
+                        reason="the workspace has no change since this slice's last snapshot.")
+            return "no_change"
+        commit = self.repo.commit_tree(snap.tree, [parent.commit], "fsm slice candidate (internal)\n")
+        self.repo.update_ref(f"refs/fsm/slices/{n}/r{rnd}", commit)
+        self.book.set_candidate(n, commit, snap.tree, parent.commit)
+        self.wtext(f"slice-{n}-r{rnd}-subject.txt", req.subject)
+        self.wtext(f"slice-{n}-r{rnd}-claim.md", outputs.sanitize(req.claim))
+        if not self.rtext(f"slice-{n}-subject.txt"):
+            self.wtext(f"slice-{n}-subject.txt", req.subject)   # the first one is the PR title
+        self.stake(n, "ok", info={"tree": snap.tree, "files": len(snap.entries)})
+        self.answer(req, True, round_no=rnd, files=len(snap.entries), commit=commit,
+                    parent=parent.commit)
+        return "accepted"
+
+    def request_there(self, req):
+        """The request directory is still where slice-submit put it."""
+        return os.path.lexists(os.path.join(str(self.run.out_dir), submit.SUBMIT_DIR, req.dirname))
+
+    def same_tree(self, tree, parent_commit):
+        """True when the workspace, as a snapshot on `parent_commit`, is `tree`."""
+        try:
+            snap = snapshot.snapshot(self.repo, self.run.path, self.run.workspace,
+                                     self.repo.tree_of(parent_commit),
+                                     allowlist=self.x.get("allowlist", []),
+                                     extra_protected=self.x.get("gate_scripts", []))
+        except snapshot.SnapshotTooLarge:
+            return False
+        return snap.tree == tree
+
+    # --- 2. the validator ---------------------------------------------------------------
+    def _val_current(self):
+        v = self._val
+        s = self.book.get(v["slice"])
+        cand = s.candidates.get(s.ctx.round, {}) if s else {}
+        return (s is not None and s.state == S.VALIDATE and s.ctx.round == v["round"]
+                and cand.get("tree") == v["tree"] and cand.get("parent") == v["base"])
+
+    def _cancel_stale_validation(self):
+        v = self._val
+        if v is not None and not v.get("cancelled") and not self._val_current():
+            v["cancelled"] = True
+            try:
+                self.svc.docker.kill(v["name"])
+            except Exception:
+                pass
+
+    def start_validation(self):
+        if self._val is not None:
+            return
+        waiting = sorted((s for s in self.book.slices.values() if s.state == S.VALIDATE),
+                         key=lambda s: s.number)
+        if not waiting:
+            return
+        s = waiting[0]
+        n, rnd = s.number, s.ctx.round
+        cand = s.candidates[rnd]
+        base, tree = cand["parent"], cand["tree"]
+        develop = self.x.get("develop") or base
+        cache = validator.ValidationCache(self.run.p("validate", "cache.json"))
+        hit = cache.hit(base, develop, tree)
+        if hit:
+            self._validated(n, rnd, base, tree, hit, cache_hit=True)
+            return
+        now = time.time()
+        if now < self._capacity_due:
+            return
+        ok, why = self.svc.capacity()
+        if not ok:
+            self._capacity_due = now + CAPACITY_RETRY_SECS
+            self.note_once(("capacity", n, rnd), info=f"slice {n}: validator waits for capacity "
+                                                       f"({str(why)[:100]})")
+            return
+        seq = len([d for d in self.run.p("validate").iterdir() if d.is_dir()]) + 1
+        vdir = self.run.p("validate", f"v{seq}")
+        validator.build_clone(self.repo, vdir / "repo", base, develop, tree, publish.PUBLIC_URL,
+                              populate=self.tooling_populate(base))
+        cache_dir = self.run.p("cache")
+        safefs.ensure_plain_dir(cache_dir)
+        for sub_ in ("go-build", "tmp"):
+            safefs.ensure_plain_dir(cache_dir / sub_)
+        name = validator.container_name(self.params["target"])
+        argv = validator.docker_argv(name, self.run.run_id, seq, "epic", f"epic={self.epic}",
+                                     vdir / "repo", cache_dir)
+        log_path = self.run.p("logs", f"validate-{seq}.log")
+        timeout = int(self.params.get("validate_timeout_min", validator.DEFAULT_TIMEOUT_MIN))
+        job = {"slice": n, "round": rnd, "base": base, "tree": tree, "develop": develop,
+               "seq": seq, "name": name, "vdir": vdir, "result": None}
+
+        def work():
+            try:
+                job["result"] = validator.run_validator(self.svc.docker, argv, name, timeout, log_path)
+            except Exception as exc:       # never leave the loop waiting for a dead thread
+                job["result"] = {"verdict": "infra_error", "exit_code": None, "timed_out": False,
+                                 "duration_seconds": 0, "log_tail": f"{type(exc).__name__}: {exc}"}
+
+        job["thread"] = threading.Thread(target=work, name="fsm-validate", daemon=True)
+        self.run.append("validate_start", slice=n, round=rnd, validate_seq=seq, validator=name,
+                        base=base, tree=tree, develop=develop)
+        self._val = job
+        job["thread"].start()
+
+    def _validated(self, n, rnd, base, tree, rec, cache_hit=False):
+        fields = {k: rec.get(k) for k in ("validator", "validate_seq", "duration_seconds")}
+        r = self.run.append("slice_validated", slice=n, round=rnd, base=base, tree=tree,
+                            cache_hit=cache_hit, **fields)
+        self.validated[(n, rnd)] = r
+        self.stake(n, "pass", info={"tree": tree, "cache_hit": cache_hit})
+
+    def collect_validation(self):
+        v = self._val
+        if v is None or v["thread"].is_alive():
+            return
+        self._val = None
+        res = v["result"]
+        n, rnd = v["slice"], v["round"]
+        import shutil
+        shutil.rmtree(v["vdir"] / "repo", ignore_errors=True)
+        current = (not v.get("cancelled")) and self._still(v)
+        self.run.append("validate", slice=n, round=rnd, verdict=res["verdict"],
+                        exit_code=res["exit_code"], validator=v["name"], validate_seq=v["seq"],
+                        tree=v["tree"], base=v["base"], timed_out=res["timed_out"],
+                        duration_seconds=res["duration_seconds"], discarded=not current)
+        if not current:
+            return
+        if res["verdict"] == "pass":
+            rec = {"validator": v["name"], "validate_seq": v["seq"],
+                   "duration_seconds": res["duration_seconds"]}
+            validator.ValidationCache(self.run.p("validate", "cache.json")).record_pass(
+                v["base"], v["develop"], v["tree"], rec)
+            self._validated(n, rnd, v["base"], v["tree"], rec)
+        elif res["verdict"] == "fail":
+            tail = "\n".join(res["log_tail"].splitlines()[-VALIDATE_LOG_LINES:])
+            safefs.write_file(self.slice_dir(n), "validate.log",
+                              f"round {rnd}: `make test-agent-complete` exited "
+                              f"{res['exit_code']}. Log tail:\n\n{tail}\n", mode=0o644)
+            self.stake(n, "fail", info={"exit_code": res["exit_code"]})
+        else:
+            self.stake(n, "infra_error", info={"exit_code": res["exit_code"],
+                                               "timed_out": res["timed_out"]})
+
+    def _still(self, v):
+        self._val = v
+        try:
+            return self._val_current()
+        finally:
+            self._val = None
+
+    # --- 3. supervisor steps of a slice -----------------------------------------------
+    def step_slices(self):
+        """SYNC and PUBLISH are short steps the supervisor finishes at once. A
+        cached validator result can put a slice into one of them, so this
+        repeats until no slice is left there: a submit request never finds a
+        slice in the middle of a supervisor step."""
+        for _ in range(8):
+            self._step_slices_once()
+            if not any(s.state in (S.SYNC, S.PUBLISH) for s in self.book.slices.values()):
+                return
+
+    def _step_slices_once(self):
+        for s in sorted(self.book.slices.values(), key=lambda s: s.number):
+            try:
+                if s.state == S.SYNC:
+                    self.do_slice_sync(s)
+                if s.state == S.PUBLISH:
+                    self.do_slice_publish(s)
+            except sup.Interrupted:
+                raise
+            except Exception as exc:
+                self.slice_error(s.number, exc)
+        try:
+            self.start_validation()
+        except sup.Interrupted:
+            raise
+        except Exception as exc:
+            waiting = sorted(s.number for s in self.book.slices.values() if s.state == S.VALIDATE)
+            if waiting:
+                self.slice_error(waiting[0], exc)
+
+    def do_slice_sync(self, s):
+        n, rnd = s.number, s.ctx.round
+        dev = self.fetch_develop()
+        cand = s.candidates[rnd]
+        base, tree = cand["parent"], cand["tree"]
+        if self.repo.is_ancestor(dev, base):
+            self.stake(n, "up_to_date", info={"develop": dev})
+            return
+        proc = self.repo.git("merge-tree", "--write-tree", "--name-only", "--no-messages",
+                             dev, cand["commit"], check=False)
+        lines = proc.stdout.decode("utf-8", "replace").splitlines()
+        if proc.returncode not in (0, 1) or not lines:
+            raise RuntimeError(f"merge-tree failed ({proc.returncode})")
+        merged = lines[0].strip()
+        if proc.returncode == 1:
+            conflicted = [ln for ln in lines[1:] if ln.strip()][:100]
+            self.write_rejected(n, "Conflicts with develop", [
+                f"Round {rnd} does not apply on the develop commit `{dev}`. Files:", ""] +
+                [f"- `{c}`" for c in conflicted] +
+                ["", "Fetch origin/develop, merge it in the workspace, fix the conflicts, and "
+                     "submit the slice again with the new --base."])
+            self.stake(n, "conflict", info={"develop": dev, "conflicted": conflicted})
+            return
+        commit = self.repo.commit_tree(merged, [dev], "fsm slice candidate (internal)\n")
+        self.repo.update_ref(f"refs/fsm/slices/{n}/r{rnd}", commit)
+        self.book.set_candidate(n, commit, merged, dev)
+        self.stake(n, "rebased", info={"develop": dev, "tree": merged})
+
+    def do_slice_publish(self, s):
+        n, rnd, p = s.number, s.ctx.round, self.params
+        key = p.get("lease_key")
+        if key:
+            st, _ = self.svc.helper.lease_status(key)
+            if st != "held_by_me" or self.lease_lost:
+                self.lease_lost = True
+                self.stake(n, "lease_lost", info={"lease": st})
+                return
+        cand = s.candidates[rnd]
+        base, tree = cand["parent"], cand["tree"]
+        v = self.validated.get((n, rnd)) or {}
+        if v.get("tree") != tree or v.get("base") != base:
+            raise RuntimeError("validated (base, tree) differs from the slice's candidate")
+        rid = f"{self.run.run_id}.s{n}r{rnd}"
+        branch = slice_branch(self.epic, n)
+        claim = self.rtext(f"slice-{n}-r{rnd}-claim.md").strip()
+        title = f"{self.rtext(f'slice-{n}-subject.txt').strip()} (Issue #{self.epic})"
+        round_subject = f"{self.rtext(f'slice-{n}-r{rnd}-subject.txt').strip()} (Issue #{self.epic})"
+        validation = ("## Validation (supervisor)\n\n"
+                      f"- base: `{base}`\n- tree: `{tree}`\n"
+                      f"- validator: `{v.get('validator', '')}` run {v.get('validate_seq', '')}, "
+                      f"`make test-agent-complete` exit 0 in {v.get('duration_seconds', '?')} s\n"
+                      f"- FSM run: `{rid}`\n\n"
+                      "CI evidence is in the PR's checks.\n")
+        body = (f"{claim}\n\n{validation}\n"
+                f"Part of epic #{self.epic} (slice {n}).\n")
+        round_body = (publish.ROUND_MARKER.format(run_id=rid) + "\n" +
+                      f"## Slice round {rnd}\n\n{claim}\n\n{validation}")
+        head = self.heads.get(n, "")
+        message = publish.commit_message(round_subject if head else title, run_id=rid)
+        sc = self.scanner()
+        base_tree = self.repo.tree_of(base)
+        changed = snapshot.diff_entries(self.repo, base_tree, tree)
+        findings = sc.scan_candidate(self.repo, base_tree, tree, changed, scan_dir=self.run.p("scan"))
+        findings += sc.scan_texts({"pr_body": body, "round_comment": round_body,
+                                   "commit_message": message}, scan_dir=self.run.p("scan"))
+        if findings:
+            self.write_rejected(n, "Secret detected before publish",
+                                [f"- {f.describe()}" for f in findings])
+            self.stake(n, "secret_detected", info={"secrets": [f.to_dict() for f in findings]})
+            return
+        body_file = self.wtext(f"slice-{n}-r{rnd}-pr-body.md", body)
+        round_file = self.wtext(f"slice-{n}-r{rnd}-round-comment.md", round_body)
+        pub = publish.Publisher(self.run, self.repo, self.remote, self.svc.gh,
+                                mode="fix-pr" if head else "branch", branch=branch, run_id=rid,
+                                base_branch=p["base_branch"], scope=f"s{n}r{rnd}")
+        try:
+            if head:
+                # a later round: one new commit on the pull request's head
+                extra = [] if self.repo.is_ancestor(base, head) else [base]
+                sha = pub.commit(tree, head, message, extra_parents=extra)
+            else:
+                sha = pub.commit(tree, base, message)
+            pub.push(sha, head)
+            number, url = pub.pr(title, body_file, round_body_file=round_file)
+            pub.landed(sha, number, tree)
+        except publish.PublishError as exc:
+            self.run.append("note", publish_error=str(exc)[:500], slice=n)
+            self.stake(n, "step_failed", info={"step": exc.step})
+            return
+        self.run.append("slice_published", slice=n, round=rnd, sha=sha, pr=number, url=url)
+        self.heads[n] = sha
+        self.book.set_pr(n, number, branch)
+        self._landing_due[n] = time.time() + LANDING_POLL_SECS
+        self.stake(n, "published", info={"sha": sha, "pr": number})
+
+    # --- 4. published slices --------------------------------------------------------------
+    def poll_landing(self):
+        now = time.time()
+        for s in sorted(self.book.slices.values(), key=lambda s: s.number):
+            if not s.pr or s.state in S.TERMINAL or s.state == S.PUBLISH:
+                continue
+            if now < self._landing_due.get(s.number, 0):
+                continue
+            self._landing_due[s.number] = now + LANDING_POLL_SECS
+            try:
+                self.poll_slice(s)
+            except sup.Interrupted:
+                raise
+            except Exception as exc:
+                self.note_once(("landing", s.number, type(exc).__name__),
+                               warning=f"slice {s.number}: pull request state not read: "
+                                       f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    def poll_slice(self, s):
+        st = self.svc.gh.pr_state(s.pr)
+        if not st:
+            return
+        if st["state"] == "MERGED":
+            self.fetch_develop()
+            self.stake(s.number, "merged", info={"merge_commit": st["merge_commit"], "pr": s.pr})
+        elif st["state"] == "CLOSED":
+            self.stake(s.number, "closed", info={"pr": s.pr})
+
+    # --- 5. the owner ---------------------------------------------------------------------
+    def read_claim_file(self, name):
+        text, problem = outputs.read_nofollow(self.run.out_dir, name, DONE_CAP)
+        if problem and problem != "absent":
+            self.note_once(("out", name, problem), warning=f"out/{name}: {problem}")
+        return text if text and text.strip() else None
+
+    def facts(self):
+        return self.olog.facts(self.book, done=self.read_claim_file("done.md") is not None,
+                               blocked=self.read_claim_file("blocked.md") is not None)
+
+    def ensure_container(self):
+        status, _code = self.svc.docker.inspect_exit(self.name)
+        if status == "running":
+            return
+        p, x = self.params, self.x
+        token, why = self.svc.claude_token()
+        cred_args = agent_session.claude_credential_args(bool(token), self.svc.credentials_file())
+        if not token:
+            self.run.append("note", warning=f"agent token {why}: using credentials file mount")
+        env_extra = {"CLAUDE_CODE_OAUTH_TOKEN": token} if token else {}
+        metrics = Path(p["tooling_root"]) / "metrics"
+        self.containers += 1
+        argv = owner_session.docker_argv(
+            epic=self.epic, run_id=self.run.run_id, workspace=self.run.workspace,
+            context_dir=self.run.context_dir, out_dir=self.run.out_dir,
+            session_dir=x["session_dir"], trust=agent_session.trust_file(self.name, self.containers),
+            canon_dir=p["canon_dir"], memory_dir=p["memory_dir"], cred_args=cred_args,
+            metrics_dir=str(metrics) if metrics.is_dir() else None)
+        try:
+            gh_token = self.svc.gh.token()
+        except Exception:
+            gh_token = None
+        res = owner_session.start(self.svc.docker, argv, self.name, env_extra,
+                                  canon_dir=p["canon_dir"], memory_dir=p["memory_dir"],
+                                  gh_token=gh_token)
+        self.run.append("owner_container", container=self.name, n=self.containers, ok=res["ok"],
+                        container_id=str(res["container_id"])[:80], error=res["error"][:300])
+        if not res["ok"]:
+            self.run.p("logs", f"owner-start-{self.containers}.log").write_text(res["log_tail"] or "")
+            raise RuntimeError(res["error"])
+        if self.olog.turns > 0 or self.olog.open_turn is not None:
+            self.olog.push(O.RESTART_TEXT)
+
+    def start_turn(self, kind):
+        self.ensure_container()
+        extra = ""
+        again = self.olog.resume_turn()
+        if again is not None:
+            # a turn the supervisor did not see end: run it again, same events
+            turn, kind, texts = again
+        else:
+            turn, texts = self.olog.begin_turn(kind)
+        if kind == O.DONE_REFUSED:
+            safefs.remove_nofollow(self.run.out_dir / "done.md")
+            extra = O.done_refused_text({s.number: s.state for s in self.book.slices.values()
+                                         if s.state != S.NEW and not O.given_up(s)})
+        owner_session.write_turn_file(self.run.context_dir, turn, O.render_turn(kind, texts, extra))
+        job = {"turn": turn, "kind": kind, "result": None, "submits": 0}
+        timeout = self.turn_timeout()
+
+        def work():
+            # "busy": an earlier process of this turn still holds the turn
+            # lock (after a supervisor restart). Wait for it, but not longer
+            # than one turn may take: a process the owner left behind can hold
+            # the lock for ever.
+            give_up = time.time() + timeout * 60
+            while True:
+                res = owner_session.run_turn(self.svc.docker, self.name, turn, timeout)
+                if not res["busy"]:
+                    break
+                if time.time() >= give_up:
+                    res = dict(res, timed_out=True, busy=False,
+                               error="the turn lock was held for a whole turn time limit")
+                    break
+                if self._stop.wait(BUSY_RETRY_SECS):
+                    break
+            job["result"] = res
+
+        job["thread"] = threading.Thread(target=work, name="fsm-owner-turn", daemon=True)
+        self.log(f"owner turn {turn} ({kind}): {len(texts)} event(s)")
+        self._turn = job
+        job["thread"].start()
+
+    def collect_turn(self):
+        t = self._turn
+        if t is None or t["thread"].is_alive():
+            return
+        self._turn = None
+        res = t["result"]
+        token, _ = self.svc.claude_token()
+        tail = res["output_tail"] or ""
+        if token:
+            tail = tail.replace(token, "[REDACTED]")
+        self.run.p("logs", f"owner-turn-{t['turn']}.log").write_text(tail)
+        self.olog.end_turn(ok=res["ok"], progress=t["submits"] > 0, exit_code=res["exit_code"],
+                           timed_out=res["timed_out"], seconds=res["duration_seconds"])
+        self.log(f"owner turn {t['turn']} ended: exit={res['exit_code']} "
+                 f"seconds={res['duration_seconds']} submits={t['submits']}"
+                 f"{' ' + res['error'] if res['error'] else ''}")
+
+    # --- the loop ----------------------------------------------------------------------------
+    def loop(self):
+        self.fetch_develop()
+        # a restart: nothing of the earlier process is still in hand
+        for n, res in self.book.reconcile():
+            self._after(n, res)
+        for s in list(self.book.slices.values()):
+            if s.state == S.SNAPSHOT:
+                self.stake(s.number, "bad_request", info={"reason": "interrupted"})
+            self.write_status(s.number)
+        self.handle_submits(stale=True)
+        while True:
+            if self.lease_lost:
+                return T.FAILED, "lease_lost"
+            self.collect_validation()
+            self.step_slices()
+            self.handle_submits()
+            self.step_slices()
+            self.poll_landing()
+            self.collect_turn()
+            if self._turn is None:
+                step = O.next_step(self.facts())
+                if step.step == O.REPORT:
+                    return T.REPORT, ""
+                if step.step == O.FAILED:
+                    return T.FAILED, step.reason
+                if step.step == O.TURN or self.olog.open_turn is not None:
+                    try:
+                        self.start_turn(step.kind or O.EVENTS)
+                    except (sup.Interrupted, agent_session.CredentialLeak):
+                        raise
+                    except Exception as exc:
+                        self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
+                                        state="owner_container")
+                        return T.FAILED, "owner_container"
+            time.sleep(TICK_SECS)
+
+    def shutdown(self):
+        """Stop what this run started: the validator and the owner container."""
+        self._stop.set()
+        if self._val is not None:
+            try:
+                self.svc.docker.kill(self._val["name"])
+            except Exception:
+                pass
+            self._val["thread"].join(60)
+        try:
+            owner_session.stop(self.svc.docker, self.name)
+        except Exception as exc:
+            self.run.append("note", warning=f"owner container not removed: {type(exc).__name__}")
+        if self._turn is not None:
+            self._turn["thread"].join(30)
+
+    # --- terminal handlers ----------------------------------------------------------------------
+    def _keep_claim(self, name):
+        text, _problem = outputs.read_nofollow(self.run.out_dir, name, DONE_CAP)
+        if text and not self.scanner().scan_texts({name: text}):
+            self.wtext(f"owner-{name}", outputs.sanitize(text))
+
+    def fin_report(self):
+        self._keep_claim("done.md")
+        merged = sorted(s.number for s in self.book.slices.values() if s.state == S.MERGED)
+        self.log(f"Epic #{self.epic}: the owner is done. Merged slices: {merged}")
+
+    def fin_failed(self):
+        self._keep_claim("blocked.md")
+        self.log(f"Epic #{self.epic} run failed ({self.x.get('final_reason', 'failed')}). "
+                 f"The workspace is kept at {self.run.workspace}")
+
+    def write_manifest(self):
+        data = {
+            "schema": 1, "mode": "epic", "epic": self.epic, "run_id": self.run.run_id,
+            "final_state": self.state, "reason": self.x.get("final_reason", ""),
+            "model": self.x.get("model", ""), "effort": self.x.get("effort", ""),
+            "turns": self.olog.turns, "session_id": self.olog.session_id,
+            "session_dir": self.x.get("session_dir", ""),
+            "slices": [s.status() for s in sorted(self.book.slices.values(),
+                                                  key=lambda s: s.number) if s.state != S.NEW],
+        }
+        tmp = self.run.p("epic-result.json.tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, self.run.p("epic-result.json"))

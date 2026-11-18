@@ -180,13 +180,18 @@ class RunDir:
                 return rec
         return None
 
-    def publish_steps(self):
-        """Completed PUBLISH sub-steps of the current publish attempt."""
+    def publish_steps(self, scope=None):
+        """Completed PUBLISH sub-steps of the current publish attempt.
+
+        A story run has one publish attempt at a time: no scope. An epic run
+        publishes many slices and rounds; each has a scope of its own, and its
+        steps are the `publish_step` records that carry that scope.
+        """
         steps = {}
         for rec in self.records():
-            if rec.get("type") == "transition" and rec.get("to") == "PUBLISH":
+            if scope is None and rec.get("type") == "transition" and rec.get("to") == "PUBLISH":
                 steps = {}
-            if rec.get("type") == "publish_step":
+            if rec.get("type") == "publish_step" and rec.get("scope") == scope:
                 steps[rec["step"]] = rec
         return steps
 

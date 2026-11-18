@@ -197,6 +197,24 @@ class GhCLI:
         return self._json(["pr", "view", str(number), "--repo", self.repo, "--json",
                            self.PR_FIELDS + ",comments,reviews"])
 
+    def pr_state(self, number):
+        """{"state": OPEN|MERGED|CLOSED, "merge_commit": sha or "", "head": sha}
+        of one pull request, or None when it cannot be read."""
+        proc = self._gh(["pr", "view", str(number), "--repo", self.repo, "--json",
+                         "state,mergeCommit,headRefOid"], check=False)
+        if proc.returncode != 0:
+            return None
+        try:
+            d = json.loads(proc.stdout.decode() or "null")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(d, dict):
+            return None
+        mc = d.get("mergeCommit")
+        return {"state": str(d.get("state", "")).upper(),
+                "merge_commit": str((mc or {}).get("oid", "")) if isinstance(mc, dict) else "",
+                "head": str(d.get("headRefOid", ""))}
+
     def create_pr(self, branch, base, title, body_file, draft=False):
         args = ["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
                 "--title", title, "--body-file", str(body_file)]
