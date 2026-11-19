@@ -104,8 +104,8 @@ token.
   | `/memory/` | host memory clone | read, write |
   | `/home/agent/.claude.json` | a trust file made for the run | read, write |
   | Go build cache, Go module cache | named volumes, shared with other agent containers | read, write |
-  | `/home/agent/.claude/.credentials.json` | host credentials file, only when there is no token | read |
-  | the metrics dir | host | read |
+  | `/home/agent/.claude/.credentials.json` | host credentials file, only when there is no token | read, write |
+  | the metrics dir | host, only when the tooling has one | read |
 
   Note **[P]**: canon and memory are mounted at `/canon` and `/memory`, not
   inside `/workspace`. Inside the workspace, the snapshot would have to skip
@@ -113,9 +113,12 @@ token.
 - **When a turn ends**, the supervisor looks at the event queue (section 5).
   Events waiting → next turn at once. No events and slices in flight → wait.
   No events, nothing in flight, no "done" → one nudge turn ("nothing is in
-  flight; continue, or say done or blocked"). When that nudge turn also
-  ends with no accepted submit, the run ends as `FAILED(owner_idle)` **[P]**:
-  there is no second nudge. Only an accepted submit resets the count. Two
+  flight; continue, or say done or blocked"). The nudge turn can end the
+  usual ways: `blocked.md`, a `done.md` that is accepted or refused once, or
+  an error or timeout, which is an event for one more turn. When it ends
+  with none of these and no accepted submit, the run ends as
+  `FAILED(owner_idle)` **[P]**: there is no second nudge. Only an accepted
+  submit resets the count. Two
   turns in
   a row that end in an error or a timeout end it as
   `FAILED(owner_turn_failed)`. The whole order is `next_step` in `owner.py`.
@@ -153,7 +156,8 @@ What happens **[P]**:
    reason.
 3. The command returns: 0 accepted, 1 refused, 2 wrong arguments (a
    malformed `--base`, `--subject` or claim; nothing is sent), 3 no answer
-   in time (the request is then withdrawn). A request withdrawn before the
+   in time (the request is then withdrawn; an answer that still arrives in
+   the next 10 seconds gives 0 or 1) or the request could not be written. A request withdrawn before the
    snapshot uses no round; one withdrawn during the snapshot uses a round
    and the owner is told. After that the owner may change the workspace
    again. How long this takes on the real repo is not measured **[T]**.
@@ -222,7 +226,8 @@ submit. A FAILED slice ends the whole run as FAILED.
 - **A new round on a published slice** is one more commit on the pull
   request head, and a round comment. Nothing is replaced: the new commit is
   a child of the head (with the new base as a second parent when the base
-  moved), so the push is a fast-forward. The push goes through
+  moved), so the push is a fast-forward. (When the new round has the same
+  tree as the head and needs no new base, no commit is made.) The push goes through
   only when the branch on GitHub is still the supervisor's last push (git
   checks that with `--force-with-lease=<branch>:<expected head>`).
 - **A branch that moved** under the supervisor (it holds commits the
@@ -411,9 +416,11 @@ owner that wants to leak.
   owner's event text and prompt say that the pipeline answers a queue
   removal with a re-enqueue; for a slice pull request that is not built. A
   cost limit per epic is an open point.
-- **Other ways a run ends**: `FAILED(prepare_error)`, `FAILED(owner_error)`
-  (an error in the supervisor's loop), `FAILED(owner_container)` (the
-  container cannot be started), `FAILED(lease_lost)`.
+- **Other ways a run ends**: `REFUSED(<gate>)` when a PREPARE gate says
+  no; `FAILED(prepare_error)`; `FAILED(owner_error)` (an error in the
+  supervisor's loop, a credential found where none may be);
+  `FAILED(owner_container)` (the container or a turn cannot be started);
+  `FAILED(lease_lost)`.
 - **Supervisor crash**: `resume` continues from `state.jsonl`. Slice states
   and PUBLISH sub-steps are idempotent as in a story run. The owner container
   may still be running; the supervisor uses it again. A turn that was open is
@@ -422,9 +429,11 @@ owner that wants to leak.
   the owner submits it again. Submit requests found at the restart are
   answered "submit again".
 - **Container lost** (host reboot): the supervisor starts a new container
-  with the same mounts and continues the same session with `--resume` and
-  one event that tells the owner the container was restarted and to read
-  its `state.md`. (The event text says the build caches are gone; the Go
+  with the mounts decided again by the same rules (the trust file is a new
+  one) and continues the same session with `--resume`. One event tells the
+  owner the container was restarted and to read its `state.md`. When a turn
+  was open at that moment, that turn is run again with its own events
+  first, and the restart event comes with the turn after it. (The event text says the build caches are gone; the Go
   caches are named volumes and are kept.) The session files are on the host, so the thread is kept.
 - **Session lost** (no transcript): the turn script starts a new session
   with the first-turn prompt and the same events. `state.md` in memory is
