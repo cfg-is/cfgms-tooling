@@ -924,6 +924,32 @@ def fsm_runs():
         return []
 
 
+def owner_run_epic_nums(runs):
+    """Epic numbers that an unfinished epic-mode FSM run on this host owns
+    (scripts/fsm/EPIC-DESIGN.md). One owner session builds such an epic in
+    slices and makes no stories, so the epic has no sub-issues for its whole
+    life. A crashed run counts: it is resumed, not replaced. A run that is
+    done or abandoned does not count."""
+    nums = set()
+    for r in runs or []:
+        if r.get("mode") != "epic" or r.get("status") in ("done", "abandoned"):
+            continue
+        tail = str(r.get("target") or "").removeprefix("epic-")
+        if tail.isdigit():
+            nums.add(int(tail))
+    return nums
+
+
+def split_owner_run_epics(epics_undecomposed, owned_nums):
+    """(still undecomposed, owner-run) from the epics with no stories. An
+    owner-run epic must not be offered for decomposition: the Planning Team
+    would make stories for work the owner is building."""
+    owned_nums = set(owned_nums or ())
+    keep = [e for e in epics_undecomposed if e.get("number") not in owned_nums]
+    owned = [e for e in epics_undecomposed if e.get("number") in owned_nums]
+    return keep, owned
+
+
 def fsm_run_view(runs, lease_rows=None, host=None):
     """What the FSM runs on this host mean for this cycle (DESIGN.md §11).
 
@@ -3268,7 +3294,12 @@ def main():
     # or not one of its containers is running right now. pr-<N> leases held
     # by any host mean the same for a PR (review, fix and resolve share it).
     lease_rows = _lease_list_rows()
-    fsm_view = fsm_run_view(fsm_runs(), lease_rows)
+    all_fsm_runs = fsm_runs()
+    fsm_view = fsm_run_view(all_fsm_runs, lease_rows)
+    # An epic that an owner session builds has no stories and is not
+    # "undecomposed": keep it away from the Planning Team.
+    out["epics_undecomposed"], out["epics_owner_run"] = split_owner_run_epics(
+        out.get("epics_undecomposed", []), owner_run_epic_nums(all_fsm_runs))
     out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
     out["fsm_recommendations"] = fsm_view["recommendations"]
     # In-flight fix-pr / resolve-conflict FSM runs hold their PR like a running
@@ -3370,6 +3401,7 @@ def write_output(out, mode):
             "fix_cycle": len(out.get("pipeline_state", {}).get("fix_cycle", [])),
             "merge_queue": len(out.get("merge_queue", [])),
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
+            "owner_run_epics": len(out.get("epics_owner_run", [])),
         },
         "host_caps": out.get("host_caps", [DEFAULT_ENV]),
         "capacity": out.get("capacity", {}),

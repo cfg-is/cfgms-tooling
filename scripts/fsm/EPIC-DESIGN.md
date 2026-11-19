@@ -445,6 +445,7 @@ owner that wants to leak.
 |---|---|---|
 | run index | an `epic-<N>` run: its owner container, the OWNER state, the 336-hour retention | built |
 | preflight | the epic's project item is in flight while the run is | built (general run view) |
+| preflight | an epic with an unfinished epic run on this host is in `epics_owner_run`, not in `epics_undecomposed`, so the Planning Team is not offered it. A run that ended (also as FAILED) puts the epic back in `epics_undecomposed` | built |
 | preflight | every slice PR the run opened is in flight | not built |
 | pipeline-watch | epic run ended; `container_stalled` from the heartbeat | built (general run rows) |
 | pipeline-watch | new events: slice published, slice merged | not built |
