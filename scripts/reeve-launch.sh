@@ -15,7 +15,9 @@
 #   /workspace/cfgms-memory         read-only  (the host clone)
 #   /workspace/claude-code-memory   read-only  (the founder's Claude Code memory files)
 #   /run/reeve-tokens/canon.token   contents:write on cfgms-canon only
-#   /run/reeve-tokens/cfgms.token   issues + project board on cfgms only
+#   /run/reeve-tokens/cfgms.token   issues on cfgms only, plus the
+#                                   organization's project boards (that
+#                                   permission is not per repository)
 #
 # The GitHub App key never enters the container. GitHub App tokens live one
 # hour, so a host loop makes new ones every 45 minutes while the container
@@ -31,7 +33,15 @@
 #
 # Know before you use it: Reeve gets the host's ~/.claude and ~/.claude.json
 # read-write (the founder's full Claude login, as po-live does) and runs with
-# no permission prompts. Its limits are the mounts and the two tokens.
+# no permission prompts. So Reeve is trusted like the founder's own Claude
+# session: a file it writes into ~/.claude can run on the host later. The
+# mounts and the two tokens limit what it does to GitHub, not to this host.
+#
+# The host never runs git in cfgms-canon: the container can write that
+# clone's .git/config, and a config line (a filter, a credential helper) is a
+# program for the git that reads it. The container checks and updates canon
+# itself (reeve-container-setup.sh). The host does not update cfgms-memory
+# either; it is mounted as it is.
 set -euo pipefail
 
 CFG_ROOT="${CFGMS_REEVE_ROOT:-$HOME/git/cfg.is}"
@@ -54,7 +64,7 @@ REEVE_DEF="${CFGMS_REEVE_DEF:-$STATE_DIR/cfgms/.claude/agents/reeve.md}"
 # is read as data (digits only), never run.
 REEVE_CONF="${CFGMS_REEVE_CONF:-$HOME/.config/cfgms/reeve.conf}"
 conf_number() {
-  [[ -r "$REEVE_CONF" ]] || return 0
+  [[ -f "$REEVE_CONF" && -r "$REEVE_CONF" ]] || return 0
   sed -n "s/^$1=\([0-9][0-9]*\)[[:space:]]*\$/\1/p" "$REEVE_CONF" | head -n 1
 }
 APP_ID="${CFGMS_REEVE_APP_ID:-$(conf_number app_id)}"
@@ -214,16 +224,10 @@ cmd_start() {
   [[ -f "$HOME/.claude/.credentials.json" ]] || die "no Claude login on the host: $HOME/.claude/.credentials.json"
   [[ -d "$CC_MEMORY_DIR" ]] || die "Claude Code memory folder not found: $CC_MEMORY_DIR"
 
-  # Canon must be on main and clean: Reeve commits straight to main.
-  # The container can write these two clones, their .git folders included.
-  # Host git must not run a hook or a file-watcher program from them.
-  local safe=(-c core.hooksPath=/dev/null -c core.fsmonitor=false)
-  [[ "$(git "${safe[@]}" -C "$CANON_DIR" branch --show-current)" == "main" ]] \
-    || die "cfgms-canon is not on main: $CANON_DIR"
-  [[ -z "$(git "${safe[@]}" -C "$CANON_DIR" status --porcelain)" ]] \
-    || die "cfgms-canon has uncommitted changes: $CANON_DIR"
-  git "${safe[@]}" -C "$CANON_DIR" pull --quiet --ff-only
-  git "${safe[@]}" -C "$MEMORY_DIR" pull --quiet --ff-only
+  [[ -d "$CANON_DIR/.git" ]] || die "cfgms-canon clone not found: $CANON_DIR"
+  [[ -d "$MEMORY_DIR" ]] || die "cfgms-memory folder not found: $MEMORY_DIR"
+  # No host git in cfgms-canon (see the header). The container checks that
+  # canon is on main and clean, and updates it, before Claude starts.
 
   # The agent definition is a project-level agent of /workspace, so it does
   # not land in the host's own ~/.claude/agents.

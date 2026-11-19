@@ -39,3 +39,13 @@ git config --global --unset-all credential.helper 2>/dev/null || true
 git config --global --unset-all "credential.https://github.com.helper" 2>/dev/null || true
 git config --global credential.useHttpPath true
 git config --global "credential.${canon_url}.helper" "$BIN/git-credential-reeve-canon"
+
+# Canon must be on main, clean and current: Reeve commits straight to main.
+# This check is here and not on the host, because the host must not run git
+# in a clone whose .git/config a container can write.
+[ "$(git -C "$CANON" branch --show-current)" = "main" ] \
+  || { echo "ERROR: cfgms-canon is not on main" >&2; exit 1; }
+[ -z "$(git -C "$CANON" status --porcelain)" ] \
+  || { echo "ERROR: cfgms-canon has uncommitted changes" >&2; exit 1; }
+git -C "$CANON" pull --quiet --ff-only \
+  || { echo "ERROR: cannot update cfgms-canon from origin" >&2; exit 1; }

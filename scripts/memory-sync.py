@@ -14,8 +14,11 @@ Each cycle:
   2. refuse anything that is not a plain note file (allow-list below)
   3. scan the staged content for secrets: gitleaks, then truffleHog
      (verified secrets); a hit moves the file out of the shared folder into a
-     host-only quarantine and writes an alert
-  4. commit, one commit per author named in the note headers
+     host-only quarantine and writes an alert. The scan finds a secret that
+     was written by accident. It does not stop an agent that hides one on
+     purpose.
+  4. commit the staged content that was checked (never a second read of the
+     folder), one commit per author named in the note headers
   5. push to main
 
 Everything the folder contains is untrusted input written by agents.
@@ -27,6 +30,7 @@ Usage:
 """
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -45,8 +49,14 @@ COMMITTER_NAME = "cfgms-memory-sync"
 COMMITTER_EMAIL = "memory-sync@agents.cfg.is"
 
 
+def printable(text):
+    """Text that can always be printed and stored: a file name written by an
+    agent can hold bytes that are not UTF-8."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def log(msg):
-    print(time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg, flush=True)
+    print(time.strftime("%Y-%m-%dT%H:%M:%S%z"), printable(msg), flush=True)
 
 
 class Repo:
@@ -62,18 +72,20 @@ class Repo:
     # Git that looks at the agent-written folder. It must not read the host's
     # global or system config (a filter or hook defined there could be
     # triggered by a file the agent wrote), and it runs no hooks.
-    def _env(self, isolated):
+    def _env(self, isolated, index=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env["GIT_DIR"] = self.git_dir
         env["GIT_WORK_TREE"] = self.work_tree
         env["GIT_TERMINAL_PROMPT"] = "0"
+        if index:
+            env["GIT_INDEX_FILE"] = index
         if isolated:
             env["GIT_CONFIG_NOSYSTEM"] = "1"
             env["GIT_CONFIG_GLOBAL"] = "/dev/null"
             env["GIT_ATTR_NOSYSTEM"] = "1"
         return env
 
-    def git(self, *args, isolated=True, check=True, stdin=None):
+    def git(self, *args, isolated=True, check=True, stdin=None, index=None):
         cmd = ["git",
                "-c", "core.hooksPath=/dev/null",
                "-c", "core.fsmonitor=false",
@@ -82,15 +94,16 @@ class Repo:
                "-c", "submodule.recurse=false",
                "-c", "commit.gpgsign=false",
                *args]
-        r = subprocess.run(cmd, env=self._env(isolated), cwd=self.state_dir,
+        r = subprocess.run(cmd, env=self._env(isolated, index), cwd=self.state_dir,
                            input=stdin, capture_output=True)
         if check and r.returncode != 0:
-            raise RuntimeError("git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace")))
+            raise RuntimeError("git %s failed: %s" % (printable(" ".join(args)),
+                                                      r.stderr.decode(errors="replace")))
         return r
 
     def staged(self):
-        """[(status, mode, path)] for every staged change against HEAD."""
-        out = self.git("diff", "--cached", "--raw", "--no-renames", "-z", "HEAD").stdout
+        """[(status, mode, blob, path)] for every staged change against HEAD."""
+        out = self.git("diff", "--cached", "--raw", "--no-renames", "--no-abbrev", "-z", "HEAD").stdout
         parts = out.split(b"\0")
         res = []
         i = 0
@@ -98,7 +111,7 @@ class Repo:
             meta = parts[i].decode()
             path = parts[i + 1].decode(errors="surrogateescape")
             fields = meta.lstrip(":").split()
-            res.append((fields[4][0], fields[1], path))
+            res.append((fields[4][0], fields[1], fields[3], path))
             i += 2
         return res
 
@@ -109,7 +122,7 @@ class Repo:
     def alert(self, kind, path, detail):
         name = "%s-%s.json" % (time.strftime("%Y%m%dT%H%M%S"), kind)
         with open(os.path.join(self.alerts, name), "a") as f:
-            f.write(json.dumps({"kind": kind, "path": path, "detail": detail}) + "\n")
+            f.write(json.dumps({"kind": kind, "path": printable(path), "detail": detail}) + "\n")
         log("ALERT %s: %s (%s)" % (kind, path, detail))
 
     def quarantine_file(self, path, reason):
@@ -118,8 +131,11 @@ class Repo:
         # a parent directory for a symlink, so that a path built from the
         # folder name points at a host file. So: walk down from the folder
         # one component at a time and never follow a symlink.
-        dst = os.path.join(self.quarantine, "%s-%s" % (time.strftime("%Y%m%dT%H%M%S"),
-                                                         path.replace("/", "__")))
+        # The name is bounded: a long path must not make the copy, and so the
+        # removal, fail.
+        flat = printable(path.replace("/", "__"))[-120:]
+        digest = hashlib.sha256(os.fsencode(path)).hexdigest()[:12]
+        dst = os.path.join(self.quarantine, "%s-%s-%s" % (time.strftime("%Y%m%dT%H%M%S"), digest, flat))
         parts = path.split("/")
         if any(p in ("", ".", "..") for p in parts):
             self.alert("quarantine_failed", path, "unsafe path")
@@ -141,11 +157,13 @@ class Repo:
                 st = os.fstat(fd)
                 if stat.S_ISREG(st.st_mode) and st.st_size <= 16 * MAX_FILE_BYTES:
                     with open(dst, "wb", opener=lambda p, f: os.open(p, f | os.O_EXCL, 0o600)) as out:
-                        while True:
-                            chunk = os.read(fd, 1 << 16)
+                        left = 16 * MAX_FILE_BYTES     # a file that still grows is cut here
+                        while left > 0:
+                            chunk = os.read(fd, min(1 << 16, left))
                             if not chunk:
                                 break
                             out.write(chunk)
+                            left -= len(chunk)
             os.unlink(name, dir_fd=dir_fd)     # removes the entry itself, never a link's target
         except OSError as e:
             self.alert("quarantine_failed", path, str(e))
@@ -159,7 +177,7 @@ class Repo:
 def refuse_reason(status, mode, path):
     if ".git" in path.split("/"):
         return "git_path"
-    if not ALLOWED.match(path):
+    if not ALLOWED.fullmatch(path):
         return "path_not_allowed"
     if status == "D":
         return None
@@ -168,9 +186,9 @@ def refuse_reason(status, mode, path):
     return None
 
 
-def note_author(repo, path):
-    """`author:` from the note's header, read from the staged blob."""
-    r = repo.git("show", ":" + path, check=False)
+def note_author(repo, blob):
+    """`author:` from the note's header, read from the checked blob."""
+    r = repo.git("cat-file", "blob", blob, check=False)
     if r.returncode != 0:
         return FALLBACK_AUTHOR
     for line in r.stdout[:4096].decode(errors="replace").splitlines()[:25]:
@@ -204,7 +222,9 @@ def scan_secrets(repo, paths):
                             "--exit-code", "9", "--no-banner"],
                            capture_output=True, cwd=tmp)
         if r.returncode == 9:
-            for f in json.load(open(report)):
+            with open(report) as fh:
+                found = json.load(fh)
+            for f in found:
                 hits.setdefault(os.path.relpath(f["File"], export), "gitleaks")
         elif r.returncode != 0:
             raise RuntimeError("gitleaks failed: " + r.stderr.decode(errors="replace")[-400:])
@@ -221,7 +241,47 @@ def scan_secrets(repo, paths):
                 raise RuntimeError("truffleHog reported a verified secret but named no file")
         elif r.returncode != 0:
             raise RuntimeError("truffleHog failed: " + r.stderr.decode(errors="replace")[-400:])
+    scanned = set(paths)
+    unknown = sorted(h for h in hits if h not in scanned)
+    if unknown:
+        # A hit that does not name a scanned file cannot be taken out of the
+        # commit. Stop this cycle; nothing is committed.
+        raise RuntimeError("secret scan named a file that was not scanned: %s"
+                           % printable(", ".join(unknown))[:300])
     return hits
+
+
+def commit_checked(repo, author, entries):
+    """One commit of `entries` [(status, mode, blob, path)] on top of HEAD.
+
+    The commit is built from the blob ids that were checked, in a private
+    index. `git commit -- <paths>` would read the files again from the
+    shared folder, where an agent can have changed them after the checks.
+    """
+    paths = sorted(printable(e[3]) for e in entries)
+    subject = "memory: %d file%s from %s" % (len(paths), "" if len(paths) == 1 else "s", author)
+    fd, index = tempfile.mkstemp(dir=repo.state_dir, prefix="index-")
+    os.close(fd)
+    os.unlink(index)
+    try:
+        repo.git("read-tree", "HEAD", index=index)
+        for status, mode, blob, path in entries:
+            if status == "D":
+                repo.git("update-index", "--force-remove", "--", path, index=index)
+            else:
+                repo.git("update-index", "--add", "--cacheinfo", "%s,%s,%s" % (mode, blob, path),
+                         index=index)
+        tree = repo.git("write-tree", index=index).stdout.decode().strip()
+    finally:
+        if os.path.exists(index):
+            os.unlink(index)
+    ident = ["-c", "user.name=" + COMMITTER_NAME, "-c", "user.email=" + COMMITTER_EMAIL]
+    env_author = "%s <%s@agents.cfg.is>" % (author, author.replace("/", "-"))
+    commit = repo.git(*ident, "-c", "author.name=" + author,
+                      "-c", "author.email=%s@agents.cfg.is" % author.replace("/", "-"),
+                      "commit-tree", tree, "-p", "HEAD", "-m", subject, "-m", "\n".join(paths)
+                      ).stdout.decode().strip()
+    repo.git("update-ref", "-m", "memory-sync: " + env_author, "HEAD", commit)
 
 
 def cycle(repo, push=True):
@@ -232,7 +292,8 @@ def cycle(repo, push=True):
     # Alert once for each, not once a minute.
     seen_file = os.path.join(repo.state_dir, "refused.json")
     try:
-        seen = set(json.load(open(seen_file)))
+        with open(seen_file) as fh:
+            seen = set(json.load(fh))
     except (OSError, ValueError):
         seen = set()
     now_refused = set()
@@ -245,42 +306,37 @@ def cycle(repo, push=True):
             repo.alert(kind, path, detail)
 
     ok = []
-    for status, mode, path in changes:
+    for status, mode, blob, path in changes:
         reason = refuse_reason(status, mode, path)
         if reason:
             refuse("refused_" + reason, path, "left out of the commit")
             continue
         if status != "D":
-            size = int(repo.git("cat-file", "-s", ":" + path).stdout)
+            size = int(repo.git("cat-file", "-s", blob).stdout)
             if size > MAX_FILE_BYTES:
                 refuse("refused_too_large", path, "%d bytes" % size)
                 continue
-        ok.append((status, path))
+        ok.append((status, mode, blob, path))
     with open(seen_file, "w") as f:
         json.dump(sorted(now_refused), f)
 
-    live = [p for s, p in ok if s != "D"]
+    live = [e[3] for e in ok if e[0] != "D"]
     hits = scan_secrets(repo, live)
     for path, tool in hits.items():
         repo.unstage([path])
         repo.quarantine_file(path, "secret_" + tool)
-    ok = [(s, p) for s, p in ok if p not in hits]
+    ok = [e for e in ok if e[3] not in hits]
 
     committed = 0
     if ok:
         by_author = {}
-        for status, path in ok:
-            author = FALLBACK_AUTHOR if status == "D" else note_author(repo, path)
-            by_author.setdefault(author, []).append(path)
-        for author, paths in sorted(by_author.items()):
-            subject = "memory: %d file%s from %s" % (len(paths), "" if len(paths) == 1 else "s", author)
-            body = "\n".join(sorted(paths))
-            repo.git("-c", "user.name=" + COMMITTER_NAME, "-c", "user.email=" + COMMITTER_EMAIL,
-                     "commit", "-q", "--no-verify",
-                     "--author", "%s <%s@agents.cfg.is>" % (author, author.replace("/", "-")),
-                     "-m", subject, "-m", body, "--", *paths)
+        for entry in ok:
+            author = FALLBACK_AUTHOR if entry[0] == "D" else note_author(repo, entry[2])
+            by_author.setdefault(author, []).append(entry)
+        for author, entries in sorted(by_author.items()):
+            commit_checked(repo, author, entries)
             committed += 1
-            log("committed %d file(s) from %s" % (len(paths), author))
+            log("committed %d file(s) from %s" % (len(entries), author))
 
     if push:
         ahead = repo.git("rev-list", "--count", "origin/main..HEAD", check=False)
