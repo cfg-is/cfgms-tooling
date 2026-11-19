@@ -924,30 +924,53 @@ def fsm_runs():
         return []
 
 
-def owner_run_epic_nums(runs):
-    """Epic numbers that an unfinished epic-mode FSM run on this host owns
-    (scripts/fsm/EPIC-DESIGN.md). One owner session builds such an epic in
-    slices and makes no stories, so the epic has no sub-issues for its whole
-    life. A crashed run counts: it is resumed, not replaced. A run that is
-    done or abandoned does not count."""
-    nums = set()
+_EPIC_KEY_RE = re.compile(r"^epic-(\d+)$")
+
+
+def owner_run_epics(runs, lease_rows=None):
+    """{epic number: why} for each epic that an owner session holds
+    (scripts/fsm/EPIC-DESIGN.md). An owner builds its epic in slices and makes
+    no stories, so the epic has no sub-issues for its whole life.
+
+    Two signals, either is enough:
+    - an epic-mode FSM run in this host's run index, in ANY status. A run
+      that ended is kept on purpose: the epic stays open until the epic audit
+      closes it, and a FAILED run has the owner's work in its run dir. The
+      hold ends when the run dir is collected.
+    - an unexpired `epic-<N>` lease, which po-act.sh takes for the run and
+      which every host can see. (`epic-decompose-<N>` is a different lease.)
+    """
+    held = {}
     for r in runs or []:
-        if r.get("mode") != "epic" or r.get("status") in ("done", "abandoned"):
+        if r.get("mode") != "epic":
             continue
-        tail = str(r.get("target") or "").removeprefix("epic-")
-        if tail.isdigit():
-            nums.add(int(tail))
-    return nums
+        m = (_EPIC_KEY_RE.match(str(r.get("key") or ""))
+             or _EPIC_KEY_RE.match(str(r.get("target") or "")))
+        if m:
+            held[int(m.group(1))] = (f"epic run {r.get('run_id') or '?'} on this host "
+                                     f"is {r.get('status') or '?'} in {r.get('state') or '?'}")
+    for key, holder, expired in lease_rows or []:
+        m = _EPIC_KEY_RE.match(str(key or ""))
+        if m and not expired:
+            held.setdefault(int(m.group(1)), f"lease {key} held by {holder}")
+    return held
 
 
-def split_owner_run_epics(epics_undecomposed, owned_nums):
-    """(still undecomposed, owner-run) from the epics with no stories. An
-    owner-run epic must not be offered for decomposition: the Planning Team
-    would make stories for work the owner is building."""
-    owned_nums = set(owned_nums or ())
-    keep = [e for e in epics_undecomposed if e.get("number") not in owned_nums]
-    owned = [e for e in epics_undecomposed if e.get("number") in owned_nums]
-    return keep, owned
+def apply_owner_run_epics(out, runs, lease_rows=None):
+    """Move each owner-held epic from out["epics_undecomposed"] to
+    out["epics_owner_run"] (with the reason). An owner-held epic must not be
+    offered for decomposition: the Planning Team would make stories for work
+    the owner is building."""
+    held = owner_run_epics(runs, lease_rows)
+    keep, owned = [], []
+    for e in out.get("epics_undecomposed", []):
+        if e.get("number") in held:
+            owned.append(dict(e, owner_run=held[e["number"]]))
+        else:
+            keep.append(e)
+    out["epics_undecomposed"] = keep
+    out["epics_owner_run"] = owned
+    return out
 
 
 def fsm_run_view(runs, lease_rows=None, host=None):
@@ -2937,7 +2960,12 @@ def main():
         "into --defer drafts (security-sensitive bodies held private until "
         "dispatch) is invisible to both signals — those still need a manual "
         "decomposition-complete marker comment on the epic (or close the epic "
-        "when stories ship)."
+        "when stories ship). An epic that an owner session holds (an "
+        "epic-mode FSM run in this host's run index, or an unexpired "
+        "epic-<N> lease) has no stories by design: it is in epics_owner_run "
+        "and never in epics_undecomposed. `epics` still lists it with "
+        "sub_issues_total 0 — choose epics to decompose from "
+        "epics_undecomposed, not from that count."
     )
 
     # Phase 2: fetch story bodies relevant to conflict detection.
@@ -3294,12 +3322,21 @@ def main():
     # or not one of its containers is running right now. pr-<N> leases held
     # by any host mean the same for a PR (review, fix and resolve share it).
     lease_rows = _lease_list_rows()
-    all_fsm_runs = fsm_runs()
+    try:
+        all_fsm_runs = _load_runindex().list_runs()
+    except Exception as e:
+        all_fsm_runs = []
+        degraded_reasons.append(
+            f"FSM run index unreadable ({e}) — an epic that an owner session "
+            "builds can show in epics_undecomposed; do not decompose from this run")
+    if lease_rows is None:
+        degraded_reasons.append(
+            "lease-list unavailable — an epic that an owner session on another "
+            "host builds can show in epics_undecomposed")
     fsm_view = fsm_run_view(all_fsm_runs, lease_rows)
     # An epic that an owner session builds has no stories and is not
     # "undecomposed": keep it away from the Planning Team.
-    out["epics_undecomposed"], out["epics_owner_run"] = split_owner_run_epics(
-        out.get("epics_undecomposed", []), owner_run_epic_nums(all_fsm_runs))
+    apply_owner_run_epics(out, all_fsm_runs, lease_rows)
     out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
     out["fsm_recommendations"] = fsm_view["recommendations"]
     # In-flight fix-pr / resolve-conflict FSM runs hold their PR like a running
