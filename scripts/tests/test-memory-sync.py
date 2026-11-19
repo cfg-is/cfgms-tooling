@@ -117,6 +117,52 @@ class MemorySync(unittest.TestCase):
         mode = self.g("ls-tree", "HEAD", "areas/a.md").decode().split()[0]
         self.assertEqual(mode, "100644")
 
+    def test_note_replaced_by_a_folder_of_the_same_name(self):
+        """A file / folder swap must not stop the cycle (it stopped every
+        later cycle, and every other author's notes with it)."""
+        self.note("areas/a.md")
+        self.ms.cycle(self.repo, push=False)
+        (self.work / "areas" / "a.md").unlink()
+        self.note("areas/a.md/b.md", NOTE.replace("owner/epic-7", "alice"))
+        self.note("areas/later.md", NOTE.replace("owner/epic-7", "zed"))
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(self.head_files(), {"README.md", "areas/a.md/b.md", "areas/later.md"})
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+
+    def test_folder_replaced_by_a_note_of_the_same_name(self):
+        self.note("areas/x.md/y.md")
+        self.ms.cycle(self.repo, push=False)
+        shutil.rmtree(self.work / "areas" / "x.md")
+        self.note("areas/x.md", NOTE.replace("owner/epic-7", "alice"))
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(self.head_files(), {"README.md", "areas/x.md"})
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+
+    def test_removed_note_is_removed_in_the_commit(self):
+        p = self.note("areas/a.md")
+        self.ms.cycle(self.repo, push=False)
+        p.unlink()
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertEqual(self.head_files(), {"README.md"})
+
+    def test_scanner_reads_the_committed_bytes_not_a_gitattributes_view(self):
+        """A .gitattributes file in the folder is refused from the commit, and
+        must not change the bytes that the scanners read."""
+        (self.work / ".gitattributes").write_text("*.md working-tree-encoding=UTF-16LE\n")
+        (self.work / "areas").mkdir()
+        (self.work / "areas" / "n.md").write_bytes(NOTE.encode("utf-16-le"))
+        seen = self.root / "seen"
+        self.set_scanners(gitleaks='''
+src=""
+while [ $# -gt 0 ]; do
+  case "$1" in --source) src="$2"; shift ;; esac
+  shift
+done
+cp "${src}areas/n.md" "%s"
+exit 0''' % seen)
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(seen.read_bytes(), self.g("cat-file", "blob", "HEAD:areas/n.md"))
+
     def test_file_outside_the_allow_list_is_refused(self):
         self.note("areas/ok.md")
         self.note("notes.txt", "x\n")

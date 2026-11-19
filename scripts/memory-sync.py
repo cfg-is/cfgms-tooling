@@ -199,14 +199,18 @@ def note_author(repo, blob):
     return FALLBACK_AUTHOR
 
 
-def scan_secrets(repo, paths):
-    """Return {path: tool} for staged files that hold a secret.
+def scan_secrets(repo, blobs):
+    """Return {path: tool} for checked files that hold a secret. `blobs` is
+    {path: blob id}.
 
-    Both tools read the STAGED content (what would be committed), exported to
-    a private folder, never the live shared folder, which an agent can still
-    change while the scan runs.
+    Both tools read the bytes of the blobs that would be committed, written
+    to a private folder. They never read the live shared folder, which an
+    agent can still change while the scan runs, and the bytes do not pass
+    through a filter or an encoding that a .gitattributes file in that folder
+    could ask for.
     """
     hits = {}
+    paths = sorted(blobs)
     if not paths:
         return hits
     for tool in ("gitleaks", "trufflehog"):
@@ -214,8 +218,11 @@ def scan_secrets(repo, paths):
             raise RuntimeError("%s is not installed; refusing to commit without a secret scan" % tool)
     with tempfile.TemporaryDirectory(dir=repo.state_dir, prefix="scan-") as tmp:
         export = os.path.join(tmp, "tree") + "/"
-        repo.git("checkout-index", "--prefix=" + export, "-z", "--stdin",
-                 stdin=b"\0".join(p.encode(errors="surrogateescape") for p in paths) + b"\0")
+        for path in paths:              # an allow-listed path: plain name parts only
+            dst = os.path.join(export, path)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as out:
+                out.write(repo.git("cat-file", "blob", blobs[path]).stdout)
         report = os.path.join(tmp, "gitleaks.json")
         r = subprocess.run(["gitleaks", "detect", "--no-git", "--source", export, "--redact",
                             "--report-format", "json", "--report-path", report,
@@ -253,6 +260,7 @@ def scan_secrets(repo, paths):
 
 def commit_checked(repo, author, entries):
     """One commit of `entries` [(status, mode, blob, path)] on top of HEAD.
+    Returns False, and makes no commit, when the entries change nothing.
 
     The commit is built from the blob ids that were checked, in a private
     index. `git commit -- <paths>` would read the files again from the
@@ -265,16 +273,20 @@ def commit_checked(repo, author, entries):
     os.unlink(index)
     try:
         repo.git("read-tree", "HEAD", index=index)
-        for status, mode, blob, path in entries:
+        # Removals first, and --replace on each add: a note can take the
+        # place of a folder with the same name, or the reverse.
+        for status, mode, blob, path in sorted(entries, key=lambda e: e[0] != "D"):
             if status == "D":
                 repo.git("update-index", "--force-remove", "--", path, index=index)
             else:
-                repo.git("update-index", "--add", "--cacheinfo", "%s,%s,%s" % (mode, blob, path),
-                         index=index)
+                repo.git("update-index", "--add", "--replace", "--cacheinfo",
+                         "%s,%s,%s" % (mode, blob, path), index=index)
         tree = repo.git("write-tree", index=index).stdout.decode().strip()
     finally:
         if os.path.exists(index):
             os.unlink(index)
+    if tree == repo.git("rev-parse", "HEAD^{tree}").stdout.decode().strip():
+        return False
     ident = ["-c", "user.name=" + COMMITTER_NAME, "-c", "user.email=" + COMMITTER_EMAIL]
     env_author = "%s <%s@agents.cfg.is>" % (author, author.replace("/", "-"))
     commit = repo.git(*ident, "-c", "author.name=" + author,
@@ -282,6 +294,7 @@ def commit_checked(repo, author, entries):
                       "commit-tree", tree, "-p", "HEAD", "-m", subject, "-m", "\n".join(paths)
                       ).stdout.decode().strip()
     repo.git("update-ref", "-m", "memory-sync: " + env_author, "HEAD", commit)
+    return True
 
 
 def cycle(repo, push=True):
@@ -320,8 +333,7 @@ def cycle(repo, push=True):
     with open(seen_file, "w") as f:
         json.dump(sorted(now_refused), f)
 
-    live = [e[3] for e in ok if e[0] != "D"]
-    hits = scan_secrets(repo, live)
+    hits = scan_secrets(repo, {e[3]: e[2] for e in ok if e[0] != "D"})
     for path, tool in hits.items():
         repo.unstage([path])
         repo.quarantine_file(path, "secret_" + tool)
@@ -333,10 +345,12 @@ def cycle(repo, push=True):
         for entry in ok:
             author = FALLBACK_AUTHOR if entry[0] == "D" else note_author(repo, entry[2])
             by_author.setdefault(author, []).append(entry)
-        for author, entries in sorted(by_author.items()):
-            commit_checked(repo, author, entries)
-            committed += 1
-            log("committed %d file(s) from %s" % (len(entries), author))
+        # The removals (author "unknown") go first: an add by one author can
+        # need the place that a removal makes free.
+        for author, entries in sorted(by_author.items(), key=lambda kv: (kv[0] != FALLBACK_AUTHOR, kv[0])):
+            if commit_checked(repo, author, entries):
+                committed += 1
+                log("committed %d file(s) from %s" % (len(entries), author))
 
     if push:
         ahead = repo.git("rev-list", "--count", "origin/main..HEAD", check=False)
