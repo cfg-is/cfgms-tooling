@@ -14,7 +14,7 @@
 # Stage 0 (builder): compile cfg binary in an isolated stage so the source tree
 # and .git history are never baked into the final image's layers.
 # CLI_BINARY=cfg  Entry point: ./cmd/cfg
-FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS cfg-builder
+FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9 AS cfg-builder
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
@@ -32,7 +32,7 @@ RUN set -eu; \
        ./cmd/cfg
 
 # Stage 1 (runtime): main agent container with full tooling
-FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385
+FROM ghcr.io/cfg-is/ci-mirror/golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9
 
 # Declare TARGETARCH so BuildKit auto-populates it from the build platform.
 # Must be declared inside the consuming stage; an undeclared ${TARGETARCH}
@@ -100,7 +100,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # gosec and staticcheck are built by scripts/install-go-analyzers.sh, the same
 # script security-scan.yml uses: it builds the pinned releases against a
 # golang.org/x/tools that can read this Go's export data. A plain `go install`
-# of the pinned releases cannot read Go 1.27.3 export data ("export data version
+# of the pinned releases cannot read Go 1.27 export data ("export data version
 # 5 is greater than maximum supported version 4") and fails on every package.
 # The script fetches through its sibling scripts/go-fetch-retry.sh (cfgms #6216),
 # resolved next to itself, so both are copied into the same directory.
