@@ -1,0 +1,507 @@
+# FSM `epic` mode: design
+
+Status: the design of `epic` mode. Written 2026-11-15, before the code;
+brought in line with the code on 2026-11-18. Where this file and the code
+differ, the code is right. "Not built" marks a plan the code does not
+implement. It extends `DESIGN.md` in this folder (called "FSM design" below;
+`§` numbers point there) and section 5 of `docs/dev-model-design.md`.
+
+Legend: **[F]** = decided by the founder. **[P]** = proposed by Claude;
+confirm before building on it. **[T]** = must be tested; not known.
+
+---
+
+## 1. What changes, in one picture
+
+A story run: one run = one agent session = one candidate = one PR. The
+agent's turn ends, and only then does the supervisor look at its files.
+
+`epic` mode: one run = one owner session that lives for the whole epic, and
+many slices that land beside it.
+
+```
+PREPARE     gates, lease, repo R, workspace A, context
+OWNER       owner container starts; the owner works in turns
+  |
+  |  owner runs `slice-submit`            (any time, many times)
+  v
+  slice n:  SNAPSHOT -> VALIDATE -> [WAIT_PARENT] -> SYNC -> VALIDATE -> PUBLISH -> LANDING
+            every result -> /fsm/context/slices/<n>/ ; important ones wake the owner
+  |
+  |  every submitted slice has ended, one is merged, and the owner said "done"
+  v
+REPORT      follow-ups, `epic-result.json`, lease release
+            (board and ledger records: not built; the epic audit is outside this repo)
+```
+
+The five principles of the FSM design (§2) do not change. No GitHub
+credential enters the owner container. The validator is still the only proof.
+The supervisor still never runs git in `A`.
+
+**Read all, write nothing** **[F]** (2026-11-15). The owner may read
+everything of `cfgms` on GitHub and writes nothing there. The supervisor
+keeps the write path: snapshot, validate, push, pull request. The founder
+rejected giving the owner push access: `cfgms` is public, a push cannot be
+taken back, the container holds private canon and memory text, and the secret
+scan must sit between the owner and every push. The read-only token of this
+decision is not built (section 2): the owner reads public data without a
+token.
+
+## 2. The owner container and its turns
+
+- **One container for the whole epic** **[P]**: `cfg-owner-<epic>`, labels
+  `cfg-agent=true`, `mode=epic`, `kind=owner`, `epic`, `run_id`. Its
+  entrypoint refuses any GitHub credential, sets up the firewall, drops to
+  `agent`, and then waits. It does not run `claude` by itself. The supervisor
+  removes it when the run ends. Reason for one container: the helper sub
+  agents' files and the session's working state live as long as the epic.
+  (The Go build and module caches are named volumes; they outlive the
+  container.) Memory and CPU
+  need (limit `--memory=4g --cpus=4`) is not measured **[T]**.
+- **Container runtime**: Docker or rootless Podman, chosen by `runtime.py`.
+- **A turn is one `exec` in the container** **[P]**: `fsm-owner-turn.sh
+  <turn>`. The turn number is the only value passed. Session id, model,
+  effort, time limit and the events of the turn come from files the
+  supervisor writes under `/fsm/context`, which the owner cannot change. The
+  script runs `claude -p --session-id <uuid>` when the session has no
+  transcript yet, and `claude -p --resume <uuid>` when it has. The session
+  files sit in a session dir on the host, so the thread survives a container
+  restart. A lock allows one turn at a time.
+- **Claude login**: the long-lived inference token, as for dev agents. When
+  the host has no token, the host's credentials file is mounted instead. The
+  owner does not need remote control.
+- **Models** **[F]**: the owner runs on Fable, set by an `owner` segment in
+  `model-routing.yaml` (read from the harness path, so the owner cannot
+  change its own model). The container sets
+  `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`: a helper with no model of its own
+  runs on Sonnet. Order per the Claude Code docs: a model the owner passes
+  for one call, then the `model:` line of the helper's definition, then this
+  variable, then the owner's model. The judge runs on Opus (`model: opus` in
+  `judge.md`) **[F]**. The code resolves the `owner` segment and passes the
+  harness copies of `owner.md` and `judge.md` to the session; what the
+  segment and `judge.md` say is in `cfgms` **[not verified]**. The run does
+  not refuse when they are missing: with no `owner` segment the owner runs on
+  the resolver's default model, and with no `owner.md` in the harness the
+  session gets no agent definitions. **[T]**: what
+  the helpers cost per slice (`/usage-report` by model and agent layer).
+- **GitHub read** **[F]**: the decision is a read-only token for `cfgms`
+  only, minted and renewed by the host. Not built. The container holds no
+  GitHub credential: `assert_no_github_credentials` checks every launch and
+  the entrypoint refuses to start with one. `git fetch` needs no login
+  (public repo, `github.com` is on the allowlist). Without a token GitHub
+  allows 60 requests per hour, which several owners share. Which GitHub App
+  would mint the token is an open point.
+- **Mounts** (`assert_owner_argv` refuses a launch with anything that is
+  not in this table):
+
+  | In the container | From | Access |
+  |---|---|---|
+  | `/workspace` | workspace `A` | read, write |
+  | `/fsm/context/` | run dir | read |
+  | `/fsm/out/` | run dir | read, write |
+  | `/agent-sessions` | session dir on the host | read, write |
+  | `/canon/` | host canon clone | read |
+  | `/memory/` | host memory clone | read, write |
+  | `/home/agent/.claude.json` | a trust file made for the run | read, write |
+  | Go build cache, Go module cache | named volumes, shared with other agent containers | read, write |
+  | `/home/agent/.claude/.credentials.json` | host credentials file, only when there is no token | read |
+  | the metrics dir | host | read |
+
+  Note **[P]**: canon and memory are mounted at `/canon` and `/memory`, not
+  inside `/workspace`. Inside the workspace, the snapshot would have to skip
+  them, and a mistake would publish private text (see decision 2).
+- **When a turn ends**, the supervisor looks at the event queue (section 5).
+  Events waiting → next turn at once. No events and slices in flight → wait.
+  No events, nothing in flight, no "done" → one nudge turn ("nothing is in
+  flight; continue, or say done or blocked"). When that nudge turn also
+  ends with no accepted submit, the run ends as `FAILED(owner_idle)` **[P]**:
+  there is no second nudge. Only an accepted submit resets the count. Two
+  turns in
+  a row that end in an error or a timeout end it as
+  `FAILED(owner_turn_failed)`. The whole order is `next_step` in `owner.py`.
+- **Turn timeout** **[P]**: the agent session limit (180 min) per turn, as a
+  recorded, changeable default. Whether it fits an owner turn is not
+  measured **[T]**.
+
+## 3. Submit
+
+Decided **[F]**: submit means "take my workspace as it is now". The supervisor
+does not read the owner's commits.
+
+The owner runs one command (image-baked, no network):
+
+```
+slice-submit --slice <n> --claim <file> --subject "<scope>: <what changed>" \
+             --base <develop commit> [--builds-on <m>]
+```
+
+- `--base`: the full `origin/develop` commit id the workspace is built on.
+- `--builds-on`: the earlier slice this one needs, when that slice has not
+  merged. A chain is 1 → 2 → 3.
+- `--subject`: one line, no issue reference, link, mention or skip marker.
+  The supervisor adds `(Issue #<epic>)`.
+
+What happens **[P]**:
+
+1. The command writes `/fsm/out/submit/<n>-<k>/` (`claim.md`, `subject.txt`,
+   `request.json`; `<k>` is the lowest free number) and then waits, 900
+   seconds by default.
+2. The supervisor reads the request, copies `A` the way SNAPSHOT does in a
+   story run (§6.1: no-follow copy, `.git` skipped, caps enforced), runs the
+   filters and scans on the copy, and writes its answer to
+   `/fsm/context/slices/<n>/submitted.json`: accepted, or refused with the
+   reason.
+3. The command returns: 0 accepted, 1 refused, 2 wrong arguments (a
+   malformed `--base`, `--subject` or claim; nothing is sent), 3 no answer
+   in time (the request is then withdrawn). A request withdrawn before the
+   snapshot uses no round; one withdrawn during the snapshot uses a round
+   and the owner is told. After that the owner may change the workspace
+   again. How long this takes on the real repo is not measured **[T]**.
+
+The owner must not write to `/workspace` while the command waits. Helpers must
+be finished before submit.
+
+**Local git belongs to the owner** **[P]**. The story prompt forbids commit,
+rebase, stash and fetch. In `epic` mode the owner may use git in `/workspace`
+as a tool: commits as checkpoints, a branch to park work for slice 3 while it
+repairs slice 1, `git fetch origin` and a merge to catch up with `develop`.
+The supervisor ignores all of it. It only ever reads the files.
+
+**What a slice's diff is measured against**:
+
+| Case | Parent of the slice commit |
+|---|---|
+| No `--builds-on` | the `--base` commit. The supervisor checks that it is on `origin/develop`. |
+| `--builds-on m`, slice `m` not merged | the candidate commit of slice `m`'s current round |
+| `--builds-on m`, slice `m` merged meanwhile | treated as no `--builds-on` |
+
+A wrong `--base` cannot land bad code unseen: the diff would show other
+people's changes or reverts, and VALIDATE, SYNC and the reviewer all see the
+real diff.
+
+## 4. Life of a slice
+
+Each slice is its own small state machine inside the epic run (`slices.py`),
+with its own records in `state.jsonl` (keyed by slice and round). It reuses
+the snapshot, validator and publish code of a story run.
+
+```
+SNAPSHOT ─bad request / no change / filter or scan violation▶ REJECTED (answer to slice-submit)
+         ─ok──────────────────────────────────▶ VALIDATE
+VALIDATE ─fail────────────────────────────────▶ REJECTED        (log tail + wake)
+         ─pass, parent slice not merged───────▶ WAIT_PARENT     (no wake)
+         ─pass, no unmerged parent────────────▶ SYNC
+         ─pass, after SYNC────────────────────▶ PUBLISH
+WAIT_PARENT ─parent merged────────────────────▶ SYNC
+SNAPSHOT, VALIDATE, WAIT_PARENT
+         ─parent got a new round, closed or failed▶ STALE       (wake)
+SYNC ─nothing to do / rebased cleanly─────────▶ VALIDATE
+     ─conflict────────────────────────────────▶ REJECTED        (conflict files + wake)
+PUBLISH ─ok───────────────────────────────────▶ LANDING
+        ─secret detected / branch moved───────▶ REJECTED        (wake)
+        ─step failed / lease lost─────────────▶ FAILED
+LANDING ─checks failed / review findings / removed from queue / conflicting▶ NEEDS_OWNER (wake)
+NEEDS_OWNER ─cleared──────────────────────────▶ LANDING         (no wake)
+            ─another of the four signals──────▶ NEEDS_OWNER     (wake)
+any state, slice has a PR ─merged─────────────▶ MERGED          (wake)
+                          ─closed without merge▶ CLOSED         (wake)
+REJECTED, STALE, NEEDS_OWNER, WAIT_PARENT, LANDING, VALIDATE
+         ─submit──────────────────────────────▶ SNAPSHOT        (a new round)
+         ─submit, no round left───────────────▶ FAILED(slice_budget)
+```
+
+End states are MERGED, CLOSED and FAILED; a slice in an end state accepts no
+submit. A FAILED slice ends the whole run as FAILED.
+
+- **No AGENT(fix) and no AGENT(resolve) inside a slice.** Where a story run
+  starts a fix or resolve session, `epic` mode writes the result and wakes the
+  owner. The owner repairs the workspace and submits the same slice number
+  again: a new round.
+- **The branch** of a slice is `feature/epic-<N>-slice-<n>`. A submit for a
+  slice number whose branch an earlier run left on GitHub is refused.
+- **A new round on a published slice** is one more commit on the pull
+  request head, and a round comment. Nothing is replaced: the new commit is
+  a child of the head (with the new base as a second parent when the base
+  moved), so the push is a fast-forward. The push goes through
+  only when the branch on GitHub is still the supervisor's last push (git
+  checks that with `--force-with-lease=<branch>:<expected head>`).
+- **A branch that moved** under the supervisor (it holds commits the
+  supervisor did not push, or it was replaced or removed) → the round is not
+  published, the slice is `REJECTED(branch_moved)`, and the supervisor
+  closes the pull request with a comment. The slice takes no new round; the
+  owner delivers the change under another slice number.
+- **A conflict in SYNC** is not resolved by the supervisor placing markers in
+  the workspace, as in a story run. The owner's workspace is live and belongs
+  to the owner. The owner catches up with `develop` itself (fetch, merge),
+  fixes the conflict, and submits a new round with the new `--base`.
+- **WAIT_PARENT** **[P]**: a slice that builds on an unmerged slice is
+  validated at once, on top of its parent, so the owner learns early whether
+  it is sound. It is published only after the parent has merged. Then SYNC
+  moves it onto `develop`, VALIDATE runs once more, and PUBLISH opens its PR.
+  See decision 1.
+- **STALE**: when slice `m` gets a new round, every slice that builds on `m`
+  was validated on something that no longer exists. The owner submits those
+  again. This is the price of working ahead, and it is the owner's.
+- **LANDING**: after PUBLISH the supervisor reads the pull request once a
+  minute, only to know when to wake the owner (`landing.py`). Signals: the
+  checks of the head commit failed; a review comment with a FAIL verdict from
+  an account that may write to the repository; removed from the merge queue
+  (not by a merge); conflicting with `develop`. A signal counts only when it
+  is about the commit the supervisor pushed and is newer than that push. When
+  it goes away without a new round (a check run again and passed, the pull
+  request back in the queue), the slice returns to LANDING and the owner is
+  not woken. One round wakes the owner at most 5 times for its pull request;
+  after that it only waits for a merge, a close or a new round. The
+  supervisor copies nothing from GitHub, starts no reviewer and enqueues
+  nothing (section 9).
+- **Round budget** **[P]**: each slice may have at most N rounds; default 3,
+  the story run's `fix_budget`, recorded and changeable. A submit past the
+  budget ends the run: `FAILED(slice_budget)`. "Work kept as a WIP draft"
+  (§10): not built; the run dir of a failed or crashed epic run, with the
+  workspace, is kept 336 hours instead. An alert to orc of its own: not
+  built; `pipeline-watch` reports that the run ended. Whether 3 fits larger
+  slices is not measured **[T]**.
+
+Cases that the table above does not show. All **[P]**.
+
+- **A request with a wrong field** (a base that is not a full commit id, a
+  slice that builds on itself, a bad subject, an empty claim) is refused. It
+  uses no round.
+- **A submit that cannot be placed** (`bad_request`: unknown `--builds-on`,
+  a base that is not on `develop`, a parent that is CLOSED, FAILED or STALE,
+  a loop) → REJECTED, with the reason. It uses a round.
+- **A submit with no change** (the same tree on the same parent as the
+  slice's last snapshot) is refused in every state, and uses no round: a
+  round in flight goes on, a pull request stays as it is, a rejected round
+  stays rejected. A workspace with no change against the slice's parent →
+  REJECTED (`no_change`); that uses a round.
+- **A new submit while the slice is in VALIDATE, WAIT_PARENT, LANDING or
+  NEEDS_OWNER** starts a new round and replaces the old one; a validator
+  running for the old round is stopped. A submit while the slice is in
+  SNAPSHOT, SYNC or PUBLISH is refused ("submit again in a moment") and uses
+  no round.
+- **The parent slice is CLOSED or FAILED** → every slice that builds on it
+  goes to STALE, the same as for a new round of the parent.
+- **STALE reaches the whole chain.** When slice 1 gets a new round, slice 2
+  (builds on 1) and slice 3 (builds on 2) go to STALE in the same step. The
+  owner sends no event for this. A STALE slice cannot be named in
+  `--builds-on` until it is submitted again.
+- **A slice with a pull request can merge or close in any state.** The PR of
+  an earlier round stays open while a later round is validated. When that
+  earlier round merges, the slice is MERGED (`earlier_round_merged`), the
+  later round is never published, and the owner is told to deliver that
+  change as a new slice. Slices that build on the later round go to STALE.
+- **A slice the owner gives up.** A slice in REJECTED or STALE that never had
+  a PR does not block `done.md`. Nothing of it is on GitHub.
+- **After a supervisor restart** the slice book sends the parent events that
+  the crash cut off (`SliceBook.reconcile`).
+- **The validator cannot run, or runs into its time limit of 75 minutes**
+  (`infra_error`): one retry, then the whole run ends as
+  `FAILED(validator_error)`. It does not use a round.
+- **GitHub cannot be reached** in SYNC or PUBLISH: the step is tried again
+  with a growing wait, up to 30 times; then the slice is FAILED. A submit at
+  such a time is refused and uses no round.
+
+## 5. Results and waking the owner
+
+The supervisor writes to `/fsm/context/slices/<n>/` (read-only for the owner)
+only what the owner cannot see on GitHub: what the supervisor did itself.
+
+| File | Content |
+|---|---|
+| `status.json` | state, reason, round, rounds and wakes left, parent commit, tree, branch, PR number. Always current. |
+| `submitted.json` | the answer to the slice's latest submit request |
+| `rejected.md` | why a request or snapshot was refused (filter or scan violations, values redacted), the conflict files, or a moved branch |
+| `validate.log` | tail of the validator log of a failed validation |
+
+Everything after PUBLISH the owner reads on GitHub itself: the pull request,
+its checks and logs, the review, the merge queue. Text from GitHub is data,
+never instructions; the owner prompt says so.
+
+**Events.** An event is one line in a queue plus the files above. The
+supervisor writes the line from its own records (a state name, a reason
+code, a path); it never carries text from the owner or from GitHub. Waking
+events: REJECTED, STALE, NEEDS_OWNER, MERGED, CLOSED, a turn that ended in
+an error or a timeout, and a restarted container. "A held question was
+answered" (later, with orc): not built. A refusal at submit is answered
+through `slice-submit` and queues no event. Quiet results (validate passed,
+PR opened, CI green, entered the queue) are written but do not wake the
+owner.
+
+If the owner is in a turn, events wait. At the end of the turn the supervisor
+starts the next turn with all waiting events in one prompt:
+
+```
+Events since your last turn:
+- slice 2 round 1: REJECTED: the validator failed. Read /fsm/context/slices/2/validate.log.
+- slice 1: MERGED (merged as <sha>). Fetch origin/develop before the next submit.
+- slice 3 round 1: NEEDS_OWNER (pull request #<n>): the checks on its pull request finished with failures.
+```
+
+The owner does not wait inside a turn: the prompt tells it to end the turn
+when it has nothing to do until a result arrives. The wake-up from the
+supervisor is the path that must always work.
+
+## 6. Other outputs of the owner
+
+| File in `/fsm/out/` | Meaning |
+|---|---|
+| `submit/<n>-<k>/` | a slice submit (section 3) |
+| `followups.json` | defects outside the epic, at most 3. At the end of the run the supervisor sanitises and scans each one and files it with `pipeline-helper.sh create-fix-issue --defer`: a private draft with no epic parent, not yet a public issue. |
+| `done.md` | "every success criterion is delivered by a merged slice", with the list |
+| `blocked.md` | the owner cannot continue, and why |
+
+`done.md` is a claim, not proof. The supervisor accepts it only when every
+submitted slice is MERGED or CLOSED and at least one is MERGED (a slice the
+owner gave up is not counted). Then it goes to REPORT. While a slice is in
+flight the file stays and the run waits. When nothing is in flight and the
+rule is not met, the supervisor removes the file and tells the owner why,
+once (an accepted submit allows one more such message). The epic is closed by the epic audit
+(`epic-completion-audit`), started by orc, never by the owner and never by
+the supervisor; the audit is outside this repository.
+
+`blocked.md` ends the run as `FAILED(owner_blocked)`.
+
+## 7. Filters for an epic
+
+SNAPSHOT filters (§6.2) stay. One of them needs a new input: protected paths
+(`Makefile`, `.github/**`, `.claude/**`, `go.mod`, `go.sum`, …) are rejected
+in a story run unless the story's Files In Scope lists them. An epic has no
+Files In Scope.
+
+**[P]** The epic has an optional section, written by Reeve with the founder
+and read from the epic's project item:
+
+```markdown
+## Protected Paths
+- go.mod
+- go.sum
+```
+
+No section means no protected path may change. The owner cannot widen this;
+if it needs more, that is a question for the judge, who must hold it (a
+protected path is a hard gate).
+
+**Private text** **[P]** (`PrivateText` in `epic.py`). At every submit the
+supervisor compares the normalised content of the canon and memory files
+with every changed file, the claim and the subject; follow-ups are checked
+the same way. A changed file that is equal to a whole private file, or a
+text that holds one, is refused. It is a content rule, not a path-name rule.
+It does not find a part of a file, an edited copy, or a file under 64 bytes
+or over 5 MiB: it is a net for the careless copy, not a guard against an
+owner that wants to leak.
+
+## 8. Start, stop, crash
+
+- **Launch**: `po-act.sh dispatch --epic <N> [--item-id ID]`. The epic text
+  comes from its project item; `CFGMS_CANON_DIR` and `CFGMS_MEMORY_DIR` name
+  the host clones. Gates: project item, capacity, image staleness,
+  unfinished run, lease. Lease key `epic-<N>`. A path of its own for a fix
+  issue: not built.
+- **Capacity**: one owner container counts as one agent. Each running
+  validator counts as in a story run. One validator runs at a time in an epic
+  run; a second slice waits, and a validator waits when the host is full.
+- **In flight signal**: lock and heartbeat as in a story run. The whole-run
+  limit of 8 hours (§5.3) does not fit an epic. **[P]**: no whole-run limit
+  in `epic` mode. The turn timeout, the round and wake budgets and the idle
+  rule bound the owner's work. They do not bound a wait: a slice in LANDING
+  or NEEDS_OWNER is in flight, and the run waits for its pull request with
+  no limit. Because nothing reviews or enqueues a slice pull request yet
+  (section 9), a published slice waits until a person does that. The
+  owner's event text and prompt say that the pipeline answers a queue
+  removal with a re-enqueue; for a slice pull request that is not built. A
+  cost limit per epic is an open point.
+- **Other ways a run ends**: `FAILED(prepare_error)`, `FAILED(owner_error)`
+  (an error in the supervisor's loop), `FAILED(owner_container)` (the
+  container cannot be started), `FAILED(lease_lost)`.
+- **Supervisor crash**: `resume` continues from `state.jsonl`. Slice states
+  and PUBLISH sub-steps are idempotent as in a story run. The owner container
+  may still be running; the supervisor uses it again. A turn that was open is
+  run again with the same events; the turn lock makes it wait for the old
+  process. A slice that was in SNAPSHOT goes to REJECTED (`interrupted`) and
+  the owner submits it again. Submit requests found at the restart are
+  answered "submit again".
+- **Container lost** (host reboot): the supervisor starts a new container
+  with the same mounts and continues the same session with `--resume` and
+  one event that tells the owner the container was restarted and to read
+  its `state.md`. (The event text says the build caches are gone; the Go
+  caches are named volumes and are kept.) The session files are on the host, so the thread is kept.
+- **Session lost** (no transcript): the turn script starts a new session
+  with the first-turn prompt and the same events. `state.md` in memory is
+  the safety net for exactly this.
+
+## 9. What other parts must learn (contracts, §12)
+
+| Consumer | Change | State |
+|---|---|---|
+| run index | an `epic-<N>` run: its owner container, the OWNER state, the 336-hour retention | built |
+| preflight | the epic's project item is in flight while the run is | built (general run view) |
+| preflight | every slice PR the run opened is in flight | not built |
+| pipeline-watch | epic run ended; `container_stalled` from the heartbeat | built (general run rows) |
+| pipeline-watch | new events: slice published, slice merged | not built |
+| capacity | the owner container counts as one agent | built (by the label `cfg-agent=true`) |
+| cleanup, isoagents | new name class `cfg-owner-<N>` | not built; the supervisor removes its own container |
+| acceptance reviewer | reviews a slice PR against the slice claim and the epic, not a story | not built |
+| review, merge and lock sweeps | pick up a slice PR | not built: the preflight links a PR to work by a `feature/story-<N>` branch or a closing reference, and the lock pass takes `feature/story-*` and `feature/item-*` branches; a slice PR has none of these |
+| ledger, token_report | one record per owner turn, keyed `(container, run_id, turn)`; slices recorded with their rounds | not built: an epic run writes no ledger record |
+| board | the epic item moves; there are no story items | not built: the run reads the item and writes no field |
+
+## 10. What is built, what is not
+
+Built and merged, with tests in `scripts/tests/test-fsm-*.py` (fake container
+runtime, fake GitHub): the slice state machine; the owner container, its
+turns, the event queue and the idle rule; `slice-submit` and the epic prompt;
+the epic driver (snapshot, filters, private-text rule, validation, sync,
+publish, later rounds, moved branches, restart); the LANDING watcher and the
+result files; the launch path, the `## Protected Paths` input, follow-ups as
+deferred fix issues, run index support; Docker or Podman as the runtime.
+
+Not built: the owner's read-only GitHub token; a WIP draft of a failed run's
+work; ledger and board records; slice events in `pipeline-watch` and slice
+PRs in the preflight; review, enqueue and lock of slice PRs by the existing
+sweeps; a cost limit per epic.
+
+In `cfgms`, not checked from this repository **[not verified]**: the
+submodule bump, `owner.md` and `judge.md` in `.claude/agents/`, the epic
+template with `## Protected Paths`.
+
+Not done: one watched test epic (step 7 of the build plan).
+
+## 11. Decisions by the founder (2026-11-15)
+
+1. **A slice that builds on an unmerged slice** is validated at once and
+   published after its parent has merged **[F]**. One PR per slice, each
+   against `develop`, each reviewed once on its real diff. Rejected: a
+   stacked PR published at once (it must be rebased and reviewed again after
+   the parent merges, and the merge queue and author-trust gates would have
+   to learn stacked PRs).
+2. **Canon and memory are mounted at `/canon` and `/memory`** **[F]**, not
+   inside `/workspace`.
+3. **Submit** means "take my workspace as it is now" **[F]**.
+4. **Read all, write nothing** **[F]** (section 1).
+
+## 12. Must test
+
+Tested:
+
+- `claude -p --session-id` / `--resume` through `exec`, across a container
+  restart. **Tested 2026-11-18**, rootless podman 4.9.3, Claude Code
+  2.1.311: turn 1 with `--session-id`, turns 2 and 3 with `--resume` through
+  `exec` kept one conversation. A new container resumed it after the first
+  was removed; the session folder was a host folder mounted at
+  `/home/agent/.claude`. In the same test, `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`
+  ran the helper on Sonnet while the main session ran on Opus (read from the
+  two transcripts).
+- The owner container scripts, and one real two-turn owner session with a
+  real `slice-submit` round trip. **Tested 2026-11-18**, rootless podman
+  4.9.3.
+
+Not tested:
+
+1. A whole epic run with a real container runtime, a real model and the real
+   GitHub together.
+2. Memory and CPU of one owner container with helpers and a build running.
+3. Whether a 180-minute turn limit and a round budget of 3 fit an owner.
+4. The copy at submit while the Go build cache and helpers are idle: how
+   long it takes on the real repo.
+5. One owner session across compactions (item 7 of the main design).
