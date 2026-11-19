@@ -95,6 +95,15 @@ class OwnerRunEpics(unittest.TestCase):
         self.assertEqual({r["status"] for r in self.rows()}, {"done"})
         self.assertEqual(self.held(), {7, 8})
 
+    def test_run_refused_at_a_gate_holds_nothing(self):
+        """No owner was started: a creds or capacity refusal must not keep the
+        epic from the Planning Team for the 336-hour retention."""
+        self.make_run("epic-7-a", epic=7, done=True,
+                      transitions=[("PREPARE", "refuse", "REFUSED")])
+        row = self.rows()[0]
+        self.assertEqual((row["status"], row["gates_passed"]), ("done", False))
+        self.assertEqual(self.held(), set())
+
     def test_story_run_with_the_same_number_does_not_hold(self):
         self.make_run("story-7-a", mode="issue", target="7", key="story-7")
         self.assertEqual(self.held(), set())

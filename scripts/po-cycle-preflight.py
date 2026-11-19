@@ -915,15 +915,6 @@ def _load_runindex():
     return mod
 
 
-def fsm_runs():
-    """FSM supervisor runs on this host (runindex.list_runs), or [] when the
-    index cannot be read."""
-    try:
-        return _load_runindex().list_runs()
-    except Exception:
-        return []
-
-
 _EPIC_KEY_RE = re.compile(r"^epic-(\d+)$")
 
 
@@ -933,16 +924,24 @@ def owner_run_epics(runs, lease_rows=None):
     no stories, so the epic has no sub-issues for its whole life.
 
     Two signals, either is enough:
-    - an epic-mode FSM run in this host's run index, in ANY status. A run
-      that ended is kept on purpose: the epic stays open until the epic audit
-      closes it, and a FAILED run has the owner's work in its run dir. The
-      hold ends when the run dir is collected.
+    - an epic-mode FSM run in this host's run index that is not ended, or
+      that ended after it passed its PREPARE gates (an owner was started). A
+      run that ended at a gate (REFUSED, deferred) never had an owner and
+      holds nothing. An ended run holds only until its run dir is collected
+      (runindex.gc): by default 24 hours after REPORT, 336 hours otherwise.
+      So a FAILED run, with the owner's work in its run dir, holds longest;
+      an epic whose run ended well is free again after a day even when the
+      epic audit has not closed it yet.
     - an unexpired `epic-<N>` lease, which po-act.sh takes for the run and
       which every host can see. (`epic-decompose-<N>` is a different lease.)
+      The lease is released when the run ends, in every end state, so
+      another host sees an ended run's epic as free at once.
     """
     held = {}
     for r in runs or []:
         if r.get("mode") != "epic":
+            continue
+        if r.get("status") in ("done", "abandoned") and not r.get("gates_passed"):
             continue
         m = (_EPIC_KEY_RE.match(str(r.get("key") or ""))
              or _EPIC_KEY_RE.match(str(r.get("target") or "")))

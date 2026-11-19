@@ -445,7 +445,7 @@ owner that wants to leak.
 |---|---|---|
 | run index | an `epic-<N>` run: its owner container, the OWNER state, the 336-hour retention | built |
 | preflight | the epic's project item is in flight while the run is | built (general run view) |
-| preflight | an epic that an owner holds is in `epics_owner_run`, not in `epics_undecomposed`. Held means: an epic-mode run in this host's run index (any status, until the run dir is collected) or an unexpired `epic-<N>` lease (seen from every host) | built in the tooling. The `cfgms` prompts (`po.md` Step 7, `/po decompose`) still choose epics by "no sub-issues" and do not read this list: not built |
+| preflight | an epic that an owner holds is in `epics_owner_run`, not in `epics_undecomposed`. Held means: an epic-mode run in this host's run index that is not ended, or that ended after its gates passed, until the run dir is collected (24 hours after REPORT, 336 hours otherwise); or an unexpired `epic-<N>` lease (seen from every host, released when the run ends). A run refused at a gate holds nothing | built in the tooling. The `cfgms` prompts (`po.md` Step 7, `/po decompose`) still choose epics by "no sub-issues" and do not read this list: not built |
 | preflight | every slice PR the run opened is in flight | not built |
 | pipeline-watch | epic run ended; `container_stalled` from the heartbeat | built (general run rows) |
 | pipeline-watch | new events: slice published, slice merged | not built |
