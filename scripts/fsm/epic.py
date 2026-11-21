@@ -815,7 +815,9 @@ class EpicSupervisor(sup.Supervisor):
             raise ParentUnclear(
                 f"--builds-on {m}: slice {m} as it was submitted does not apply on develop "
                 f"commit {base[:12]}, which /workspace is built on (" + ", ".join(conflicted[:10])
-                + f"). Submit slice {m} again first, from this workspace")
+                + f"). Submit slice {m} again first, with the files of slice {m} only: put "
+                  f"the files of this slice away for that submit (a branch, a stash), then "
+                  f"bring them back and submit this slice")
         # A fixed date: the same slice m on the same base is the same commit
         # at every submit, so "the same parent" can be read from the id.
         built = self.repo.commit_tree(tree, [base], "fsm slice parent (internal)\n",

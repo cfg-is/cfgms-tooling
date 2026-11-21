@@ -159,9 +159,10 @@ slice-submit --slice <n> --claim <file> --subject "<scope>: <what changed>" \
   argument. The command reads it from git in `/workspace`
   (`git merge-base HEAD origin/develop`) and writes it into the request with
   `"base_from": "git"`. It sends nothing (exit 2) while a merge,
-  cherry-pick, revert or rebase is not finished (for a rebase it looks for
-  the `rebase-merge` and `rebase-apply` directories too: a rebase stopped at
-  `break` or a failed `exec` has no `REBASE_HEAD`). It also sends nothing
+  cherry-pick, revert or rebase is not finished (for a rebase it reads the
+  `rebase-merge` and `rebase-apply` directories, not `REBASE_HEAD`: git
+  leaves that file after a rebase that stopped at a conflict and was
+  finished, and a rebase stopped at `break` has none). It also sends nothing
   when the `origin/develop` of the workspace is not merged in git, all of
   it: **what is fetched must be merged.** The base is then that commit. A
   workspace that did not fetch is on the commit it started from. Why: to
@@ -350,7 +351,9 @@ Cases that the table above does not show. All **[P]**.
     snapshot merged onto the base, as a commit with a fixed date, so the
     same slice `m` on the same base is the same commit at every submit;
   - slice `m`'s snapshot conflicts with the base → refused with the files,
-    no round. The owner submits slice `m` again first, from this workspace;
+    no round. The owner submits slice `m` again first, with the files of
+    slice `m` only (it puts the files of the later slice away for that
+    submit);
   - the base is older than the `develop` commit of slice `m`'s snapshot
     (the workspace went back) → refused, no round. The owner merges
     `develop`.

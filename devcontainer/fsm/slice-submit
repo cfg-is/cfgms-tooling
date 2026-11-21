@@ -85,18 +85,19 @@ def workspace_base():
     code, _ = git("rev-parse", "--verify", "-q", "HEAD^{commit}")
     if code != 0:
         fail(2, f"{WORKSPACE} has no HEAD commit that git can read. No request was sent.")
+    # The files git keeps while one of these is open. They are read as
+    # files of the git directory: a branch can have such a name. REBASE_HEAD
+    # is not one of them: git leaves it behind after a rebase that stopped
+    # at a conflict and was finished, and a rebase stopped at `break`,
+    # `edit` or a failed `exec` has none. The two directories are there
+    # exactly while a rebase is open.
     for name, what in (("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick"),
-                       ("REVERT_HEAD", "revert"), ("REBASE_HEAD", "rebase")):
-        code, _ = git("rev-parse", "--verify", "-q", name)
-        if code == 0:
-            fail(2, f"a {what} in {WORKSPACE} is not finished. Finish it and commit it (or "
-                    f"abort it), then submit again. No request was sent.")
-    for name in ("rebase-merge", "rebase-apply"):
-        # a rebase that stopped at `break`, `edit` or a failed `exec` has no REBASE_HEAD
+                       ("REVERT_HEAD", "revert"), ("rebase-merge", "rebase"),
+                       ("rebase-apply", "rebase")):
         code, path = git("rev-parse", "--git-path", name)
         if code == 0 and os.path.exists(os.path.join(WORKSPACE, path)):
-            fail(2, f"a rebase in {WORKSPACE} is not finished. Finish it (or abort it), then "
-                    f"submit again. No request was sent.")
+            fail(2, f"a {what} in {WORKSPACE} is not finished. Finish it and commit it (or "
+                    f"abort it), then submit again. No request was sent.")
     code, _ = git("rev-parse", "--verify", "-q", DEVELOP_REF + "^{commit}")
     if code != 0:
         fail(2, f"{WORKSPACE} has no origin/develop (git fetch origin develop). "

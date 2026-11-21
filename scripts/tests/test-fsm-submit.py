@@ -331,6 +331,42 @@ class TestBaseFromGit(Case):
         self.git("rebase", "-q", "refs/remotes/origin/develop")      # a finished rebase is a catch-up
         self.assertEqual(self.submitted()[0], new)
 
+    def test_a_rebase_that_stopped_at_a_conflict_and_was_finished_is_taken(self):
+        # git leaves REBASE_HEAD behind then; it does not say a rebase is open
+        (self.ws / "a.txt").write_text("mine\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "work")
+        new = self.develop_moves("a.txt", "theirs\n")
+        self.git("rebase", "refs/remotes/origin/develop", check=False)
+        self.refused_by_the_command("a rebase in")
+        (self.ws / "a.txt").write_text("both\n")
+        self.git("add", "a.txt")
+        self.git("-c", "core.editor=true", "rebase", "--continue")
+        self.assertTrue(self.git("rev-parse", "-q", "--verify", "REBASE_HEAD", check=False),
+                        "this git leaves no REBASE_HEAD; the test proves nothing")
+        self.assertEqual(self.submitted()[0], new)
+
+    def test_a_cherry_pick_or_a_revert_that_is_not_finished_is_refused(self):
+        (self.ws / "a.txt").write_text("mine\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "work")
+        self.git("revert", "--no-commit", "HEAD")
+        self.refused_by_the_command("a revert in")
+        self.git("revert", "--abort")
+        self.git("checkout", "-q", "-b", "side", self.base)
+        (self.ws / "a.txt").write_text("other\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "side work")
+        self.git("checkout", "-q", "feature/epic")
+        self.git("cherry-pick", "side", check=False)
+        self.refused_by_the_command("a cherry-pick in")
+        self.git("cherry-pick", "--abort")
+        self.assertEqual(self.submitted()[0], self.base)
+
+    def test_a_branch_with_the_name_of_a_git_state_file_is_not_an_open_merge(self):
+        self.git("branch", "MERGE_HEAD")
+        self.assertEqual(self.submitted()[0], self.base)
+
     def test_a_workspace_with_no_origin_develop_is_refused(self):
         self.git("update-ref", "-d", "refs/remotes/origin/develop")
         self.refused_by_the_command("has no origin/develop")

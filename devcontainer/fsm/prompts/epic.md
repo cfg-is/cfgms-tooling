@@ -105,7 +105,7 @@ inside a turn with a sleep or a watch loop.
 ## Git and GitHub
 
 Git in `/workspace` is your tool: commits as checkpoints, branches to park
-work, `git fetch origin` and a merge to catch up with `develop`. The
+work, `git fetch origin develop` and a merge to catch up with `develop`. The
 supervisor reads only the files at submit. `slice-submit` reads one fact
 from your git history: which `develop` commit the workspace is built on.
 

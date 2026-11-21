@@ -405,7 +405,8 @@ class TestEpicRun(EpicCase):
         out = self.submits()[1]["output"]
         self.assertIn(f"slice 1 as it was submitted does not apply on develop commit "
                       f"{dev1[:12]}, which /workspace is built on (src/util.go)", out)
-        self.assertIn("Submit slice 1 again first, from this workspace", out)
+        self.assertIn("Submit slice 1 again first, with the files of slice 1 only: put the "
+                      "files of this slice away for that submit", out)
         self.assertIn("This request used no round", out)
         self.assertEqual(self.path_of(2), [])                 # no round, no slice record
         self.assertEqual(self.status(1)["state"], "LANDING")
