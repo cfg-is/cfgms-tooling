@@ -640,7 +640,8 @@ class EpicSupervisor(sup.Supervisor):
             # nothing. It uses no round: a round in flight goes on, a pull
             # request stays as it is, a rejected round stays rejected.
             last = s.candidates[max(s.candidates)]
-            if last["parent"] == parent.commit and self.same_tree(last["tree"], parent.commit):
+            if (last["snap_parent"] == parent.commit
+                    and self.same_tree(last["snap_tree"], parent.commit)):
                 what = (f"Round {s.ctx.round} goes on." if s.state not in S.OWNER_TURN
                         else f"Slice {n} stays {s.state}.")
                 self.answer(req, False, round_no=s.ctx.round,
@@ -705,8 +706,8 @@ class EpicSupervisor(sup.Supervisor):
                                                          "snapshot was taken. Submit again.")
             return "withdrawn"
         last = s.candidates[max(s.candidates)] if s.candidates else None
-        if snap.tree == base_tree or (last and last["tree"] == snap.tree
-                                      and last["parent"] == parent.commit):
+        if snap.tree == base_tree or (last and last["snap_tree"] == snap.tree
+                                      and last["snap_parent"] == parent.commit):
             self.stake(n, "unchanged", quiet=True)
             self.answer(req, False, round_no=rnd,
                         reason="the workspace has no change since this slice's last snapshot.")
@@ -873,8 +874,10 @@ class EpicSupervisor(sup.Supervisor):
     def step_slices(self):
         """SYNC and PUBLISH are short steps the supervisor finishes at once. A
         cached validator result can put a slice into one of them, so this
-        repeats until no slice is left there: a submit request never finds a
-        slice in the middle of a supervisor step."""
+        repeats until no slice is left there. (A slice can still be in SYNC
+        when a request is read: an accepted submit leaves it there until
+        this runs, and a failed fetch keeps it there. Such a request is
+        refused with "submit again in a moment".)"""
         for _ in range(8):
             self._step_slices_once()
             if not any(s.state in (S.SYNC, S.PUBLISH) for s in self.book.slices.values()):
@@ -945,7 +948,7 @@ class EpicSupervisor(sup.Supervisor):
             return
         commit = self.repo.commit_tree(merged, [dev], "fsm slice candidate (internal)\n")
         self.repo.update_ref(f"refs/fsm/slices/{n}/r{rnd}", commit)
-        self.book.set_candidate(n, commit, merged, dev)
+        self.book.set_candidate(n, commit, merged, dev, synced=True)
         self.stake(n, "rebased", info={"develop": dev, "tree": merged})
 
     def do_slice_publish(self, s):

@@ -142,6 +142,129 @@ class TestEpicRun(EpicCase):
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
 
+    DEVELOP_MOVED = {"src/util.go": "package src\n\n// develop moved\nfunc U() int {\n\treturn 2\n}\n",
+                     "src/new_on_develop.go": "package src\n// new\n"}
+
+    def flag(self, name):
+        self.f.docker_state.mkdir(parents=True, exist_ok=True)
+        (self.f.docker_state / f"flag-{name}").write_text("1")
+
+    def develop_moves_before_turn_1(self, files=None):
+        """The workspace is on the develop commit of the launch; develop gets a
+        commit of another author before the owner submits anything."""
+        self.launch()
+        self.wait_for("turn 1", lambda: self.recs("owner_turn_start"))
+        self.f.commit_on("develop", files or self.DEVELOP_MOVED)
+        self.flag("go")
+
+    def path_of(self, n):
+        return [(r["round"], r["event"], r["to"]) for r in self.recs("slice_transition")
+                if r["slice"] == n]
+
+    def assert_child_keeps_develop(self, head2):
+        self.assertEqual(self.changed(head2), ["src/b.go"])
+        self.assertIn("develop moved", self.f.remote_show(head2, "src/util.go"))
+        self.assertIn("// new", self.f.remote_show(head2, "src/new_on_develop.go"))
+
+    def test_a_child_of_a_slice_that_sync_moved_does_not_undo_develop(self):
+        # Slice 1 is rebased by SYNC at its submit. Slice 2 builds on it from
+        # the same workspace, which does not hold develop's new commit. Its
+        # diff is measured against slice 1's snapshot, not the rebased commit.
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, base=base0),
+             write("src/b.go", "package src\n// b\n"), submit(2, base=base0, builds_on=1)],
+            [],
+            [DONE],
+        ]})
+        self.develop_moves_before_turn_1()
+        pr1 = self.wait_pr(1)
+        self.assertIn((1, "rebased", "VALIDATE"), self.path_of(1))
+        self.wait_state(2, "WAIT_PARENT")
+        c1 = [r for r in self.recs("slice_candidate") if r["slice"] == 1]
+        c2 = [r for r in self.recs("slice_candidate") if r["slice"] == 2]
+        self.assertEqual([r["snap_parent"] for r in c1], [base0, base0])
+        self.assertNotEqual(c1[-1]["commit"], c1[-1]["snap_commit"])
+        self.assertEqual(c2[0]["parent"], c1[-1]["snap_commit"])
+        self.merge(pr1)
+        self.wait_pr(2)
+        self.assert_child_keeps_develop(self.f.remote_head("feature/epic-900-slice-2"))
+
+    def test_a_child_submitted_after_its_parent_was_published_does_not_undo_develop(self):
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, base=base0),
+             {"op": "wait_pr", "slice": 1},
+             write("src/b.go", "package src\n// b\n"), submit(2, base=base0, builds_on=1)],
+            [],
+            [DONE],
+        ]})
+        self.develop_moves_before_turn_1()
+        pr1 = self.wait_pr(1)
+        self.wait_state(2, "WAIT_PARENT")
+        self.merge(pr1)
+        self.wait_pr(2)
+        self.assert_child_keeps_develop(self.f.remote_head("feature/epic-900-slice-2"))
+
+    def test_the_same_submit_after_sync_moved_the_slice_uses_no_round(self):
+        # develop moved, so SYNC rebased round 1. The validator fails. The same
+        # workspace on the same base is "no change": no round, no validator.
+        base0 = self.f.remote_head("develop")
+        again = submit(1, base=base0, expect=1)
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// FAIL_VALIDATION\n"), submit(1, base=base0)],
+            [again, again],
+            [{"op": "out", "name": "blocked.md", "content": "stop\n"}],
+        ]})
+        self.develop_moves_before_turn_1()
+        self.finish()
+        self.assertEqual(self.path_of(1), [(1, "submitted", "SNAPSHOT"), (1, "ok", "SYNC"),
+                                           (1, "rebased", "VALIDATE"), (1, "fail", "REJECTED")])
+        out = [s["output"] for s in self.submits()]
+        self.assertEqual(len(out), 3)
+        for text in out[1:]:
+            self.assertIn("no change since this slice's last snapshot", text)
+        self.assertEqual(self.status(1)["rounds_left"], 2)
+        self.assertEqual(len(self.recs("validate_start")), 1)
+
+    def test_a_conflict_with_develop_is_found_before_the_validator_runs(self):
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/util.go", "package src\n\nfunc U() int {\n\treturn 7\n}\n"),
+             submit(1, base=base0)],
+            [{"op": "out", "name": "blocked.md", "content": "stop\n"}],
+        ]})
+        self.develop_moves_before_turn_1()
+        self.finish()
+        self.assertEqual(self.path_of(1), [(1, "submitted", "SNAPSHOT"), (1, "ok", "SYNC"),
+                                           (1, "conflict", "REJECTED")])
+        self.assertEqual(self.recs("validate_start"), [])
+        rejected = (self.run_dir / "context" / "slices" / "1" / "rejected.md").read_text()
+        self.assertIn("src/util.go", rejected)
+        self.assertIn("slice 1 round 1: REJECTED", self.turns()[1]["text"])
+
+    def test_develop_moves_during_the_validation_and_the_slice_is_published_as_validated(self):
+        self.f.plan({"owner": [[write("src/a.go", "package src\n// a\n"), submit(1)], [DONE]],
+                     "validate_hooks": {"0": [{"path": "README.md", "content": "# moved\n"}]}})
+        base0 = self.f.remote_head("develop")
+        self.launch()
+        pr = self.wait_pr(1)
+        head = self.f.remote_head("feature/epic-900-slice-1")
+        self.assertNotEqual(self.f.remote_head("develop"), base0)       # develop did move
+        self.assertEqual(git(self.f.remote, "rev-parse", f"{head}^"), base0)
+        self.assertEqual(self.path_of(1), [(1, "submitted", "SNAPSHOT"), (1, "ok", "SYNC"),
+                                           (1, "up_to_date", "VALIDATE"), (1, "pass", "PUBLISH"),
+                                           (1, "published", "LANDING")])
+        v = self.recs("slice_validated")
+        self.assertEqual([(r["cache_hit"], r["tree"]) for r in v], [(False, self.f.remote_tree(head))])
+        self.merge(pr)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+
     def test_a_slice_on_an_unmerged_slice_is_validated_at_once_and_published_after_the_merge(self):
         self.f.plan({"owner": [
             [write("src/a.go", "package src\n// a\n"), submit(1),

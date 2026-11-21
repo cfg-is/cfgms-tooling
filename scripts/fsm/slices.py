@@ -192,7 +192,7 @@ TABLE = {
     (VALIDATE, "parent_closed"): [Edge("on_unmerged_parent", STALE, reason="parent_closed")],
 
     # The parent merged while this slice is still in SNAPSHOT or VALIDATE: the
-    # slice only learns it, and goes to SYNC when it passes.
+    # slice only learns it, and goes to SYNC at its next event (`ok`, `pass`).
     (SNAPSHOT, "parent_merged"): [Edge("on_unmerged_parent", SNAPSHOT, sets_parent_merged=True)],
     (VALIDATE, "parent_merged"): [Edge("on_unmerged_parent", VALIDATE, sets_parent_merged=True)],
     (SNAPSHOT, "parent_new_round"): [Edge("on_unmerged_parent", STALE, reason="parent_new_round")],
@@ -345,7 +345,9 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
     only git question this rule asks and the caller owns the git call.
 
       no builds_on                  -> the base commit; it must be on develop
-      builds_on m, m not merged     -> the candidate commit of m's current round
+      builds_on m, m not merged     -> the snapshot commit of m's current round
+                                       (what the owner built on, not what SYNC
+                                       made of it)
       builds_on m, m already merged -> as if builds_on was not given
 
     Every value of the request comes from the owner. A value of the wrong
@@ -386,7 +388,7 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
             if not cand:
                 raise BadRequest(f"--builds-on {builds_on}: that slice has no accepted "
                                  f"snapshot of its current round; submit it again first")
-            return Parent(cand["commit"], builds_on)
+            return Parent(cand["snap_commit"], builds_on)
     if not is_on_develop(base):
         raise BadRequest(f"--base {base[:12]} is not a commit on origin/develop")
     return Parent(base, 0)
@@ -405,7 +407,13 @@ class Slice:
         self.reason = ""
         self.ctx = SliceCtx(slice=number, round_budget=round_budget)
         self.candidate = ""     # latest snapshot commit that passed SNAPSHOT
-        self.candidates = {}    # round -> {"commit", "tree", "parent"}
+        #: round -> {"commit", "tree", "parent", "snap_commit", "snap_tree",
+        #: "snap_parent"}. The first three are what is validated and
+        #: published; SYNC replaces them. The `snap_` values are the snapshot
+        #: of the owner's workspace on the owner's parent and never change in
+        #: a round: a slice that builds on this one stands on `snap_commit`,
+        #: and "no change since the last snapshot" is measured against them.
+        self.candidates = {}
         self.pr = 0
         self.branch = ""
 
@@ -444,7 +452,10 @@ class SliceBook:
             s.state, s.reason = rec["to"], rec.get("reason", "")
             s.ctx = SliceCtx.from_dict(rec.get("ctx"))
         elif kind == "slice_candidate":
-            s.candidates[rec["round"]] = {k: rec[k] for k in ("commit", "tree", "parent")}
+            cand = {k: rec[k] for k in ("commit", "tree", "parent")}
+            for k in ("commit", "tree", "parent"):     # a record from before the snap_ values
+                cand[f"snap_{k}"] = rec.get(f"snap_{k}") or rec[k]
+            s.candidates[rec["round"]] = cand
             s.candidate = rec["commit"]
         else:
             s.pr, s.branch = rec.get("pr", 0), rec.get("branch", "")
@@ -520,13 +531,20 @@ class SliceBook:
             res.cascade = self._parent_event(number, "parent_new_round")
         return res
 
-    def set_candidate(self, number, commit, tree, parent):
-        """Record the snapshot commit of the slice's current round."""
+    def set_candidate(self, number, commit, tree, parent, synced=False):
+        """Record the candidate of the slice's current round.
+
+        The first call of a round records the snapshot. A call with
+        `synced=True` records what SYNC made of it and keeps the snapshot
+        values of the round."""
         s = self._slice(number)
-        s.candidates[s.ctx.round] = {"commit": commit, "tree": tree, "parent": parent}
+        cand = {"commit": commit, "tree": tree, "parent": parent}
+        old = s.candidates.get(s.ctx.round) if synced else None
+        for k in ("commit", "tree", "parent"):
+            cand[f"snap_{k}"] = old[f"snap_{k}"] if old else cand[k]
+        s.candidates[s.ctx.round] = cand
         s.candidate = commit
-        self.run.append("slice_candidate", slice=number, round=s.ctx.round,
-                        commit=commit, tree=tree, parent=parent)
+        self.run.append("slice_candidate", slice=number, round=s.ctx.round, **cand)
 
     def set_pr(self, number, pr, branch):
         s = self._slice(number)
