@@ -419,8 +419,8 @@ class Slice:
         #: published; SYNC replaces them. The `snap_` values are the snapshot
         #: of the owner's workspace on the owner's parent and never change in
         #: a round. A slice that builds on this one is measured against
-        #: `snap_commit`, or a merge of it onto a later develop commit; the
-        #: "no change" rule reads both.
+        #: `snap_commit`, or a merge of it onto a later develop commit
+        #: (epic.parent_for_workspace); the "no change" rule reads both.
         self.candidates = {}
         self.pr = 0
         self.branch = ""

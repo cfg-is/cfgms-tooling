@@ -431,6 +431,108 @@ class TestEpicRun(EpicCase):
         self.assertIn((2, "submitted", "SNAPSHOT"), self.path_of(1))
         self.assertEqual(len(self.recs("validate_start")), 2)
 
+    NEW = "package src\n// new\n"
+
+    def test_a_rejected_child_on_a_built_parent_submitted_again_uses_no_round(self):
+        # Slice 2 comes from a workspace that merged develop, so its parent is
+        # built for the submit. The validator fails. The same submit again must
+        # find the same parent commit: no round, no validator.
+        base0 = self.f.remote_head("develop")
+        again = submit(2, builds_on=1, expect=1)
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, base=base0),
+             {"op": "wait_pr", "slice": 1},
+             write("src/new_on_develop.go", self.NEW),
+             write("src/b.go", "package src\n// FAIL_VALIDATION\n"), submit(2, builds_on=1)],
+            [{"op": "sleep", "secs": 1.2}, again, again],
+            [{"op": "out", "name": "blocked.md", "content": "stop\n"}],
+        ]})
+        self.develop_moves_before_turn_1({"src/new_on_develop.go": self.NEW})
+        self.wait_for("four submits", lambda: len(self.submits()) == 4)   # slice 1 is still open
+        out = [s["output"] for s in self.submits()]
+        for text in out[2:]:
+            self.assertIn("no change since this slice's last snapshot. Slice 2 stays REJECTED.", text)
+        self.assertEqual((self.status(2)["round"], self.status(2)["rounds_left"]), (1, 2))
+        self.assertEqual(len([r for r in self.recs("validate_start") if r["slice"] == 2]), 1)
+
+    def test_a_child_from_a_workspace_that_holds_a_part_of_develop_up_to_its_base_is_refused(self):
+        # The workspace merged the first develop commit. develop moves again
+        # and the owner gives the tip as the base without a merge. Measured
+        # against "slice 1 on the tip" the slice would delete develop's second
+        # file; measured against slice 1 as submitted it would bring the first
+        # one again. The supervisor says what it sees and takes no round.
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, base=base0),
+             {"op": "wait_pr", "slice": 1}, {"op": "wait_flag", "name": "second"},
+             write("src/new_on_develop.go", self.NEW),                # the merge of the first commit
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1, expect=1),
+             write("src/second.go", "package src\n// second\n"),      # the owner merges the rest
+             submit(2, builds_on=1)],
+            [],
+            [DONE],
+        ]})
+        self.develop_moves_before_turn_1({"src/new_on_develop.go": self.NEW})
+        pr1 = self.wait_pr(1)
+        dev2 = self.f.commit_on("develop", {"src/second.go": "package src\n// second\n"})
+        self.flag("second")
+        self.wait_state(2, "WAIT_PARENT")
+        out = self.submits()[1]["output"]
+        self.assertIn(f"--base {dev2[:12]}: /workspace holds a part of what develop changed", out)
+        self.assertIn("src/new_on_develop.go", out)
+        self.assertIn("src/second.go", out)
+        self.assertIn("This request used no round.", out)
+        self.assertEqual((self.status(2)["round"], self.status(2)["rounds_left"]), (1, 2))
+        self.merge(pr1)
+        self.wait_pr(2)
+        self.assertEqual(self.changed(self.f.remote_head("feature/epic-900-slice-2")), ["src/b.go"])
+
+    def test_a_merged_child_that_edits_the_only_file_develop_changed_stands_on_the_built_parent(self):
+        # develop changed util.go only. The owner merged it and slice 2 edits
+        # the same lines. No path has develop's content and none the old one:
+        # the base is believed, and the pull request holds the edit.
+        base0 = self.f.remote_head("develop")
+        edited = self.UTIL1.replace("return 2", "return 5")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, base=base0),
+             {"op": "wait_pr", "slice": 1},
+             write("src/util.go", edited), write("src/b.go", "package src\n// b\n"),
+             submit(2, builds_on=1)],
+            [],
+            [DONE],
+        ]})
+        self.develop_moves_before_turn_1({"src/util.go": self.UTIL1})
+        pr1 = self.wait_pr(1)
+        self.wait_state(2, "WAIT_PARENT")
+        self.assertFalse([r for r in self.recs("note") if "holds no develop change" in str(r.get("info", ""))])
+        self.merge(pr1)
+        self.wait_pr(2)
+        head2 = self.f.remote_head("feature/epic-900-slice-2")
+        self.assertEqual(self.changed(head2), ["src/b.go", "src/util.go"])
+        self.assertIn("return 5", self.f.remote_show(head2, "src/util.go"))
+
+    def test_a_rejected_slice_gets_a_new_round_on_its_old_base_when_develop_has_moved(self):
+        # The round was synced and validated on a develop commit and failed.
+        # develop moves (it repaired what failed). The same workspace on the
+        # same base would now be validated on the new commit: a new round.
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [write("src/a.go", "package src\n// FAIL_VALIDATION\n"), submit(1)],
+            [{"op": "wait_flag", "name": "moved"}, submit(1, base=base0)],
+            [{"op": "out", "name": "blocked.md", "content": "stop\n"}],
+        ]})
+        self.launch()
+        self.wait_state(1, "REJECTED")
+        self.f.commit_on("develop", {"src/new_on_develop.go": self.NEW})
+        self.flag("moved")
+        self.finish()
+        self.assertEqual([s["exit"] for s in self.submits()], [0, 0])
+        self.assertIn((2, "rebased", "VALIDATE"), self.path_of(1))
+        self.assertEqual(len(self.recs("validate_start")), 2)
+
     def test_a_stale_slice_gets_its_new_round_when_the_parent_is_back_at_the_old_tree(self):
         # Slice 2 waits on slice 1. The owner changes slice 1 (slice 2 is
         # STALE), then takes the change back: round 3 of slice 1 has the tree

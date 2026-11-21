@@ -193,7 +193,7 @@ The supervisor ignores all of it. It only ever reads the files.
 | Case | Parent of the slice commit |
 |---|---|
 | No `--builds-on` | the `--base` commit. The supervisor checks that it is on `origin/develop`. |
-| `--builds-on m`, slice `m` not merged | the snapshot commit of slice `m`'s current round (the owner's tree, not what SYNC made of it), brought onto the `--base` commit when that commit is not in it. The supervisor checks that the base is on `origin/develop`. |
+| `--builds-on m`, slice `m` not merged | the snapshot commit of slice `m`'s current round (the owner's tree, not what SYNC made of it), or that snapshot merged onto the `--base` commit. The workspace decides which (below). The supervisor checks that the base is on `origin/develop`. |
 | `--builds-on m`, slice `m` merged meanwhile | treated as no `--builds-on` |
 
 A wrong `--base` cannot land bad code unseen: the diff would show other
@@ -305,26 +305,35 @@ Cases that the table above does not show. All **[P]**.
 - **A submit that cannot be placed** (`bad_request`: unknown `--builds-on`,
   a base that is not on `develop`, a parent that is CLOSED, FAILED or STALE,
   a loop) → REJECTED, with the reason. It uses a round.
-- **A `--builds-on` slice whose parent does not apply on its base** (the
-  snapshot of the parent conflicts with the `--base` commit) is refused
-  with the files. It uses no round and the slice stays as it is. The owner
-  submits the parent again first.
-- **A `--builds-on` slice with a base it did not merge** (no path that
-  `develop` changed between the parent's snapshot and the base has
-  `develop`'s content in the workspace) is measured against the parent's
-  snapshot, as if the base was the parent's. The run records a note.
-- **A submit with no change** (the same tree on the same parent as the
-  slice's last snapshot, or as what SYNC made of it) is refused in every
-  state but STALE (a STALE slice must get a new round on its parent's new
-  round), and uses no round: a round in flight goes on, a pull request
-  stays as it is, a rejected round stays rejected. "The same parent" is
-  the same commit. For a round in flight or published, a commit with the
-  same tree counts too (the built parent of a `--builds-on` slice is a new
-  commit at each submit). For a slice that waits for the owner it does
-  not: a rejected slice submitted on a new `develop` commit gets a new
-  round, also when `develop` only took a commit back. A workspace with no
-  change against the slice's parent → REJECTED (`no_change`); that uses a
-  round.
+- **What a `--builds-on` slice is measured against.** The workspace is "a
+  `develop` commit, plus slice `m`, plus this slice". `--base` says which
+  `develop` commit, but it comes from the owner and is often the tip with no
+  merge. So the supervisor builds "slice `m`'s snapshot on `--base`" and
+  looks at the paths that differ between it and slice `m`'s snapshot (what
+  `develop` changed between the two):
+  - `--base` is in slice `m`'s snapshot commit → that commit;
+  - the workspace has the built content at some of those paths and the old
+    content at none → the built commit (the owner merged `develop`);
+  - the old content at some and the built content at none → slice `m`'s
+    snapshot commit (the owner did not merge); the run records a note;
+  - some of each → refused: the workspace holds a part of `develop` up to
+    the base. The answer names example paths. No round is used and the
+    slice stays as it is;
+  - neither (this slice edits every such path) → the built commit;
+  - slice `m`'s snapshot conflicts with `--base` → refused with the files,
+    no round. The owner submits slice `m` again first.
+
+  The built commit has a fixed date, so the same slice `m` on the same base
+  is the same commit at every submit.
+- **A submit with no change** (the same tree on the same parent commit as
+  the slice's last snapshot, or as what SYNC made of it) is refused and uses
+  no round: a round in flight goes on, a pull request stays as it is, a
+  rejected round stays rejected. Two exceptions get a new round: a STALE
+  slice (its parent has a new round), and a slice that waits for the owner
+  (REJECTED, NEEDS_OWNER) whose round was synced when `develop` has moved
+  since (the same workspace would be validated on another `develop`
+  commit). A workspace with no change against the slice's parent →
+  REJECTED (`no_change`); that uses a round.
 - **A new submit while the slice is in VALIDATE, WAIT_PARENT, LANDING or
   NEEDS_OWNER** starts a new round and replaces the old one; a validator
   running for the old round is stopped. A submit while the slice is in
