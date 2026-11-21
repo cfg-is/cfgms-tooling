@@ -70,13 +70,16 @@ token.
 - **Claude login**: the long-lived inference token, as for dev agents. When
   the host has no token file, the host's credentials file is mounted instead.
   When the token file is there and the supervisor cannot read it, the launch
-  is refused (`REFUSED(claude_token_<reason>)`), and a container that must be
-  started again later ends the run (`FAILED(claude_token_<reason>)`): the
+  is refused (`REFUSED(claude_token_<reason>)`; deferred when the reason is
+  `timeout`, after two more tries), and a run whose container must be started
+  again later stops as an interrupted run, which `dispatch resume` continues
+  when the token can be read: the
   credentials file is a short-life login, and the first owner run (cfgms epic
   6380) ended with it 2 minutes after its launch. The token is sealed with
   the TPM, which group `tss` reads; `po-act.sh dispatch`, `dispatch-fix` and
   `resolve-conflict` run again under `sg tss` when the shell is not in the
-  group and the account is. `CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1` starts the
+  group and the account is (the files of the run then get group `tss`).
+  `CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1` starts the
   owner with the credentials file. The owner does not need remote control.
 - **Models** **[F]**: the owner runs on Fable, set by an `owner` segment in
   `model-routing.yaml` (read from the harness path, so the owner cannot

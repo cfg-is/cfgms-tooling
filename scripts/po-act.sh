@@ -875,7 +875,14 @@ _fsm_outcome() {
     3)
       why=$(_fsm_log_token FSM_REFUSED || echo "refused")
       _rollback_claim "$item"
-      echo "${refuse}:${label}:${why}"
+      case "$why" in
+        *claude_token_*)
+          # the supervisor's own text is in its launch log, which the caller
+          # of this script does not see
+          echo "${refuse}:${label}:${why} (the long-life Claude token of this host is there and this process cannot read it; an owner is not started with the short-life credentials file. Launch from an account in group tss. Text: ${FSM_LAST_LOG})"
+          ;;
+        *) echo "${refuse}:${label}:${why}" ;;
+      esac
       exit 3
       ;;
     4)
@@ -1074,8 +1081,15 @@ except Exception: print('')" 2>/dev/null || true)
 #   When the token file is there, this process is not in `tss` and the account
 #   is, the launch commands run again under `sg tss`. Nothing was done before
 #   this point, so nothing is done twice. CFGMS_NO_TSS_REEXEC=1 turns it off.
+#   `sg -c` gives one string to /bin/sh, so each argument is put in single
+#   quotes by the POSIX rule (' becomes '\''). bash's `printf %q` is not used:
+#   its $'...' form is not POSIX, and a shell that does not know it runs what
+#   comes after a quote in the argument.
+#   Under `sg tss` the primary group of the process is tss, so the files of the
+#   run get group tss. `sg` stays as the parent of the command: a signal to the
+#   pid the caller holds reaches `sg`, not this script.
 _tss_reexec() {
-  local c="$1"
+  local c="${1:-}"
   case "$c" in dispatch|dispatch-fix|resolve-conflict) ;; *) return 0 ;; esac
   [[ -z "${CFGMS_TSS_REEXEC:-}" && "${CFGMS_NO_TSS_REEXEC:-}" != "1" ]] || return 0
   [[ -f "${CFGMS_AGENT_TOKEN_CRED:-${HOME}/.config/cfgms/claude-oauth-token.cred}" ]] || return 0
@@ -1085,8 +1099,12 @@ _tss_reexec() {
   [[ " $now " == *" tss "* ]] && return 0
   account=$(id -nG "$(id -un)" 2>/dev/null) || return 0
   [[ " $account " == *" tss "* ]] || return 0
+  local sq="'" esc="'\\''" line="" a
+  for a in bash "$0" "$@"; do
+    line+="'${a//$sq/$esc}' "
+  done
   export CFGMS_TSS_REEXEC=1
-  exec sg tss -c "$(printf '%q ' bash "$0" "$@")"
+  exec sg tss -c "$line"
 }
 
 cmd="${1:-}"

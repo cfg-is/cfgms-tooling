@@ -233,6 +233,17 @@ class TestRefusals(EpicCase):
         self.assertEqual(self.recs("owner_container"), [])   # no container was started
         self.assertEqual(self.turns(), [])
 
+    def test_a_token_read_that_times_out_is_tried_again_and_then_deferred(self):
+        # a token program that cannot be run gives the reason "timeout"
+        self.credentials_file()
+        self.f.plan({"owner": [[]]})
+        self.launch(env={"CFGMS_SYSTEMD_CREDS_BIN": "/nonexistent/systemd-creds",
+                         "CFGMS_FSM_EPIC_TOKEN_RETRY_SECS": "0.05"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_DEFERRED:epic-900:claude_token_timeout", out)
+        self.assertEqual(self.recs("owner_container"), [])
+
     def test_the_credentials_file_is_used_only_when_the_host_says_so_or_has_no_token(self):
         for env in ({"FSM_FAKE_CLAUDE_TOKEN": "", "CFGMS_FSM_ALLOW_CREDENTIALS_FILE": "1"},
                     {"FSM_FAKE_CLAUDE_TOKEN": "", "CFGMS_AGENT_TOKEN_CRED": "/nonexistent/token.cred"}):

@@ -25,7 +25,7 @@ echo ""
 echo "po_act_tss_reexec.test.sh"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/runs"
+mkdir -p "$TMP/bin" "$TMP/runs" "$TMP/po-cache" "$TMP/cycles" "$TMP/work"
 : > "$TMP/token.cred"
 
 cat > "$TMP/bin/id" <<'EOF'
@@ -50,13 +50,14 @@ run() {
   rm -f "$TMP/sg.log"
   RC=0
   PATH="$TMP/bin:$PATH" SG_LOG="$TMP/sg.log" CFGMS_AGENT_TOKEN_CRED="${CRED-$TMP/token.cred}" \
-    CFGMS_FSM_RUNS_DIR="$TMP/runs" FAKE_GROUPS_NOW="${NOW-tester docker}" \
+    CFGMS_FSM_RUNS_DIR="$TMP/runs" PO_CACHE_DIR="$TMP/po-cache" CFGMS_CYCLE_DIR="$TMP/cycles" \
+    FAKE_GROUPS_NOW="${NOW-tester docker}" \
     FAKE_GROUPS_ACCOUNT="${ACCOUNT-tester docker tss}" \
     bash "$PO_ACT" "$@" > "$TMP/out" 2>&1 || RC=$?
 }
 called() { [[ -f "$TMP/sg.log" ]] && echo yes || echo no; }
 
-EXPECT="$(printf '%q ' bash "$PO_ACT" dispatch status "run id")"
+EXPECT="'bash' '$PO_ACT' 'dispatch' 'status' 'run id' "
 
 unset CFGMS_TSS_REEXEC CFGMS_NO_TSS_REEXEC
 run dispatch status "run id"
@@ -93,8 +94,10 @@ check "second start: no sg again (no loop)" "$(called)" no
 
 run help
 check "another command: no sg" "$(called)" no
-run cycle-end
-check "cycle-end: no sg" "$(called)" no
+run no-such-command
+check "an unknown command: no sg" "$(called)" no
+run
+check "no command: no sg, usage (exit 2)" "$(called):$RC" "no:2"
 
 # The whole path: sg runs the command, and the second start does the work.
 SG_RUN=1 run dispatch status
@@ -104,6 +107,19 @@ SG_RUN=1 run dispatch status no-such-run
 rc_through=$RC
 NOW="tester tss" run dispatch status no-such-run
 check "through sg: the exit code is the command's" "$rc_through" "$RC"
+
+# An argument is data for the shell that sg starts, in every locale. With
+# bash's `printf %q` and LC_ALL=C the first of these ran `touch` in /bin/sh.
+for loc in C C.UTF-8; do
+  for arg in "é';touch\${IFS}$TMP/work/PWNED;#" "a'b" "\$(touch $TMP/work/PWNED)" '`touch '"$TMP"'/work/PWNED`' "x; touch $TMP/work/PWNED" $'two\nlines'; do
+    rm -f "$TMP/work/PWNED"
+    LC_ALL="$loc" SG_RUN=1 run dispatch status "$arg"
+    check "[$loc] nothing in the argument is run: $(printf '%q' "$arg")" "$([[ -e "$TMP/work/PWNED" ]] && echo ran || echo no)" no
+    rc_through=$RC; cp "$TMP/out" "$TMP/out.sg"
+    LC_ALL="$loc" NOW="tester tss" run dispatch status "$arg"
+    check "[$loc] the argument arrives unchanged (same result as with no sg)" "$rc_through:$(cat "$TMP/out.sg")" "$RC:$(cat "$TMP/out")"
+  done
+done
 
 echo ""
 if [[ $fail -gt 0 ]]; then printf 'FAILED: %d\n' "$fail"; exit 1; fi

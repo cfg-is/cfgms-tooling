@@ -87,6 +87,7 @@ run_dispatch() {
   CFGMS_AGENT_CAPACITY_GATE=off \
   CFGMS_PO_HOST_CAPS=linux \
   PO_CACHE_DIR="${SANDBOX}/po-cache" \
+  CFGMS_NO_TSS_REEXEC=1 \
   bash "$POACT" dispatch "$1" 2>&1
 }
 

@@ -93,6 +93,9 @@ DONE_CAP = 64 * 1024
 #: "1": start the owner with the host's credentials file when the long-life
 #: token is there and cannot be read. For a host that has no other way.
 ALLOW_CREDENTIALS_FILE_ENV = "CFGMS_FSM_ALLOW_CREDENTIALS_FILE"
+#: A token read that timed out is tried again this often, with this wait.
+TOKEN_TIMEOUT_RETRIES = 2
+TOKEN_RETRY_SECS = float(os.environ.get("CFGMS_FSM_EPIC_TOKEN_RETRY_SECS", "10"))
 TOKEN_UNREADABLE_TEXT = (
     "The long-life Claude token of this host is there, but this process cannot read it "
     "({why}). The owner is not started with the short-life credentials file: that login "
@@ -388,12 +391,12 @@ class EpicSupervisor(sup.Supervisor):
                 if rs == "not_holder":
                     raise sup.Refused("lease_not_held")
             self._last_renew = time.time()
-        tok, why = self.svc.claude_token()
+        tok, why = self.read_token()
         if not tok and token_must_be_read(why):
-            # refused before anything is started; a later cycle gets the same
-            # answer, so it is not deferred
+            # refused before anything is started. "timeout" can be gone at
+            # the next cycle (deferred); the other reasons are not.
             self.log(TOKEN_UNREADABLE_TEXT.format(why=why))
-            raise sup.Refused(f"claude_token_{why}")
+            raise sup.Refused(f"claude_token_{why}", deferred=(why == "timeout"))
         if not tok and not os.path.isfile(self.svc.credentials_file()):
             raise sup.Refused("creds", deferred=True, exit_code=sup.EXIT_CREDS_DEFERRED)
         ok, why = self.svc.capacity()
@@ -1192,6 +1195,16 @@ class EpicSupervisor(sup.Supervisor):
         return self.olog.facts(self.book, done=self.read_claim_file("done.md") is not None,
                                blocked=self.read_claim_file("blocked.md") is not None)
 
+    def read_token(self):
+        """Services.claude_token, tried again when the read timed out."""
+        token, why = self.svc.claude_token()
+        for _ in range(TOKEN_TIMEOUT_RETRIES):
+            if token or why != "timeout":
+                break
+            time.sleep(TOKEN_RETRY_SECS)
+            token, why = self.svc.claude_token()
+        return token, why
+
     def ensure_container(self):
         status, _code = self.svc.docker.inspect_exit(self.name)
         if status == "running":
@@ -1201,7 +1214,7 @@ class EpicSupervisor(sup.Supervisor):
             # mounts are that run's workspace and context
             self.run.append("note", warning=f"{self.name} belongs to another run: replaced")
         p, x = self.params, self.x
-        token, why = self.svc.claude_token()
+        token, why = self.read_token()
         if not token and token_must_be_read(why):
             # the launch gate refuses this; here it is a container that is
             # started again later in the run
@@ -1336,10 +1349,14 @@ class EpicSupervisor(sup.Supervisor):
                     except (sup.Interrupted, agent_session.CredentialLeak):
                         raise
                     except TokenUnreadable as exc:
+                        # The run has work in it (this is a container that is
+                        # started again). It stops as an interrupted run, not
+                        # FAILED, so `dispatch resume` continues it when the
+                        # host can read the token.
                         text = TOKEN_UNREADABLE_TEXT.format(why=exc.why)
                         self.run.append("note", state="owner_container", error=text)
                         self.log(text)
-                        return T.FAILED, f"claude_token_{exc.why}"
+                        raise sup.Interrupted(f"claude_token_{exc.why}")
                     except Exception as exc:
                         self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
                                         state="owner_container")
