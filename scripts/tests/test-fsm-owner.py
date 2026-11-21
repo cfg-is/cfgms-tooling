@@ -142,7 +142,7 @@ class TestEpicRun(RunCase):
     def test_two_slices_one_repair_then_done(self):
         self.assertEqual(self.turn(O.START)[1], [])
         # turn 1: the owner submitted slices 1 and 2 (2 builds on 1)
-        self.take(1, "submitted", "ok")
+        self.take(1, "submitted", "ok", "up_to_date")
         self.book.set_candidate(1, "1" * 40, "t" * 40, "b" * 40)
         self.take(2, "submitted", "ok", builds_on=1)
         self.book.set_candidate(2, "2" * 40, "t" * 40, "1" * 40)
@@ -164,7 +164,7 @@ class TestEpicRun(RunCase):
         self.turn(O.EVENTS, progress=True)
         self.take(2, "submitted", "ok", builds_on=1)
         self.book.set_candidate(2, "4" * 40, "t" * 40, "3" * 40)
-        self.take(1, "pass", "up_to_date", "pass", "published")
+        self.take(1, "up_to_date", "pass", "published")
         self.take(2, "pass")
         self.assertEqual(self.step(), O.Step(O.WAIT))     # LANDING + WAIT_PARENT
         self.take(1, "merged")                             # wakes; slice 2 -> SYNC
@@ -186,20 +186,20 @@ class TestEpicRun(RunCase):
     def test_progress_in_the_nudge_turn_clears_the_idle_count(self):
         self.turn(O.START)
         self.turn(O.NUDGE, progress=True)
-        self.take(1, "submitted", "ok", "fail")
+        self.take(1, "submitted", "ok", "up_to_date", "fail")
         self.turn(O.EVENTS)                 # told about the rejection, did nothing
         self.turn(O.NUDGE)                  # nudged, did nothing
         self.assertEqual(self.step().reason, "owner_idle")
 
     def test_progress_after_an_empty_nudge_gives_the_owner_a_new_nudge(self):
         self.turn(O.START, progress=True)
-        self.take(1, "submitted", "ok", "fail")     # wakes; nothing is in flight
+        self.take(1, "submitted", "ok", "up_to_date", "fail")     # wakes; nothing is in flight
         self.turn(O.EVENTS)                 # did nothing
         self.turn(O.NUDGE)                  # did nothing: idle count is 1
         self.log.push("an event that arrives late")
         self.turn(O.EVENTS, progress=True)  # events come before the idle rule
         self.assertEqual(self.log.idle_turns, 0)
-        self.take(1, "submitted", "ok", "fail")
+        self.take(1, "submitted", "ok", "up_to_date", "fail")
         self.turn(O.EVENTS)
         self.turn(O.NUDGE)                  # a new nudge, not FAILED
         self.assertEqual(self.step().reason, "owner_idle")
@@ -208,7 +208,7 @@ class TestEpicRun(RunCase):
         # A removal from the merge queue is most often answered by a re-enqueue
         # with no push. The owner looks, decides to wait, and the run waits.
         self.turn(O.START, progress=True)
-        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published")
+        self.take(1, "submitted", "ok", "up_to_date", "pass", "published")
         self.take(1, "queue_kicked")
         _n, texts = self.turn(O.EVENTS)                  # the owner did nothing
         self.assertIn("a re-enqueue is done by the pipeline", texts[0])
@@ -220,7 +220,7 @@ class TestEpicRun(RunCase):
 
     def test_done_is_refused_once_and_cannot_loop(self):
         self.turn(O.START, progress=True)
-        self.take(1, "submitted", "ok", "fail")
+        self.take(1, "submitted", "ok", "up_to_date", "fail")
         self.done = True                    # claims done with slice 1 REJECTED
         n, texts = self.turn(O.DONE_REFUSED)
         self.assertEqual(len(texts), 1)     # the turn also carries the waiting event
@@ -231,7 +231,7 @@ class TestEpicRun(RunCase):
 
     def test_done_while_slices_are_in_flight_waits_then_reports(self):
         self.turn(O.START, progress=True)
-        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published")
+        self.take(1, "submitted", "ok", "up_to_date", "pass", "published")
         self.done = True
         self.assertEqual(self.step(), O.Step(O.WAIT))
         self.take(1, "merged")
@@ -240,7 +240,7 @@ class TestEpicRun(RunCase):
     def test_slice_budget_spent_fails_the_run(self):
         self.turn(O.START, progress=True)
         for _ in range(S.DEFAULT_ROUND_BUDGET):
-            self.take(1, "submitted", "ok", "fail")
+            self.take(1, "submitted", "ok", "up_to_date", "fail")
         self.take(1, "submitted")
         self.assertEqual(self.step(), O.Step(O.FAILED, reason="slice_budget"))
 
@@ -249,7 +249,7 @@ class TestEpicRun(RunCase):
         self.assertEqual(self.log.pending(), [O.TURN_FAILED_TEXT])
         self.turn(O.EVENTS, progress=True)
         self.assertEqual(self.log.failed_turns, 0)
-        self.take(1, "submitted", "ok", "fail")
+        self.take(1, "submitted", "ok", "up_to_date", "fail")
         self.turn(O.EVENTS, ok=False)
         self.turn(O.EVENTS, ok=False)
         self.assertEqual(self.step(), O.Step(O.FAILED, reason="owner_turn_failed"))
@@ -271,13 +271,13 @@ class TestEpicRun(RunCase):
         self.assertNotEqual(self.step().step, O.FAILED)
 
     def test_an_unpublished_slice_the_owner_gave_up_does_not_block_done(self):
-        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
-        self.take(2, "submitted", "ok", "fail")              # REJECTED, no pull request
+        self.take(1, "submitted", "ok", "up_to_date", "pass", "published", "merged")
+        self.take(2, "submitted", "ok", "up_to_date", "fail")              # REJECTED, no pull request
         self.done = True
         self.assertEqual(self.step().step, O.REPORT)
         # a rejected slice WITH a pull request is still open work
-        self.take(3, "submitted", "ok", "pass", "up_to_date", "pass", "published",
-                  "checks_failed", "submitted", "ok", "fail")
+        self.take(3, "submitted", "ok", "up_to_date", "pass", "published",
+                  "checks_failed", "submitted", "ok", "up_to_date", "fail")
         self.assertEqual(self.book.get(3).state, S.REJECTED)
         self.assertNotEqual(self.step().step, O.REPORT)
         # and a given-up slice alone, with nothing merged, is not a delivery
@@ -291,7 +291,7 @@ class TestEpicRun(RunCase):
         self.assertNotEqual(O.next_step(log.facts(book, done=True, blocked=False)).step, O.REPORT)
 
     def test_report_comes_before_the_failed_turns_rule(self):
-        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
+        self.take(1, "submitted", "ok", "up_to_date", "pass", "published", "merged")
         f = self.log.facts(self.book, done=True, blocked=False)
         import dataclasses
         f = dataclasses.replace(f, turns=3, failed_turns=O.TURN_FAILURE_LIMIT, pending=0)
@@ -318,22 +318,22 @@ class TestEpicRun(RunCase):
         self.assertLessEqual(len(kinds), 4)
 
     def test_given_up_is_only_rejected_or_stale_without_a_pull_request(self):
-        self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
-        self.take(2, "submitted", "ok", "pass", "up_to_date", "pass", "published", "checks_failed")
+        self.take(1, "submitted", "ok", "up_to_date", "pass", "published", "merged")
+        self.take(2, "submitted", "ok", "up_to_date", "pass", "published", "checks_failed")
         self.assertFalse(O.given_up(self.book.get(2)))                 # NEEDS_OWNER has a pull request
         self.done = True
         self.assertNotEqual(self.step().step, O.REPORT)
         self.take(2, "merged")
-        self.take(3, "submitted", "ok", "pass", "up_to_date", "pass", "published")
+        self.take(3, "submitted", "ok", "up_to_date", "pass", "published")
         self.take(4, "submitted", "ok", "pass", builds_on=3)
         self.take(3, "submitted", "ok")                                # 4 is STALE, no pull request
         self.assertEqual(self.book.get(4).state, S.STALE)
         self.assertTrue(O.given_up(self.book.get(4)))
-        self.take(3, "pass", "up_to_date", "pass", "published", "merged")
+        self.take(3, "up_to_date", "pass", "published", "merged")
         self.assertEqual(self.step().step, O.REPORT)
 
     def test_a_slice_that_waits_for_a_parent_that_waits_for_the_owner_is_not_in_flight(self):
-        self.take(1, "submitted", "ok")
+        self.take(1, "submitted", "ok", "up_to_date")
         self.take(2, "submitted", "ok", "pass", builds_on=1)           # WAIT_PARENT on 1
         self.take(3, "submitted", "ok", "pass", builds_on=2)           # WAIT_PARENT on 2
         self.log.begin_turn(O.START)

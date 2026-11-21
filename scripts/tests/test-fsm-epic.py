@@ -53,7 +53,7 @@ class TestEpicRun(EpicCase):
         self.assertEqual(git(self.f.remote, "rev-parse", f"{head}^"), base)
         v = [r for r in self.recs("slice_validated")]
         self.assertEqual([(r["slice"], r["round"], r["cache_hit"]) for r in v],
-                         [(1, 1, False), (1, 1, True)])      # VALIDATE, SYNC up to date, VALIDATE
+                         [(1, 1, False)])      # SYNC (up to date), then one VALIDATE
         self.assertEqual(self.f.remote_tree(head), v[-1]["tree"])
         self.assertEqual(self.f.records("docker-validate")[0]["validated_tree"], v[0]["tree"])
 
@@ -110,6 +110,37 @@ class TestEpicRun(EpicCase):
         self.assertNotIn("FAIL_VALIDATION", self.f.remote_all_text())   # round 1 was never pushed
         self.assertEqual(self.status(1)["round"], 2)
         self.assertEqual(len(self.f.gh()["prs"]), 1)
+
+    def test_develop_moved_before_the_submit_and_the_validator_runs_once_on_the_synced_tree(self):
+        # Slice 2 is built on the develop commit of the launch. Slice 1 merges
+        # before slice 2 is submitted, so develop has moved. SYNC comes first:
+        # one validator run, on the tree that is published.
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [write("src/a.go", "package src\n// a\n"), submit(1)],
+            [write("src/b.go", "package src\n// b\n"), submit(2, base=base0)],
+            [DONE],
+        ]})
+        self.launch()
+        self.merge(self.wait_pr(1))
+        self.assertNotEqual(self.f.remote_head("develop"), base0)
+        pr2 = self.wait_pr(2)
+        dev = self.f.remote_head("develop")
+        head2 = self.f.remote_head("feature/epic-900-slice-2")
+        self.assertEqual(git(self.f.remote, "rev-parse", f"{head2}^"), dev)
+        self.assertEqual(self.changed(head2), ["src/b.go"])
+        path = [(r["event"], r["to"]) for r in self.recs("slice_transition")
+                if r["slice"] == 2 and r["round"] == 1]
+        self.assertEqual(path, [("submitted", "SNAPSHOT"), ("ok", "SYNC"), ("rebased", "VALIDATE"),
+                                ("pass", "PUBLISH"), ("published", "LANDING")])
+        v2 = [r for r in self.recs("slice_validated") if r["slice"] == 2]
+        self.assertEqual([(r["cache_hit"], r["base"], r["tree"]) for r in v2],
+                         [(False, dev, self.f.remote_tree(head2))])
+        runs = [r for r in self.recs("validate_start") if r["slice"] == 2]
+        self.assertEqual(len(runs), 1)
+        self.merge(pr2)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
 
     def test_a_slice_on_an_unmerged_slice_is_validated_at_once_and_published_after_the_merge(self):
         self.f.plan({"owner": [

@@ -6,10 +6,10 @@ An epic run holds one owner session and many slices. Each slice is a small
 state machine of its own. This module is that machine and its records; it
 starts no container and runs no git command. The supervisor drives it.
 
-    NEW ─submitted─▶ SNAPSHOT ─ok─▶ VALIDATE ─pass─▶ SYNC ─▶ VALIDATE ─pass─▶ PUBLISH ─▶ LANDING
-                                       │ pass, parent slice not merged
-                                       ▼
-                                  WAIT_PARENT ─parent_merged─▶ SYNC
+    NEW ─submitted─▶ SNAPSHOT ─ok─▶ SYNC ─▶ VALIDATE ─pass─▶ PUBLISH ─▶ LANDING
+                        │ ok, parent slice not merged
+                        ▼
+                    VALIDATE ─pass─▶ WAIT_PARENT ─parent_merged─▶ SYNC
 
 Where a story run starts a fix or resolve session, a slice stops in a state
 that hands the work back to the owner: REJECTED, STALE or NEEDS_OWNER. The
@@ -164,7 +164,13 @@ TABLE = {
     (VALIDATE, "submitted"): _SUBMIT,
 
     # SNAPSHOT ------------------------------------------------------------
-    (SNAPSHOT, "ok"): [Edge("always", VALIDATE)],
+    # A slice with no unmerged parent goes onto the develop tip first, so the
+    # validator runs once, on the tree that is published. A slice on an
+    # unmerged parent is validated on that parent now and synced later.
+    (SNAPSHOT, "ok"): [
+        Edge("ready_for_sync", SYNC),
+        Edge("on_unmerged_parent", VALIDATE),
+    ],
     (SNAPSHOT, "bad_request"): [Edge("always", REJECTED, reason="bad_request")],
     (SNAPSHOT, "unchanged"): [Edge("always", REJECTED, reason="no_change")],
     (SNAPSHOT, "violation"): [Edge("always", REJECTED, reason="export_rejected")],

@@ -25,7 +25,7 @@ OWNER       owner container starts; the owner works in turns
   |
   |  owner runs `slice-submit`            (any time, many times)
   v
-  slice n:  SNAPSHOT -> VALIDATE -> [WAIT_PARENT] -> SYNC -> VALIDATE -> PUBLISH -> LANDING
+  slice n:  SNAPSHOT -> [VALIDATE -> WAIT_PARENT] -> SYNC -> VALIDATE -> PUBLISH -> LANDING
             every result -> /fsm/context/slices/<n>/ ; important ones wake the owner
   |
   |  every submitted slice has ended, one is merged, and the owner said "done"
@@ -208,10 +208,11 @@ the snapshot, validator and publish code of a story run.
 
 ```
 SNAPSHOT ─bad request / no change / filter or scan violation▶ REJECTED (answer to slice-submit)
-         ─ok──────────────────────────────────▶ VALIDATE
+         ─ok, no unmerged parent──────────────▶ SYNC
+         ─ok, parent slice not merged─────────▶ VALIDATE
 VALIDATE ─fail────────────────────────────────▶ REJECTED        (log tail + wake)
          ─pass, parent slice not merged───────▶ WAIT_PARENT     (no wake)
-         ─pass, no unmerged parent────────────▶ SYNC
+         ─pass, parent merged meanwhile───────▶ SYNC
          ─pass, after SYNC────────────────────▶ PUBLISH
 WAIT_PARENT ─parent merged────────────────────▶ SYNC
 SNAPSHOT, VALIDATE, WAIT_PARENT
@@ -252,6 +253,13 @@ submit. A FAILED slice ends the whole run as FAILED.
   published, the slice is `REJECTED(branch_moved)`, and the supervisor
   closes the pull request with a comment. The slice takes no new round; the
   owner delivers the change under another slice number.
+- **SYNC comes before VALIDATE** for a slice with no unmerged parent. The
+  validator then runs once, on the tree that is published. (In the run of
+  epic #6302 the order was VALIDATE, SYNC, VALIDATE; `develop` moved during
+  the first validation, so the validator ran twice: 3470 s and 2976 s.) A
+  conflict with `develop` is found before the validator runs. When `develop`
+  moves during the validation, the slice is published as validated; the
+  merge queue tests the combination.
 - **A conflict in SYNC** is not resolved by the supervisor placing markers in
   the workspace, as in a story run. The owner's workspace is live and belongs
   to the owner. The owner catches up with `develop` itself (fetch, merge),
