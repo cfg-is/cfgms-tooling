@@ -855,13 +855,23 @@ except Exception: print('')" 2>/dev/null || echo "")
 #   live run. The lease is released here only when the run never got past
 #   PREPARE far enough to own it (no run dir, or no terminal state recorded and
 #   the supervisor is gone without being interrupted).
+# _claude_token_hint — what to do about a claude_token_<reason> refusal or
+#   deferral of an epic run. The supervisor's own text goes to its log, which
+#   the caller of this script does not see.
+_claude_token_hint() {
+  echo "(the long-life Claude token file of this host is there and this process cannot read it; an owner is not started with the short-life credentials file. The token is read through the TPM by group tss: check that the account is in that group and that systemd-creds can decrypt the file. CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1 takes the credentials file.)"
+}
+
 _fsm_outcome() {
   local rc="$1" label="$2" ok_token="$3" refuse="$4" defer="$5" lease_key="$6" item="${7:-}" why
   case "$rc" in
     0)
       if why=$(_fsm_log_token DISPATCH_DEFERRED); then
         _rollback_claim "$item"
-        echo "${defer}:${label}:${why}"
+        case "$why" in
+          *claude_token_*) echo "${defer}:${label}:${why} $(_claude_token_hint)" ;;
+          *) echo "${defer}:${label}:${why}" ;;
+        esac
         exit 0
       fi
       echo "$ok_token"
@@ -876,11 +886,7 @@ _fsm_outcome() {
       why=$(_fsm_log_token FSM_REFUSED || echo "refused")
       _rollback_claim "$item"
       case "$why" in
-        *claude_token_*)
-          # the supervisor's own text is in its launch log, which the caller
-          # of this script does not see
-          echo "${refuse}:${label}:${why} (the long-life Claude token of this host is there and this process cannot read it; an owner is not started with the short-life credentials file. Launch from an account in group tss. Text: ${FSM_LAST_LOG})"
-          ;;
+        *claude_token_*) echo "${refuse}:${label}:${why} $(_claude_token_hint)" ;;
         *) echo "${refuse}:${label}:${why}" ;;
       esac
       exit 3
@@ -1035,6 +1041,17 @@ except Exception: print('')" 2>/dev/null || true)
     return 0
   fi
   _fsm_image_gate "$run_id" FSM_RESUME_REFUSED || return 3
+  # An epic run that must start its owner container again stops (exit 75) when
+  # the token file is there and cannot be read (fsm/epic.py). Asked here first:
+  # the supervisor is not started, the run's records do not change (its age
+  # limit is counted from them), and the caller gets the reason.
+  if [[ "$mode" == "epic" && "${CFGMS_FSM_ALLOW_CREDENTIALS_FILE:-}" != "1" ]]; then
+    if ! _agent_token_fetch && [[ "$AGENT_TOKEN_REASON" != "absent" ]]; then
+      echo "FSM_RESUME_REFUSED:${run_id}:claude_token_${AGENT_TOKEN_REASON} $(_claude_token_hint)"
+      return 3
+    fi
+    AGENT_TOKEN_VALUE=""
+  fi
   if [[ -n "$lease_key" ]]; then
     holder=$(_lease_holder_state "$lease_key")
     case "$holder" in

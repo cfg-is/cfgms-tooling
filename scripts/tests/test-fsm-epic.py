@@ -346,6 +346,28 @@ class TestRefusals(EpicCase):
 
 
 class TestParts(unittest.TestCase):
+    def test_a_token_read_that_timed_out_is_read_again_and_no_other_reason_is(self):
+        import types
+        saved = epic.TOKEN_RETRY_SECS
+        epic.TOKEN_RETRY_SECS = 0
+        self.addCleanup(setattr, epic, "TOKEN_RETRY_SECS", saved)
+
+        def read(answers):
+            calls = []
+
+            def claude_token():
+                calls.append(1)
+                return answers[min(len(calls), len(answers)) - 1]
+            me = types.SimpleNamespace(svc=types.SimpleNamespace(claude_token=claude_token))
+            return epic.EpicSupervisor.read_token(me), len(calls)
+
+        self.assertEqual(read([(None, "timeout"), (None, "timeout"), ("tok", "ok")]), (("tok", "ok"), 3))
+        self.assertEqual(read([(None, "timeout")]), ((None, "timeout"), 1 + epic.TOKEN_TIMEOUT_RETRIES))
+        self.assertEqual(read([(None, "decrypt_failed"), ("tok", "ok")]), ((None, "decrypt_failed"), 1))
+        self.assertEqual(read([(None, "absent")]), ((None, "absent"), 1))
+        self.assertEqual(read([("tok", "ok")]), (("tok", "ok"), 1))
+        self.assertGreaterEqual(epic.TOKEN_TIMEOUT_RETRIES, 1)
+
     def test_agent_definition(self):
         d = epic.parse_agent_definition(
             "---\nname: judge\ndescription: Judges a slice\nmodel: opus\ntools: Read, Grep\n---\n"

@@ -72,8 +72,10 @@ token.
   When the token file is there and the supervisor cannot read it, the launch
   is refused (`REFUSED(claude_token_<reason>)`; deferred when the reason is
   `timeout`, after two more tries), and a run whose container must be started
-  again later stops as an interrupted run, which `dispatch resume` continues
-  when the token can be read: the
+  again later stops as an interrupted run (also after three reads that timed
+  out). `dispatch resume` of an epic run asks for the token first and refuses
+  with `claude_token_<reason>` while it cannot be read; it continues the run
+  when it can: the
   credentials file is a short-life login, and the first owner run (cfgms epic
   6380) ended with it 2 minutes after its launch. The token is sealed with
   the TPM, which group `tss` reads; `po-act.sh dispatch`, `dispatch-fix` and

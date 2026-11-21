@@ -6,6 +6,8 @@
 # extracts the lane jq filter from po.md verbatim (drift guard) and runs it
 # against a fixture preflight JSON, then checks Step 0 forbids `gh pr merge`.
 set -euo pipefail
+# po-act.sh must not run the real `sg tss` from a suite (po_act_tss_reexec.test.sh)
+export CFGMS_NO_TSS_REEXEC=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"

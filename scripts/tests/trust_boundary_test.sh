@@ -24,6 +24,8 @@
 #
 # Run: bash test/security/trust_boundary_test.sh
 set -euo pipefail
+# po-act.sh must not run the real `sg tss` from a suite (po_act_tss_reexec.test.sh)
+export CFGMS_NO_TSS_REEXEC=1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 ENTRYPOINT="$REPO_ROOT/.claude/tooling/devcontainer/entrypoint.sh"

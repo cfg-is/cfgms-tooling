@@ -14,6 +14,8 @@
 # project-queue.sh; gh is a PATH stand-in; leases go to
 # mock-pipeline-helper.sh.
 set -euo pipefail
+# po-act.sh must not run the real `sg tss` from a suite (po_act_tss_reexec.test.sh)
+export CFGMS_NO_TSS_REEXEC=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT_REAL="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
@@ -87,7 +89,6 @@ run_dispatch() {
   CFGMS_AGENT_CAPACITY_GATE=off \
   CFGMS_PO_HOST_CAPS=linux \
   PO_CACHE_DIR="${SANDBOX}/po-cache" \
-  CFGMS_NO_TSS_REEXEC=1 \
   bash "$POACT" dispatch "$1" 2>&1
 }
 
@@ -207,6 +208,51 @@ t10_out=$(PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELI
 check_eq "T10: exits 0" "$t10_rc" "0"
 check_contains "T10: skipped, the run is named" "$t10_out" "DISPATCH_SKIPPED:epic-4242:run_"
 check_eq "T10: no second supervisor" "$(cat "${SANDBOX}/supervisor.log")" ""
+
+printf '\n== T11: a claude_token refusal or deferral says what to do ==\n'
+t11_rc=0
+t11_out=$(FAKE_SUP_MODE="refused:claude_token_decrypt_failed" CFGMS_CANON_DIR="${SANDBOX}/canon" \
+  CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t11_rc=$?
+check_eq "T11a: refused -> exits 3" "$t11_rc" "3"
+check_contains "T11a: the reason" "$t11_out" "DISPATCH_REFUSED:epic-4242:claude_token_decrypt_failed (the long-life Claude token file"
+check_contains "T11a: the way out" "$t11_out" "CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1"
+t11_rc=0
+t11_out=$(FAKE_SUP_MODE="deferred:claude_token_timeout" CFGMS_CANON_DIR="${SANDBOX}/canon" \
+  CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t11_rc=$?
+check_eq "T11b: deferred -> exits 0" "$t11_rc" "0"
+check_contains "T11b: the reason and the text" "$t11_out" "DISPATCH_DEFERRED:epic-4242:claude_token_timeout (the long-life Claude token file"
+t11_out=$(FAKE_SUP_MODE="refused:lease_not_held" CFGMS_CANON_DIR="${SANDBOX}/canon" \
+  CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || true
+check_not_contains "T11c: another refusal has no token text" "$t11_out" "Claude token"
+
+printf '\n== T12: resume of an epic run asks for the token before it starts the supervisor ==\n'
+# a run that passed its gates and whose supervisor is gone: crashed
+FAKE_SUP_MODE=gates_only CFGMS_FSM_LAUNCH_WAIT_SECS=1 CFGMS_FSM_PREPARE_WAIT_SECS=1 \
+  CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242 >/dev/null || true
+t12_run=$(ls "${SANDBOX}/runs" | grep '^epic-4242-fake-' | head -1)
+t12_records=$(wc -l < "${SANDBOX}/runs/${t12_run}/state.jsonl")
+: > "${SANDBOX}/token.cred"
+printf '#!/usr/bin/env bash\nexit 1\n' > "${SANDBOX}/bin/creds-no"
+printf '#!/usr/bin/env bash\necho fake-token-value-0123456789\n' > "${SANDBOX}/bin/creds-yes"
+chmod +x "${SANDBOX}/bin/creds-no" "${SANDBOX}/bin/creds-yes"
+resume_epic() {
+  : > "${SANDBOX}/supervisor.log"
+  PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=off CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" CFGMS_AGENT_TOKEN_CRED="${SANDBOX}/token.cred" CFGMS_FSM_START_GRACE_SECS=0 \
+  bash "$POACT" dispatch resume "$t12_run" 2>&1
+}
+t12_rc=0
+t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-no" resume_epic) || t12_rc=$?
+check_eq "T12a: token not readable -> exits 3" "$t12_rc" "3"
+check_contains "T12a: refused with the reason and the text" "$t12_out" "FSM_RESUME_REFUSED:${t12_run}:claude_token_decrypt_failed (the long-life Claude token file"
+check_eq "T12a: the supervisor was not started" "$(cat "${SANDBOX}/supervisor.log")" ""
+check_eq "T12a: the run's records did not change" "$(wc -l < "${SANDBOX}/runs/${t12_run}/state.jsonl")" "$t12_records"
+t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-no" CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1 resume_epic) || true
+check_contains "T12b: with the variable the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
+t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-yes" resume_epic) || true
+check_contains "T12c: token readable -> the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
+check_not_contains "T12c: the token value is not printed" "$t12_out" "fake-token-value"
 
 echo ""
 echo "-----------------------------------------"
