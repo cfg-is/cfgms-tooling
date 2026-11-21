@@ -17,8 +17,11 @@ change /workspace, and let every helper finish, before this command returns.
 The command reads from git which origin/develop commit /workspace is built on
 (`git merge-base HEAD origin/develop`) and sends it with the request. To bring
 in newer develop commits, merge origin/develop and commit the merge before
-you submit. A merge that is not finished is refused. `--base` is still
-accepted and is not used.
+you submit. The command sends nothing (exit 2) when a merge, cherry-pick,
+revert or rebase is not finished, and when the files hold what a newer
+develop commit made while git has no merge of it (a squash merge, copied
+files, a slice of yours that has merged). `--base` is still accepted and is
+not used.
 
 Exit code: 0 the supervisor took the snapshot; 1 it refused the request (the
 reason is printed); 2 wrong arguments; 3 no answer inside the time limit.
@@ -51,22 +54,86 @@ def fail(code, text):
     sys.exit(code)
 
 
+def git_raw(*args, stdin=None):
+    """(exit code, stdout bytes) of git in the workspace."""
+    try:
+        proc = subprocess.run(["git", "-C", WORKSPACE, *args], capture_output=True, timeout=300,
+                              input=stdin)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(2, f"cannot run git in {WORKSPACE}: {exc}. No request was sent.")
+    return proc.returncode, proc.stdout
+
+
 def git(*args):
     """(exit code, stdout) of git in the workspace."""
-    try:
-        proc = subprocess.run(["git", "-C", WORKSPACE, *args], capture_output=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        fail(2, f"cannot run git in {WORKSPACE}: {exc}")
-    return proc.returncode, proc.stdout.decode("utf-8", "replace").strip()
+    code, out = git_raw(*args)
+    return code, out.decode("utf-8", "replace").strip()
+
+
+ABSENT = "0" * 40
+
+
+def develop_in_files(base):
+    """Paths where the work tree holds what a develop commit after `base`
+    made and `base` did not have.
+
+    The supervisor measures the slice against `base`. Such a path would be
+    read as a change of the slice: a develop change that develop took back
+    would be published again, a develop change to a protected path would be
+    refused as the slice's, a conflict the owner repaired would come again.
+    A real merge of origin/develop moves the base and ends this."""
+    code, out = git_raw("log", "--first-parent", "-m", "--format=", "--raw", "--no-abbrev",
+                        "--no-renames", "-z", f"{base}..{DEVELOP_REF}")
+    if code != 0:
+        fail(2, f"cannot read the develop commits after {base[:12]}. No request was sent.")
+    made = {}                                   # path -> blobs develop commits gave it
+    parts = out.split(b"\0")
+    for i, part in enumerate(parts[:-1]):
+        meta = part.lstrip(b"\n")
+        if not meta.startswith(b":"):
+            continue
+        fields = meta.split()
+        if len(fields) < 5 or fields[1] == b"160000" or fields[0] == b":160000":
+            continue                            # a submodule pointer is not a file
+        made.setdefault(parts[i + 1], set()).add(fields[3].decode())
+    if not made:
+        return []
+    code, out = git_raw("ls-tree", "-r", "-z", base)
+    if code != 0:
+        fail(2, f"cannot read the tree of {base[:12]}. No request was sent.")
+    at_base = {}
+    for rec in out.split(b"\0"):
+        meta, _, path = rec.partition(b"\t")
+        if path in made:
+            at_base[path] = meta.split()[2].decode()
+    there, held = [], {}
+    for path in sorted(made):
+        full = os.path.join(os.fsencode(WORKSPACE), path)
+        if os.path.islink(full) or b"\n" in path:
+            continue
+        if os.path.isfile(full):
+            there.append(path)
+        elif not os.path.lexists(full):
+            held[path] = ABSENT
+    if there:
+        code, out = git_raw("hash-object", "--stdin-paths", stdin=b"\n".join(there) + b"\n")
+        blobs = out.decode("ascii", "replace").split()
+        if code != 0 or len(blobs) != len(there):
+            fail(2, f"cannot read the files of {WORKSPACE} with git. No request was sent.")
+        held.update(zip(there, blobs))
+    return [p.decode("utf-8", "replace") for p in sorted(held)
+            if held[p] in made[p] and held[p] != at_base.get(p, ABSENT)]
 
 
 def workspace_base():
     """The origin/develop commit the workspace is built on, read from git.
 
-    It is an ancestor of HEAD, so the work tree started from a commit that
-    holds all of develop up to it. The supervisor measures the slice against
-    it; a base that is newer than the workspace would make the slice undo
-    develop commits, and that cannot come from here."""
+    The supervisor measures the slice against it. A base that is newer than
+    the files would make the slice undo develop commits; a base that is
+    older would make it bring develop changes as its own. The base is an
+    ancestor of HEAD, and `develop_in_files` refuses the second case. A
+    history that says "merged" over files that were turned back on purpose
+    (a reverted merge, reset --soft, merge -s ours) is not seen here."""
     code, _ = git("rev-parse", "--verify", "-q", "HEAD^{commit}")
     if code != 0:
         fail(2, f"{WORKSPACE} has no HEAD commit that git can read. No request was sent.")
@@ -76,6 +143,12 @@ def workspace_base():
         if code == 0:
             fail(2, f"a {what} in {WORKSPACE} is not finished. Finish it and commit it (or "
                     f"abort it), then submit again. No request was sent.")
+    for name in ("rebase-merge", "rebase-apply"):
+        # a rebase that stopped at `break`, `edit` or a failed `exec` has no REBASE_HEAD
+        code, path = git("rev-parse", "--git-path", name)
+        if code == 0 and os.path.exists(os.path.join(WORKSPACE, path)):
+            fail(2, f"a rebase in {WORKSPACE} is not finished. Finish it (or abort it), then "
+                    f"submit again. No request was sent.")
     code, _ = git("rev-parse", "--verify", "-q", DEVELOP_REF + "^{commit}")
     if code != 0:
         fail(2, f"{WORKSPACE} has no origin/develop (git fetch origin develop). "
@@ -84,6 +157,14 @@ def workspace_base():
     if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", base):
         fail(2, f"HEAD of {WORKSPACE} has no common commit with origin/develop. "
                 f"No request was sent.")
+    paths = develop_in_files(base)
+    if paths:
+        more = f" and {len(paths) - 5} more" if len(paths) > 5 else ""
+        fail(2, f"{WORKSPACE} holds changes of origin/develop that git has no merge of: "
+                f"{', '.join(paths[:5])}{more}. In git, {WORKSPACE} is built on develop commit "
+                f"{base[:12]}, and the slice is measured against that commit. Commit your "
+                f"work, run `git merge origin/develop` (a real merge: not --squash, not "
+                f"copied files), commit the merge, then submit again. No request was sent.")
     return base
 
 

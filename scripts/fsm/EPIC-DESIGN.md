@@ -158,8 +158,20 @@ slice-submit --slice <n> --claim <file> --subject "<scope>: <what changed>" \
 - The base, the `origin/develop` commit the workspace is built on, is not an
   argument. The command reads it from git in `/workspace`
   (`git merge-base HEAD origin/develop`) and writes it into the request with
-  `"base_from": "git"`. It refuses, and sends nothing, while a merge,
-  cherry-pick, revert or rebase is not finished. The supervisor refuses a
+  `"base_from": "git"`. It sends nothing (exit 2) while a merge,
+  cherry-pick, revert or rebase is not finished (for a rebase it looks for
+  the `rebase-merge` and `rebase-apply` directories too: a rebase stopped at
+  `break` or a failed `exec` has no `REBASE_HEAD`). It also sends nothing
+  when a file holds what a `develop` commit after the base made and the
+  base did not have: a squash merge, copied files, or a slice of this epic
+  that has merged while the workspace did not merge `develop`. Measured
+  against the base, such a file would be read as a change of the slice: a
+  change `develop` took back would be published again, a `develop` change
+  to a protected path would be refused as the slice's, a conflict the
+  owner repaired would come again. The answer names the files and the
+  cure, which always works: a real merge of `origin/develop`, committed.
+  So after a slice of the epic merges, the owner merges `develop` before
+  the next submit. The supervisor refuses a
   request with no `base_from` (an older `slice-submit`). `--base` is still
   accepted, so an older owner definition does not fail; it is not used, and
   the command says so when it differs. Why: the supervisor measures the
@@ -211,12 +223,13 @@ commit the owner merges `origin/develop` and commits the merge.
 | `--builds-on m`, slice `m` not merged | the snapshot commit of slice `m`'s current round (the owner's tree, not what SYNC made of it) when the base is the `develop` commit that snapshot is on; that snapshot merged onto the base when the base is newer (§4). The supervisor checks that the base is on `origin/develop`. |
 | `--builds-on m`, slice `m` merged meanwhile | treated as no `--builds-on` |
 
-The base is an ancestor of the HEAD of the workspace, so the work tree
-started from a commit that holds all of `develop` up to it. A base that is
-older than what the files hold (the owner copied `develop` files in with no
-merge) only makes the slice bring changes `develop` already has; SYNC merges
-those away. A request that was not written by `slice-submit` can name any
-base; that cannot land bad code unseen: the diff would show other
+The base is an ancestor of the HEAD of the workspace, and no file holds a
+later `develop` change. What the command cannot see is a history that says
+"merged" over files that were turned back on purpose: a revert of the merge
+commit, `git reset --soft origin/develop` with no merge, `git merge -s
+ours`. The slice then undoes those `develop` commits, as a typed tip did
+before. A request that was not written by `slice-submit` can name any
+base. Neither can land bad code unseen: the diff would show other
 people's changes or reverts, and VALIDATE, SYNC and the reviewer all see the
 real diff.
 

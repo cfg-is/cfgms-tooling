@@ -283,6 +283,70 @@ class TestBaseFromGit(Case):
         self.git("commit", "-qm", "merge develop")
         self.assertEqual(self.submitted()[0], self.git("rev-parse", "refs/remotes/origin/develop"))
 
+    def test_a_rebase_that_stopped_with_no_conflict_is_refused(self):
+        # `break`, or an `exec` that failed: git has no REBASE_HEAD then
+        (self.ws / "mine.txt").write_text("work\n")
+        self.git("add", "mine.txt")
+        self.git("commit", "-qm", "work")
+        (self.ws / "more.txt").write_text("more\n")
+        self.git("add", "more.txt")
+        self.git("commit", "-qm", "more work")
+        self.develop_moves()
+        self.git("rebase", "-x", "false", "refs/remotes/origin/develop", check=False)
+        self.assertFalse(self.git("rev-parse", "-q", "--verify", "REBASE_HEAD", check=False))
+        self.refused_by_the_command("a rebase in")
+        self.git("rebase", "--abort")
+        self.assertEqual(self.submitted()[0], self.base)
+
+    def develop_in_files_refused(self, *paths):
+        p = self.command(*self.std_args(), wait=1)
+        _, err = p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 2, err)
+        self.assertIn("holds changes of origin/develop that git has no merge of: "
+                      + ", ".join(paths) + ". In git", err)
+        self.assertIn("No request was sent.", err)
+        self.assertFalse((self.out / "submit").exists() and any((self.out / "submit").iterdir()))
+
+    def test_develop_files_with_no_merge_in_git_are_refused(self):
+        # a squash merge: the files of develop, and no merge commit
+        (self.ws / "mine.txt").write_text("work\n")
+        self.git("add", "mine.txt")
+        self.git("commit", "-qm", "work")
+        new = self.develop_moves()
+        self.git("merge", "-q", "--squash", "refs/remotes/origin/develop")
+        self.git("commit", "-qm", "develop, squashed")
+        self.develop_in_files_refused("d.txt")
+        # develop takes its change back: the tip has no d.txt, the files have
+        self.git("checkout", "-q", "--detach", "refs/remotes/origin/develop")
+        self.git("rm", "-q", "d.txt")
+        self.git("commit", "-qm", "develop: take d.txt back")
+        self.git("update-ref", "refs/remotes/origin/develop", self.git("rev-parse", "HEAD"))
+        self.git("checkout", "-q", "feature/epic")
+        self.develop_in_files_refused("d.txt")
+        # a real merge of the commit that made d.txt ends it, with the later
+        # develop commit fetched and not merged
+        self.git("merge", "-q", "--no-edit", new)
+        self.assertEqual(self.submitted()[0], new)
+
+    def test_a_copied_develop_file_and_a_file_develop_deleted_are_refused(self):
+        (self.ws / "gone.txt").write_text("old\n")
+        self.git("add", "gone.txt")
+        self.git("commit", "-qm", "work")              # not on develop: no part of this
+        self.develop_moves("a.txt", "two\n")
+        self.git("checkout", "-q", "--detach", "refs/remotes/origin/develop")
+        self.git("rm", "-q", "a.txt")
+        self.git("commit", "-qm", "develop: delete a.txt")
+        self.git("update-ref", "refs/remotes/origin/develop", self.git("rev-parse", "HEAD"))
+        self.git("checkout", "-q", "feature/epic")
+        (self.ws / "a.txt").write_text("two\n")        # not committed: the files count
+        self.develop_in_files_refused("a.txt")
+        (self.ws / "a.txt").unlink()
+        self.develop_in_files_refused("a.txt")
+        (self.ws / "a.txt").write_text("one\n")        # as at the base
+        self.assertEqual(self.submitted()[0], self.base)
+        (self.ws / "a.txt").write_text("mine\n")       # the slice's own change
+        self.assertEqual(self.submitted()[0], self.base)
+
     def test_a_workspace_with_no_origin_develop_is_refused(self):
         self.git("update-ref", "-d", "refs/remotes/origin/develop")
         self.refused_by_the_command("has no origin/develop")

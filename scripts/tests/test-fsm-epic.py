@@ -112,33 +112,139 @@ class TestEpicRun(EpicCase):
         self.assertEqual(len(self.f.gh()["prs"]), 1)
 
     def test_develop_moved_before_the_submit_and_the_validator_runs_once_on_the_synced_tree(self):
-        # Slice 2 is built on the develop commit of the launch. Slice 1 merges
-        # before slice 2 is submitted, so develop has moved. SYNC comes first:
-        # one validator run, on the tree that is published.
+        # The slice is built on the develop commit of the launch. develop gets
+        # a commit of another author before the submit. SYNC comes first: one
+        # validator run, on the tree that is published.
         base0 = self.f.remote_head("develop")
         self.f.plan({"owner": [
-            [write("src/a.go", "package src\n// a\n"), submit(1)],
-            [write("src/b.go", "package src\n// b\n"), submit(2, base=base0)],
+            [{"op": "wait_flag", "name": "go"},
+             write("src/b.go", "package src\n// b\n"), submit(1, base=base0)],
+            [DONE],
+        ]})
+        dev = self.develop_moves_before_turn_1()
+        pr = self.wait_pr(1)
+        head = self.f.remote_head("feature/epic-900-slice-1")
+        self.assertEqual(git(self.f.remote, "rev-parse", f"{head}^"), dev)
+        self.assertEqual(self.changed(head), ["src/b.go"])
+        path = [(r["event"], r["to"]) for r in self.recs("slice_transition")
+                if r["slice"] == 1 and r["round"] == 1]
+        self.assertEqual(path, [("submitted", "SNAPSHOT"), ("ok", "SYNC"), ("rebased", "VALIDATE"),
+                                ("pass", "PUBLISH"), ("published", "LANDING")])
+        v = [r for r in self.recs("slice_validated") if r["slice"] == 1]
+        self.assertEqual([(r["cache_hit"], r["base"], r["tree"]) for r in v],
+                         [(False, dev, self.f.remote_tree(head))])
+        self.assertEqual(len(self.recs("validate_start")), 1)
+        self.merge(pr)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+
+    # --- real git in the workspace ("git": "keep": the fake leaves the history alone)
+    def fetch(self):
+        # origin of the workspace is the public URL; the tests fetch the fixture
+        return {"op": "git", "args": ["fetch", "-q", "--no-tags", str(self.f.remote),
+                                      "+refs/heads/*:refs/remotes/origin/*"]}
+
+    @staticmethod
+    def g(*args):
+        return {"op": "git", "args": list(args)}
+
+    def test_real_git_a_slice_of_the_owner_merged_and_the_next_submit_needs_a_merge(self):
+        # Slice 1 merges: develop has a.go, and so has the workspace, with no
+        # merge in git. slice-submit sends nothing until the owner merges.
+        self.f.plan({"owner": [
+            [write("src/a.go", "package src\n// a\n"), submit(1, git="keep")],
+            [self.g("add", "-A"), self.g("commit", "-qm", "slice 1"), self.fetch(),
+             write("src/b.go", "package src\n// b\n"),
+             submit(2, git="keep", flag_base="tip", expect=2),
+             self.g("merge", "-q", "--no-edit", "origin/develop"),
+             submit(2, git="keep")],
             [DONE],
         ]})
         self.launch()
         self.merge(self.wait_pr(1))
-        self.assertNotEqual(self.f.remote_head("develop"), base0)
-        pr2 = self.wait_pr(2)
         dev = self.f.remote_head("develop")
+        pr2 = self.wait_pr(2)
+        out = self.submits()[1]["output"]
+        self.assertIn("holds changes of origin/develop that git has no merge of: src/a.go.", out)
+        self.assertIn("No request was sent.", out)
+        self.assertEqual(self.status(2)["round"], 1)
         head2 = self.f.remote_head("feature/epic-900-slice-2")
         self.assertEqual(git(self.f.remote, "rev-parse", f"{head2}^"), dev)
         self.assertEqual(self.changed(head2), ["src/b.go"])
-        path = [(r["event"], r["to"]) for r in self.recs("slice_transition")
-                if r["slice"] == 2 and r["round"] == 1]
-        self.assertEqual(path, [("submitted", "SNAPSHOT"), ("ok", "SYNC"), ("rebased", "VALIDATE"),
-                                ("pass", "PUBLISH"), ("published", "LANDING")])
-        v2 = [r for r in self.recs("slice_validated") if r["slice"] == 2]
-        self.assertEqual([(r["cache_hit"], r["base"], r["tree"]) for r in v2],
-                         [(False, dev, self.f.remote_tree(head2))])
-        runs = [r for r in self.recs("validate_start") if r["slice"] == 2]
-        self.assertEqual(len(runs), 1)
         self.merge(pr2)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+
+    U_MINE = "package src\n\nfunc U() int {\n\treturn 7\n}\n"
+    U_BOTH = "package src\n\n// develop moved\nfunc U() int {\n\treturn 7\n}\n"
+
+    def test_real_git_a_conflict_with_develop_is_repaired_with_a_merge(self):
+        # Round 1 conflicts with develop. A squash merge of develop is not a
+        # merge in git: nothing is sent. A real merge, repaired and committed,
+        # is round 2 on the new develop commit.
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"}, write("src/util.go", self.U_MINE),
+             submit(1, git="keep")],
+            [self.g("add", "-A"), self.g("commit", "-qm", "wip"), self.fetch(),
+             self.g("merge", "--squash", "origin/develop"),
+             write("src/util.go", self.U_BOTH), self.g("add", "-A"),
+             self.g("commit", "-qm", "develop, squashed"),
+             submit(1, git="keep", expect=2),                   # develop's files, no merge
+             self.g("merge", "--no-edit", "origin/develop"),
+             submit(1, git="keep", expect=2),                   # a merge that is not finished
+             write("src/util.go", self.U_BOTH), self.g("add", "-A"),
+             self.g("commit", "--no-edit"),
+             submit(1, git="keep")],
+            [DONE],
+        ]})
+        dev = self.develop_moves_before_turn_1()
+        pr = self.wait_pr(1)
+        outs = [s["output"] for s in self.submits()]
+        self.assertEqual([s["exit"] for s in self.submits()], [0, 2, 2, 0])
+        self.assertIn("holds changes of origin/develop that git has no merge of: "
+                      "src/new_on_develop.go.", outs[1])
+        self.assertIn("a merge in", outs[2])
+        self.assertIn((1, "conflict", "REJECTED"), self.path_of(1))
+        self.assertEqual((self.status(1)["round"], self.status(1)["rounds_left"]), (2, 1))
+        head = self.f.remote_head("feature/epic-900-slice-1")
+        self.assertEqual(self.changed(head), ["src/util.go"])
+        self.assertEqual(self.f.remote_show(head, "src/util.go"), self.U_BOTH.strip())
+        c = [r for r in self.recs("slice_candidate") if r["slice"] == 1]
+        self.assertEqual([(r["round"], r["snap_parent"]) for r in c], [(1, base0), (2, dev)])
+        self.merge(pr)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+
+    def test_real_git_a_chain_of_three_with_a_merge_of_develop_in_the_middle(self):
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, git="keep"),
+             self.g("add", "-A"), self.g("commit", "-qm", "s1"),
+             write("src/b.go", "package src\n// b\n"), submit(2, git="keep", builds_on=1),
+             self.g("add", "-A"), self.g("commit", "-qm", "s2"),
+             self.fetch(), self.g("merge", "-q", "--no-edit", "origin/develop"),
+             write("src/c.go", "package src\n// c\n"), submit(3, git="keep", builds_on=2),
+             submit(3, git="keep", builds_on=2, expect=1)],      # the same again: no round
+            [], [], [],
+            [self.g("add", "-A"), self.g("commit", "-qm", "s3"), self.fetch(),
+             self.g("merge", "-q", "--no-edit", "origin/develop"), DONE],
+        ]})
+        dev1 = self.develop_moves_before_turn_1()
+        pr1 = self.wait_pr(1)
+        self.wait_state(3, "WAIT_PARENT")
+        c3 = [r for r in self.recs("slice_candidate") if r["slice"] == 3][-1]
+        repo = self.run_dir / "R"
+        self.assertEqual(git(repo, "diff", "--name-only", c3["parent"], c3["commit"]), "src/c.go")
+        self.assertEqual(git(repo, "rev-parse", c3["parent"] + "^"), dev1)
+        self.assertEqual(self.status(3)["rounds_left"], 2)
+        self.merge(pr1)
+        self.merge(self.wait_pr(2))
+        pr3 = self.wait_pr(3)
+        head3 = self.f.remote_head("feature/epic-900-slice-3")
+        self.assertEqual(self.changed(head3), ["src/c.go"])
+        self.assertIn("develop moved", self.f.remote_show(head3, "src/util.go"))
+        self.merge(pr3)
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
 
