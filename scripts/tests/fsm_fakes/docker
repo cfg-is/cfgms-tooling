@@ -302,6 +302,10 @@ def owner_exec(argv):
     log({"tool": "docker-owner-turn", "turn": int(turn), "index": idx, "text": tfile.read_text(),
          "owner": json.loads((ctx / "owner.json").read_text()),
          "agents": (ctx / "agents.json").exists(), "has_git": (ws / ".git").is_dir()})
+    if idx in plan().get("owner_login_refused", []):
+        # what Claude Code printed when the login of the owner was refused
+        print("Failed to authenticate: OAuth session expired and could not be refreshed")
+        return 1
     turns = plan().get("owner", [])
     actions = turns[idx] if idx < len(turns) else []
     code = apply_agent(actions, ws, out, Path(mounts["/agent-sessions"]), ctx,

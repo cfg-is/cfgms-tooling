@@ -68,8 +68,21 @@ token.
   files sit in a session dir on the host, so the thread survives a container
   restart. A lock allows one turn at a time.
 - **Claude login**: the long-lived inference token, as for dev agents. When
-  the host has no token, the host's credentials file is mounted instead. The
-  owner does not need remote control.
+  the host has no token file, the host's credentials file is mounted instead.
+  When the token file is there and the supervisor cannot read it, the launch
+  is refused (`REFUSED(claude_token_<reason>)`; deferred when the reason is
+  `timeout`, after two more tries), and a run whose container must be started
+  again later stops as an interrupted run (also after three reads that timed
+  out). `dispatch resume` of an epic run asks for the token first and refuses
+  with `claude_token_<reason>` while it cannot be read; it continues the run
+  when it can: the
+  credentials file is a short-life login, and the first owner run (cfgms epic
+  6380) ended with it 2 minutes after its launch. The token is sealed with
+  the TPM, which group `tss` reads; `po-act.sh dispatch`, `dispatch-fix` and
+  `resolve-conflict` run again under `sg tss` when the shell is not in the
+  group and the account is (the files of the run then get group `tss`).
+  `CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1` starts the
+  owner with the credentials file. The owner does not need remote control.
 - **Models** **[F]**: the owner runs on Fable, set by an `owner` segment in
   `model-routing.yaml` (read from the harness path, so the owner cannot
   change its own model). The container sets
@@ -121,7 +134,11 @@ token.
   submit resets the count. Two
   turns in
   a row that end in an error or a timeout end it as
-  `FAILED(owner_turn_failed)`. The whole order is `next_step` in `owner.py`.
+  `FAILED(owner_turn_failed)`. A failed turn whose output ends with Claude
+  Code's login error (`Failed to authenticate`, the one wording that was
+  measured) ends the run at once as `FAILED(claude_login_failed)`: the
+  credential is fixed for the life of the container, so a second turn gets
+  the same refusal. The whole order is `next_step` in `owner.py`.
 - **Turn timeout** **[P]**: the agent session limit (180 min) per turn, as a
   recorded, changeable default. Whether it fits an owner turn is not
   measured **[T]**.

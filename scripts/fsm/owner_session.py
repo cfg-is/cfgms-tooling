@@ -313,6 +313,20 @@ def start(docker, argv, name, env_extra, *, canon_dir, memory_dir, gh_token=None
             "log_tail": tail}
 
 
+#: The line Claude Code prints when its login is refused (measured: "Failed
+#: to authenticate: OAuth session expired and could not be refreshed", owner
+#: run of cfgms epic 6380). Other wordings are not measured and not matched.
+_LOGIN_FAILURE_RE = re.compile(r"^Failed to authenticate\b")
+LOGIN_FAILURE_TAIL_LINES = 5
+
+
+def is_login_failure(output_tail):
+    """True when a failed turn ended with Claude Code's login error. A new
+    turn cannot repair that, so the run must end and say so."""
+    lines = [ln for ln in (output_tail or "").splitlines() if ln.strip()]
+    return any(_LOGIN_FAILURE_RE.match(ln.strip()) for ln in lines[-LOGIN_FAILURE_TAIL_LINES:])
+
+
 def run_turn(docker, name, turn, timeout_min, env_extra=None):
     """Run one turn and wait for it.
 

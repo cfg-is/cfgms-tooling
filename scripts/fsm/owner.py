@@ -10,6 +10,7 @@ is a pure function; it starts nothing and reads no file.
     blocked.md                                   -> FAILED(owner_blocked)
     a slice is FAILED                            -> FAILED(<the slice's reason>)
     done.md, every slice ended, one is MERGED    -> REPORT
+    a turn ended with Claude's login error        -> FAILED(claude_login_failed)
     two turns in a row failed                    -> FAILED(owner_turn_failed)
     no turn yet                                  -> TURN(start)
     done.md, but not acceptable, nothing in flight -> TURN(done_refused) once
@@ -83,6 +84,7 @@ class Facts:
     blocked: bool = False      # out/blocked.md is there
     idle_turns: int = 0        # nudge turns without progress since the last progress
     failed_turns: int = 0      # turns in a row that ended in error or timeout
+    login_failed: bool = False  # the last turn ended with Claude's login error
     done_refused: bool = False  # the owner was already told that done.md is refused
 
 
@@ -104,6 +106,10 @@ def next_step(f):
         return Step(FAILED, reason=f.failed_reason or "slice_failed")
     if f.done and not unfinished and S.MERGED in f.states:
         return Step(REPORT)
+    if f.login_failed:
+        # A second turn gets the same refusal: the credential is fixed for
+        # the life of the container.
+        return Step(FAILED, reason="claude_login_failed")
     if f.failed_turns >= TURN_FAILURE_LIMIT:
         return Step(FAILED, reason="owner_turn_failed")
     if f.turns == 0:
@@ -255,6 +261,7 @@ class OwnerLog:
         self.open_turn = None   # {"turn", "kind", "upto"} of a started, not ended turn
         self.idle_turns = 0
         self.failed_turns = 0
+        self.login_failed = False
         self.done_refused = False
         self.session_id = ""
         for rec in run.records():
@@ -269,11 +276,13 @@ class OwnerLog:
         elif kind == "owner_turn_start":
             self.open_turn = {"turn": rec["turn"], "kind": rec["kind"], "upto": rec["upto"]}
         elif kind == "owner_turn_end":
-            self._close(rec["turn"], rec["upto"], rec["ok"], rec["progress"], rec["kind"])
+            self._close(rec["turn"], rec["upto"], rec["ok"], rec["progress"], rec["kind"],
+                        bool(rec.get("login_failed")))
 
-    def _close(self, turn, upto, ok, progress, kind):
+    def _close(self, turn, upto, ok, progress, kind, login_failed=False):
         self.turns = turn
         self.open_turn = None
+        self.login_failed = login_failed and not ok
         if ok:
             self.delivered = max(self.delivered, upto)
             self.failed_turns = 0
@@ -326,23 +335,29 @@ class OwnerLog:
         self.open_turn = {"turn": turn, "kind": kind, "upto": upto}
         return turn, texts
 
-    def end_turn(self, *, ok, progress, exit_code=None, timed_out=False, seconds=0):
+    def end_turn(self, *, ok, progress, exit_code=None, timed_out=False, seconds=0,
+                 login_failed=False):
         """Record the end of the open turn.
 
         ok        the session ended with exit code 0 inside its time limit
         progress  the supervisor accepted a snapshot during the turn. A
                   refused request, done.md and blocked.md are not progress.
 
+        login_failed  the turn did not end ok and its output ends with Claude
+                      Code's login error (owner_session.is_login_failure)
+
         A turn that did not end ok queues one event that says so, so the next
         turn tells the owner.
         """
+        login_failed = bool(login_failed) and not ok
         if self.open_turn is None:
             raise RuntimeError("no turn is open")
         t = self.open_turn
         self.run.append("owner_turn_end", turn=t["turn"], kind=t["kind"], upto=t["upto"],
                         ok=bool(ok), progress=bool(progress), exit_code=exit_code,
-                        timed_out=bool(timed_out), seconds=int(seconds))
-        self._close(t["turn"], t["upto"], bool(ok), bool(progress), t["kind"])
+                        timed_out=bool(timed_out), seconds=int(seconds),
+                        login_failed=login_failed)
+        self._close(t["turn"], t["upto"], bool(ok), bool(progress), t["kind"], login_failed)
         if not ok:
             self.push(TURN_TIMEOUT_TEXT if timed_out else TURN_FAILED_TEXT)
 
@@ -378,4 +393,5 @@ class OwnerLog:
         return Facts(turns=self.turns, pending=len(self.events) - self.delivered,
                      states=states, failed_reason=failed, done=done, blocked=blocked,
                      idle_turns=self.idle_turns, failed_turns=self.failed_turns,
+                     login_failed=self.login_failed,
                      done_refused=self.done_refused)

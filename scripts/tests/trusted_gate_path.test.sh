@@ -6,6 +6,8 @@
 # from there; this test proves the trusted copy decides, and that a launch or
 # gate with a missing trusted source fails closed.
 set -euo pipefail
+# po-act.sh must not run the real `sg tss` from a suite (po_act_tss_reexec.test.sh)
+export CFGMS_NO_TSS_REEXEC=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HARNESS_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"

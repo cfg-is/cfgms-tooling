@@ -360,6 +360,24 @@ class TestStartAndTurn(unittest.TestCase):
         self.assertEqual(len(r["output_tail"].splitlines()), agent_session.LOG_TAIL_LINES)
 
 
+class TestLoginFailure(unittest.TestCase):
+    MEASURED = "Failed to authenticate: OAuth session expired and could not be refreshed"
+
+    def test_the_measured_line_at_the_end_of_the_output(self):
+        tail = "Owner turn 1 (start, epic=6380)...\n[claude-code:unrecognized_model] {}\n" + self.MEASURED
+        self.assertTrue(OS.is_login_failure(tail))
+        self.assertTrue(OS.is_login_failure(self.MEASURED + "\n\n  \n"))
+        self.assertTrue(OS.is_login_failure("  " + self.MEASURED + "\r\n"))
+
+    def test_not_a_login_failure(self):
+        for tail in ("", None, "owner turn 1 done", "the test said: Failed to authenticate",
+                     "Failed to authenticated users", "failed to authenticate",
+                     # the line is far from the end: text the owner wrote about, not the end of the turn
+                     self.MEASURED + "\n" + "\n".join(f"line {i}" for i in range(OS.LOGIN_FAILURE_TAIL_LINES))):
+            with self.subTest(tail=tail):
+                self.assertFalse(OS.is_login_failure(tail))
+
+
 class TestDockerExec(FilesCase):
     def stub(self, body):
         p = self.tmp / "docker"

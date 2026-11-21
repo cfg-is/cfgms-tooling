@@ -855,13 +855,23 @@ except Exception: print('')" 2>/dev/null || echo "")
 #   live run. The lease is released here only when the run never got past
 #   PREPARE far enough to own it (no run dir, or no terminal state recorded and
 #   the supervisor is gone without being interrupted).
+# _claude_token_hint — what to do about a claude_token_<reason> refusal or
+#   deferral of an epic run. The supervisor's own text goes to its log, which
+#   the caller of this script does not see.
+_claude_token_hint() {
+  echo "(the long-life Claude token file of this host is there and this process cannot read it; an owner is not started with the short-life credentials file. The token is read through the TPM by group tss: check that the account is in that group and that systemd-creds can decrypt the file. CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1 takes the credentials file.)"
+}
+
 _fsm_outcome() {
   local rc="$1" label="$2" ok_token="$3" refuse="$4" defer="$5" lease_key="$6" item="${7:-}" why
   case "$rc" in
     0)
       if why=$(_fsm_log_token DISPATCH_DEFERRED); then
         _rollback_claim "$item"
-        echo "${defer}:${label}:${why}"
+        case "$why" in
+          *claude_token_*) echo "${defer}:${label}:${why} $(_claude_token_hint)" ;;
+          *) echo "${defer}:${label}:${why}" ;;
+        esac
         exit 0
       fi
       echo "$ok_token"
@@ -875,7 +885,10 @@ _fsm_outcome() {
     3)
       why=$(_fsm_log_token FSM_REFUSED || echo "refused")
       _rollback_claim "$item"
-      echo "${refuse}:${label}:${why}"
+      case "$why" in
+        *claude_token_*) echo "${refuse}:${label}:${why} $(_claude_token_hint)" ;;
+        *) echo "${refuse}:${label}:${why}" ;;
+      esac
       exit 3
       ;;
     4)
@@ -1028,6 +1041,24 @@ except Exception: print('')" 2>/dev/null || true)
     return 0
   fi
   _fsm_image_gate "$run_id" FSM_RESUME_REFUSED || return 3
+  # An epic run that must start its owner container again stops (exit 75) when
+  # the token file is there and cannot be read (fsm/epic.py). Asked here first:
+  # the supervisor is not started, the run's records do not change (its age
+  # limit is counted from them), and the caller gets the reason. A read that
+  # timed out is deferred, as at a launch. This is stricter than the
+  # supervisor in one case: a run whose owner container still runs needs no
+  # token to continue, and is refused here too.
+  if [[ "$mode" == "epic" && "${CFGMS_FSM_ALLOW_CREDENTIALS_FILE:-}" != "1" ]]; then
+    if ! _agent_token_fetch && [[ "$AGENT_TOKEN_REASON" != "absent" ]]; then
+      if [[ "$AGENT_TOKEN_REASON" == "timeout" ]]; then
+        echo "DISPATCH_DEFERRED:${run_id}:claude_token_timeout $(_claude_token_hint)"
+        return 0
+      fi
+      echo "FSM_RESUME_REFUSED:${run_id}:claude_token_${AGENT_TOKEN_REASON} $(_claude_token_hint)"
+      return 3
+    fi
+    AGENT_TOKEN_VALUE=""
+  fi
   if [[ -n "$lease_key" ]]; then
     holder=$(_lease_holder_state "$lease_key")
     case "$holder" in
@@ -1063,7 +1094,45 @@ except Exception: print('')" 2>/dev/null || true)
   return "$rc"
 }
 
+# _tss_reexec <cmd> [args...]
+#   The long-life Claude token (claude-oauth-token.cred) is sealed with the
+#   TPM, and the TPM device is readable by group `tss` only. A shell that was
+#   started before the account joined the group (or by a service that does not
+#   take the account's groups) cannot read the token; the agent then gets the
+#   host's short-life credentials file and stops at the next renewal (measured:
+#   the first owner run of cfgms epic 6380 ended 2 minutes after its launch
+#   with "OAuth session expired and could not be refreshed").
+#   When the token file is there, this process is not in `tss` and the account
+#   is, the launch commands run again under `sg tss`. Nothing was done before
+#   this point, so nothing is done twice. CFGMS_NO_TSS_REEXEC=1 turns it off.
+#   `sg -c` gives one string to /bin/sh, so each argument is put in single
+#   quotes by the POSIX rule (' becomes '\''). bash's `printf %q` is not used:
+#   its $'...' form is not POSIX, and a shell that does not know it runs what
+#   comes after a quote in the argument.
+#   Under `sg tss` the primary group of the process is tss, so the files of the
+#   run get group tss. `sg` stays as the parent of the command: a signal to the
+#   pid the caller holds reaches `sg`, not this script.
+_tss_reexec() {
+  local c="${1:-}"
+  case "$c" in dispatch|dispatch-fix|resolve-conflict) ;; *) return 0 ;; esac
+  [[ -z "${CFGMS_TSS_REEXEC:-}" && "${CFGMS_NO_TSS_REEXEC:-}" != "1" ]] || return 0
+  [[ -f "${CFGMS_AGENT_TOKEN_CRED:-${HOME}/.config/cfgms/claude-oauth-token.cred}" ]] || return 0
+  command -v sg >/dev/null 2>&1 || return 0
+  local now account
+  now=$(id -nG 2>/dev/null) || return 0
+  [[ " $now " == *" tss "* ]] && return 0
+  account=$(id -nG "$(id -un)" 2>/dev/null) || return 0
+  [[ " $account " == *" tss "* ]] || return 0
+  local sq="'" esc="'\\''" line="" a
+  for a in bash "$0" "$@"; do
+    line+="'${a//$sq/$esc}' "
+  done
+  export CFGMS_TSS_REEXEC=1
+  exec sg tss -c "$line"
+}
+
 cmd="${1:-}"
+_tss_reexec "$@"
 shift || true
 
 # Deterministic step boundary (Issue #3053): every subcommand except the

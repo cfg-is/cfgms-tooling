@@ -210,6 +210,8 @@ class Fixture:
             "FSM_FAKE_REMOTE": str(self.remote),
             "FSM_FAKE_BOARD_ITEM": str(self.board_item),
             "FSM_FAKE_CLAUDE_TOKEN": CLAUDE_TOKEN,
+            # po-act.sh must not run the real `sg tss` from a suite
+            "CFGMS_NO_TSS_REEXEC": "1",
             "FSM_FAKE_GH_TOKEN": GH_TOKEN,
             # present in the supervisor's own environment: must never reach a container
             "GH_TOKEN": GH_TOKEN,

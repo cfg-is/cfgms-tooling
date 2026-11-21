@@ -166,6 +166,31 @@ class TestRestart(EpicCase):
         self.assertIn(O.RESTART_TEXT, t[1]["text"])
         self.assertEqual(len({x["owner"]["session_id"] for x in t}), 1)
 
+    def test_a_token_that_cannot_be_read_any_more_stops_the_run_and_it_can_be_resumed(self):
+        # readable at the launch; not readable when the lost container must be
+        # started again: no start with the credentials file, and the run is
+        # not FAILED: it resumes when the token can be read
+        pr = self.stop_while_waiting()
+        run_id = self.run_dir.name
+        (self.f.docker_state / "containers.json").write_text("{}")
+        d = self.f.home / ".claude"
+        d.mkdir(exist_ok=True)
+        (d / ".credentials.json").write_text("{}")
+        self.merge(pr)
+        before = len(self.recs("transition"))
+        self.launch("resume", run_id, env={"FSM_FAKE_CLAUDE_TOKEN": ""})
+        rc, out = self.finish()
+        self.assertEqual(rc, 75, out)
+        self.assertEqual(len(self.f.records("docker-owner-start")), 1)
+        self.assertIn("cannot read it (decrypt_failed)",
+                      (self.run_dir / "logs" / "supervisor.log").read_text())
+        self.assertEqual(self.recs("note")[-1].get("interrupted"), "claude_token_decrypt_failed")
+        self.assertNotIn("FAILED", [t["to"] for t in self.recs("transition")[before:]])
+        self.launch("resume", run_id)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.f.records("docker-owner-start")), 2)
+
     def test_the_owner_container_of_another_run_is_replaced(self):
         self.f.plan({"owner": [[write("src/a.go", "package src\n"), submit(1)], [DONE]]})
         self.f.docker_state.mkdir(parents=True, exist_ok=True)

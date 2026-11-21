@@ -11,6 +11,8 @@
 #           the story's project item and the pr-<N> lease handed to it.
 
 set -euo pipefail
+# po-act.sh must not run the real `sg tss` from a suite (po_act_tss_reexec.test.sh)
+export CFGMS_NO_TSS_REEXEC=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Route lease calls to the hermetic mock so this test never touches real GitHub.
