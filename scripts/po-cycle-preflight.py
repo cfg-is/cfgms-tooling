@@ -150,6 +150,12 @@ BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)
 #: decide pipeline ownership would claim genuine manual work.
 AGENT_BRANCH_RE = re.compile(r"^feature/(?:story-\d+|item-[A-Za-z0-9]+)-agent$")
 
+#: The branch of one slice of an epic that an owner session builds
+#: (fsm/epic.py: `feature/epic-<N>-slice-<n>`). The epic run's supervisor
+#: pushes it and the owner repairs it; see `_slice_review_rec`. ASCII digits
+#: only, as in agent-dispatch.sh's resolve_pr_story_or_item.
+SLICE_BRANCH_RE = re.compile(r"feature/epic-([1-9][0-9]*)-slice-([1-9][0-9]*)")
+
 # Markers identifying a WIP draft PR left by an agent run that did not finish.
 # Both a body prefix and a title-suffix form are accepted because either alone
 # is sufficient evidence.
@@ -479,7 +485,7 @@ query {
         approvals: reviews(states: [APPROVED], last: 50) {
           nodes { author { login } commit { oid } }
         }
-        comments(first: 30) { nodes { author { login } body createdAt } }
+        comments(last: 30) { nodes { author { login } body createdAt } }
         commits(last: 1) {
           nodes {
             commit {
@@ -763,6 +769,36 @@ def latest_review(comments):
                 verdict = v
                 created_at = c.get("createdAt")
     return verdict, created_at
+
+
+#: The line that names the commit a review judged. The dispatcher gives the
+#: reviewer of a slice the exact line (agent-dispatch.sh review-pr).
+#: agent-dispatch.sh `_slice_review_is_stale` reads the same line with the same
+#: pattern (in jq); the two must agree, or one layer asks for a review that the
+#: other refuses.
+_REVIEWED_HEAD_RE = re.compile(r"(?im)^[ \t]*Reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t\r]*$")
+
+#: The verdict as the epic run's supervisor reads it (fsm/landing.py
+#: `_VERDICT_RE`): the marker first, the heading on the next line that is not
+#: empty, the verdict in capitals. Looser forms are a verdict for the preflight
+#: (`_REVIEW_VERDICT_RE`) and nothing for the supervisor.
+_LANDING_VERDICT_RE = re.compile(
+    r"\A\s*<!-- cfgms-acceptance-review -->\s*\n\s*#+\s*Acceptance Review\s*[\u2014\u2013:-]+\s*(PASS|FAIL)\b")
+
+
+def latest_review_detail(comments):
+    """(reviewed_head, landing_verdict) of the comment `latest_review` picks:
+    the commit id it names in a "Reviewed head:" line (or None), and the
+    verdict as fsm/landing.py reads that comment ("PASS", "FAIL" or "")."""
+    head, strict = None, ""
+    for c in comments:
+        if is_trusted_review_comment(c) and review_verdict(c) is not None:
+            body = c.get("body") or ""
+            m = _REVIEWED_HEAD_RE.search(body)
+            head = m.group(1) if m else None
+            m = _LANDING_VERDICT_RE.match(body)
+            strict = m.group(1) if m else ""
+    return head, strict
 
 
 def latest_review_verdict(comments):
@@ -2264,6 +2300,17 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "reason": "draft PR on a hand-authored branch — not pipeline-managed (manual work in progress); cron leaves it untouched",
             })
             continue
+        if pr.get("is_slice") and pr.get("epic_number") in blocked_story_nums:
+            recs.append({
+                "pr": pr["pr"], "story": None,
+                "epic": pr["epic_number"], "slice": pr["slice_number"],
+                "action": "skip",
+                "reason": "slice of an epic whose project status is Blocked — fenced off from the autonomous pipeline; cron will not review or enqueue it",
+            })
+            continue
+        if pr.get("is_slice"):
+            recs.append(_slice_review_rec(pr, in_queue))
+            continue
         if pr.get("story_number") in blocked_story_nums:
             recs.append({
                 "pr": pr["pr"],
@@ -2521,6 +2568,120 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     return recs
 
 
+def _slice_review_rec(pr, in_queue):
+    """The recommendation for one slice pull request of an owner-run epic.
+
+    A slice branch belongs to the epic run: its supervisor pushes it (and
+    closes the pull request when the branch moves under it), and the owner
+    repairs it after the supervisor's LANDING watcher wakes it (fsm/landing.py:
+    failed checks, a FAIL review, a queue removal, a conflict). The pipeline's
+    part is to review it, to enqueue it after a PASS, and to re-run a failed
+    check once. So the actions here are only spawn_acceptance_reviewer,
+    enqueue_merge, dequeue_unreviewed, rerun_failed_checks, ci_stuck (rerun),
+    defer and skip: nothing that pushes to the branch (rebase-pr.sh) and
+    nothing that starts a fix or resolve-conflict agent.
+
+    A review counts for the commit it names ("Reviewed head: <sha>" in the
+    comment), not for a time: nothing stops the owner from submitting a new
+    round while a reviewer works, and a commit made before the review can be
+    pushed after it. A verdict for another commit, or for none, is a reason
+    for a new review and never for an enqueue.
+    """
+    overall = pr["ci_summary"]["overall"]
+    ms = (pr.get("merge_state_status") or "").upper()
+    head = pr.get("head_oid") or ""
+    verdict = pr.get("latest_review_verdict")
+    what = f"slice {pr['slice_number']} of epic #{pr['epic_number']}"
+    woken = ("the epic run's supervisor wakes the owner (up to its wake limit for the round), "
+             "who repairs it with a new round")
+    person = "nothing wakes the owner for this: it needs a person"
+
+    def rec(action, reason, **more):
+        return {"pr": pr["pr"], "story": None, "epic": pr["epic_number"], "slice": pr["slice_number"],
+                "action": action, "reason": f"{what}: {reason}", **more}
+
+    def pending(prefix):
+        r = _ci_pending_rec(pr, prefix)
+        if r["action"] == "ci_stuck" and r.get("remedy") != "rerun":
+            return rec("skip", "its checks cannot start without a new head commit, and the pipeline "
+                               f"does not push to a slice branch — {person}")
+        more = {k: r[k] for k in ("remedy", "rerun_run_ids") if k in r}
+        return rec(r["action"], r["reason"], **more)
+
+    closes = ", ".join(f"#{n}" for n in pr.get("closing_issue_numbers") or [])
+    reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
+    if in_queue or pr.get("auto_merge_enabled"):
+        # On its way to a merge.
+        where = "in the merge queue" if in_queue else "auto-merge armed"
+        dequeue = (f"run `./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}` (it also disarms "
+                   "auto-merge)")
+        if closes:
+            return rec("dequeue_unreviewed",
+                       f"{where}, and its body closes {closes} at the merge; a slice must close "
+                       f"nothing — {dequeue}")
+        if reviewed and verdict == "pass":
+            return rec("skip", f"reviewed PASS on this commit, {where} "
+                               f"(mergeStateStatus={ms or 'UNKNOWN'})")
+        if verdict in ("pass", "fail"):
+            # The pipeline's newest verdict is not a PASS of this commit: a
+            # round was pushed after the enqueue, or the verdict is a FAIL.
+            # It must not merge on the verdict of the round before it.
+            return rec("dequeue_unreviewed",
+                       f"{where}, but the newest review verdict is not a PASS of its head commit — "
+                       f"{dequeue}; the next cycle reviews the commit")
+        # No verdict from the pipeline at all: a person enqueued it (the
+        # reviewer of a slice posts its verdict before it enqueues). The
+        # pipeline cannot know which commit that person meant, so it also
+        # leaves a round alone that the owner pushes afterwards.
+        return rec("skip", f"{where} with no review verdict: enqueued by a person; the pipeline "
+                           "neither reviews nor dequeues it, also not after a new round")
+    if closes:
+        return rec("skip", f"its body closes {closes} at the merge; a slice must close nothing (the "
+                           f"epic audit closes the epic) — {person}")
+    if ms == "DIRTY" or pr.get("mergeable") == "CONFLICTING":
+        return rec("skip", f"conflicts with develop — {woken}")
+
+    if not reviewed:
+        if not pr["has_acceptance_review_comment"]:
+            why = "no acceptance review yet"
+        elif verdict not in ("pass", "fail"):
+            why = "its review comment has no verdict"
+        else:
+            why = "its review is for another commit (or names none)"
+        if overall == "green":
+            return rec("spawn_acceptance_reviewer", f"checks green; {why}")
+        if overall == "pending":
+            return pending(f"{why}; checks pending: ")
+        return rec("skip", f"checks failed — {woken}")
+
+    # The latest verdict is for the head commit.
+    if verdict == "fail":
+        if pr.get("latest_review_landing_verdict") == "FAIL":
+            return rec("skip", f"acceptance review FAILED — {woken}")
+        return rec("skip", "acceptance review FAILED, but the comment is not in the form the supervisor "
+                           f"reads (the marker line first, then the heading) — {person}")
+    kicks = pr.get("evictions_since_review", 0)
+    if kicks >= 2:
+        return rec("skip", f"reviewed PASS but removed from the merge queue {kicks}x since that "
+                           f"review — {woken}")
+    if overall == "red":
+        if pr.get("failed_run_attempt", 1) <= 1:
+            return rec("rerun_failed_checks", "reviewed PASS but its checks failed (attempt 1) — one "
+                                              "`po-act.sh rerun <PR>` to clear a transient failure")
+        return rec("skip", f"reviewed PASS but its checks still fail after a rerun — {woken}")
+    if overall == "pending":
+        return pending("reviewed PASS; checks pending: ")
+    # BLOCKED: a required check or rule is not met, and `gh pr merge` would arm
+    # auto-merge instead of queueing. A slice is never left armed (enqueue
+    # disarms and refuses), so that would repeat every cycle.
+    if pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", ""):
+        return rec("enqueue_merge",
+                   "reviewed PASS on this commit + checks green + mergeable — run "
+                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`")
+    return rec("skip", f"reviewed PASS but not mergeable (mergeable={pr.get('mergeable')}, "
+                       f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
+
+
 def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=None, queued_pr_numbers=None):
     """Decide what to do for each Fix-status story (Step 4 of pipeline cycle).
 
@@ -2766,9 +2927,19 @@ def _build_pr_summaries(prs):
                         story_number = cin
                         break
 
+        # A slice of an owner-run epic. It has no story: a closing reference in
+        # its body must not give it one, or the fix cycle would take it.
+        epic_number = slice_number = None
+        if not pr_is_external:
+            sm = SLICE_BRANCH_RE.fullmatch(head)
+            if sm:
+                epic_number, slice_number = int(sm.group(1)), int(sm.group(2))
+                story_number = None
+
         comments = pr.get("comments") or []
         has_review_comment = any(is_trusted_review_comment(c) for c in comments)
         review_verdict_val, review_comment_date = latest_review(comments)
+        review_head, review_landing_verdict = latest_review_detail(comments)
         is_draft = bool(pr.get("isDraft"))
         wip_session_failed = is_draft and (
             body.startswith(_WIP_SESSION_FAILED_BODY_PREFIXES)
@@ -2783,10 +2954,21 @@ def _build_pr_summaries(prs):
             "is_external": pr_is_external,
             "is_released": pr_is_released,
             "story_number": story_number,
+            "is_slice": epic_number is not None,
+            "epic_number": epic_number,
+            "slice_number": slice_number,
             "comment_count": len(comments),
             "has_acceptance_review_comment": has_review_comment,
             "latest_review_verdict": review_verdict_val,
             "latest_review_comment_date": review_comment_date,
+            "latest_review_head": review_head,
+            "latest_review_landing_verdict": review_landing_verdict,
+            "closing_issue_numbers": [n for n in pr.get("closing_issue_numbers", []) if isinstance(n, int)],
+            # Queue removals after the latest verdict comment. For a slice:
+            # the pipeline's own dequeue of an unreviewed head comes before
+            # that head's review, so it is not counted against the head.
+            "evictions_since_review": count_merge_queue_evictions(
+                pr.get("timeline_items", []), review_comment_date),
             "latest_commit_date": pr.get("latest_commit_date"),
             "is_draft": is_draft,
             "wip_session_failed": wip_session_failed,

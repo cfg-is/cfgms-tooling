@@ -85,6 +85,7 @@ case "$1 $2" in
       *author,labels*) echo '{"author":{"login":"ext-user"},"labels":[{"name":"human-reviewed:ok"}]}' ;;
       *baseRefName*)   echo develop ;;
       *headRefOid*)    cat "$HEAD_SHA_FILE" 2>/dev/null ;;
+      *headRefName*)   echo feature/story-12-agent ;;
       *)               echo '' ;;
     esac ;;
   "pr comment") ;;

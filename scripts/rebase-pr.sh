@@ -70,6 +70,15 @@ if [[ ! "$branch" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
   exit 3
 fi
 
+# A slice of an owner-run epic (fsm/epic.py). Its supervisor pushed the branch
+# and accepts no other commit on it: after a push from here it would see
+# `branch_moved`, close the pull request, and the owner would have to deliver
+# the work again. The owner catches up with develop itself.
+if [[ "$branch" =~ ^feature/epic-[1-9][0-9]*-slice-[1-9][0-9]*$ ]]; then
+  echo "REBASE_REFUSED:${pr}:slice_pr_owner_repairs"
+  exit 3
+fi
+
 workdir="/tmp/rebase-${pr}"
 rm -rf "$workdir"
 mkdir -p "$workdir"

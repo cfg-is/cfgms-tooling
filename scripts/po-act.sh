@@ -916,6 +916,17 @@ _pr_story_num() {
   esac
 }
 
+# _pr_is_slice <pr>  — true when the PR's branch is a slice of an owner-run
+#   epic (feature/epic-<N>-slice-<n>). The epic run's supervisor pushes that
+#   branch and the owner repairs it: the pipeline never pushes to it. A PR
+#   that cannot be read is not a slice here; every caller has its own
+#   fail-closed read of the PR.
+_pr_is_slice() {
+  local branch
+  branch=$(gh pr view "$1" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null) || return 1
+  [[ "$(resolve_pr_story_or_item "$branch" "")" == SLICE:* ]]
+}
+
 # _item_for_issue <issue>  — the project item of an issue (project-queue.sh
 #   item-for-issue), or returns 1.
 _item_for_issue() {
@@ -1330,6 +1341,10 @@ except Exception: print('')" 2>/dev/null || echo "")
   dispatch-fix)
     pr="${1:?PR number required}"
     [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 2; }
+    if _pr_is_slice "$pr"; then
+      echo "DISPATCH_FIX_REFUSED:${pr}:slice_pr_owner_repairs"
+      exit 3
+    fi
     # External-author gate (Issue #1786): refuse before touching any PR content.
     # Read the head once and bind the trust check to it (Issue #5401). The
     # supervisor re-checks author trust and refuses if the head moved.
@@ -1377,6 +1392,10 @@ except Exception: print('')" 2>/dev/null || echo "")
   resolve-conflict)
     pr="${1:?PR number required}"
     [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 1; }
+    if _pr_is_slice "$pr"; then
+      echo "RESOLVE_CONFLICT_REFUSED:${pr}:slice_pr_owner_repairs"
+      exit 3
+    fi
     # Subcommand-level author gate (defense in depth — must run before any
     # fetch or launch). Uses #1786's permission-level helper
     # (push/maintain/admin); the supervisor re-checks it at PREPARE.
@@ -1431,8 +1450,67 @@ except Exception: print('')" 2>/dev/null || echo "")
     ;;
 
   enqueue)
+    # enqueue <PR> [<story>] [--head <sha>]
+    #   --head <sha>: the commit that was reviewed. The merge is refused when
+    #   the pull request head is another commit. Required for a slice.
     pr="${1:?PR number required}"
-    story="${2:-}"
+    shift
+    story=""
+    reviewed_head=""
+    head_given=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head)
+          head_given=true
+          reviewed_head="${2:-}"
+          shift
+          if [ $# -gt 0 ]; then shift; fi
+          ;;
+        *)
+          if [ -z "$story" ]; then story="$1"; fi   # the first one, as before
+          shift
+          ;;
+      esac
+    done
+    if $head_given && [[ ! "$reviewed_head" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "ENQUEUE_REFUSED:${pr}:bad_head_argument"
+      exit 3
+    fi
+    # A slice of an owner-run epic (fsm/epic.py).
+    #  - It has no story. A closing reference would close the epic when the
+    #    slice merges, and would hand the PR to the fix cycle. A story argument
+    #    is dropped, not refused: the merge is still wanted.
+    #  - Its owner can push a new round at any time, also while a reviewer
+    #    works. So the merge must name the commit that was reviewed.
+    #  - A closing reference already in the pull request is refused.
+    # The branch is read once here and a failed read refuses: "not a slice"
+    # must be known, not assumed, before a story's closing reference is written.
+    enqueue_is_slice=false
+    enqueue_branch=$(gh pr view "$pr" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || echo "")
+    if [ -z "$enqueue_branch" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:branch_unknown"
+      exit 3
+    fi
+    if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "")" == SLICE:* ]]; then
+      enqueue_is_slice=true
+      if [ -n "$story" ]; then
+        echo "ENQUEUE_NOTE:${pr}:slice_pr_story_argument_ignored"
+        story=""
+      fi
+      if [ -z "$reviewed_head" ]; then
+        echo "ENQUEUE_REFUSED:${pr}:slice_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
+        exit 3
+      fi
+      # GraphQL: `gh pr view --json` has no closingIssuesReferences field in
+      # every gh version (2.45 has none).
+      closes=$(gh api graphql \
+        -f query='query($pr: Int!) { repository(owner: "cfg-is", name: "cfgms") { pullRequest(number: $pr) { closingIssuesReferences(first: 1) { totalCount } } } }' \
+        -F pr="$pr" --jq '.data.repository.pullRequest.closingIssuesReferences.totalCount' 2>/dev/null || echo "")
+      if [ "$closes" != "0" ]; then
+        echo "ENQUEUE_REFUSED:${pr}:slice_pr_closes_an_issue (${closes:-unreadable})"
+        exit 3
+      fi
+    fi
     # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
     # the merge to it with --match-head-commit. The trust check is passed this
     # SHA so it cannot re-read a different head (an author swapping heads
@@ -1441,6 +1519,12 @@ except Exception: print('')" 2>/dev/null || echo "")
     head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
     if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
       echo "ENQUEUE_REFUSED:${pr}:head_unknown"
+      exit 3
+    fi
+    # The merge below is bound to head_sha (--match-head-commit). With --head
+    # it must also be the commit that was reviewed.
+    if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
       exit 3
     fi
     # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
@@ -1502,6 +1586,25 @@ except Exception: print('')" 2>/dev/null || echo "")
     }
     squash_enqueue
     state=$(enqueue_state)
+    # A slice must not wait with auto-merge armed: its owner can push a new
+    # round, and the armed merge would then take a commit that nobody
+    # reviewed. Queued, or not at all. The state is read up to three times:
+    # GitHub may need a moment to show the queue entry.
+    if $enqueue_is_slice; then
+      for _ in 1 2; do
+        [ "$state" = "queued" ] && break
+        sleep 3
+        state=$(enqueue_state)
+      done
+      if [ "$state" != "queued" ]; then
+        if gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1; then
+          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed; a queue entry, if there is one, stays)"
+        else
+          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
+        fi
+        exit 3
+      fi
+    fi
     case "$state" in
       MERGE|REBASE|unknown)
         # Auto-merge armed with a method the queue rejects: disarm it, arm
@@ -1532,9 +1635,24 @@ except Exception: print('')" 2>/dev/null || echo "")
   dequeue)
     pr="${1:?PR number required}"
     pr_id=$(gh pr view "$pr" --repo "$REPO" --json id -q .id)
+    # Auto-merge too: an armed pull request is queued again by GitHub when its
+    # checks pass. Not armed is not an error.
+    gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
+    # Not in the queue is not an error either (the preflight's
+    # dequeue_unreviewed is also given for "armed, not queued").
     gh api graphql \
       -f query='mutation($prId: ID!) { dequeuePullRequest(input: {id: $prId}) { mergeQueueEntry { state } } }' \
-      -F prId="$pr_id" >/dev/null
+      -F prId="$pr_id" >/dev/null 2>&1 || true
+    # Both calls may fail for a good reason, so the result is read, not assumed.
+    dq_state=$(gh api graphql \
+      -f query='query($pr: Int!) { repository(owner: "cfg-is", name: "cfgms") { pullRequest(number: $pr) { mergeQueueEntry { position } autoMergeRequest { mergeMethod } } } }' \
+      -F pr="$pr" \
+      --jq '.data.repository.pullRequest | if .mergeQueueEntry != null then "queued" elif .autoMergeRequest != null then "armed" else "none" end' \
+      2>/dev/null || echo "unreadable")
+    if [ "$dq_state" != "none" ]; then
+      echo "DEQUEUE_FAILED:$pr (still ${dq_state})" >&2
+      exit 1
+    fi
     echo "DEQUEUED:$pr"
     ;;
 

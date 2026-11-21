@@ -31,6 +31,7 @@ case "\$args" in
   *headRefOid*) echo "$SHA" ;;
   *"--json author,labels"*) echo '{"author":{"login":"outsider"},"labels":[]}' ;;
   *baseRefName*) echo develop ;;
+  *headRefName*) echo feature/story-12-agent ;;
   *) : ;;
 esac
 exit 0

@@ -57,6 +57,29 @@ assert_resolves "item-branch with Closes #<epic> in body (#1804 case)" \
   $'Some PR body\n\nCloses #1801\n\nMore notes.' \
   "ITEM:BX5ezzgt5raU"
 
+# A slice of an owner-run epic (fsm/epic.py). The branch decides; a closing
+# reference in the body must not make it a story (the fix cycle would take it).
+assert_resolves "slice branch" \
+  "feature/epic-6380-slice-1" \
+  "the claim" \
+  "SLICE:6380:1"
+assert_resolves "slice branch with Fixes #<epic> in body stays a slice" \
+  "feature/epic-6380-slice-12" \
+  $'the claim\n\nFixes #6380' \
+  "SLICE:6380:12"
+assert_resolves "slice-like branch with a suffix is not a slice" \
+  "feature/epic-6380-slice-1-agent" \
+  "no link" \
+  "REFUSED:no_story_link"
+assert_resolves "slice-like branch with a prefix is not a slice" \
+  "x/feature/epic-6380-slice-1" \
+  "no link" \
+  "REFUSED:no_story_link"
+assert_resolves "slice number 0 is not a slice" \
+  "feature/epic-6380-slice-0" \
+  "no link" \
+  "REFUSED:no_story_link"
+
 # Item-branch with no auto-close keyword in body (typical Path A PR).
 assert_resolves "item-branch with no body keyword" \
   "feature/item-BX5ezzgt5rcg-agent" \
@@ -384,6 +407,62 @@ f=$(write_fixture broken '{"comments":[],"commits":[]}')
 assert_staleness "missing commit data → fails open (reviewable)" "$f" "reviewable"
 
 echo
+echo "--- review-pr: reviewed-head guard for a slice (_slice_review_is_stale) ---"
+
+# A slice is reviewed when the newest trusted review comment names the head
+# commit. Times do not count: a commit made before the review can be pushed
+# after it.
+SHA_X=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+SHA_Y=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_slice_staleness() {
+  local description="$1" fixture="$2" head="$3" expected="$4"
+  ran=$((ran + 1))
+  local actual
+  actual=$(GH_FIXTURE="$fixture" PATH="$STALE_STUB_DIR:$PATH" \
+    bash -c "source '$DISPATCH' 2>/dev/null
+             _check_author_permission() { [[ \"\$1\" == jrdnr ]] && echo internal || echo external; }
+             if _slice_review_is_stale 1 '$head'; then echo stale; else echo reviewable; fi" \
+    2>/dev/null | tail -1) || true
+  if [[ "$actual" == "$expected" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n        expected=%q got=%q\n' "$description" "$expected" "$actual"
+    fail=$((fail + 1))
+  fi
+}
+slice_review() {  # slice_review <createdAt> <author> <verdict> <reviewed sha or ''> [<text after the sha>]
+  local line=""
+  [[ -n "$4" ]] && line="\\nReviewed head: $4${5:-}"
+  printf '{"createdAt":"%s","author":{"login":"%s"},"body":"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — %s%s\\n\\ntext"}' "$1" "$2" "$3" "$line"
+}
+f=$(write_fixture s-same "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X)]}")
+assert_slice_staleness "review names the head → stale" "$f" "$SHA_X" "stale"
+assert_slice_staleness "review names another commit → reviewable" "$f" "$SHA_Y" "reviewable"
+f=$(write_fixture s-nohead "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS '')]}")
+assert_slice_staleness "review names no commit → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-newer "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr FAIL $SHA_X),$(slice_review 2026-07-30T11:00:00Z jrdnr PASS $SHA_Y)]}")
+assert_slice_staleness "only the newest review counts (it names another commit) → reviewable" "$f" "$SHA_X" "reviewable"
+assert_slice_staleness "only the newest review counts (it names the head) → stale" "$f" "$SHA_Y" "stale"
+f=$(write_fixture s-forged "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z stranger PASS $SHA_X)]}")
+assert_slice_staleness "a review by an untrusted account does not count → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-none '{"comments":[]}')
+assert_slice_staleness "no review → reviewable" "$f" "$SHA_X" "reviewable"
+# The cases below are the ones where a looser rule here than in the preflight
+# would refuse every review the preflight asks for (test-preflight-slice-prs.py
+# has the same cases for the preflight).
+f=$(write_fixture s-wait "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr WAIT $SHA_X)]}")
+assert_slice_staleness "a WAIT comment that names the head is no review → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-passwait "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X),$(slice_review 2026-07-30T11:00:00Z jrdnr WAIT '')]}")
+assert_slice_staleness "a later WAIT comment does not undo a review of the head → stale" "$f" "$SHA_X" "stale"
+f=$(write_fixture s-trail "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X ' (round 2)')]}")
+assert_slice_staleness "text after the commit id: not the line → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-crlf "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X '\r')]}")
+assert_slice_staleness "CRLF line end after the commit id still counts → stale" "$f" "$SHA_X" "stale"
+f=$(write_fixture s-tick "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS "\`$SHA_X\`")]}")
+assert_slice_staleness "commit id in backticks counts → stale" "$f" "$SHA_X" "stale"
+assert_slice_staleness "a head that is no commit id → fails open (reviewable)" "$f" "not-a-sha" "reviewable"
+
+echo
 echo "--- review-pr: conflict guard (mergeStateStatus) ---"
 
 # A DIRTY PR has no merge ref, so GitHub runs no pull_request workflow and every
@@ -503,6 +582,7 @@ cat > "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
   add-issue)    echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  item-for-issue) echo 'PVTI_adv_epic' ;;
   update-field) echo "$*" >> "$ADV_CALLS" ; echo '{"updated": true}' ;;
   *)            echo '[]' ;;
 esac
@@ -579,6 +659,47 @@ for verdict in "ADVERSARIAL_REVIEW:pass" "ADVERSARIAL_REVIEW:pass:released" "ADV
   assert_adv "$verdict → gate passes and review continues to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-pass.log" && [[ "$out" != *adversarial* ]]'
 done
 
+# A slice of an owner-run epic: the item is the epic's. A hold refuses the
+# review and writes NO board field (an epic run writes none).
+ADV_STORY_META=$(cat "$ADV_ROOT/meta.json")
+ADV_SLICE_HEAD=2222222222222222222222222222222222222222
+slice_meta() {  # slice_meta <comments json array>
+  printf '{"state":"OPEN","headRefName":"feature/epic-77-slice-2","headRefOid":"%s","body":"the claim","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","comments":%s}' \
+    "$ADV_SLICE_HEAD" "$1" > "$ADV_ROOT/meta.json"
+}
+slice_meta '[]'
+rm -f "$ADV_ROOT/home/.cache/cfgms-adversarial-hold/notified-pr-4242"
+out=$(run_adv_review slicehold "ADVERSARIAL_REVIEW:hold:2")
+assert_adv "slice hold → refused adversarial_review_hold" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_hold"* ]]'
+assert_adv "slice hold → the gate got the epic item" 'grep -q "adversarial-review 4242 --item PVTI_adv_epic --check" "$ADV_ROOT/calls-slicehold.log"'
+assert_adv "slice hold → no board field written" '! grep -q "update-field" "$ADV_ROOT/calls-slicehold.log"'
+assert_adv "slice hold → one detail-free PR comment" 'grep -q "helper comment-inline 4242 Held for a security review" "$ADV_ROOT/calls-slicehold.log"'
+
+# A slice whose head commit is already reviewed is refused; --force reviews
+# it again. (The story rule, by times, would say "reviewable": this payload
+# has no commits.)
+run_adv_slice() {  # run_adv_slice <label> [--force]
+  ADV_CALLS="$ADV_ROOT/calls-$1.log"; : > "$ADV_CALLS"
+  ADV_VERDICT="ADVERSARIAL_REVIEW:not_applicable" ADV_CALLS="$ADV_CALLS" GH_FIXTURE="$ADV_ROOT/meta.json" \
+    PATH="$ADV_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$ADV_ROOT/home" \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" CFGMS_TEST_REPO_ROOT="$ADV_ROOT" \
+    CFGMS_TEST_COLLAB_PERM=admin \
+    CFGMS_TEST_ADVERSARIAL_SCRIPT="$ADV_ROOT/adversarial.sh" \
+    CFGMS_TEST_PIPELINE_HELPER="$ADV_ROOT/pipeline-helper.sh" \
+    CFGMS_AGENT_CAPACITY_GATE=off \
+    "$DISPATCH" review-pr 4242 ${2:-} 2>&1 | head -1 || true
+}
+slice_meta "[{\"createdAt\":\"2026-07-30T10:00:00Z\",\"author\":{\"login\":\"jrdnr\"},\"body\":\"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — PASS\\nReviewed head: ${ADV_SLICE_HEAD}\\n\"}]"
+out=$(run_adv_slice slicestale)
+assert_adv "slice with a reviewed head → refused head_already_reviewed" '[[ "$out" == *"REVIEW_REFUSED:4242:head_already_reviewed"* ]]'
+assert_adv "slice with a reviewed head → no lease taken" '! grep -q "lease-acquire" "$ADV_ROOT/calls-slicestale.log"'
+out=$(run_adv_slice sliceforce --force)
+assert_adv "slice with a reviewed head, --force → goes on to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-sliceforce.log" && [[ "$out" != *head_already_reviewed* ]]'
+slice_meta "[{\"createdAt\":\"2026-07-30T10:00:00Z\",\"author\":{\"login\":\"jrdnr\"},\"body\":\"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — PASS\\nReviewed head: 3333333333333333333333333333333333333333\\n\"}]"
+out=$(run_adv_slice slicefresh)
+assert_adv "slice whose review names another commit → goes on to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-slicefresh.log"'
+printf '%s' "$ADV_STORY_META" > "$ADV_ROOT/meta.json"
+
 
 echo
 echo "--- review-pr: prompts use the trusted gate path (Issue #5386) ---"
@@ -598,12 +719,16 @@ git -C "$PR_ROOT/origin" branch feature/story-4242-agent
 # list-by-status scan below; otherwise the launch falls back to the body's
 # "Fixes #4242" and the item-branch prompt is never generated.
 git -C "$PR_ROOT/origin" branch feature/item-promptitem01-agent
+git -C "$PR_ROOT/origin" branch feature/epic-77-slice-2
 git clone -q "$PR_ROOT/origin" "$PR_ROOT/repo"
 seed_trusted_sources "$PR_ROOT/repo"
 cat > "$PR_ROOT/repo/.claude/tooling/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-  add-issue)      echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  add-issue)      echo "add-issue $2" >> "$PR_ROOT/queue-calls.txt"
+                  echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  item-for-issue) [[ "$2" == 77 && -z "${NO_EPIC_ITEM:-}" ]] || exit 3
+                  echo PVTI_epicitem77 ;;
   list-by-status) echo '[{"item_id":"PVTI_promptitem01"}]' ;;
   update-field)   echo '{"updated": true}' ;;
   *)              echo '[]' ;;
@@ -658,6 +783,34 @@ for kind in story:feature/story-4242-agent item:feature/item-promptitem01-agent;
 done
 run_prompt_launch feature/story-4242-agent story
 assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
+
+echo
+echo "--- review-pr: a slice of an owner-run epic ---"
+
+# The body holds "Fixes #4242" (run_prompt_launch): the slice branch must win.
+rm -f "$PR_ROOT/queue-calls.txt"
+run_prompt_launch feature/epic-77-slice-2 slice
+assert_adv "slice launch is dispatched" 'grep -q "^REVIEW_DISPATCHED:4242:0:" "$PR_ROOT/launch-slice.out"'
+assert_adv "slice prompt names the slice, the epic and the epic item" 'grep -qF "pr:4242 slice:2 epic:77 --project-item PVTI_epicitem77" "$PR_ROOT/prompt.md"'
+assert_adv "slice launch does not add the epic to the board (read-only lookup)" '[[ ! -e "$PR_ROOT/queue-calls.txt" ]]'
+assert_adv "slice prompt reads the epic item from the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/project-queue.sh get-item PVTI_epicitem77" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt reads the agent definition from the trusted path" 'grep -qF "\`/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md\`" "$PR_ROOT/prompt.md"'
+SLICE_HEAD=$(git -C "$PR_ROOT/origin" rev-parse feature/epic-77-slice-2)
+assert_adv "slice prompt enqueues the reviewed head, with no story argument" 'grep -qF "po-act.sh enqueue 4242 --head ${SLICE_HEAD}\`" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt gives the Reviewed head line with the head" 'grep -qx "    Reviewed head: ${SLICE_HEAD}" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt has no enqueue with a story argument" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt writes no board field" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "update-field" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt assigns nobody" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "add-assignee" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt has no workspace-relative tooling command" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
+# The two lines fsm/landing.py reads to wake the owner.
+assert_adv "slice prompt gives the marker line" 'grep -qF "<!-- cfgms-acceptance-review -->" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt gives the FAIL heading the supervisor reads" 'grep -qF "## Acceptance Review — FAIL" "$PR_ROOT/prompt.md"'
+assert_adv "slice container is labelled story=0" 'grep -qx "story=0" "$PR_ROOT/docker-args.txt"'
+
+# An epic that is not on the project: refused, nothing launched.
+NO_EPIC_ITEM=1 run_prompt_launch feature/epic-77-slice-2 slice-noitem
+assert_adv "slice of an epic with no project item is refused" 'grep -q "REVIEW_REFUSED:4242:no_project_item_for_epic_77" "$PR_ROOT/launch-slice-noitem.out"'
+assert_adv "slice of an epic with no project item starts no container" '[[ -s "$PR_ROOT/launch-slice-noitem.out" && ! -e "$PR_ROOT/docker-args.txt" ]]'
 
 echo
 echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"
