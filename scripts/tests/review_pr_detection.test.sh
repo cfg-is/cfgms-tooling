@@ -407,6 +407,49 @@ f=$(write_fixture broken '{"comments":[],"commits":[]}')
 assert_staleness "missing commit data → fails open (reviewable)" "$f" "reviewable"
 
 echo
+echo "--- review-pr: reviewed-head guard for a slice (_slice_review_is_stale) ---"
+
+# A slice is reviewed when the newest trusted review comment names the head
+# commit. Times do not count: a commit made before the review can be pushed
+# after it.
+SHA_X=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+SHA_Y=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_slice_staleness() {
+  local description="$1" fixture="$2" head="$3" expected="$4"
+  ran=$((ran + 1))
+  local actual
+  actual=$(GH_FIXTURE="$fixture" PATH="$STALE_STUB_DIR:$PATH" \
+    bash -c "source '$DISPATCH' 2>/dev/null
+             _check_author_permission() { [[ \"\$1\" == jrdnr ]] && echo internal || echo external; }
+             if _slice_review_is_stale 1 '$head'; then echo stale; else echo reviewable; fi" \
+    2>/dev/null | tail -1) || true
+  if [[ "$actual" == "$expected" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    printf '  FAIL  %s\n        expected=%q got=%q\n' "$description" "$expected" "$actual"
+    fail=$((fail + 1))
+  fi
+}
+slice_review() {  # slice_review <createdAt> <author> <verdict> <reviewed sha or ''>
+  local line=""
+  [[ -n "$4" ]] && line="\\nReviewed head: $4"
+  printf '{"createdAt":"%s","author":{"login":"%s"},"body":"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — %s%s\\n\\ntext"}' "$1" "$2" "$3" "$line"
+}
+f=$(write_fixture s-same "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X)]}")
+assert_slice_staleness "review names the head → stale" "$f" "$SHA_X" "stale"
+assert_slice_staleness "review names another commit → reviewable" "$f" "$SHA_Y" "reviewable"
+f=$(write_fixture s-nohead "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS '')]}")
+assert_slice_staleness "review names no commit → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-newer "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr FAIL $SHA_X),$(slice_review 2026-07-30T11:00:00Z jrdnr PASS $SHA_Y)]}")
+assert_slice_staleness "only the newest review counts (it names another commit) → reviewable" "$f" "$SHA_X" "reviewable"
+assert_slice_staleness "only the newest review counts (it names the head) → stale" "$f" "$SHA_Y" "stale"
+f=$(write_fixture s-forged "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z stranger PASS $SHA_X)]}")
+assert_slice_staleness "a review by an untrusted account does not count → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-none '{"comments":[]}')
+assert_slice_staleness "no review → reviewable" "$f" "$SHA_X" "reviewable"
+assert_slice_staleness "a head that is no commit id → fails open (reviewable)" "$f" "not-a-sha" "reviewable"
+
+echo
 echo "--- review-pr: conflict guard (mergeStateStatus) ---"
 
 # A DIRTY PR has no merge ref, so GitHub runs no pull_request workflow and every
@@ -697,11 +740,13 @@ assert_adv "slice prompt names the slice, the epic and the epic item" 'grep -qF 
 assert_adv "slice launch does not add the epic to the board (read-only lookup)" '[[ ! -e "$PR_ROOT/queue-calls.txt" ]]'
 assert_adv "slice prompt reads the epic item from the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/project-queue.sh get-item PVTI_epicitem77" "$PR_ROOT/prompt.md"'
 assert_adv "slice prompt reads the agent definition from the trusted path" 'grep -qF "\`/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md\`" "$PR_ROOT/prompt.md"'
-assert_adv "slice prompt enqueues with no story argument" 'grep -qE "po-act\.sh enqueue 4242.\$" "$PR_ROOT/prompt.md"'
-assert_adv "slice prompt has no enqueue with a second argument" '! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
-assert_adv "slice prompt writes no board field" '! grep -qF "update-field" "$PR_ROOT/prompt.md"'
-assert_adv "slice prompt assigns nobody" '! grep -qF "add-assignee" "$PR_ROOT/prompt.md"'
-assert_adv "slice prompt has no workspace-relative tooling command" '! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
+SLICE_HEAD=$(git -C "$PR_ROOT/origin" rev-parse feature/epic-77-slice-2)
+assert_adv "slice prompt enqueues the reviewed head, with no story argument" 'grep -qF "po-act.sh enqueue 4242 --head ${SLICE_HEAD}\`" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt gives the Reviewed head line with the head" 'grep -qx "    Reviewed head: ${SLICE_HEAD}" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt has no enqueue with a story argument" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt writes no board field" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "update-field" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt assigns nobody" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "add-assignee" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt has no workspace-relative tooling command" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
 # The two lines fsm/landing.py reads to wake the owner.
 assert_adv "slice prompt gives the marker line" 'grep -qF "<!-- cfgms-acceptance-review -->" "$PR_ROOT/prompt.md"'
 assert_adv "slice prompt gives the FAIL heading the supervisor reads" 'grep -qF "## Acceptance Review — FAIL" "$PR_ROOT/prompt.md"'
@@ -710,7 +755,7 @@ assert_adv "slice container is labelled story=0" 'grep -qx "story=0" "$PR_ROOT/d
 # An epic that is not on the project: refused, nothing launched.
 NO_EPIC_ITEM=1 run_prompt_launch feature/epic-77-slice-2 slice-noitem
 assert_adv "slice of an epic with no project item is refused" 'grep -q "REVIEW_REFUSED:4242:no_project_item_for_epic_77" "$PR_ROOT/launch-slice-noitem.out"'
-assert_adv "slice of an epic with no project item starts no container" '[[ ! -e "$PR_ROOT/docker-args.txt" ]]'
+assert_adv "slice of an epic with no project item starts no container" '[[ -s "$PR_ROOT/launch-slice-noitem.out" && ! -e "$PR_ROOT/docker-args.txt" ]]'
 
 echo
 echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"

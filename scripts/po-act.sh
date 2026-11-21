@@ -1450,14 +1450,47 @@ except Exception: print('')" 2>/dev/null || echo "")
     ;;
 
   enqueue)
+    # enqueue <PR> [<story>] [--head <sha>]
+    #   --head <sha>: the commit that was reviewed. The merge is refused when
+    #   the pull request head is another commit. Required for a slice.
     pr="${1:?PR number required}"
-    story="${2:-}"
-    # A slice of an owner-run epic has no story. A closing reference would
-    # close the epic when the slice merges, and would hand the PR to the fix
-    # cycle. The argument is dropped, not refused: the merge is still wanted.
-    if [ -n "$story" ] && _pr_is_slice "$pr"; then
-      echo "ENQUEUE_NOTE:${pr}:slice_pr_story_argument_ignored"
-      story=""
+    shift
+    story=""
+    reviewed_head=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head) reviewed_head="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+        *)      story="$1"; shift ;;
+      esac
+    done
+    if [ -n "$reviewed_head" ] && [[ ! "$reviewed_head" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "ENQUEUE_REFUSED:${pr}:bad_head_argument"
+      exit 3
+    fi
+    # A slice of an owner-run epic (fsm/epic.py).
+    #  - It has no story. A closing reference would close the epic when the
+    #    slice merges, and would hand the PR to the fix cycle. A story argument
+    #    is dropped, not refused: the merge is still wanted.
+    #  - Its owner can push a new round at any time, also while a reviewer
+    #    works. So the merge must name the commit that was reviewed.
+    #  - A closing reference already in the pull request is refused.
+    enqueue_is_slice=false
+    if _pr_is_slice "$pr"; then
+      enqueue_is_slice=true
+      if [ -n "$story" ]; then
+        echo "ENQUEUE_NOTE:${pr}:slice_pr_story_argument_ignored"
+        story=""
+      fi
+      if [ -z "$reviewed_head" ]; then
+        echo "ENQUEUE_REFUSED:${pr}:slice_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
+        exit 3
+      fi
+      closes=$(gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
+        --jq '.closingIssuesReferences | length' 2>/dev/null || echo "")
+      if [ "$closes" != "0" ]; then
+        echo "ENQUEUE_REFUSED:${pr}:slice_pr_closes_an_issue (${closes:-unreadable})"
+        exit 3
+      fi
     fi
     # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
     # the merge to it with --match-head-commit. The trust check is passed this
@@ -1467,6 +1500,12 @@ except Exception: print('')" 2>/dev/null || echo "")
     head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
     if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
       echo "ENQUEUE_REFUSED:${pr}:head_unknown"
+      exit 3
+    fi
+    # The merge below is bound to head_sha (--match-head-commit). With --head
+    # it must also be the commit that was reviewed.
+    if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
       exit 3
     fi
     # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
