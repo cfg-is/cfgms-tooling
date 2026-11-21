@@ -773,7 +773,10 @@ def latest_review(comments):
 
 #: The line that names the commit a review judged. The dispatcher gives the
 #: reviewer of a slice the exact line (agent-dispatch.sh review-pr).
-_REVIEWED_HEAD_RE = re.compile(r"(?im)^[ \t]*Reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t]*$")
+#: agent-dispatch.sh `_slice_review_is_stale` reads the same line with the same
+#: pattern (in jq); the two must agree, or one layer asks for a review that the
+#: other refuses.
+_REVIEWED_HEAD_RE = re.compile(r"(?im)^[ \t]*Reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t\r]*$")
 
 #: The verdict as the epic run's supervisor reads it (fsm/landing.py
 #: `_VERDICT_RE`): the marker first, the heading on the next line that is not
@@ -2574,9 +2577,9 @@ def _slice_review_rec(pr, in_queue):
     failed checks, a FAIL review, a queue removal, a conflict). The pipeline's
     part is to review it, to enqueue it after a PASS, and to re-run a failed
     check once. So the actions here are only spawn_acceptance_reviewer,
-    enqueue_merge, rerun_failed_checks, ci_stuck (rerun), defer and skip:
-    nothing that pushes to the branch (rebase-pr.sh) and nothing that starts a
-    fix or resolve-conflict agent.
+    enqueue_merge, dequeue_unreviewed, rerun_failed_checks, ci_stuck (rerun),
+    defer and skip: nothing that pushes to the branch (rebase-pr.sh) and
+    nothing that starts a fix or resolve-conflict agent.
 
     A review counts for the commit it names ("Reviewed head: <sha>" in the
     comment), not for a time: nothing stops the owner from submitting a new
@@ -2589,7 +2592,8 @@ def _slice_review_rec(pr, in_queue):
     head = pr.get("head_oid") or ""
     verdict = pr.get("latest_review_verdict")
     what = f"slice {pr['slice_number']} of epic #{pr['epic_number']}"
-    woken = "the epic run's supervisor wakes the owner, who repairs it with a new round"
+    woken = ("the epic run's supervisor wakes the owner (up to its wake limit for the round), "
+             "who repairs it with a new round")
     person = "nothing wakes the owner for this: it needs a person"
 
     def rec(action, reason, **more):
@@ -2608,12 +2612,23 @@ def _slice_review_rec(pr, in_queue):
         nums = ", ".join(f"#{n}" for n in pr["closing_issue_numbers"])
         return rec("skip", f"its body closes {nums} at the merge; a slice must close nothing (the epic "
                            f"audit closes the epic) — {person}")
-    if in_queue:
-        return rec("skip", "in the merge queue")
-    if ms == "DIRTY":
+    reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
+    if in_queue or pr.get("auto_merge_enabled"):
+        # On its way to a merge. That is right only for a PASS of this very
+        # commit: a round pushed after the enqueue must not merge on the
+        # verdict of the round before it.
+        where = "in the merge queue" if in_queue else "auto-merge armed"
+        if reviewed and verdict == "pass":
+            return rec("skip", f"reviewed PASS on this commit, {where} "
+                               f"(mergeStateStatus={ms or 'UNKNOWN'})")
+        return rec("dequeue_unreviewed",
+                   f"{where}, but its head commit has no PASS review — run "
+                   f"`./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}` (it also disarms "
+                   "auto-merge); the next cycle reviews the commit")
+    if ms == "DIRTY" or pr.get("mergeable") == "CONFLICTING":
         return rec("skip", f"conflicts with develop — {woken}")
 
-    if verdict not in ("pass", "fail") or pr.get("latest_review_head") != head or not head:
+    if not reviewed:
         if not pr["has_acceptance_review_comment"]:
             why = "no acceptance review yet"
         elif verdict not in ("pass", "fail"):
@@ -2642,8 +2657,6 @@ def _slice_review_rec(pr, in_queue):
         return rec("skip", f"reviewed PASS but its checks still fail after a rerun — {woken}")
     if overall == "pending":
         return pending("reviewed PASS; checks pending: ")
-    if pr.get("auto_merge_enabled"):
-        return rec("skip", f"reviewed PASS, auto-merge armed (mergeStateStatus={ms or 'UNKNOWN'})")
     if pr.get("mergeable") == "MERGEABLE":
         return rec("enqueue_merge",
                    "reviewed PASS on this commit + checks green + mergeable — run "

@@ -965,32 +965,43 @@ _review_is_stale() {
 }
 
 # _slice_review_is_stale <pr_num> <head_sha>
-#   Exit 0 when the newest trusted acceptance-review comment names <head_sha>
-#   in a "Reviewed head:" line: that commit is reviewed. Exit 1 otherwise.
+#   Exit 0 when the head commit is already reviewed: the newest trusted
+#   acceptance-review comment that carries a verdict names <head_sha> in a
+#   "Reviewed head:" line. Exit 1 otherwise.
 #
 # A slice of an owner-run epic is not judged by commit and comment times as in
 # _review_is_stale: the owner can submit a new round while a reviewer works,
 # and a commit made before the review comment can be pushed after it. The
-# reviewer of a slice writes the commit it judged into the comment; a WAIT
-# comment has no such line and so never makes the head "reviewed".
+# reviewer of a slice writes the commit it judged into the comment.
+#
+# The same rule as the preflight (po-cycle-preflight.py latest_review_detail,
+# _REVIEW_VERDICT_RE, _REVIEWED_HEAD_RE), kept identical so the two layers
+# cannot disagree: only a comment with a PASS or FAIL verdict counts (a WAIT
+# comment does not), and the head is read from a whole line. (In jq's regex
+# flavour ^ and $ are the two ends of the text, so the line ends are written
+# out.)
 #
 # Fails open like _review_is_stale: missing data means "reviewable".
 _slice_review_is_stale() {
   local pr_num="$1" head="$2"
-  local pr_json newest="" newest_body="" c_date c_author c_body
+  local pr_json newest="" newest_head="" c_date c_author c_head
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
   pr_json=$(gh pr view "$pr_num" --repo cfg-is/cfgms --json comments 2>/dev/null) || return 1
   [[ -n "$pr_json" ]] || return 1
-  while IFS=$'\t' read -r c_date c_author c_body; do
-    [[ -n "$c_date" ]] || continue
-    case "$c_body" in
-      *"<!-- cfgms-acceptance-review -->"*|*"## acceptance review"*) ;;
-      *) continue ;;
-    esac
+  while IFS=$'\t' read -r c_date c_author c_head; do
+    [[ -n "$c_date" && -n "$c_author" ]] || continue
     [[ "$(_check_author_permission "$c_author" "$pr_num" "")" == "internal" ]] || continue
-    if [[ "$c_date" > "$newest" ]]; then newest="$c_date"; newest_body="$c_body"; fi
-  done < <(echo "$pr_json" | jq -r '.comments[] | [.createdAt, (.author.login // ""), (.body | ascii_downcase | gsub("\t|\r|\n";" "))] | @tsv' 2>/dev/null)
-  [[ "$newest_body" == *"reviewed head: ${head}"* || "$newest_body" == *"reviewed head: \`${head}\`"* ]]
+    if [[ "$c_date" > "$newest" ]]; then newest="$c_date"; newest_head="$c_head"; fi
+  done < <(echo "$pr_json" | jq -r '
+      .comments[]
+      | (.body // "") as $b | ($b | ascii_downcase) as $l
+      | select(($l | contains("<!-- cfgms-acceptance-review -->")) or ($l | contains("## acceptance review")))
+      | select($b | test("acceptance review\\s*[\u2014\u2013-]\\s*(pass|fail)"; "i"))
+      | [.createdAt, (.author.login // ""),
+         ([$b | match("(^|\\n)[ \\t]*Reviewed head:[ \\t]*`?(?<h>[0-9a-f]{40})`?[ \\t\\r]*(\\n|$)"; "gi")
+             | .captures[] | select(.name == "h") | .string] | first // "-")]
+      | @tsv' 2>/dev/null)
+  [[ "$newest_head" == "$head" ]]
 }
 
 # Reduce a gh error message (read on stdin) to one printable line for a
@@ -3993,10 +4004,11 @@ Then take exactly ONE of these closing actions:
   request head is no longer the commit you reviewed (\`head_moved_since_review\`):
   then post the PASS comment for your commit all the same and stop; the new
   commit gets its own review.
+  If it refuses for another reason, post the PASS comment, add the refusal line
+  under it, and stop.
 - **FAIL**: nothing after the comment.
-- **WAIT (CI pending)**: post the WAIT verdict comment, WITHOUT the
-  \`Reviewed head:\` line, and exit cleanly. The host PO will re-dispatch when CI
-  completes.
+- **WAIT (CI pending)**: do what the agent definition says for WAIT. Whatever you
+  post then must NOT contain a \`Reviewed head:\` line: nothing was reviewed.
 PROMPT_EOF
     else
       # Story-branch prompt: includes enqueue and founder assignment.

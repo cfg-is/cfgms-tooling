@@ -42,8 +42,11 @@ cat > "$SANDBOX/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
-  "pr view"*"closingIssuesReferences"*) [[ "$GH_CLOSES" == unreadable ]] && exit 1; printf '%s\n' "$GH_CLOSES" ;;
-  "pr view"*"--jq .headRefName"*) printf '%s\n' "$GH_BRANCH" ;;
+  "api graphql"*"closingIssuesReferences"*) [[ "$GH_CLOSES" == unreadable ]] && exit 1; printf '%s\n' "$GH_CLOSES" ;;
+  "api graphql"*"dequeuePullRequest"*) exit 1 ;;          # "not in the queue"
+  "api graphql"*) printf '%s\n' "$GH_STATE" ;;            # enqueue_state
+  "pr view"*"--jq .headRefName"*) [[ "$GH_BRANCH" == unreadable ]] && exit 1; printf '%s\n' "$GH_BRANCH" ;;
+  "pr view"*"-q .id"*)            printf 'PR_node\n' ;;
   "pr view"*"--jq .headRefOid"*)  printf '%s\n' "$GH_HEAD" ;;
   "pr view"*"--jq .baseRefName"*) printf '%s\n' "develop" ;;
   "pr view"*"--jq .body"*)        printf '%s\n' "the claim" ;;
@@ -51,7 +54,6 @@ case "$*" in
     printf '{"number":7,"headRefName":"%s","baseRefName":"develop","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"cfg-is"},"body":"the claim"}\n' "$GH_BRANCH" ;;
   "pr edit"*)  cat > /dev/null ;;
   "pr merge"*) ;;
-  "api graphql"*) printf 'queued\n' ;;
   *) exit 1 ;;
 esac
 STUB
@@ -66,12 +68,13 @@ chmod +x "$SANDBOX/bin/gh" "$SANDBOX/bin/dispatch-stub" "$SANDBOX/bin/sleep"
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 GH_CLOSES=0
+GH_STATE=queued
 
 run() {  # run <branch> <command...>   (stdout+stderr in $out, exit code in $rc, gh calls in $calls)
   local branch="$1"; shift
   : > "$SANDBOX/gh.log"
   rc=0
-  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_LOG="$SANDBOX/gh.log" \
+  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_STATE="$GH_STATE" GH_LOG="$SANDBOX/gh.log" \
         PATH="$SANDBOX/bin:$PATH" HOME="$SANDBOX/home" \
         CFGMS_TEST_DISPATCH="$SANDBOX/bin/dispatch-stub" \
         CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
@@ -122,6 +125,20 @@ check "story: --head for the head is enqueued" "$out" "ENQUEUED:7"
 run "$STORY" "$POACT" enqueue 7 --head nonsense
 check "a --head that is no commit id is refused" "$out" "ENQUEUE_REFUSED:7:bad_head_argument"
 check "... and nothing is merged" "$calls" "pr merge" not
+run "$STORY" "$POACT" enqueue 7 --head
+check "a --head with no value is refused" "$out" "ENQUEUE_REFUSED:7:bad_head_argument"
+check "... and nothing is merged" "$calls" "pr merge" not
+run "$STORY" "$POACT" enqueue 7 12 13
+check "two story arguments: the first one is used, as before" "$out" "PATCHED_FIXES:7 (added Fixes #12)"
+GH_STATE=SQUASH
+run "$STORY" "$POACT" enqueue 7 12
+check "story: armed for auto-merge counts as enqueued" "$out" "ENQUEUED:7"
+check "story: ... and stays armed" "$calls" "--disable-auto" not
+GH_STATE=queued
+run unreadable "$POACT" enqueue 7 12
+check "a branch that cannot be read refuses the enqueue" "$out" "ENQUEUE_REFUSED:7:branch_unknown"
+check "... and writes no closing reference" "$calls" "pr edit" not
+check "... and merges nothing" "$calls" "pr merge" not
 
 printf '\n== enqueue: a slice ==\n'
 run "$SLICE" "$POACT" enqueue 7 6380 --head "$HEAD_A"
@@ -154,6 +171,24 @@ run "$SLICE" "$POACT" enqueue 7 --head "$HEAD_A"
 check "slice whose closing references cannot be read is refused" "$out" "ENQUEUE_REFUSED:7:slice_pr_closes_an_issue"
 check "slice whose closing references cannot be read: nothing is merged" "$calls" "pr merge" not
 GH_CLOSES=0
+
+# A slice is queued or nothing: armed auto-merge would take a later round
+# that nobody reviewed.
+for st in SQUASH none; do
+  GH_STATE="$st"
+  run "$SLICE" "$POACT" enqueue 7 --head "$HEAD_A"
+  check "slice not queued after the merge call (state $st) is refused" "$out" "ENQUEUE_REFUSED:7:slice_pr_not_queued"
+  check "slice not queued (state $st): auto-merge is disarmed" "$calls" "pr merge 7 --repo cfg-is/cfgms --disable-auto"
+  check "slice not queued (state $st): not reported as enqueued" "$out" "ENQUEUED:7" not
+done
+GH_STATE=queued
+
+printf '\n== dequeue ==\n'
+run "$SLICE" "$POACT" dequeue 7
+check "dequeue disarms auto-merge" "$calls" "pr merge 7 --repo cfg-is/cfgms --disable-auto"
+check "dequeue asks GitHub to take it out of the queue" "$calls" "dequeuePullRequest"
+check "dequeue of a pull request that is not queued is no error" "$out" "DEQUEUED:7"
+check "dequeue exits 0" "$rc" "0"
 
 echo ""
 if (( fail > 0 )); then

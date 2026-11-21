@@ -33,7 +33,8 @@ PENDING = [{"__typename": "CheckRun", "name": "unit-tests", "status": "IN_PROGRE
 T0, T1, T2 = "2026-11-19T10:00:00Z", "2026-11-19T11:00:00Z", "2026-11-19T12:00:00Z"
 #: Every action a slice may get. Anything else pushes to the branch or starts
 #: an agent that does.
-ALLOWED = {"spawn_acceptance_reviewer", "enqueue_merge", "rerun_failed_checks", "ci_stuck", "defer", "skip"}
+ALLOWED = {"spawn_acceptance_reviewer", "enqueue_merge", "dequeue_unreviewed", "rerun_failed_checks",
+           "ci_stuck", "defer", "skip"}
 
 
 def _load():
@@ -193,6 +194,18 @@ class SlicePullRequests(unittest.TestCase):
                                merge_state="BLOCKED"))
         self.assert_skip(r, "auto-merge")
 
+    def test_queued_or_armed_without_a_pass_of_the_head_is_dequeued(self):
+        """Round 1 was enqueued (or armed) on its PASS; the owner pushed round
+        2. Round 2 must not merge on the verdict of round 1."""
+        armed = {"mergeMethod": "SQUASH"}
+        for comments in ([review("PASS", head=OLD_HEAD)], [review("FAIL")], [],
+                         [review("PASS", head=None)]):
+            for queued, auto in (([6382], None), ([], armed), ([6382], armed)):
+                for rollup in (GREEN, PENDING, RED):
+                    _, r = self.rec(raw_pr(comments=comments, auto_merge=auto, rollup=rollup), queued=queued)
+                    self.assertEqual(r["action"], "dequeue_unreviewed", (comments, queued, auto))
+                    self.assertIn("po-act.sh dequeue 6382`", r["reason"])
+
     def test_pass_that_is_not_mergeable_says_who_must_act(self):
         _, r = self.rec(raw_pr(comments=[review("PASS")], mergeable="UNKNOWN", merge_state="BLOCKED"))
         self.assert_skip(r, "needs a person")
@@ -213,8 +226,33 @@ class SlicePullRequests(unittest.TestCase):
 
     def test_conflicting_slice_is_not_rebased(self):
         for comments in ([], [review("PASS")], [review("FAIL")]):
-            _, r = self.rec(raw_pr(merge_state="DIRTY", mergeable="CONFLICTING", comments=comments))
-            self.assert_skip(r, "conflicts", "wakes the owner")
+            for ms in ("DIRTY", "UNKNOWN"):     # landing.py goes by mergeable == CONFLICTING
+                _, r = self.rec(raw_pr(merge_state=ms, mergeable="CONFLICTING", comments=comments))
+                self.assert_skip(r, "conflicts", "wakes the owner")
+
+    # ---- the same cases as _slice_review_is_stale in agent-dispatch.sh
+    # (review_pr_detection.test.sh): where the preflight asks for a review the
+    # dispatcher must not refuse it, and the reverse.
+
+    def test_wait_comment_that_names_the_head_is_no_review(self):
+        wait = review("", body=f"{MARKER}## Acceptance Review — WAIT\nReviewed head: {HEAD}\n")
+        _, r = self.rec(raw_pr(comments=[wait]))
+        self.assertEqual(r["action"], "spawn_acceptance_reviewer")
+
+    def test_later_wait_comment_does_not_undo_a_review_of_the_head(self):
+        wait = review("", when=T2, body=f"{MARKER}## Acceptance Review — WAIT\n")
+        _, r = self.rec(raw_pr(comments=[review("PASS", when=T1), wait]))
+        self.assertEqual(r["action"], "enqueue_merge")
+
+    def test_text_after_the_commit_id_is_not_the_line(self):
+        body = f"{MARKER}## Acceptance Review — PASS\nReviewed head: {HEAD} (round 2)\n"
+        _, r = self.rec(raw_pr(comments=[review("PASS", body=body)]))
+        self.assertEqual(r["action"], "spawn_acceptance_reviewer")
+
+    def test_crlf_line_ends_still_count(self):
+        body = f"{MARKER}## Acceptance Review — PASS\r\nReviewed head: {HEAD}\r\n\r\ntext"
+        _, r = self.rec(raw_pr(comments=[review("PASS", body=body)]))
+        self.assertEqual(r["action"], "enqueue_merge")
 
     def test_red_slice_is_not_rebased_or_investigated(self):
         _, r = self.rec(raw_pr(rollup=RED))

@@ -430,9 +430,9 @@ assert_slice_staleness() {
     fail=$((fail + 1))
   fi
 }
-slice_review() {  # slice_review <createdAt> <author> <verdict> <reviewed sha or ''>
+slice_review() {  # slice_review <createdAt> <author> <verdict> <reviewed sha or ''> [<text after the sha>]
   local line=""
-  [[ -n "$4" ]] && line="\\nReviewed head: $4"
+  [[ -n "$4" ]] && line="\\nReviewed head: $4${5:-}"
   printf '{"createdAt":"%s","author":{"login":"%s"},"body":"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — %s%s\\n\\ntext"}' "$1" "$2" "$3" "$line"
 }
 f=$(write_fixture s-same "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X)]}")
@@ -447,6 +447,19 @@ f=$(write_fixture s-forged "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z s
 assert_slice_staleness "a review by an untrusted account does not count → reviewable" "$f" "$SHA_X" "reviewable"
 f=$(write_fixture s-none '{"comments":[]}')
 assert_slice_staleness "no review → reviewable" "$f" "$SHA_X" "reviewable"
+# The cases below are the ones where a looser rule here than in the preflight
+# would refuse every review the preflight asks for (test-preflight-slice-prs.py
+# has the same cases for the preflight).
+f=$(write_fixture s-wait "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr WAIT $SHA_X)]}")
+assert_slice_staleness "a WAIT comment that names the head is no review → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-passwait "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X),$(slice_review 2026-07-30T11:00:00Z jrdnr WAIT '')]}")
+assert_slice_staleness "a later WAIT comment does not undo a review of the head → stale" "$f" "$SHA_X" "stale"
+f=$(write_fixture s-trail "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X ' (round 2)')]}")
+assert_slice_staleness "text after the commit id: not the line → reviewable" "$f" "$SHA_X" "reviewable"
+f=$(write_fixture s-crlf "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS $SHA_X '\r')]}")
+assert_slice_staleness "CRLF line end after the commit id still counts → stale" "$f" "$SHA_X" "stale"
+f=$(write_fixture s-tick "{\"comments\":[$(slice_review 2026-07-30T10:00:00Z jrdnr PASS "\`$SHA_X\`")]}")
+assert_slice_staleness "commit id in backticks counts → stale" "$f" "$SHA_X" "stale"
 assert_slice_staleness "a head that is no commit id → fails open (reviewable)" "$f" "not-a-sha" "reviewable"
 
 echo
@@ -569,6 +582,7 @@ cat > "$ADV_ROOT/.claude/tooling/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
   add-issue)    echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  item-for-issue) echo 'PVTI_adv_epic' ;;
   update-field) echo "$*" >> "$ADV_CALLS" ; echo '{"updated": true}' ;;
   *)            echo '[]' ;;
 esac
@@ -644,6 +658,47 @@ for verdict in "ADVERSARIAL_REVIEW:pass" "ADVERSARIAL_REVIEW:pass:released" "ADV
   out=$(run_adv_review pass "$verdict")
   assert_adv "$verdict → gate passes and review continues to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-pass.log" && [[ "$out" != *adversarial* ]]'
 done
+
+# A slice of an owner-run epic: the item is the epic's. A hold refuses the
+# review and writes NO board field (an epic run writes none).
+ADV_STORY_META=$(cat "$ADV_ROOT/meta.json")
+ADV_SLICE_HEAD=2222222222222222222222222222222222222222
+slice_meta() {  # slice_meta <comments json array>
+  printf '{"state":"OPEN","headRefName":"feature/epic-77-slice-2","headRefOid":"%s","body":"the claim","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","comments":%s}' \
+    "$ADV_SLICE_HEAD" "$1" > "$ADV_ROOT/meta.json"
+}
+slice_meta '[]'
+rm -f "$ADV_ROOT/home/.cache/cfgms-adversarial-hold/notified-pr-4242"
+out=$(run_adv_review slicehold "ADVERSARIAL_REVIEW:hold:2")
+assert_adv "slice hold → refused adversarial_review_hold" '[[ "$out" == *"REVIEW_REFUSED:4242:adversarial_review_hold"* ]]'
+assert_adv "slice hold → the gate got the epic item" 'grep -q "adversarial-review 4242 --item PVTI_adv_epic --check" "$ADV_ROOT/calls-slicehold.log"'
+assert_adv "slice hold → no board field written" '! grep -q "update-field" "$ADV_ROOT/calls-slicehold.log"'
+assert_adv "slice hold → one detail-free PR comment" 'grep -q "helper comment-inline 4242 Held for a security review" "$ADV_ROOT/calls-slicehold.log"'
+
+# A slice whose head commit is already reviewed is refused; --force reviews
+# it again. (The story rule, by times, would say "reviewable": this payload
+# has no commits.)
+run_adv_slice() {  # run_adv_slice <label> [--force]
+  ADV_CALLS="$ADV_ROOT/calls-$1.log"; : > "$ADV_CALLS"
+  ADV_VERDICT="ADVERSARIAL_REVIEW:not_applicable" ADV_CALLS="$ADV_CALLS" GH_FIXTURE="$ADV_ROOT/meta.json" \
+    PATH="$ADV_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$ADV_ROOT/home" \
+    CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" CFGMS_TEST_REPO_ROOT="$ADV_ROOT" \
+    CFGMS_TEST_COLLAB_PERM=admin \
+    CFGMS_TEST_ADVERSARIAL_SCRIPT="$ADV_ROOT/adversarial.sh" \
+    CFGMS_TEST_PIPELINE_HELPER="$ADV_ROOT/pipeline-helper.sh" \
+    CFGMS_AGENT_CAPACITY_GATE=off \
+    "$DISPATCH" review-pr 4242 ${2:-} 2>&1 | head -1 || true
+}
+slice_meta "[{\"createdAt\":\"2026-07-30T10:00:00Z\",\"author\":{\"login\":\"jrdnr\"},\"body\":\"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — PASS\\nReviewed head: ${ADV_SLICE_HEAD}\\n\"}]"
+out=$(run_adv_slice slicestale)
+assert_adv "slice with a reviewed head → refused head_already_reviewed" '[[ "$out" == *"REVIEW_REFUSED:4242:head_already_reviewed"* ]]'
+assert_adv "slice with a reviewed head → no lease taken" '! grep -q "lease-acquire" "$ADV_ROOT/calls-slicestale.log"'
+out=$(run_adv_slice sliceforce --force)
+assert_adv "slice with a reviewed head, --force → goes on to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-sliceforce.log" && [[ "$out" != *head_already_reviewed* ]]'
+slice_meta "[{\"createdAt\":\"2026-07-30T10:00:00Z\",\"author\":{\"login\":\"jrdnr\"},\"body\":\"<!-- cfgms-acceptance-review -->\\n## Acceptance Review — PASS\\nReviewed head: 3333333333333333333333333333333333333333\\n\"}]"
+out=$(run_adv_slice slicefresh)
+assert_adv "slice whose review names another commit → goes on to the lease" 'grep -q "lease-acquire pr-4242" "$ADV_ROOT/calls-slicefresh.log"'
+printf '%s' "$ADV_STORY_META" > "$ADV_ROOT/meta.json"
 
 
 echo

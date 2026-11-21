@@ -1457,13 +1457,22 @@ except Exception: print('')" 2>/dev/null || echo "")
     shift
     story=""
     reviewed_head=""
+    head_given=false
     while [ $# -gt 0 ]; do
       case "$1" in
-        --head) reviewed_head="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-        *)      story="$1"; shift ;;
+        --head)
+          head_given=true
+          reviewed_head="${2:-}"
+          shift
+          if [ $# -gt 0 ]; then shift; fi
+          ;;
+        *)
+          if [ -z "$story" ]; then story="$1"; fi   # the first one, as before
+          shift
+          ;;
       esac
     done
-    if [ -n "$reviewed_head" ] && [[ ! "$reviewed_head" =~ ^[0-9a-f]{40}$ ]]; then
+    if $head_given && [[ ! "$reviewed_head" =~ ^[0-9a-f]{40}$ ]]; then
       echo "ENQUEUE_REFUSED:${pr}:bad_head_argument"
       exit 3
     fi
@@ -1474,8 +1483,15 @@ except Exception: print('')" 2>/dev/null || echo "")
     #  - Its owner can push a new round at any time, also while a reviewer
     #    works. So the merge must name the commit that was reviewed.
     #  - A closing reference already in the pull request is refused.
+    # The branch is read once here and a failed read refuses: "not a slice"
+    # must be known, not assumed, before a story's closing reference is written.
     enqueue_is_slice=false
-    if _pr_is_slice "$pr"; then
+    enqueue_branch=$(gh pr view "$pr" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || echo "")
+    if [ -z "$enqueue_branch" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:branch_unknown"
+      exit 3
+    fi
+    if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "")" == SLICE:* ]]; then
       enqueue_is_slice=true
       if [ -n "$story" ]; then
         echo "ENQUEUE_NOTE:${pr}:slice_pr_story_argument_ignored"
@@ -1485,8 +1501,11 @@ except Exception: print('')" 2>/dev/null || echo "")
         echo "ENQUEUE_REFUSED:${pr}:slice_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
         exit 3
       fi
-      closes=$(gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
-        --jq '.closingIssuesReferences | length' 2>/dev/null || echo "")
+      # GraphQL: `gh pr view --json` has no closingIssuesReferences field in
+      # every gh version (2.45 has none).
+      closes=$(gh api graphql \
+        -f query='query($pr: Int!) { repository(owner: "cfg-is", name: "cfgms") { pullRequest(number: $pr) { closingIssuesReferences(first: 1) { totalCount } } } }' \
+        -F pr="$pr" --jq '.data.repository.pullRequest.closingIssuesReferences.totalCount' 2>/dev/null || echo "")
       if [ "$closes" != "0" ]; then
         echo "ENQUEUE_REFUSED:${pr}:slice_pr_closes_an_issue (${closes:-unreadable})"
         exit 3
@@ -1583,6 +1602,14 @@ except Exception: print('')" 2>/dev/null || echo "")
         fi
         ;;
     esac
+    # A slice must not wait with auto-merge armed: its owner can push a new
+    # round, and the armed merge would then take a commit that nobody
+    # reviewed. Queued or nothing.
+    if $enqueue_is_slice && [ "$state" != "queued" ]; then
+      gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
+      echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed)"
+      exit 3
+    fi
     case "$state" in
       queued|SQUASH) echo "ENQUEUED:$pr" ;;
       none)
@@ -1597,9 +1624,14 @@ except Exception: print('')" 2>/dev/null || echo "")
   dequeue)
     pr="${1:?PR number required}"
     pr_id=$(gh pr view "$pr" --repo "$REPO" --json id -q .id)
+    # Auto-merge too: an armed pull request is queued again by GitHub when its
+    # checks pass. Not armed is not an error.
+    gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
+    # Not in the queue is not an error either (the preflight's
+    # dequeue_unreviewed is also given for "armed, not queued").
     gh api graphql \
       -f query='mutation($prId: ID!) { dequeuePullRequest(input: {id: $prId}) { mergeQueueEntry { state } } }' \
-      -F prId="$pr_id" >/dev/null
+      -F prId="$pr_id" >/dev/null 2>&1 || true
     echo "DEQUEUED:$pr"
     ;;
 
