@@ -650,14 +650,19 @@ class EpicSupervisor(sup.Supervisor):
         # A STALE slice must get a new round: what it stood on has a new
         # round, and that round can have the tree of the old one.
         was_stale = s is not None and s.state == S.STALE
+        # A slice that waits for the owner gets a new round on a new parent
+        # commit, also when that commit has the tree of the old one (develop
+        # took back the commit the round failed on).
+        by_commit = s is not None and s.state in S.OWNER_TURN
         if parent is not None and s is not None and s.candidates and not was_stale:
             # A request that brings the same tree on the same parent changes
             # nothing. It uses no round: a round in flight goes on, a pull
-            # request stays as it is, a rejected round stays rejected.
+            # request stays as it is, a rejected round stays rejected. Both
+            # commits the slice can be measured against are tried (the built
+            # parent, and the parent as it was submitted).
             last = s.candidates[max(s.candidates)]
-            ptree = self.repo.tree_of(parent.commit)
-            if any(p == ptree and self.same_tree(t, parent.commit)
-                   for p, t in self.known_trees(last)):
+            if any(self.repeats(last, q, by_commit, lambda t, q=q: self.same_tree(t, q))
+                   for q in dict.fromkeys((parent.commit, stood.commit))):
                 what = (f"Round {s.ctx.round} goes on." if s.state not in S.OWNER_TURN
                         else f"Slice {n} stays {s.state}.")
                 self.answer(req, False, round_no=s.ctx.round,
@@ -685,12 +690,13 @@ class EpicSupervisor(sup.Supervisor):
                                      extra_protected=self.x.get("gate_scripts", []))
         try:
             snap = take(base_tree)
-            if stood.commit != parent.commit and self.holds_none_of(
+            if stood.commit != parent.commit and self.did_not_merge(
                     self.repo.tree_of(stood.commit), base_tree, snap.tree):
-                # The parent was built on --base, but the workspace holds none
-                # of what develop changed up to that commit: the owner gave a
-                # base it did not merge. Measured against the built parent,
-                # the slice would undo those develop commits.
+                # The parent was built on --base, but no path that develop
+                # changed up to that commit has develop's content in the
+                # workspace: the owner gave a base it did not merge. Measured
+                # against the built parent, the slice would undo those
+                # develop commits.
                 self.run.append("note", info=f"slice {n}: the workspace holds no develop "
                                              f"change up to --base {req.base[:12]}; it is "
                                              f"measured against slice {stood.builds_on} as "
@@ -737,8 +743,8 @@ class EpicSupervisor(sup.Supervisor):
                                                          "snapshot was taken. Submit again.")
             return "withdrawn"
         last = s.candidates[max(s.candidates)] if s.candidates else None
-        if snap.tree == base_tree or (last and not was_stale and (base_tree, snap.tree)
-                                      in self.known_trees(last)):
+        if snap.tree == base_tree or (last and not was_stale and self.repeats(
+                last, parent.commit, by_commit, lambda t: t == snap.tree)):
             self.stake(n, "unchanged", quiet=True)
             self.answer(req, False, round_no=rnd,
                         reason="the workspace has no change since this slice's last snapshot.")
@@ -768,14 +774,22 @@ class EpicSupervisor(sup.Supervisor):
             return False
         return private.is_copy(self.repo.blob(sha))
 
-    def known_trees(self, cand):
-        """The (tree of the parent, tree) pairs of a round that a new submit
-        can repeat: the snapshot, and what SYNC made of it (the owner merged
-        develop and submits the tree that is already validated or
-        published). The parent is compared by its tree: the parent of a
-        `--builds-on` slice can be a commit made for one submit."""
-        pairs = {(cand["snap_parent"], cand["snap_tree"]), (cand["parent"], cand["tree"])}
-        return [(self.repo.tree_of(p), t) for p, t in sorted(pairs)]
+    def repeats(self, cand, parent_commit, by_commit, same_tree):
+        """True when a submit on `parent_commit` repeats the round `cand`:
+        its snapshot, or what SYNC made of it (the owner merged develop and
+        submits the tree that is already validated or published).
+        `same_tree(tree)` says whether the workspace is that tree.
+
+        The parent is the same when it is the same commit. Unless
+        `by_commit`, a commit with the same tree is the same parent too: the
+        built parent of a `--builds-on` slice is a new commit at each
+        submit."""
+        ptree = None if by_commit else self.repo.tree_of(parent_commit)
+        for p, t in sorted({(cand["snap_parent"], cand["snap_tree"]),
+                            (cand["parent"], cand["tree"])}):
+            if (p == parent_commit or (ptree and self.repo.tree_of(p) == ptree)) and same_tree(t):
+                return True
+        return False
 
     def merge_onto(self, onto, commit):
         """Three-way merge of `commit` onto `onto`, no work tree. Returns
@@ -812,14 +826,17 @@ class EpicSupervisor(sup.Supervisor):
         commit = self.repo.commit_tree(tree, [base], "fsm slice parent (internal)\n")
         return S.Parent(commit, parent.builds_on)
 
-    def holds_none_of(self, old_tree, new_tree, ws_tree):
-        """True when `ws_tree` has the content of `old_tree` at every path
-        that differs between `old_tree` and `new_tree` (and there is one)."""
+    def did_not_merge(self, old_tree, new_tree, ws_tree):
+        """True when no path that differs between `old_tree` and `new_tree`
+        has the content of `new_tree` in `ws_tree` (and there is such a
+        path). A workspace that merged the change holds the new content at
+        every such path it did not edit itself; one that did not merge
+        holds it at none."""
         def names(a, b):
             out = self.repo.git("diff", "--no-renames", "--name-only", "-z", a, b).stdout
             return {p for p in out.split(b"\0") if p}
         changed = names(old_tree, new_tree)
-        return bool(changed) and not (changed & names(old_tree, ws_tree))
+        return bool(changed) and changed <= names(new_tree, ws_tree)
 
     def request_there(self, req):
         """The request directory is still where slice-submit put it."""

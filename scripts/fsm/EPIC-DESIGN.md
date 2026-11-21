@@ -309,16 +309,22 @@ Cases that the table above does not show. All **[P]**.
   snapshot of the parent conflicts with the `--base` commit) is refused
   with the files. It uses no round and the slice stays as it is. The owner
   submits the parent again first.
-- **A `--builds-on` slice with a base it did not merge** (the workspace
-  holds the old content at every path `develop` changed between the
-  parent's snapshot and the base) is measured against the parent's
+- **A `--builds-on` slice with a base it did not merge** (no path that
+  `develop` changed between the parent's snapshot and the base has
+  `develop`'s content in the workspace) is measured against the parent's
   snapshot, as if the base was the parent's. The run records a note.
 - **A submit with no change** (the same tree on the same parent as the
-  slice's last snapshot) is refused in every state but STALE (a STALE slice
-  must get a new round on its parent's new round), and uses no round: a
-  round in flight goes on, a pull request stays as it is, a rejected round
-  stays rejected. A workspace with no change against the slice's parent →
-  REJECTED (`no_change`); that uses a round.
+  slice's last snapshot, or as what SYNC made of it) is refused in every
+  state but STALE (a STALE slice must get a new round on its parent's new
+  round), and uses no round: a round in flight goes on, a pull request
+  stays as it is, a rejected round stays rejected. "The same parent" is
+  the same commit. For a round in flight or published, a commit with the
+  same tree counts too (the built parent of a `--builds-on` slice is a new
+  commit at each submit). For a slice that waits for the owner it does
+  not: a rejected slice submitted on a new `develop` commit gets a new
+  round, also when `develop` only took a commit back. A workspace with no
+  change against the slice's parent → REJECTED (`no_change`); that uses a
+  round.
 - **A new submit while the slice is in VALIDATE, WAIT_PARENT, LANDING or
   NEEDS_OWNER** starts a new round and replaces the old one; a validator
   running for the old round is stopped. A submit while the slice is in
