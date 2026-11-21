@@ -640,8 +640,8 @@ class EpicSupervisor(sup.Supervisor):
             # nothing. It uses no round: a round in flight goes on, a pull
             # request stays as it is, a rejected round stays rejected.
             last = s.candidates[max(s.candidates)]
-            if (last["snap_parent"] == parent.commit
-                    and self.same_tree(last["snap_tree"], parent.commit)):
+            if any(p == parent.commit and self.same_tree(t, parent.commit)
+                   for p, t in self.known_trees(last)):
                 what = (f"Round {s.ctx.round} goes on." if s.state not in S.OWNER_TURN
                         else f"Slice {n} stays {s.state}.")
                 self.answer(req, False, round_no=s.ctx.round,
@@ -706,15 +706,15 @@ class EpicSupervisor(sup.Supervisor):
                                                          "snapshot was taken. Submit again.")
             return "withdrawn"
         last = s.candidates[max(s.candidates)] if s.candidates else None
-        if snap.tree == base_tree or (last and last["snap_tree"] == snap.tree
-                                      and last["snap_parent"] == parent.commit):
+        if snap.tree == base_tree or (last and (parent.commit, snap.tree)
+                                      in self.known_trees(last)):
             self.stake(n, "unchanged", quiet=True)
             self.answer(req, False, round_no=rnd,
                         reason="the workspace has no change since this slice's last snapshot.")
             return "no_change"
         commit = self.repo.commit_tree(snap.tree, [parent.commit], "fsm slice candidate (internal)\n")
         self.repo.update_ref(f"refs/fsm/slices/{n}/r{rnd}", commit)
-        self.book.set_candidate(n, commit, snap.tree, parent.commit)
+        self.book.set_candidate(n, commit, snap.tree, parent.commit, base=req.base)
         self.wtext(f"slice-{n}-r{rnd}-subject.txt", req.subject)
         self.wtext(f"slice-{n}-r{rnd}-claim.md", public_claim(req.claim))
         if not self.rtext(f"slice-{n}-subject.txt"):
@@ -736,6 +736,13 @@ class EpicSupervisor(sup.Supervisor):
         if not size.isdigit() or not PRIVATE_MIN_BYTES <= int(size) <= PRIVATE_MAX_BYTES + 65536:
             return False
         return private.is_copy(self.repo.blob(sha))
+
+    @staticmethod
+    def known_trees(cand):
+        """The (parent, tree) pairs of a round that a new submit can repeat:
+        the snapshot, and what SYNC made of it (the owner merged develop and
+        submits the tree that is already validated or published)."""
+        return [(cand["snap_parent"], cand["snap_tree"]), (cand["parent"], cand["tree"])]
 
     def request_there(self, req):
         """The request directory is still where slice-submit put it."""

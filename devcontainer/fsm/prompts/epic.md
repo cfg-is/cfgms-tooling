@@ -61,6 +61,9 @@ by itself: it builds, its tests pass, and it can merge alone.
 (`git rev-parse origin/develop` after a fetch). Use `--builds-on <m>` when
 this slice needs slice `m` and slice `m` has not merged: the slice is then
 validated at once on top of slice `m`, and published after slice `m` merges.
+With `--builds-on <m>`, `--base` must be the base you gave for slice `m`, or,
+when you merged `develop` since, the `parent` in slice `m`'s `status.json`.
+With any other base, submit slice `m` again first.
 
 The same slice number again is a new round of that slice. A slice has 3
 rounds. A slice that uses all of them stops the whole epic, so check your work

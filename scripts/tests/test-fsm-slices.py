@@ -433,28 +433,46 @@ class TestBook(BookCase):
 
     def test_sync_keeps_the_snapshot_of_the_round_and_children_stand_on_it(self):
         self.walk(1, "submitted", "ok")
-        self.book.set_candidate(1, "a" * 40, "1" * 40, "b" * 40)            # the snapshot
+        with self.assertRaises(ValueError):                                 # nothing to sync yet
+            self.book.set_candidate(1, "c" * 40, "2" * 40, "d" * 40, synced=True)
+        self.book.set_candidate(1, "a" * 40, "1" * 40, "b" * 40, base="b" * 40)   # the snapshot
         self.book.set_candidate(1, "c" * 40, "2" * 40, "d" * 40, synced=True)   # what SYNC made
         want = {"commit": "c" * 40, "tree": "2" * 40, "parent": "d" * 40,
-                "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40}
+                "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40,
+                "snap_base": "b" * 40}
         again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
         for book in (self.book, again):
             self.assertEqual(book.get(1).candidates[1], want)
             self.assertEqual(book.get(1).status()["commit"], "c" * 40)
-            parent = S.resolve_parent(book, 2, "b" * 40, 1, lambda sha: True)
-            self.assertEqual(parent, S.Parent("a" * 40, 1))
+            # the child's base says which commit of slice 1 its workspace holds
+            for base, commit in (("b" * 40, "a" * 40),      # still on slice 1's base
+                                 ("d" * 40, "c" * 40)):     # merged develop since
+                parent = S.resolve_parent(book, 2, base, 1, lambda sha: True)
+                self.assertEqual(parent, S.Parent(commit, 1))
+            with self.assertRaises(S.BadRequest) as cm:     # on some other develop commit
+                S.resolve_parent(book, 2, "9" * 40, 1, lambda sha: True)
+            self.assertIn("bbbbbbbbbbbb", str(cm.exception))
+            self.assertIn("dddddddddddd", str(cm.exception))
+            self.assertIn("submit slice 1 again", str(cm.exception))
         # a new round starts from its own snapshot
         self.walk(1, "rebased", "fail", "submitted", "ok")
         self.book.set_candidate(1, "e" * 40, "3" * 40, "d" * 40)
         self.assertEqual(self.book.get(1).candidates[2]["snap_commit"], "e" * 40)
 
-    def test_a_candidate_record_without_snapshot_values_is_its_own_snapshot(self):
+    def test_candidate_records_of_an_older_supervisor_keep_the_first_of_a_round_as_the_snapshot(self):
         self.walk(1, "submitted", "ok")
         self.run.append("slice_candidate", slice=1, round=1, commit="a" * 40, tree="1" * 40,
-                        parent="b" * 40)                                   # written by an older supervisor
+                        parent="b" * 40)                                   # its snapshot
+        self.run.append("slice_candidate", slice=1, round=1, commit="c" * 40, tree="2" * 40,
+                        parent="d" * 40)                                   # its SYNC
         again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
-        self.assertEqual(again.get(1).candidates[1]["snap_commit"], "a" * 40)
-        self.assertEqual(again.get(1).candidates[1]["snap_parent"], "b" * 40)
+        self.assertEqual(again.get(1).candidates[1],
+                         {"commit": "c" * 40, "tree": "2" * 40, "parent": "d" * 40,
+                          "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40,
+                          "snap_base": ""})
+        # no base on record: a child stands on the snapshot, with any base
+        self.assertEqual(S.resolve_parent(again, 2, "9" * 40, 1, lambda sha: True),
+                         S.Parent("a" * 40, 1))
 
     def test_published_slice_merges_while_a_later_round_is_on_its_way(self):
         # the pull request of round 1 merges in every state round 2 passes through
