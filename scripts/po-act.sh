@@ -1063,7 +1063,34 @@ except Exception: print('')" 2>/dev/null || true)
   return "$rc"
 }
 
+# _tss_reexec <cmd> [args...]
+#   The long-life Claude token (claude-oauth-token.cred) is sealed with the
+#   TPM, and the TPM device is readable by group `tss` only. A shell that was
+#   started before the account joined the group (or by a service that does not
+#   take the account's groups) cannot read the token; the agent then gets the
+#   host's short-life credentials file and stops at the next renewal (measured:
+#   the first owner run of cfgms epic 6380 ended 2 minutes after its launch
+#   with "OAuth session expired and could not be refreshed").
+#   When the token file is there, this process is not in `tss` and the account
+#   is, the launch commands run again under `sg tss`. Nothing was done before
+#   this point, so nothing is done twice. CFGMS_NO_TSS_REEXEC=1 turns it off.
+_tss_reexec() {
+  local c="$1"
+  case "$c" in dispatch|dispatch-fix|resolve-conflict) ;; *) return 0 ;; esac
+  [[ -z "${CFGMS_TSS_REEXEC:-}" && "${CFGMS_NO_TSS_REEXEC:-}" != "1" ]] || return 0
+  [[ -f "${CFGMS_AGENT_TOKEN_CRED:-${HOME}/.config/cfgms/claude-oauth-token.cred}" ]] || return 0
+  command -v sg >/dev/null 2>&1 || return 0
+  local now account
+  now=$(id -nG 2>/dev/null) || return 0
+  [[ " $now " == *" tss "* ]] && return 0
+  account=$(id -nG "$(id -un)" 2>/dev/null) || return 0
+  [[ " $account " == *" tss "* ]] || return 0
+  export CFGMS_TSS_REEXEC=1
+  exec sg tss -c "$(printf '%q ' bash "$0" "$@")"
+}
+
 cmd="${1:-}"
+_tss_reexec "$@"
 shift || true
 
 # Deterministic step boundary (Issue #3053): every subcommand except the

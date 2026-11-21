@@ -190,6 +190,65 @@ class TestRefusals(EpicCase):
         self.assertEqual(self.f.gh()["prs"], [])
         self.assertEqual(self.f.remote_head("feature/epic-900-slice-1"), "")
 
+    def test_a_refused_login_ends_the_run_after_one_turn(self):
+        self.f.plan({"owner": [[], []], "owner_login_refused": [0]})
+        self.launch()
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(len(self.turns()), 1)               # no second turn
+        self.assertEqual(self.recs("transition")[-1]["reason"], "claude_login_failed")
+        end = self.recs("owner_turn_end")
+        self.assertEqual([(r["ok"], r["login_failed"]) for r in end], [(False, True)])
+        self.assertIn("Claude Code refused the login",
+                      (self.run_dir / "logs" / "supervisor.log").read_text())
+        self.assertEqual(json.loads((self.run_dir / "epic-result.json").read_text())["reason"],
+                         "claude_login_failed")
+
+    def test_a_failed_turn_with_no_login_error_gets_its_second_turn(self):
+        # the same exit code, another last line: the two-failed-turns rule
+        self.f.plan({"owner": [[{"op": "exit", "code": 1}], [{"op": "exit", "code": 1}]]})
+        self.launch()
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(len(self.turns()), 2)
+        self.assertEqual(self.recs("transition")[-1]["reason"], "owner_turn_failed")
+        self.assertEqual([r["login_failed"] for r in self.recs("owner_turn_end")], [False, False])
+
+    def credentials_file(self):
+        d = self.f.home / ".claude"
+        d.mkdir(exist_ok=True)
+        (d / ".credentials.json").write_text("{}")
+
+    def test_a_token_that_cannot_be_read_refuses_the_launch(self):
+        # the token file is there (fixture) and the decrypt gives nothing; the
+        # credentials file is there too and is not taken
+        self.credentials_file()
+        self.f.plan({"owner": [[]]})
+        self.launch(env={"FSM_FAKE_CLAUDE_TOKEN": ""})
+        rc, out = self.finish()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("FSM_REFUSED:epic-900:claude_token_decrypt_failed", out)
+        self.assertIn("cannot read it (decrypt_failed)", out)
+        self.assertEqual(self.recs("transition")[-1]["to"], "REFUSED")
+        self.assertEqual(self.recs("owner_container"), [])   # no container was started
+        self.assertEqual(self.turns(), [])
+
+    def test_the_credentials_file_is_used_only_when_the_host_says_so_or_has_no_token(self):
+        for env in ({"FSM_FAKE_CLAUDE_TOKEN": "", "CFGMS_FSM_ALLOW_CREDENTIALS_FILE": "1"},
+                    {"FSM_FAKE_CLAUDE_TOKEN": "", "CFGMS_AGENT_TOKEN_CRED": "/nonexistent/token.cred"}):
+            with self.subTest(env=sorted(env)):
+                self.setUp()
+                self.credentials_file()
+                self.f.plan({"owner": [[], []]})
+                self.launch(env=env)
+                rc, out = self.finish()
+                self.assertEqual(rc, 1, out)
+                self.assertEqual(self.recs("transition")[-1]["reason"], "owner_idle")
+                self.assertEqual([r["ok"] for r in self.recs("owner_container")], [True])
+                self.assertTrue(any("using credentials file mount" in (r.get("warning") or "")
+                                    for r in self.recs("note")))
+                self.tearDown()
+
     def test_private_text_copied_into_the_workspace_is_refused(self):
         self.f.plan({"owner": [
             [{"op": "copy_private", "from": "canon", "name": "principles.md", "path": "docs/notes.md"},

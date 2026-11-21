@@ -89,6 +89,38 @@ LANDING_POLL_SECS = float(os.environ.get("CFGMS_FSM_EPIC_LANDING_POLL_SECS", "60
 CAPACITY_RETRY_SECS = float(os.environ.get("CFGMS_FSM_EPIC_CAPACITY_RETRY_SECS", "30"))
 BUSY_RETRY_SECS = float(os.environ.get("CFGMS_FSM_EPIC_BUSY_RETRY_SECS", "30"))
 DONE_CAP = 64 * 1024
+
+#: "1": start the owner with the host's credentials file when the long-life
+#: token is there and cannot be read. For a host that has no other way.
+ALLOW_CREDENTIALS_FILE_ENV = "CFGMS_FSM_ALLOW_CREDENTIALS_FILE"
+TOKEN_UNREADABLE_TEXT = (
+    "The long-life Claude token of this host is there, but this process cannot read it "
+    "({why}). The owner is not started with the short-life credentials file: that login "
+    "ends in the middle of an epic. The token is sealed with the TPM, which only group "
+    "tss can read: start the run with po-act.sh from a shell of an account in group tss "
+    "(po-act.sh changes to the group by itself when the account is a member). "
+    "CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1 starts the owner with the credentials file.")
+LOGIN_FAILED_TEXT = (
+    "Claude Code refused the login of the owner (the turn log has the line). A new turn "
+    "gets the same refusal, so the run ends. Repair the login on the host, then start "
+    "the epic again.")
+
+
+def token_must_be_read(why):
+    """The host has the long-life token and this process cannot read it
+    (`why` from Services.claude_token is not "absent"). The credentials file
+    is a short-life login: an owner session that outlives it stops in the
+    middle of the epic, so the owner is not started with it."""
+    return why != "absent" and os.environ.get(ALLOW_CREDENTIALS_FILE_ENV) != "1"
+
+
+class TokenUnreadable(Exception):
+    """The long-life token is on the host and cannot be read. `why` is the
+    reason from Services.claude_token (decrypt_failed, timeout)."""
+
+    def __init__(self, why):
+        super().__init__(why)
+        self.why = why
 VALIDATE_LOG_LINES = 200
 #: Files in canon and memory smaller than this are not compared with the
 #: candidate: an empty file or a one-line file is equal to many public files.
@@ -356,7 +388,12 @@ class EpicSupervisor(sup.Supervisor):
                 if rs == "not_holder":
                     raise sup.Refused("lease_not_held")
             self._last_renew = time.time()
-        tok, _why = self.svc.claude_token()
+        tok, why = self.svc.claude_token()
+        if not tok and token_must_be_read(why):
+            # refused before anything is started; a later cycle gets the same
+            # answer, so it is not deferred
+            self.log(TOKEN_UNREADABLE_TEXT.format(why=why))
+            raise sup.Refused(f"claude_token_{why}")
         if not tok and not os.path.isfile(self.svc.credentials_file()):
             raise sup.Refused("creds", deferred=True, exit_code=sup.EXIT_CREDS_DEFERRED)
         ok, why = self.svc.capacity()
@@ -1165,6 +1202,10 @@ class EpicSupervisor(sup.Supervisor):
             self.run.append("note", warning=f"{self.name} belongs to another run: replaced")
         p, x = self.params, self.x
         token, why = self.svc.claude_token()
+        if not token and token_must_be_read(why):
+            # the launch gate refuses this; here it is a container that is
+            # started again later in the run
+            raise TokenUnreadable(why)
         cred_args = agent_session.claude_credential_args(bool(token), self.svc.credentials_file())
         if not token:
             self.run.append("note", warning=f"agent token {why}: using credentials file mount")
@@ -1251,8 +1292,14 @@ class EpicSupervisor(sup.Supervisor):
         if token:
             tail = tail.replace(token, "[REDACTED]")
         self.run.p("logs", f"owner-turn-{t['turn']}.log").write_text(tail)
+        login_failed = (not res["ok"] and not res["timed_out"]
+                        and owner_session.is_login_failure(tail))
         self.olog.end_turn(ok=res["ok"], progress=t["submits"] > 0, exit_code=res["exit_code"],
-                           timed_out=res["timed_out"], seconds=res["duration_seconds"])
+                           timed_out=res["timed_out"], seconds=res["duration_seconds"],
+                           login_failed=login_failed)
+        if login_failed:
+            self.run.append("note", state="owner_turn", error=LOGIN_FAILED_TEXT)
+            self.log(f"owner turn {t['turn']}: {LOGIN_FAILED_TEXT}")
         self.log(f"owner turn {t['turn']} ended: exit={res['exit_code']} "
                  f"seconds={res['duration_seconds']} submits={t['submits']}"
                  f"{' ' + res['error'] if res['error'] else ''}")
@@ -1288,6 +1335,11 @@ class EpicSupervisor(sup.Supervisor):
                         self.start_turn(step.kind or O.EVENTS)
                     except (sup.Interrupted, agent_session.CredentialLeak):
                         raise
+                    except TokenUnreadable as exc:
+                        text = TOKEN_UNREADABLE_TEXT.format(why=exc.why)
+                        self.run.append("note", state="owner_container", error=text)
+                        self.log(text)
+                        return T.FAILED, f"claude_token_{exc.why}"
                     except Exception as exc:
                         self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
                                         state="owner_container")

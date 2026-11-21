@@ -49,6 +49,9 @@ class TestNextStep(unittest.TestCase):
              O.Step(O.FAILED, reason="slice_budget")),
             (dict(turns=3, failed_turns=2, pending=1), O.Step(O.FAILED, reason="owner_turn_failed")),
             (dict(turns=3, failed_turns=1, pending=1), O.Step(O.TURN, kind=O.EVENTS)),
+            (dict(turns=1, failed_turns=1, login_failed=True, pending=1),
+             O.Step(O.FAILED, reason="claude_login_failed")),
+            (dict(turns=3, done=True, states=(S.MERGED,), login_failed=True), O.Step(O.REPORT)),
             (dict(turns=3, done=True, states=(S.MERGED, S.CLOSED), pending=1), O.Step(O.REPORT)),
             (dict(turns=3, done=True, states=(S.MERGED, S.LANDING)), O.Step(O.WAIT)),
             (dict(turns=3, done=True, states=(S.MERGED, S.REJECTED)),
@@ -251,6 +254,22 @@ class TestEpicRun(RunCase):
         self.turn(O.EVENTS, ok=False)
         self.assertEqual(self.step(), O.Step(O.FAILED, reason="owner_turn_failed"))
 
+    def test_a_refused_login_fails_the_run_after_one_turn(self):
+        self.assertEqual(self.step().kind, O.START)
+        self.log.begin_turn(O.START)
+        self.log.end_turn(ok=False, progress=False, exit_code=1, login_failed=True)
+        self.assertEqual(self.step(), O.Step(O.FAILED, reason="claude_login_failed"))
+        # the record says it, and a new reader of the log gets the same step
+        self.assertTrue(self.run.records()[-2]["login_failed"])
+        again = O.OwnerLog(self.run)
+        self.assertTrue(again.login_failed)
+
+    def test_login_failed_is_only_for_a_turn_that_did_not_end_ok(self):
+        self.log.begin_turn(O.START)
+        self.log.end_turn(ok=True, progress=False, exit_code=0, login_failed=True)
+        self.assertFalse(self.log.login_failed)
+        self.assertNotEqual(self.step().step, O.FAILED)
+
     def test_an_unpublished_slice_the_owner_gave_up_does_not_block_done(self):
         self.take(1, "submitted", "ok", "pass", "up_to_date", "pass", "published", "merged")
         self.take(2, "submitted", "ok", "fail")              # REJECTED, no pull request
@@ -364,7 +383,7 @@ class TestQueue(RunCase):
         self.log.push("c")
         again = O.OwnerLog(self.run)
         for attr in ("events", "delivered", "turns", "open_turn", "idle_turns", "failed_turns",
-                     "done_refused", "session_id"):
+                     "login_failed", "done_refused", "session_id"):
             self.assertEqual(getattr(again, attr), getattr(self.log, attr), attr)
         self.assertEqual(again.idle_turns, 1)
         self.assertEqual(again.pending(), ["c"])
