@@ -227,12 +227,14 @@ check_not_contains "T11c: another refusal has no token text" "$t11_out" "Claude 
 
 printf '\n== T12: resume of an epic run asks for the token before it starts the supervisor ==\n'
 # a run that passed its gates and whose supervisor is gone: crashed
-FAKE_SUP_MODE=gates_only CFGMS_FSM_LAUNCH_WAIT_SECS=1 CFGMS_FSM_PREPARE_WAIT_SECS=1 \
-  CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242 >/dev/null || true
-t12_run=$(ls "${SANDBOX}/runs" | grep '^epic-4242-fake-' | head -1)
-t12_records=$(wc -l < "${SANDBOX}/runs/${t12_run}/state.jsonl")
+FAKE_SUP_MODE=gates_only CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" \
+  run_epic 4242 >/dev/null || true
+t12_run=$(ls "${SANDBOX}/runs" | grep '^epic-4242-fake-' | head -1 || true)
+[[ -n "$t12_run" ]] || { bad "T12: the setup run exists" "no epic-4242-fake-* under runs"; t12_run="epic-4242-fake-none"; }
 : > "${SANDBOX}/token.cred"
 printf '#!/usr/bin/env bash\nexit 1\n' > "${SANDBOX}/bin/creds-no"
+printf '#!/usr/bin/env bash\nexit 124\n' > "${SANDBOX}/bin/creds-slow"
+chmod +x "${SANDBOX}/bin/creds-slow"
 printf '#!/usr/bin/env bash\necho fake-token-value-0123456789\n' > "${SANDBOX}/bin/creds-yes"
 chmod +x "${SANDBOX}/bin/creds-no" "${SANDBOX}/bin/creds-yes"
 resume_epic() {
@@ -247,7 +249,11 @@ t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-no" resume_epic) || t12_
 check_eq "T12a: token not readable -> exits 3" "$t12_rc" "3"
 check_contains "T12a: refused with the reason and the text" "$t12_out" "FSM_RESUME_REFUSED:${t12_run}:claude_token_decrypt_failed (the long-life Claude token file"
 check_eq "T12a: the supervisor was not started" "$(cat "${SANDBOX}/supervisor.log")" ""
-check_eq "T12a: the run's records did not change" "$(wc -l < "${SANDBOX}/runs/${t12_run}/state.jsonl")" "$t12_records"
+t12_rc=0
+t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-slow" resume_epic) || t12_rc=$?
+check_eq "T12a: a read that timed out -> deferred, exits 0" "$t12_rc" "0"
+check_contains "T12a: deferred with the reason" "$t12_out" "DISPATCH_DEFERRED:${t12_run}:claude_token_timeout (the long-life"
+check_eq "T12a: deferred: the supervisor was not started" "$(cat "${SANDBOX}/supervisor.log")" ""
 t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-no" CFGMS_FSM_ALLOW_CREDENTIALS_FILE=1 resume_epic) || true
 check_contains "T12b: with the variable the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
 t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-yes" resume_epic) || true

@@ -1044,9 +1044,16 @@ except Exception: print('')" 2>/dev/null || true)
   # An epic run that must start its owner container again stops (exit 75) when
   # the token file is there and cannot be read (fsm/epic.py). Asked here first:
   # the supervisor is not started, the run's records do not change (its age
-  # limit is counted from them), and the caller gets the reason.
+  # limit is counted from them), and the caller gets the reason. A read that
+  # timed out is deferred, as at a launch. This is stricter than the
+  # supervisor in one case: a run whose owner container still runs needs no
+  # token to continue, and is refused here too.
   if [[ "$mode" == "epic" && "${CFGMS_FSM_ALLOW_CREDENTIALS_FILE:-}" != "1" ]]; then
     if ! _agent_token_fetch && [[ "$AGENT_TOKEN_REASON" != "absent" ]]; then
+      if [[ "$AGENT_TOKEN_REASON" == "timeout" ]]; then
+        echo "DISPATCH_DEFERRED:${run_id}:claude_token_timeout $(_claude_token_hint)"
+        return 0
+      fi
       echo "FSM_RESUME_REFUSED:${run_id}:claude_token_${AGENT_TOKEN_REASON} $(_claude_token_hint)"
       return 3
     fi
