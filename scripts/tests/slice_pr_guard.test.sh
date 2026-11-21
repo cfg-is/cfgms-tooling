@@ -44,6 +44,7 @@ printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
   "api graphql"*"closingIssuesReferences"*) [[ "$GH_CLOSES" == unreadable ]] && exit 1; printf '%s\n' "$GH_CLOSES" ;;
   "api graphql"*"dequeuePullRequest"*) exit 1 ;;          # "not in the queue"
+  "api graphql"*'then "armed"'*) printf '%s\n' "$GH_AFTER_DEQUEUE" ;;   # dequeue's read of the result
   "api graphql"*) printf '%s\n' "$GH_STATE" ;;            # enqueue_state
   "pr view"*"--jq .headRefName"*) [[ "$GH_BRANCH" == unreadable ]] && exit 1; printf '%s\n' "$GH_BRANCH" ;;
   "pr view"*"-q .id"*)            printf 'PR_node\n' ;;
@@ -69,12 +70,13 @@ HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 GH_CLOSES=0
 GH_STATE=queued
+GH_AFTER_DEQUEUE=none
 
 run() {  # run <branch> <command...>   (stdout+stderr in $out, exit code in $rc, gh calls in $calls)
   local branch="$1"; shift
   : > "$SANDBOX/gh.log"
   rc=0
-  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_STATE="$GH_STATE" GH_LOG="$SANDBOX/gh.log" \
+  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_STATE="$GH_STATE" GH_AFTER_DEQUEUE="$GH_AFTER_DEQUEUE" GH_LOG="$SANDBOX/gh.log" \
         PATH="$SANDBOX/bin:$PATH" HOME="$SANDBOX/home" \
         CFGMS_TEST_DISPATCH="$SANDBOX/bin/dispatch-stub" \
         CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
@@ -189,6 +191,14 @@ check "dequeue disarms auto-merge" "$calls" "pr merge 7 --repo cfg-is/cfgms --di
 check "dequeue asks GitHub to take it out of the queue" "$calls" "dequeuePullRequest"
 check "dequeue of a pull request that is not queued is no error" "$out" "DEQUEUED:7"
 check "dequeue exits 0" "$rc" "0"
+for st in queued armed unreadable; do
+  GH_AFTER_DEQUEUE="$st"
+  run "$SLICE" "$POACT" dequeue 7
+  check "dequeue that leaves it ${st} says so" "$out" "DEQUEUE_FAILED:7 (still ${st})"
+  check "dequeue that leaves it ${st} does not say DEQUEUED" "$out" "DEQUEUED:7" not
+  check "dequeue that leaves it ${st} exits 1" "$rc" "1"
+done
+GH_AFTER_DEQUEUE=none
 
 echo ""
 if (( fail > 0 )); then

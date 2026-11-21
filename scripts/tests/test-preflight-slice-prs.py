@@ -131,6 +131,14 @@ class SlicePullRequests(unittest.TestCase):
         self.assertIsNone(s["story_number"])
         self.assert_skip(r, "#6380", "needs a person")
 
+    def test_slice_that_closes_an_issue_is_taken_out_of_the_queue(self):
+        for comments in ([], [review("PASS")]):
+            for queued, auto in (([6382], None), ([], {"mergeMethod": "SQUASH"})):
+                _, r = self.rec(raw_pr(body="Fixes #6380", comments=comments, auto_merge=auto),
+                                queued=queued)
+                self.assertEqual(r["action"], "dequeue_unreviewed")
+                self.assertIn("closes #6380", r["reason"])
+
     # ---- review
 
     def test_green_slice_with_no_review_gets_a_reviewer(self):
@@ -198,7 +206,7 @@ class SlicePullRequests(unittest.TestCase):
         """Round 1 was enqueued (or armed) on its PASS; the owner pushed round
         2. Round 2 must not merge on the verdict of round 1."""
         armed = {"mergeMethod": "SQUASH"}
-        for comments in ([review("PASS", head=OLD_HEAD)], [review("FAIL")], [],
+        for comments in ([review("PASS", head=OLD_HEAD)], [review("FAIL")], [review("FAIL", head=OLD_HEAD)],
                          [review("PASS", head=None)]):
             for queued, auto in (([6382], None), ([], armed), ([6382], armed)):
                 for rollup in (GREEN, PENDING, RED):
@@ -221,6 +229,26 @@ class SlicePullRequests(unittest.TestCase):
         self.assertEqual(r["action"], "enqueue_merge")
         _, r = self.rec(raw_pr(comments=[review("PASS")]), eviction_count=2)
         self.assert_skip(r, "wakes the owner")
+
+    def test_queued_with_no_verdict_was_enqueued_by_a_person_and_is_left_alone(self):
+        """No verdict of the pipeline at all (the reviewer of a slice posts its
+        verdict before it enqueues): a person enqueued it. cfgms PR 6382, the
+        first slice, merged this way."""
+        wait = review("", body=f"{MARKER}## Acceptance Review — WAIT\n")
+        for comments in ([], [wait]):
+            for queued, auto in (([6382], None), ([], {"mergeMethod": "SQUASH"})):
+                _, r = self.rec(raw_pr(comments=comments, auto_merge=auto), queued=queued)
+                self.assert_skip(r, "enqueued by a person")
+
+    def test_pass_that_github_would_arm_and_not_queue_is_not_enqueued(self):
+        """enqueue leaves a slice queued or not at all. BLOCKED would arm
+        auto-merge, be disarmed and refused, and come back every cycle."""
+        for ms in ("BLOCKED", "UNKNOWN", None):
+            _, r = self.rec(raw_pr(comments=[review("PASS")], merge_state=ms))
+            self.assert_skip(r, "needs a person")
+        for ms in ("CLEAN", "BEHIND", "UNSTABLE", "HAS_HOOKS"):
+            _, r = self.rec(raw_pr(comments=[review("PASS")], merge_state=ms))
+            self.assertEqual(r["action"], "enqueue_merge", ms)
 
     # ---- never the pipeline's part: push to the branch, fix agents
 

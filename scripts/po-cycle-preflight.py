@@ -485,7 +485,7 @@ query {
         approvals: reviews(states: [APPROVED], last: 50) {
           nodes { author { login } commit { oid } }
         }
-        comments(first: 30) { nodes { author { login } body createdAt } }
+        comments(last: 30) { nodes { author { login } body createdAt } }
         commits(last: 1) {
           nodes {
             commit {
@@ -2608,23 +2608,33 @@ def _slice_review_rec(pr, in_queue):
         more = {k: r[k] for k in ("remedy", "rerun_run_ids") if k in r}
         return rec(r["action"], r["reason"], **more)
 
-    if pr.get("closing_issue_numbers"):
-        nums = ", ".join(f"#{n}" for n in pr["closing_issue_numbers"])
-        return rec("skip", f"its body closes {nums} at the merge; a slice must close nothing (the epic "
-                           f"audit closes the epic) — {person}")
+    closes = ", ".join(f"#{n}" for n in pr.get("closing_issue_numbers") or [])
     reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
     if in_queue or pr.get("auto_merge_enabled"):
-        # On its way to a merge. That is right only for a PASS of this very
-        # commit: a round pushed after the enqueue must not merge on the
-        # verdict of the round before it.
+        # On its way to a merge.
         where = "in the merge queue" if in_queue else "auto-merge armed"
+        dequeue = (f"run `./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}` (it also disarms "
+                   "auto-merge)")
+        if closes:
+            return rec("dequeue_unreviewed",
+                       f"{where}, and its body closes {closes} at the merge; a slice must close "
+                       f"nothing — {dequeue}")
         if reviewed and verdict == "pass":
             return rec("skip", f"reviewed PASS on this commit, {where} "
                                f"(mergeStateStatus={ms or 'UNKNOWN'})")
-        return rec("dequeue_unreviewed",
-                   f"{where}, but its head commit has no PASS review — run "
-                   f"`./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}` (it also disarms "
-                   "auto-merge); the next cycle reviews the commit")
+        if verdict in ("pass", "fail"):
+            # The pipeline's newest verdict is not a PASS of this commit: a
+            # round was pushed after the enqueue, or the verdict is a FAIL.
+            # It must not merge on the verdict of the round before it.
+            return rec("dequeue_unreviewed",
+                       f"{where}, but the newest review verdict is not a PASS of its head commit — "
+                       f"{dequeue}; the next cycle reviews the commit")
+        # No verdict from the pipeline at all: a person enqueued it (the
+        # reviewer of a slice posts its verdict before it enqueues).
+        return rec("skip", f"{where} with no review verdict: enqueued by a person; left alone")
+    if closes:
+        return rec("skip", f"its body closes {closes} at the merge; a slice must close nothing (the "
+                           f"epic audit closes the epic) — {person}")
     if ms == "DIRTY" or pr.get("mergeable") == "CONFLICTING":
         return rec("skip", f"conflicts with develop — {woken}")
 
@@ -2657,7 +2667,10 @@ def _slice_review_rec(pr, in_queue):
         return rec("skip", f"reviewed PASS but its checks still fail after a rerun — {woken}")
     if overall == "pending":
         return pending("reviewed PASS; checks pending: ")
-    if pr.get("mergeable") == "MERGEABLE":
+    # BLOCKED: a required check or rule is not met, and `gh pr merge` would arm
+    # auto-merge instead of queueing. A slice is never left armed (enqueue
+    # disarms and refuses), so that would repeat every cycle.
+    if pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", ""):
         return rec("enqueue_merge",
                    "reviewed PASS on this commit + checks green + mergeable — run "
                    f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`")

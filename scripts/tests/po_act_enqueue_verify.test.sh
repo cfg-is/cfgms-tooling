@@ -59,6 +59,7 @@ case "$1 $2" in
     case "$*" in
       *headRefOid*)  echo "$HEAD_SHA" ;;
       *baseRefName*) echo develop ;;
+      *headRefName*) echo feature/story-12-agent ;;
       *)             echo '' ;;
     esac ;;
   "pr merge")

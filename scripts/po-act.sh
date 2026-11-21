@@ -1586,6 +1586,25 @@ except Exception: print('')" 2>/dev/null || echo "")
     }
     squash_enqueue
     state=$(enqueue_state)
+    # A slice must not wait with auto-merge armed: its owner can push a new
+    # round, and the armed merge would then take a commit that nobody
+    # reviewed. Queued, or not at all. The state is read up to three times:
+    # GitHub may need a moment to show the queue entry.
+    if $enqueue_is_slice; then
+      for _ in 1 2; do
+        [ "$state" = "queued" ] && break
+        sleep 3
+        state=$(enqueue_state)
+      done
+      if [ "$state" != "queued" ]; then
+        if gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1; then
+          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed)"
+        else
+          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
+        fi
+        exit 3
+      fi
+    fi
     case "$state" in
       MERGE|REBASE|unknown)
         # Auto-merge armed with a method the queue rejects: disarm it, arm
@@ -1602,14 +1621,6 @@ except Exception: print('')" 2>/dev/null || echo "")
         fi
         ;;
     esac
-    # A slice must not wait with auto-merge armed: its owner can push a new
-    # round, and the armed merge would then take a commit that nobody
-    # reviewed. Queued or nothing.
-    if $enqueue_is_slice && [ "$state" != "queued" ]; then
-      gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
-      echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed)"
-      exit 3
-    fi
     case "$state" in
       queued|SQUASH) echo "ENQUEUED:$pr" ;;
       none)
@@ -1632,6 +1643,16 @@ except Exception: print('')" 2>/dev/null || echo "")
     gh api graphql \
       -f query='mutation($prId: ID!) { dequeuePullRequest(input: {id: $prId}) { mergeQueueEntry { state } } }' \
       -F prId="$pr_id" >/dev/null 2>&1 || true
+    # Both calls may fail for a good reason, so the result is read, not assumed.
+    dq_state=$(gh api graphql \
+      -f query='query($pr: Int!) { repository(owner: "cfg-is", name: "cfgms") { pullRequest(number: $pr) { mergeQueueEntry { position } autoMergeRequest { mergeMethod } } } }' \
+      -F pr="$pr" \
+      --jq '.data.repository.pullRequest | if .mergeQueueEntry != null then "queued" elif .autoMergeRequest != null then "armed" else "none" end' \
+      2>/dev/null || echo "unreadable")
+    if [ "$dq_state" != "none" ]; then
+      echo "DEQUEUE_FAILED:$pr (still ${dq_state})" >&2
+      exit 1
+    fi
     echo "DEQUEUED:$pr"
     ;;
 

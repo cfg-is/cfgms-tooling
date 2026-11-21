@@ -991,7 +991,9 @@ _slice_review_is_stale() {
   while IFS=$'\t' read -r c_date c_author c_head; do
     [[ -n "$c_date" && -n "$c_author" ]] || continue
     [[ "$(_check_author_permission "$c_author" "$pr_num" "")" == "internal" ]] || continue
-    if [[ "$c_date" > "$newest" ]]; then newest="$c_date"; newest_head="$c_head"; fi
+    # Not older: of two comments with the same time the later one in the list
+    # decides, as in the preflight.
+    if [[ ! "$c_date" < "$newest" ]]; then newest="$c_date"; newest_head="$c_head"; fi
   done < <(echo "$pr_json" | jq -r '
       .comments[]
       | (.body // "") as $b | ($b | ascii_downcase) as $l
@@ -3995,17 +3997,21 @@ pipeline reads the third to know which commit the verdict is for. On a FAIL,
 give each finding its file and line and say what must be true instead: the owner
 acts on the comment alone and cannot ask you.
 
+The order on a PASS is NOT the order of the agent definition: for a slice, post
+the verdict comment FIRST and enqueue SECOND. (The pipeline takes a slice out of
+the merge queue when the newest verdict is not a PASS of its head commit; a
+slice queued before its PASS comment exists could be taken out.) The comment has
+no "Enqueued" line.
+
 Then take exactly ONE of these closing actions:
 
-- **PASS (zero findings)**: enqueue with
+- **PASS (zero findings)**: after the PASS comment is posted, enqueue with
   \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} --head ${pr_head_review}\`
   and NO story argument (a story argument adds a closing reference; that would
-  close the epic when this slice merges). The command refuses when the pull
-  request head is no longer the commit you reviewed (\`head_moved_since_review\`):
-  then post the PASS comment for your commit all the same and stop; the new
-  commit gets its own review.
-  If it refuses for another reason, post the PASS comment, add the refusal line
-  under it, and stop.
+  close the epic when this slice merges). If the command refuses (for example
+  \`head_moved_since_review\`: the owner pushed a new commit, which gets its own
+  review), post its output line as a second, plain comment and stop. Do not
+  retry and do not change the verdict.
 - **FAIL**: nothing after the comment.
 - **WAIT (CI pending)**: do what the agent definition says for WAIT. Whatever you
   post then must NOT contain a \`Reviewed head:\` line: nothing was reviewed.
