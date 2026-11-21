@@ -57,13 +57,12 @@ by itself: it builds, its tests pass, and it can merge alone.
    validation in a clean container, and opens the pull request. You keep
    working meanwhile.
 
-`--base` is the full `origin/develop` commit id your workspace is built on
-(`git rev-parse origin/develop` after a fetch). Use `--builds-on <m>` when
+`--base` is the full `origin/develop` commit id your workspace is built on:
+the last one you merged in (`git merge-base HEAD origin/develop`). A fetch
+alone does not change it. A base that is newer than your workspace makes the
+slice undo the `develop` commits you did not merge. Use `--builds-on <m>` when
 this slice needs slice `m` and slice `m` has not merged: the slice is then
 validated at once on top of slice `m`, and published after slice `m` merges.
-With `--builds-on <m>`, `--base` must be the base you gave for slice `m`, or,
-when you merged `develop` since, the `parent` in slice `m`'s `status.json`.
-With any other base, submit slice `m` again first.
 
 The same slice number again is a new round of that slice. A slice has 3
 rounds. A slice that uses all of them stops the whole epic, so check your work

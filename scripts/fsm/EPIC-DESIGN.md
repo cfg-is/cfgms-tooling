@@ -193,9 +193,7 @@ The supervisor ignores all of it. It only ever reads the files.
 | Case | Parent of the slice commit |
 |---|---|
 | No `--builds-on` | the `--base` commit. The supervisor checks that it is on `origin/develop`. |
-| `--builds-on m`, slice `m` not merged, `--base` is the base slice `m` was submitted on | the snapshot commit of slice `m`'s current round: the owner's tree on the owner's parent |
-| `--builds-on m`, slice `m` not merged, SYNC moved slice `m`, `--base` is the `develop` commit it was moved onto | the commit SYNC made of slice `m`'s current round (the owner merged `develop` since) |
-| `--builds-on m`, slice `m` not merged, any other `--base` | refused. The owner submits slice `m` again with that base first. |
+| `--builds-on m`, slice `m` not merged | the snapshot commit of slice `m`'s current round (the owner's tree, not what SYNC made of it), brought onto the `--base` commit when that commit is not in it. The supervisor checks that the base is on `origin/develop`. |
 | `--builds-on m`, slice `m` merged meanwhile | treated as no `--builds-on` |
 
 A wrong `--base` cannot land bad code unseen: the diff would show other
@@ -263,9 +261,9 @@ submit. A FAILED slice ends the whole run as FAILED.
   moves during the validation, the slice is published as validated; the
   merge queue tests the combination. SYNC replaces the candidate of the
   round (the tree on the `develop` tip). The snapshot of the round is kept
-  beside it, with the `--base` of the submit. A slice that builds on this
-  one stands on the snapshot or on the synced commit, by its own `--base`
-  (§3). "No change since the last snapshot" holds for a submit that
+  beside it. A slice that builds on this one is measured against the
+  snapshot, merged onto its own `--base` when the owner merged `develop`
+  since (§3). "No change since the last snapshot" holds for a submit that
   repeats either of the two.
 - **A conflict in SYNC** is not resolved by the supervisor placing markers in
   the workspace, as in a story run. The owner's workspace is live and belongs
@@ -306,7 +304,8 @@ Cases that the table above does not show. All **[P]**.
   uses no round.
 - **A submit that cannot be placed** (`bad_request`: unknown `--builds-on`,
   a base that is not on `develop`, a parent that is CLOSED, FAILED or STALE,
-  a loop) → REJECTED, with the reason. It uses a round.
+  a loop, a parent whose snapshot does not apply on the base) → REJECTED,
+  with the reason. It uses a round.
 - **A submit with no change** (the same tree on the same parent as the
   slice's last snapshot) is refused in every state, and uses no round: a
   round in flight goes on, a pull request stays as it is, a rejected round

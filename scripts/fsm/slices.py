@@ -345,12 +345,11 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
     only git question this rule asks and the caller owns the git call.
 
       no builds_on                  -> the base commit; it must be on develop
-      builds_on m, m not merged     -> a commit of m's current round, chosen by
-                                       the base: the snapshot commit when the
-                                       base is the base m was submitted on; the
-                                       commit SYNC made when the base is the
-                                       develop commit SYNC moved m onto; any
-                                       other base is refused
+      builds_on m, m not merged     -> the snapshot commit of m's current round
+                                       (what the owner built, not what SYNC made
+                                       of it); the base must be on develop. The
+                                       caller brings that commit onto the base
+                                       when the base is not in it.
       builds_on m, m already merged -> as if builds_on was not given
 
     Every value of the request comes from the owner. A value of the wrong
@@ -391,26 +390,12 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
             if not cand:
                 raise BadRequest(f"--builds-on {builds_on}: that slice has no accepted "
                                  f"snapshot of its current round; submit it again first")
-            # The workspace holds slice m. Which commit of m it stands on
-            # depends on what else it holds: the develop commit m was
-            # submitted on (the snapshot), or the one SYNC moved m onto (the
-            # owner merged develop since). The base says which. A diff
-            # against the other one would undo, or bring again, the develop
-            # commits between the two.
-            snap_base = cand.get("snap_base")
-            if not snap_base or base == snap_base:      # no base on record: an older run
-                return Parent(cand["snap_commit"], builds_on)
-            if cand["commit"] != cand["snap_commit"] and base == cand["parent"]:
-                return Parent(cand["commit"], builds_on)
-            moved = (f", or {cand['parent'][:12]} (the develop commit the supervisor moved "
-                     f"it onto, when your workspace holds that commit)"
-                     if cand["commit"] != cand["snap_commit"] else "")
-            raise BadRequest(
-                f"--builds-on {builds_on}: --base {base[:12]} is not a base of slice "
-                f"{builds_on}. Use {snap_base[:12]} (the base slice {builds_on} was "
-                f"submitted on, when your workspace is still on it){moved}. When your "
-                f"workspace is on another develop commit, submit slice {builds_on} again "
-                f"with that --base first")
+            # The snapshot, not what SYNC made of it: the caller measures the
+            # workspace against "slice m on this base", and it builds that
+            # from the owner's own tree of slice m.
+            if not is_on_develop(base):
+                raise BadRequest(f"--base {base[:12]} is not a commit on origin/develop")
+            return Parent(cand["snap_commit"], builds_on)
     if not is_on_develop(base):
         raise BadRequest(f"--base {base[:12]} is not a commit on origin/develop")
     return Parent(base, 0)
@@ -430,11 +415,11 @@ class Slice:
         self.ctx = SliceCtx(slice=number, round_budget=round_budget)
         self.candidate = ""     # commit of the latest candidate record
         #: round -> {"commit", "tree", "parent", "snap_commit", "snap_tree",
-        #: "snap_parent", "snap_base"}. The first three are what is validated
-        #: and published; SYNC replaces them. The `snap_` values are the
-        #: snapshot of the owner's workspace on the owner's parent, and the
-        #: `--base` of that submit ("" when not on record). They never change
-        #: in a round. `resolve_parent` and the "no change" rule read both.
+        #: "snap_parent"}. The first three are what is validated and
+        #: published; SYNC replaces them. The `snap_` values are the snapshot
+        #: of the owner's workspace on the owner's parent and never change in
+        #: a round. A slice that builds on this one stands on `snap_commit`;
+        #: the "no change" rule reads both.
         self.candidates = {}
         self.pr = 0
         self.branch = ""
@@ -480,7 +465,6 @@ class SliceBook:
             old = s.candidates.get(rec["round"])
             for k in ("commit", "tree", "parent"):
                 cand[f"snap_{k}"] = rec.get(f"snap_{k}") or (old[f"snap_{k}"] if old else rec[k])
-            cand["snap_base"] = rec.get("snap_base") or (old["snap_base"] if old else "")
             s.candidates[rec["round"]] = cand
             s.candidate = rec["commit"]
         else:
@@ -557,12 +541,12 @@ class SliceBook:
             res.cascade = self._parent_event(number, "parent_new_round")
         return res
 
-    def set_candidate(self, number, commit, tree, parent, base="", synced=False):
+    def set_candidate(self, number, commit, tree, parent, synced=False):
         """Record the candidate of the slice's current round.
 
-        A call without `synced` records the snapshot; `base` is the `--base`
-        of the submit. A call with `synced=True` records what SYNC made of
-        it and keeps the snapshot values of the round."""
+        A call without `synced` records the snapshot. A call with
+        `synced=True` records what SYNC made of it and keeps the snapshot
+        values of the round."""
         s = self._slice(number)
         cand = {"commit": commit, "tree": tree, "parent": parent}
         old = s.candidates.get(s.ctx.round) if synced else None
@@ -570,7 +554,6 @@ class SliceBook:
             raise ValueError(f"slice {number} round {s.ctx.round}: no snapshot to sync")
         for k in ("commit", "tree", "parent"):
             cand[f"snap_{k}"] = old[f"snap_{k}"] if old else cand[k]
-        cand["snap_base"] = old["snap_base"] if old else base
         s.candidates[s.ctx.round] = cand
         s.candidate = commit
         self.run.append("slice_candidate", slice=number, round=s.ctx.round, **cand)

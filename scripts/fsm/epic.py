@@ -633,14 +633,17 @@ class EpicSupervisor(sup.Supervisor):
         bad, parent = "", None
         try:
             parent = S.resolve_parent(self.book, n, req.base, req.builds_on, self.on_develop)
+            if parent.builds_on:
+                parent = self.parent_on_base(parent, req.base)
         except S.BadRequest as exc:
-            bad = str(exc)
+            bad, parent = str(exc), None
         if parent is not None and s is not None and s.candidates:
             # A request that brings the same tree on the same parent changes
             # nothing. It uses no round: a round in flight goes on, a pull
             # request stays as it is, a rejected round stays rejected.
             last = s.candidates[max(s.candidates)]
-            if any(p == parent.commit and self.same_tree(t, parent.commit)
+            ptree = self.repo.tree_of(parent.commit)
+            if any(p == ptree and self.same_tree(t, parent.commit)
                    for p, t in self.known_trees(last)):
                 what = (f"Round {s.ctx.round} goes on." if s.state not in S.OWNER_TURN
                         else f"Slice {n} stays {s.state}.")
@@ -706,7 +709,7 @@ class EpicSupervisor(sup.Supervisor):
                                                          "snapshot was taken. Submit again.")
             return "withdrawn"
         last = s.candidates[max(s.candidates)] if s.candidates else None
-        if snap.tree == base_tree or (last and (parent.commit, snap.tree)
+        if snap.tree == base_tree or (last and (base_tree, snap.tree)
                                       in self.known_trees(last)):
             self.stake(n, "unchanged", quiet=True)
             self.answer(req, False, round_no=rnd,
@@ -714,7 +717,7 @@ class EpicSupervisor(sup.Supervisor):
             return "no_change"
         commit = self.repo.commit_tree(snap.tree, [parent.commit], "fsm slice candidate (internal)\n")
         self.repo.update_ref(f"refs/fsm/slices/{n}/r{rnd}", commit)
-        self.book.set_candidate(n, commit, snap.tree, parent.commit, base=req.base)
+        self.book.set_candidate(n, commit, snap.tree, parent.commit)
         self.wtext(f"slice-{n}-r{rnd}-subject.txt", req.subject)
         self.wtext(f"slice-{n}-r{rnd}-claim.md", public_claim(req.claim))
         if not self.rtext(f"slice-{n}-subject.txt"):
@@ -737,12 +740,48 @@ class EpicSupervisor(sup.Supervisor):
             return False
         return private.is_copy(self.repo.blob(sha))
 
-    @staticmethod
-    def known_trees(cand):
-        """The (parent, tree) pairs of a round that a new submit can repeat:
-        the snapshot, and what SYNC made of it (the owner merged develop and
-        submits the tree that is already validated or published)."""
-        return [(cand["snap_parent"], cand["snap_tree"]), (cand["parent"], cand["tree"])]
+    def known_trees(self, cand):
+        """The (tree of the parent, tree) pairs of a round that a new submit
+        can repeat: the snapshot, and what SYNC made of it (the owner merged
+        develop and submits the tree that is already validated or
+        published). The parent is compared by its tree: the parent of a
+        `--builds-on` slice can be a commit made for one submit."""
+        pairs = {(cand["snap_parent"], cand["snap_tree"]), (cand["parent"], cand["tree"])}
+        return [(self.repo.tree_of(p), t) for p, t in sorted(pairs)]
+
+    def merge_onto(self, onto, commit):
+        """Three-way merge of `commit` onto `onto`, no work tree. Returns
+        (tree, []) or ("", [conflicted paths])."""
+        proc = self.repo.git("merge-tree", "--write-tree", "--name-only", "--no-messages",
+                             onto, commit, check=False)
+        lines = proc.stdout.decode("utf-8", "replace").splitlines()
+        if proc.returncode not in (0, 1) or not lines:
+            raise RuntimeError(f"merge-tree failed ({proc.returncode})")
+        if proc.returncode == 1:
+            return "", ([ln for ln in lines[1:] if ln.strip()] or ["(unknown)"])[:100]
+        return lines[0].strip(), []
+
+    def parent_on_base(self, parent, base):
+        """The commit a `--builds-on` slice is measured against: the snapshot
+        of the slice it builds on, on the develop commit `base` that the
+        workspace holds.
+
+        The workspace is "develop at `base`, plus slice m, plus this slice".
+        When `base` is in the snapshot commit of slice m, that commit is the
+        answer. When the owner merged a later develop commit, the answer is
+        slice m's snapshot merged onto it. A diff against anything else
+        would undo, or bring again, the develop commits between the two."""
+        if self.repo.is_ancestor(base, parent.commit):
+            return parent
+        tree, conflicted = self.merge_onto(base, parent.commit)
+        if conflicted:
+            m = parent.builds_on
+            raise S.BadRequest(
+                f"--builds-on {m}: slice {m} as it was submitted does not apply on --base "
+                f"{base[:12]} (" + ", ".join(conflicted[:10]) + f"). Submit slice {m} again "
+                f"from this workspace with that --base first")
+        commit = self.repo.commit_tree(tree, [base], "fsm slice parent (internal)\n")
+        return S.Parent(commit, parent.builds_on)
 
     def request_there(self, req):
         """The request directory is still where slice-submit put it."""
@@ -938,14 +977,8 @@ class EpicSupervisor(sup.Supervisor):
         if self.repo.is_ancestor(dev, base):
             self.stake(n, "up_to_date", info={"develop": dev})
             return
-        proc = self.repo.git("merge-tree", "--write-tree", "--name-only", "--no-messages",
-                             dev, cand["commit"], check=False)
-        lines = proc.stdout.decode("utf-8", "replace").splitlines()
-        if proc.returncode not in (0, 1) or not lines:
-            raise RuntimeError(f"merge-tree failed ({proc.returncode})")
-        merged = lines[0].strip()
-        if proc.returncode == 1:
-            conflicted = [ln for ln in lines[1:] if ln.strip()][:100]
+        merged, conflicted = self.merge_onto(dev, cand["commit"])
+        if conflicted:
             self.write_rejected(n, "Conflicts with develop", [
                 f"Round {rnd} does not apply on the develop commit `{dev}`. Files:", ""] +
                 [f"- `{c}`" for c in conflicted] +

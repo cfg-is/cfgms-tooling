@@ -435,25 +435,18 @@ class TestBook(BookCase):
         self.walk(1, "submitted", "ok")
         with self.assertRaises(ValueError):                                 # nothing to sync yet
             self.book.set_candidate(1, "c" * 40, "2" * 40, "d" * 40, synced=True)
-        self.book.set_candidate(1, "a" * 40, "1" * 40, "b" * 40, base="b" * 40)   # the snapshot
+        self.book.set_candidate(1, "a" * 40, "1" * 40, "b" * 40)            # the snapshot
         self.book.set_candidate(1, "c" * 40, "2" * 40, "d" * 40, synced=True)   # what SYNC made
         want = {"commit": "c" * 40, "tree": "2" * 40, "parent": "d" * 40,
-                "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40,
-                "snap_base": "b" * 40}
+                "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40}
         again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
         for book in (self.book, again):
             self.assertEqual(book.get(1).candidates[1], want)
             self.assertEqual(book.get(1).status()["commit"], "c" * 40)
-            # the child's base says which commit of slice 1 its workspace holds
-            for base, commit in (("b" * 40, "a" * 40),      # still on slice 1's base
-                                 ("d" * 40, "c" * 40)):     # merged develop since
-                parent = S.resolve_parent(book, 2, base, 1, lambda sha: True)
-                self.assertEqual(parent, S.Parent(commit, 1))
-            with self.assertRaises(S.BadRequest) as cm:     # on some other develop commit
-                S.resolve_parent(book, 2, "9" * 40, 1, lambda sha: True)
-            self.assertIn("bbbbbbbbbbbb", str(cm.exception))
-            self.assertIn("dddddddddddd", str(cm.exception))
-            self.assertIn("submit slice 1 again", str(cm.exception))
+            parent = S.resolve_parent(book, 2, "b" * 40, 1, lambda sha: True)
+            self.assertEqual(parent, S.Parent("a" * 40, 1))
+            with self.assertRaises(S.BadRequest):               # the base must be on develop
+                S.resolve_parent(book, 2, "9" * 40, 1, lambda sha: False)
         # a new round starts from its own snapshot
         self.walk(1, "rebased", "fail", "submitted", "ok")
         self.book.set_candidate(1, "e" * 40, "3" * 40, "d" * 40)
@@ -468,9 +461,7 @@ class TestBook(BookCase):
         again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
         self.assertEqual(again.get(1).candidates[1],
                          {"commit": "c" * 40, "tree": "2" * 40, "parent": "d" * 40,
-                          "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40,
-                          "snap_base": ""})
-        # no base on record: a child stands on the snapshot, with any base
+                          "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40})
         self.assertEqual(S.resolve_parent(again, 2, "9" * 40, 1, lambda sha: True),
                          S.Parent("a" * 40, 1))
 

@@ -233,9 +233,10 @@ class TestEpicRun(EpicCase):
         self.wait_state(2, "WAIT_PARENT")
         c1 = [r for r in self.recs("slice_candidate") if r["slice"] == 1][-1]
         c2 = [r for r in self.recs("slice_candidate") if r["slice"] == 2][-1]
-        self.assertEqual(c2["parent"], c1["commit"])
-        self.assertNotEqual(c1["commit"], c1["snap_commit"])
-        self.assertEqual(git(self.run_dir / "R", "diff", "--name-only", c2["parent"], c2["commit"]),
+        repo = self.run_dir / "R"
+        self.assertEqual(git(repo, "rev-parse", c2["parent"] + "^{tree}"), c1["tree"])
+        self.assertNotEqual(c1["tree"], c1["snap_tree"])
+        self.assertEqual(git(repo, "diff", "--name-only", c2["parent"], c2["commit"]),
                          "src/b.go")
         self.f.commit_on("develop", {"src/util.go": self.UTIL0}, message="take it back")
         self.merge(pr1)
@@ -244,29 +245,59 @@ class TestEpicRun(EpicCase):
         self.assertEqual(self.changed(head2), ["src/b.go"])
         self.assertEqual(self.f.remote_show(head2, "src/util.go").strip(), self.UTIL0.strip())
 
-    def test_a_child_with_a_base_that_is_no_base_of_its_parent_is_refused(self):
-        # develop moves after slice 1 is submitted and synced. A workspace on
-        # that newer commit holds neither of the two trees slice 1 has.
+    def test_a_child_from_a_workspace_on_a_later_develop_commit_than_its_parent(self):
+        # Slice 1 is published on the develop commit of its submit. develop
+        # moves. The owner merges it and submits slice 2 on slice 1. Slice 2 is
+        # measured against "slice 1 on the new develop commit": its pull
+        # request holds its own file only. No round of slice 1 is used.
         self.f.plan({"owner": [
             [write("src/a.go", "package src\n// a\n"), submit(1),
              {"op": "wait_pr", "slice": 1}, {"op": "wait_flag", "name": "moved"},
-             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1, expect=1)],
+             write("src/new_on_develop.go", "package src\n// new\n"),
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1)],
+            [],
             [DONE],
         ]})
-        base0 = self.f.remote_head("develop")
         self.launch()
         pr1 = self.wait_pr(1)
         dev1 = self.f.commit_on("develop", {"src/new_on_develop.go": "package src\n// new\n"})
         self.flag("moved")
-        self.wait_for("two submits", lambda: len(self.submits()) == 2)
+        self.wait_state(2, "WAIT_PARENT")
+        c1 = [r for r in self.recs("slice_candidate") if r["slice"] == 1]
+        c2 = [r for r in self.recs("slice_candidate") if r["slice"] == 2][-1]
+        repo = self.run_dir / "R"
+        self.assertEqual(len(c1), 1)                                  # slice 1 was not touched
+        self.assertEqual(git(repo, "rev-parse", c2["parent"] + "^"), dev1)
+        self.assertEqual(git(repo, "diff", "--name-only", dev1, c2["parent"]), "src/a.go")
+        self.assertEqual(git(repo, "diff", "--name-only", c2["parent"], c2["commit"]), "src/b.go")
+        self.assertEqual((self.status(1)["round"], self.status(2)["round"]), (1, 1))
         self.merge(pr1)
-        rc, out = self.finish()
-        self.assertEqual(rc, 0, out)
+        self.wait_pr(2)
+        head2 = self.f.remote_head("feature/epic-900-slice-2")
+        self.assertEqual(self.changed(head2), ["src/b.go"])
+        self.assertIn("// new", self.f.remote_show(head2, "src/new_on_develop.go"))
+
+    def test_a_child_whose_parent_does_not_apply_on_its_base_is_refused(self):
+        # develop changes the lines slice 1 changed. Slice 1 as submitted
+        # cannot be put on that commit, so there is nothing to measure slice 2
+        # against: the owner repairs slice 1 first.
+        self.f.plan({"owner": [
+            [write("src/util.go", "package src\n\nfunc U() int {\n\treturn 7\n}\n"), submit(1),
+             {"op": "wait_pr", "slice": 1}, {"op": "wait_flag", "name": "moved"},
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1, expect=1)],
+            [{"op": "out", "name": "blocked.md", "content": "stop\n"}],
+        ]})
+        self.launch()
+        self.wait_pr(1)
+        dev1 = self.f.commit_on("develop", {"src/util.go": self.UTIL1})
+        self.flag("moved")
+        self.wait_for("two submits", lambda: len(self.submits()) == 2)
         out = self.submits()[1]["output"]
-        self.assertIn(f"--base {dev1[:12]} is not a base of slice 1", out)
-        self.assertIn(base0[:12], out)
-        self.assertIn("submit slice 1 again with that --base first", out)
-        self.assertEqual(self.status(2)["state"], "REJECTED")
+        self.assertIn(f"slice 1 as it was submitted does not apply on --base {dev1[:12]} "
+                      f"(src/util.go)", out)
+        self.assertIn("Submit slice 1 again from this workspace with that --base first", out)
+        self.wait_state(2, "REJECTED")
+        self.assertEqual(self.status(1)["state"], "LANDING")
 
     def test_the_synced_tree_submitted_again_after_a_merge_of_develop_uses_no_round(self):
         # SYNC moved slice 1 onto the new develop commit and it is published.
