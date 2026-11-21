@@ -6,7 +6,9 @@ The owner runs `slice-submit` in its container. That command writes one
 request directory and waits for the supervisor's answer:
 
     /fsm/out/submit/<slice>-<k>/     written by the owner (rw mount)
-        request.json                 {"slice", "request_id", "base", "builds_on"}
+        request.json                 {"slice", "request_id", "base", "base_from",
+                                      "builds_on"}; `base` is what slice-submit
+                                      read from git in the workspace
         subject.txt                  "<scope>: <what changed>", one line
         claim.md                     what the slice claims to deliver
     /fsm/context/slices/<slice>/submitted.json
@@ -183,7 +185,14 @@ def _parse(dirname, slice_no, dfd):
         return refuse("request.json names a different slice than its directory")
     base = req.get("base")
     if not isinstance(base, str) or not _SHA_RE.fullmatch(base):
-        return refuse("--base must be a full 40-character commit id")
+        return refuse("the base must be a full 40-character commit id")
+    if req.get("base_from") != "git":
+        # An older slice-submit sent the --base the owner typed. The
+        # supervisor measures the slice against the base, so it takes only
+        # one that was read from the workspace.
+        return refuse("this slice-submit is an old version: it did not read the base from "
+                      "git in /workspace. The agent image must be built again. Write this "
+                      "in blocked.md and end your turn")
     builds_on = req.get("builds_on", 0)
     if builds_on is None:
         builds_on = 0

@@ -117,6 +117,13 @@ def token_must_be_read(why):
     return why != "absent" and os.environ.get(ALLOW_CREDENTIALS_FILE_ENV) != "1"
 
 
+class ParentUnclear(Exception):
+    """The supervisor cannot say what a `--builds-on` slice is measured
+    against: the slice it builds on does not apply on the base of the
+    workspace, or the workspace is on an older develop commit than that
+    slice."""
+
+
 class TokenUnreadable(Exception):
     """The long-life token is on the host and cannot be read. `why` is the
     reason from Services.claude_token (decrypt_failed, timeout)."""
@@ -131,6 +138,10 @@ PRIVATE_MIN_BYTES = 64
 PRIVATE_MAX_BYTES = 5 * 1024 * 1024
 PRIVATE_MAX_FILES = 20000
 PRIVATE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+#: Author and committer date of the commit a `--builds-on` slice is measured
+#: against when it is built for a submit (`parent_for_workspace`).
+BUILT_PARENT_DATE = "2000-01-01T00:00:00+0000"
+
 #: A network step of SYNC or PUBLISH (fetch, ls-remote, push, a GitHub call)
 #: that fails is tried again; a slice that fails NET_RETRIES times takes
 #: `error` in SYNC and `step_failed` in PUBLISH.
@@ -633,16 +644,31 @@ class EpicSupervisor(sup.Supervisor):
         bad, parent = "", None
         try:
             parent = S.resolve_parent(self.book, n, req.base, req.builds_on, self.on_develop)
+            if parent.builds_on:
+                parent = self.parent_for_workspace(parent, req.base)
         except S.BadRequest as exc:
-            bad = str(exc)
-        if parent is not None and s is not None and s.candidates:
+            bad, parent = str(exc), None
+        except ParentUnclear as exc:
+            # Known before anything is taken: no round, and the slice (it can
+            # be a validated round that waits for its parent) stays as it is.
+            self.answer(req, False, reason=f"{exc}. This request used no round.")
+            return "refused"
+        # A STALE slice must get a new round: what it stood on has a new
+        # round, and that round can have the tree of the old one.
+        was_stale = s is not None and s.state == S.STALE
+        # The snapshot of the round the slice is in. A round that took no
+        # snapshot (a refused request, a refused snapshot) has none, and an
+        # older round is not what the slice is now: the submit is a new round.
+        last = s.candidates.get(s.ctx.round) if s is not None and not was_stale else None
+        if parent is not None and last:
             # A request that brings the same tree on the same parent changes
             # nothing. It uses no round: a round in flight goes on, a pull
             # request stays as it is, a rejected round stays rejected.
-            last = s.candidates[max(s.candidates)]
-            if last["parent"] == parent.commit and self.same_tree(last["tree"], parent.commit):
+            if self.repeats(last, parent.commit, lambda t: self.same_tree(t, parent.commit)):
                 what = (f"Round {s.ctx.round} goes on." if s.state not in S.OWNER_TURN
-                        else f"Slice {n} stays {s.state}.")
+                        else f"Slice {n} stays {s.state}: round {s.ctx.round} used this tree "
+                             f"on this develop commit. Change the workspace, or merge a "
+                             f"newer origin/develop (commit the merge), and submit again.")
                 self.answer(req, False, round_no=s.ctx.round,
                             reason=f"the workspace has no change since this slice's last "
                                    f"snapshot. {what}")
@@ -704,9 +730,8 @@ class EpicSupervisor(sup.Supervisor):
             self.answer(req, False, round_no=rnd, reason="the request was withdrawn while the "
                                                          "snapshot was taken. Submit again.")
             return "withdrawn"
-        last = s.candidates[max(s.candidates)] if s.candidates else None
-        if snap.tree == base_tree or (last and last["tree"] == snap.tree
-                                      and last["parent"] == parent.commit):
+        if snap.tree == base_tree or (last and self.repeats(
+                last, parent.commit, lambda t: t == snap.tree)):
             self.stake(n, "unchanged", quiet=True)
             self.answer(req, False, round_no=rnd,
                         reason="the workspace has no change since this slice's last snapshot.")
@@ -735,6 +760,70 @@ class EpicSupervisor(sup.Supervisor):
         if not size.isdigit() or not PRIVATE_MIN_BYTES <= int(size) <= PRIVATE_MAX_BYTES + 65536:
             return False
         return private.is_copy(self.repo.blob(sha))
+
+    def repeats(self, cand, parent_commit, same_tree):
+        """True when a submit on `parent_commit` repeats the round `cand`:
+        its snapshot, or what SYNC made of it (the owner merged develop and
+        submits the tree that is already validated or published).
+        `same_tree(tree)` says whether the workspace is that tree.
+
+        The base of a submit is read from git in the workspace, so the same
+        parent commit means the same develop commit: an owner that wants the
+        slice validated on a newer one merges it, and that is another parent."""
+        pairs = {(cand["snap_parent"], cand["snap_tree"]), (cand["parent"], cand["tree"])}
+        return any(p == parent_commit and same_tree(t) for p, t in sorted(pairs))
+
+    def merge_onto(self, onto, commit):
+        """Three-way merge of `commit` onto `onto`, no work tree. Returns
+        (tree, []) or ("", [conflicted paths])."""
+        proc = self.repo.git("merge-tree", "--write-tree", "--name-only", "--no-messages",
+                             onto, commit, check=False)
+        lines = proc.stdout.decode("utf-8", "replace").splitlines()
+        if proc.returncode not in (0, 1) or not lines:
+            raise RuntimeError(f"merge-tree failed ({proc.returncode})")
+        if proc.returncode == 1:
+            return "", ([ln for ln in lines[1:] if ln.strip()] or ["(unknown)"])[:100]
+        return lines[0].strip(), []
+
+    def parent_for_workspace(self, stood, base):
+        """The commit a `--builds-on` slice is measured against.
+
+        `stood` is the snapshot commit of the slice it builds on (slice m).
+        `base` is the develop commit the workspace is built on; slice-submit
+        read it from git in the workspace (submit.py takes no other). So the
+        workspace is "`base`, plus slice m, plus this slice":
+
+          `base` is the develop commit of `stood`  -> `stood`
+          `base` is newer (the owner merged)       -> slice m's snapshot
+                                                      merged onto `base`
+          `base` is older, or slice m does not
+          apply on it                              -> ParentUnclear
+
+        A diff against the wrong one would undo, or bring again, the develop
+        commits between the two."""
+        m = stood.builds_on
+        if self.repo.is_ancestor(base, stood.commit):
+            under = self.repo.out("merge-base", stood.commit, self.x["develop"], check=False)
+            if under == base:
+                return stood
+            raise ParentUnclear(
+                f"--builds-on {m}: /workspace is built on develop commit {base[:12]}. Slice {m} "
+                f"was submitted on a newer one ({under[:12]}). Merge origin/develop into "
+                f"/workspace, commit the merge, and submit again")
+        tree, conflicted = self.merge_onto(base, stood.commit)
+        if conflicted:
+            raise ParentUnclear(
+                f"--builds-on {m}: slice {m} as it was submitted does not apply on develop "
+                f"commit {base[:12]}, which /workspace is built on (" + ", ".join(conflicted[:10])
+                + f"). Submit slice {m} again first, with the files of slice {m} only: put "
+                  f"the files of this slice away for that submit (a branch, a stash), then "
+                  f"bring them back and submit this slice")
+        # A fixed date: the same slice m on the same base is the same commit
+        # at every submit, so "the same parent" can be read from the id.
+        built = self.repo.commit_tree(tree, [base], "fsm slice parent (internal)\n",
+                                      ident={"GIT_AUTHOR_DATE": BUILT_PARENT_DATE,
+                                             "GIT_COMMITTER_DATE": BUILT_PARENT_DATE})
+        return S.Parent(built, m)
 
     def request_there(self, req):
         """The request directory is still where slice-submit put it."""
@@ -873,8 +962,10 @@ class EpicSupervisor(sup.Supervisor):
     def step_slices(self):
         """SYNC and PUBLISH are short steps the supervisor finishes at once. A
         cached validator result can put a slice into one of them, so this
-        repeats until no slice is left there: a submit request never finds a
-        slice in the middle of a supervisor step."""
+        repeats until no slice is left there. (A slice can still be in SYNC
+        when a request is read: an accepted submit leaves it there until
+        this runs, and a failed fetch keeps it there. Such a request is
+        refused with "submit again in a moment".)"""
         for _ in range(8):
             self._step_slices_once()
             if not any(s.state in (S.SYNC, S.PUBLISH) for s in self.book.slices.values()):
@@ -928,24 +1019,18 @@ class EpicSupervisor(sup.Supervisor):
         if self.repo.is_ancestor(dev, base):
             self.stake(n, "up_to_date", info={"develop": dev})
             return
-        proc = self.repo.git("merge-tree", "--write-tree", "--name-only", "--no-messages",
-                             dev, cand["commit"], check=False)
-        lines = proc.stdout.decode("utf-8", "replace").splitlines()
-        if proc.returncode not in (0, 1) or not lines:
-            raise RuntimeError(f"merge-tree failed ({proc.returncode})")
-        merged = lines[0].strip()
-        if proc.returncode == 1:
-            conflicted = [ln for ln in lines[1:] if ln.strip()][:100]
+        merged, conflicted = self.merge_onto(dev, cand["commit"])
+        if conflicted:
             self.write_rejected(n, "Conflicts with develop", [
                 f"Round {rnd} does not apply on the develop commit `{dev}`. Files:", ""] +
                 [f"- `{c}`" for c in conflicted] +
-                ["", "Fetch origin/develop, merge it in the workspace, fix the conflicts, and "
-                     "submit the slice again with the new --base."])
+                ["", "Fetch origin/develop, merge it in the workspace, fix the conflicts, "
+                     "commit the merge, and submit the slice again."])
             self.stake(n, "conflict", info={"develop": dev, "conflicted": conflicted})
             return
         commit = self.repo.commit_tree(merged, [dev], "fsm slice candidate (internal)\n")
         self.repo.update_ref(f"refs/fsm/slices/{n}/r{rnd}", commit)
-        self.book.set_candidate(n, commit, merged, dev)
+        self.book.set_candidate(n, commit, merged, dev, synced=True)
         self.stake(n, "rebased", info={"develop": dev, "tree": merged})
 
     def do_slice_publish(self, s):

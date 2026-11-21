@@ -57,7 +57,7 @@ EXPECTED = {
     ("LANDING", "submitted"): _SUBMIT,
     ("VALIDATE", "submitted"): _SUBMIT,
 
-    ("SNAPSHOT", "ok"): [("always", "VALIDATE", "", "")],
+    ("SNAPSHOT", "ok"): [("ready_for_sync", "SYNC", "", ""), (_ON, "VALIDATE", "", "")],
     ("SNAPSHOT", "bad_request"): [("always", "REJECTED", "bad_request", "")],
     ("SNAPSHOT", "unchanged"): [("always", "REJECTED", "no_change", "")],
     ("SNAPSHOT", "violation"): [("always", "REJECTED", "export_rejected", "")],
@@ -226,6 +226,13 @@ class TestTable(unittest.TestCase):
         self.assertFalse(S.transition(S.PUBLISH, "published", S.SliceCtx()).wakes_owner)
         self.assertTrue(S.transition(S.VALIDATE, "fail", S.SliceCtx()).wakes_owner)
 
+    def test_snapshot_ok_routes(self):
+        # no unmerged parent: onto develop first, so the validator runs once
+        for ctx, want in ((S.SliceCtx(), S.SYNC),
+                          (S.SliceCtx(builds_on=1, parent_merged=True), S.SYNC),
+                          (S.SliceCtx(builds_on=1), S.VALIDATE)):
+            self.assertEqual(S.transition(S.SNAPSHOT, "ok", ctx).state, want, ctx)
+
     def test_validate_pass_routes(self):
         for ctx, want in ((S.SliceCtx(), S.SYNC),
                           (S.SliceCtx(builds_on=1), S.WAIT_PARENT),
@@ -338,7 +345,7 @@ class BookCase(unittest.TestCase):
     def to_landing(self, number):
         self.walk(number, "submitted", "ok")
         self.book.set_candidate(number, f"{number:040x}", "t" * 40, "b" * 40)
-        return self.walk(number, "pass", "up_to_date", "pass", "published")
+        return self.walk(number, "up_to_date", "pass", "published")
 
 
 class TestBook(BookCase):
@@ -363,7 +370,7 @@ class TestBook(BookCase):
             self.assertEqual(again.get(n).status(), self.book.get(n).status())
         s1 = again.get(1)
         self.assertEqual((s1.state, s1.ctx.round, s1.ctx.round_budget, s1.ctx.published, s1.pr),
-                         (S.VALIDATE, 2, 1, True, 4242))
+                         (S.SYNC, 2, 1, True, 4242))
         self.assertEqual(s1.candidate, "c" * 40)
         self.assertEqual((s1.status()["round"], s1.status()["commit"], s1.status()["tree"]),
                          (2, "c" * 40, "d" * 40))
@@ -424,12 +431,46 @@ class TestBook(BookCase):
         self.walk(2, "checks_failed", "submitted")
         self.assertEqual(self.book.get(2).ctx.wakes, S.DEFAULT_WAKE_BUDGET)
 
+    def test_sync_keeps_the_snapshot_of_the_round_and_children_stand_on_it(self):
+        self.walk(1, "submitted", "ok")
+        with self.assertRaises(ValueError):                                 # nothing to sync yet
+            self.book.set_candidate(1, "c" * 40, "2" * 40, "d" * 40, synced=True)
+        self.book.set_candidate(1, "a" * 40, "1" * 40, "b" * 40)            # the snapshot
+        self.book.set_candidate(1, "c" * 40, "2" * 40, "d" * 40, synced=True)   # what SYNC made
+        want = {"commit": "c" * 40, "tree": "2" * 40, "parent": "d" * 40,
+                "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40}
+        again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
+        for book in (self.book, again):
+            self.assertEqual(book.get(1).candidates[1], want)
+            self.assertEqual(book.get(1).status()["commit"], "c" * 40)
+            parent = S.resolve_parent(book, 2, "b" * 40, 1, lambda sha: True)
+            self.assertEqual(parent, S.Parent("a" * 40, 1))
+            with self.assertRaises(S.BadRequest):               # the base must be on develop
+                S.resolve_parent(book, 2, "9" * 40, 1, lambda sha: False)
+        # a new round starts from its own snapshot
+        self.walk(1, "rebased", "fail", "submitted", "ok")
+        self.book.set_candidate(1, "e" * 40, "3" * 40, "d" * 40)
+        self.assertEqual(self.book.get(1).candidates[2]["snap_commit"], "e" * 40)
+
+    def test_candidate_records_of_an_older_supervisor_keep_the_first_of_a_round_as_the_snapshot(self):
+        self.walk(1, "submitted", "ok")
+        self.run.append("slice_candidate", slice=1, round=1, commit="a" * 40, tree="1" * 40,
+                        parent="b" * 40)                                   # its snapshot
+        self.run.append("slice_candidate", slice=1, round=1, commit="c" * 40, tree="2" * 40,
+                        parent="d" * 40)                                   # its SYNC
+        again = S.SliceBook(state.RunDir("epic-900-test", base=self.tmp / "runs"))
+        self.assertEqual(again.get(1).candidates[1],
+                         {"commit": "c" * 40, "tree": "2" * 40, "parent": "d" * 40,
+                          "snap_commit": "a" * 40, "snap_tree": "1" * 40, "snap_parent": "b" * 40})
+        self.assertEqual(S.resolve_parent(again, 2, "9" * 40, 1, lambda sha: True),
+                         S.Parent("a" * 40, 1))
+
     def test_published_slice_merges_while_a_later_round_is_on_its_way(self):
         # the pull request of round 1 merges in every state round 2 passes through
-        stops = [("submitted",), ("submitted", "ok"), ("submitted", "ok", "pass"),
-                 ("submitted", "ok", "pass", "up_to_date", "pass"),
+        stops = [("submitted",), ("submitted", "ok"), ("submitted", "ok", "up_to_date"),
+                 ("submitted", "ok", "up_to_date", "pass"),
                  ("submitted", "violation")]
-        want = [S.SNAPSHOT, S.VALIDATE, S.SYNC, S.PUBLISH, S.REJECTED]
+        want = [S.SNAPSHOT, S.SYNC, S.VALIDATE, S.PUBLISH, S.REJECTED]
         for n, (events, state_) in enumerate(zip(stops, want), start=1):
             self.to_landing(n)
             self.walk(n, *events)
@@ -464,7 +505,7 @@ class TestBook(BookCase):
         self.book.take(3, "merged")
         self.book.take(4, "submitted", builds_on=3)                # merged: as if not given
         self.assertEqual((self.book.get(4).ctx.builds_on, self.book.get(4).ctx.parent_round), (0, 0))
-        self.assertEqual(self.walk(4, "ok", "pass").state, S.SYNC)
+        self.assertEqual(self.walk(4, "ok").state, S.SYNC)
         self.to_landing(5)
         self.book.take(5, "closed")
         with self.assertRaises(ValueError):
@@ -548,7 +589,7 @@ class TestParentCascade(BookCase):
         self.walk(2, "submitted", builds_on=1)                    # 2 is in SNAPSHOT
         self.assertEqual(self.book.take(1, "merged").cascade, [])
         self.assertTrue(self.book.get(2).ctx.parent_merged)
-        self.assertEqual(self.walk(2, "ok", "pass").state, S.SYNC)
+        self.assertEqual(self.walk(2, "ok").state, S.SYNC)
         self.to_landing(3)
         self.walk(4, "submitted", builds_on=3)
         self.book.take(3, "checks_failed")
@@ -557,7 +598,7 @@ class TestParentCascade(BookCase):
 
     def test_parent_failed_makes_child_stale(self):
         self.child_waiting()
-        self.walk(1, "checks_failed", "submitted", "ok", "pass", "up_to_date", "pass")
+        self.walk(1, "checks_failed", "submitted", "ok", "up_to_date", "pass")
         self.assertEqual(self.book.get(2).state, S.STALE)          # new round of 1
         self.book.take(2, "submitted", builds_on=1)
         res = self.book.take(1, "step_failed")                     # 1 -> FAILED(publish)
@@ -566,11 +607,11 @@ class TestParentCascade(BookCase):
                          [(2, S.STALE, "parent_closed")])
 
     def test_budget_failure_of_parent_makes_child_stale(self):
-        self.walk(1, "submitted", "ok")
+        self.walk(1, "submitted", "ok", "up_to_date")
         self.book.set_candidate(1, "a" * 40, "t" * 40, "b" * 40)
-        self.walk(1, "fail", "submitted", "ok")
+        self.walk(1, "fail", "submitted", "ok", "up_to_date")
         self.book.set_candidate(1, "c" * 40, "t" * 40, "b" * 40)
-        self.walk(1, "fail", "submitted", "ok")
+        self.walk(1, "fail", "submitted", "ok", "up_to_date")
         self.book.set_candidate(1, "d" * 40, "t" * 40, "b" * 40)
         self.walk(2, "submitted", "ok", "pass", builds_on=1)       # waits on round 3 of 1
         self.book.take(1, "fail")
@@ -722,7 +763,7 @@ class TestParentCascade(BookCase):
     def test_reconcile_sends_a_failed_parent(self):
         self.to_landing(1)
         self.walk(2, "submitted", "ok", "pass", builds_on=1)
-        self.walk(1, "checks_failed", "submitted", "ok", "pass", "up_to_date", "pass")
+        self.walk(1, "checks_failed", "submitted", "ok", "up_to_date", "pass")
         self.book.take(2, "submitted", builds_on=1)
         self.walk(2, "ok", "pass")
         self.book.take(1, "step_failed")
