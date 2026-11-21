@@ -225,10 +225,28 @@ class SlicePullRequests(unittest.TestCase):
         self.assert_skip(r, "wakes the owner")
 
     def test_pass_removed_from_the_queue_twice_is_left_to_the_owner(self):
-        _, r = self.rec(raw_pr(comments=[review("PASS")]), eviction_count=1)
+        def kick(when):
+            return {"__typename": "RemovedFromMergeQueueEvent", "createdAt": when}
+        # one removal after the PASS (T1): enqueue again; two: the owner's
+        _, r = self.rec(raw_pr(comments=[review("PASS")], timeline=[kick(T2)]))
         self.assertEqual(r["action"], "enqueue_merge")
-        _, r = self.rec(raw_pr(comments=[review("PASS")]), eviction_count=2)
+        _, r = self.rec(raw_pr(comments=[review("PASS")], timeline=[kick(T2), kick(T2)]))
         self.assert_skip(r, "wakes the owner")
+
+    def test_the_pipelines_own_dequeue_is_not_counted_against_the_new_round(self):
+        """PASS of round 1 queued; round 2 pushed (commit T0b); the pipeline
+        dequeues it; round 2 gets its PASS at T2; then ONE real removal. The
+        dequeue came before the review of this head and is not a removal of
+        it, though it is after the head's commit date."""
+        def kick(when):
+            return {"__typename": "RemovedFromMergeQueueEvent", "createdAt": when}
+        t_commit, t_dequeue, t_pass, t_kick = (
+            "2026-11-19T10:10:00Z", "2026-11-19T10:20:00Z", "2026-11-19T10:30:00Z", "2026-11-19T10:40:00Z")
+        pr = raw_pr(comments=[review("PASS", when=T0, head=OLD_HEAD), review("PASS", when=t_pass)],
+                    commit_date=t_commit, timeline=[kick(t_dequeue), kick(t_kick)])
+        s, r = self.rec(pr)
+        self.assertEqual((s["eviction_count"], s["evictions_since_review"]), (2, 1))
+        self.assertEqual(r["action"], "enqueue_merge")
 
     def test_queued_with_no_verdict_was_enqueued_by_a_person_and_is_left_alone(self):
         """No verdict of the pipeline at all (the reviewer of a slice posts its
@@ -320,7 +338,7 @@ class SlicePullRequests(unittest.TestCase):
                         for evictions in (0, 2):
                             self.rec(raw_pr(rollup=rollup, merge_state=ms, mergeable=mergeable,
                                             comments=comments, auto_merge=auto),
-                                     eviction_count=evictions)
+                                     evictions_since_review=evictions)
 
     # ---- the supervisor's verdict pattern is the one copied here
 

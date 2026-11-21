@@ -4008,10 +4008,11 @@ Then take exactly ONE of these closing actions:
 - **PASS (zero findings)**: after the PASS comment is posted, enqueue with
   \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} --head ${pr_head_review}\`
   and NO story argument (a story argument adds a closing reference; that would
-  close the epic when this slice merges). If the command refuses (for example
-  \`head_moved_since_review\`: the owner pushed a new commit, which gets its own
-  review), post its output line as a second, plain comment and stop. Do not
-  retry and do not change the verdict.
+  close the epic when this slice merges). \`ENQUEUED\` or \`ALREADY_QUEUED\` in its
+  output: done. Anything else (a refusal such as \`head_moved_since_review\`: the
+  owner pushed a new commit, which gets its own review; or a failure): post its
+  output line as a second, plain comment and stop. Do not retry and do not change
+  the verdict.
 - **FAIL**: nothing after the comment.
 - **WAIT (CI pending)**: do what the agent definition says for WAIT. Whatever you
   post then must NOT contain a \`Reviewed head:\` line: nothing was reviewed.

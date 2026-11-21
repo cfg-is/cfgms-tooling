@@ -2630,8 +2630,11 @@ def _slice_review_rec(pr, in_queue):
                        f"{where}, but the newest review verdict is not a PASS of its head commit — "
                        f"{dequeue}; the next cycle reviews the commit")
         # No verdict from the pipeline at all: a person enqueued it (the
-        # reviewer of a slice posts its verdict before it enqueues).
-        return rec("skip", f"{where} with no review verdict: enqueued by a person; left alone")
+        # reviewer of a slice posts its verdict before it enqueues). The
+        # pipeline cannot know which commit that person meant, so it also
+        # leaves a round alone that the owner pushes afterwards.
+        return rec("skip", f"{where} with no review verdict: enqueued by a person; the pipeline "
+                           "neither reviews nor dequeues it, also not after a new round")
     if closes:
         return rec("skip", f"its body closes {closes} at the merge; a slice must close nothing (the "
                            f"epic audit closes the epic) — {person}")
@@ -2657,9 +2660,10 @@ def _slice_review_rec(pr, in_queue):
             return rec("skip", f"acceptance review FAILED — {woken}")
         return rec("skip", "acceptance review FAILED, but the comment is not in the form the supervisor "
                            f"reads (the marker line first, then the heading) — {person}")
-    if pr.get("eviction_count", 0) >= 2:
-        return rec("skip", f"reviewed PASS but removed from the merge queue {pr['eviction_count']}x on "
-                           f"this commit — {woken}")
+    kicks = pr.get("evictions_since_review", 0)
+    if kicks >= 2:
+        return rec("skip", f"reviewed PASS but removed from the merge queue {kicks}x since that "
+                           f"review — {woken}")
     if overall == "red":
         if pr.get("failed_run_attempt", 1) <= 1:
             return rec("rerun_failed_checks", "reviewed PASS but its checks failed (attempt 1) — one "
@@ -2960,6 +2964,11 @@ def _build_pr_summaries(prs):
             "latest_review_head": review_head,
             "latest_review_landing_verdict": review_landing_verdict,
             "closing_issue_numbers": [n for n in pr.get("closing_issue_numbers", []) if isinstance(n, int)],
+            # Queue removals after the latest verdict comment. For a slice:
+            # the pipeline's own dequeue of an unreviewed head comes before
+            # that head's review, so it is not counted against the head.
+            "evictions_since_review": count_merge_queue_evictions(
+                pr.get("timeline_items", []), review_comment_date),
             "latest_commit_date": pr.get("latest_commit_date"),
             "is_draft": is_draft,
             "wip_session_failed": wip_session_failed,

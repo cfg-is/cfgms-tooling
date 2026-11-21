@@ -1598,7 +1598,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       done
       if [ "$state" != "queued" ]; then
         if gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1; then
-          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed)"
+          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed; a queue entry, if there is one, stays)"
         else
           echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
         fi
