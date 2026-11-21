@@ -146,7 +146,7 @@ _REASON_TEXT = {
                      "A new round is needed only when the cause is in this slice; a re-enqueue "
                      "is done by the pipeline, not by you"),
     "conflicting": ("its pull request conflicts with develop. Fetch origin/develop, merge it, "
-                    "and submit the slice again with the new --base"),
+                    "commit the merge, and submit the slice again"),
     "interrupted": "the supervisor restarted while it took the snapshot. Submit this slice again",
     "branch_moved": "its branch on GitHub is not what the supervisor pushed. Read {dir}/rejected.md",
     "withdrawn": "slice-submit gave up waiting before the snapshot was done. Submit this slice again",

@@ -46,18 +46,48 @@ class Case(unittest.TestCase):
         self.claim.write_text("# Slice 1\nDelivers the thing.\n")
         self.secret = self.tmp / "host-secret"
         self.secret.write_text("HOST-SECRET-VALUE\n")
+        # The owner's workspace: a branch that starts at the develop commit.
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+        self.git("init", "-q", "-b", "feature/epic")
+        (self.ws / "a.txt").write_text("one\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "develop 0")
+        self.base = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/develop", self.base)
+
+    def git(self, *args, check=True):
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(self.tmp))
+        proc = subprocess.run(["/usr/bin/git", "-C", str(self.ws), "-c", "user.name=t",
+                               "-c", "user.email=t@t", *args], env=env, capture_output=True, text=True)
+        if check and proc.returncode != 0:
+            self.fail(f"git {args}: {proc.stderr}")
+        return proc.stdout.strip()
+
+    def develop_moves(self, path="d.txt", text="develop\n"):
+        """A new commit on origin/develop that the workspace has fetched and
+        not merged. Returns its id."""
+        self.git("checkout", "-q", "--detach", "refs/remotes/origin/develop")
+        (self.ws / path).write_text(text)
+        self.git("add", path)
+        self.git("commit", "-qm", f"develop: {path}")
+        new = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/develop", new)
+        self.git("checkout", "-q", "feature/epic")
+        return new
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def command(self, *args, wait=20):
-        env = dict(os.environ, CFGMS_FSM_OUT=str(self.out), CFGMS_FSM_CONTEXT=str(self.ctx))
+        env = dict(os.environ, CFGMS_FSM_OUT=str(self.out), CFGMS_FSM_CONTEXT=str(self.ctx),
+                   CFGMS_FSM_WORKSPACE=str(self.ws), GIT_CONFIG_NOSYSTEM="1", HOME=str(self.tmp))
         return subprocess.Popen([sys.executable, "-I", str(COMMAND), "--wait", str(wait), *args],
                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def std_args(self, slice_no=1, **over):
         a = {"--slice": str(slice_no), "--claim": str(self.claim),
-             "--subject": "fsm: add the thing", "--base": BASE}
+             "--subject": "fsm: add the thing"}
         a.update(over)
         return [x for kv in a.items() for x in kv]
 
@@ -83,7 +113,8 @@ class Case(unittest.TestCase):
         return d
 
     def req(self, slice_no=1, **over):
-        r = {"slice": slice_no, "request_id": RID, "base": BASE, "builds_on": 0}
+        r = {"slice": slice_no, "request_id": RID, "base": BASE, "base_from": "git",
+             "builds_on": 0}
         r.update(over)
         return r
 
@@ -94,7 +125,7 @@ class TestCommandAndReader(Case):
         (r,) = self.wait_for_request()
         self.assertIsInstance(r, submit.Request)
         self.assertEqual((r.dirname, r.slice, r.base, r.builds_on, r.subject),
-                         ("1-1", 1, BASE, 0, "fsm: add the thing"))
+                         ("1-1", 1, self.base, 0, "fsm: add the thing"))
         self.assertEqual(r.claim, self.claim.read_text())
         self.assertIsNone(p.poll(), "the command must wait for the answer")
         submit.write_answer(self.ctx, 1, r.request_id, accepted=True, round_no=1, files=42)
@@ -170,8 +201,6 @@ class TestCommandAndReader(Case):
         bad = [
             self.std_args(slice_no=0),
             self.std_args(slice_no=1000),
-            self.std_args(**{"--base": "abc123"}),
-            self.std_args(**{"--base": "A" * 40}),
             self.std_args(**{"--subject": "No Scope Here"}),
             self.std_args(**{"--subject": "fsm: a\nFixes #1"}),
             self.std_args(**{"--subject": "fsm: " + "x" * 150}),
@@ -179,7 +208,7 @@ class TestCommandAndReader(Case):
             self.std_args(**{"--claim": str(big)}),
             self.std_args(**{"--claim": str(empty)}),
             self.std_args() + ["--builds-on", "1"],          # itself
-            self.std_args()[:-2],                            # no --base
+            self.std_args()[:-2],                            # no --subject
         ]
         for args in bad:
             p = self.command(*args, wait=1)
@@ -191,6 +220,86 @@ class TestCommandAndReader(Case):
         self.request_dir(".1-abc.tmp", request=self.req())
         s = submit.scan(self.out)
         self.assertEqual((s.requests, s.ignored, s.problem), ([], [], ""))
+
+
+class TestBaseFromGit(Case):
+    """The base of a request is what git in the workspace says, never what
+    the owner types. The supervisor measures the slice against it."""
+
+    def submitted(self, *extra):
+        """(base in the request, what the command printed) of one accepted submit."""
+        p = self.command(*self.std_args(), *extra)
+        (r,) = self.wait_for_request()
+        submit.write_answer(self.ctx, 1, r.request_id, accepted=True, round_no=1)
+        out, err = p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 0, err)
+        return r.base, out + err
+
+    def refused_by_the_command(self, text):
+        p = self.command(*self.std_args(), wait=1)
+        _, err = p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 2, err)
+        self.assertIn(text, err)
+        self.assertIn("No request was sent.", err)
+        self.assertFalse((self.out / "submit").exists() and any((self.out / "submit").iterdir()))
+
+    def test_develop_moved_and_the_workspace_did_not_merge_it(self):
+        self.develop_moves()
+        (self.ws / "mine.txt").write_text("work, not committed\n")
+        self.assertEqual(self.submitted()[0], self.base)
+
+    def test_a_committed_merge_of_develop_moves_the_base(self):
+        (self.ws / "mine.txt").write_text("work\n")
+        self.git("add", "mine.txt")
+        self.git("commit", "-qm", "work")
+        new = self.develop_moves()
+        self.git("merge", "-q", "--no-edit", "refs/remotes/origin/develop")
+        self.assertEqual(self.submitted()[0], new)
+        newer = self.develop_moves("e.txt")                  # fetched, not merged
+        self.assertNotEqual(newer, new)
+        self.assertEqual(self.submitted()[0], new)
+
+    def test_a_typed_base_is_not_used(self):
+        new = self.develop_moves()
+        base, text = self.submitted("--base", new)
+        self.assertEqual(base, self.base)
+        self.assertIn(f"--base {new[:12]} is not used. /workspace is built on origin/develop "
+                      f"commit {self.base[:12]}", text)
+        _, text = self.submitted("--base", self.base)
+        self.assertNotIn("is not used", text)
+
+    def test_a_merge_that_is_not_finished_is_refused(self):
+        (self.ws / "a.txt").write_text("mine\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "work")
+        self.develop_moves("a.txt", "theirs\n")
+        self.git("merge", "-q", "--no-edit", "refs/remotes/origin/develop", check=False)
+        self.assertTrue(self.git("rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        self.refused_by_the_command("a merge in")
+        # the conflict is repaired and the merge is not committed: the same
+        (self.ws / "a.txt").write_text("both\n")
+        self.git("add", "a.txt")
+        self.refused_by_the_command("a merge in")
+        self.git("commit", "-qm", "merge develop")
+        self.assertEqual(self.submitted()[0], self.git("rev-parse", "refs/remotes/origin/develop"))
+
+    def test_a_workspace_with_no_origin_develop_is_refused(self):
+        self.git("update-ref", "-d", "refs/remotes/origin/develop")
+        self.refused_by_the_command("has no origin/develop")
+
+    def test_a_workspace_that_is_no_git_repository_is_refused(self):
+        shutil.rmtree(self.ws / ".git")
+        self.refused_by_the_command("has no HEAD commit")
+
+    def test_the_reader_takes_only_a_base_that_was_read_from_git(self):
+        old_tool = self.req()
+        del old_tool["base_from"]
+        self.request_dir("1-1", request=old_tool)
+        self.request_dir("2-1", request=self.req(2, base_from="owner", request_id="f" * 32))
+        got = submit.scan(self.out).requests
+        self.assertEqual([type(r) for r in got], [submit.Refused, submit.Refused])
+        for r in got:
+            self.assertIn("this slice-submit is an old version", r.reason)
 
 
 class TestReaderIsSafe(Case):
@@ -260,8 +369,8 @@ class TestReaderIsSafe(Case):
         cases = [
             (self.req(2), "request.json names a different slice than its directory"),
             (self.req(True), "request.json names a different slice than its directory"),
-            (self.req(base="abc"), "--base must be a full 40-character commit id"),
-            (self.req(base=BASE + "\n"), "--base must be a full 40-character commit id"),
+            (self.req(base="abc"), "the base must be a full 40-character commit id"),
+            (self.req(base=BASE + "\n"), "the base must be a full 40-character commit id"),
             (self.req(builds_on="2"), "--builds-on must be a slice number"),
             (self.req(builds_on=-1), "--builds-on must be a slice number"),
             (self.req(builds_on=True), "--builds-on must be a slice number"),

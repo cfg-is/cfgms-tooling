@@ -2,7 +2,7 @@
 """slice-submit: hand one slice of the epic to the supervisor.
 
     slice-submit --slice <n> --claim <file> --subject "<scope>: <what changed>" \\
-                 --base <develop commit> [--builds-on <m>]
+                 [--builds-on <m>]
 
 "Take my workspace as it is now." The command writes a request under
 /fsm/out/submit/ and waits until the supervisor has copied /workspace. Do not
@@ -12,8 +12,13 @@ change /workspace, and let every helper finish, before this command returns.
                round of that slice.
   --claim      a file that says what this slice delivers (at most 64 KiB)
   --subject    the commit subject, without an issue reference
-  --base       the full origin/develop commit id the workspace is built on
   --builds-on  an earlier slice this one needs, while that slice is not merged
+
+The command reads from git which origin/develop commit /workspace is built on
+(`git merge-base HEAD origin/develop`) and sends it with the request. To bring
+in newer develop commits, merge origin/develop and commit the merge before
+you submit. A merge that is not finished is refused. `--base` is still
+accepted and is not used.
 
 Exit code: 0 the supervisor took the snapshot; 1 it refused the request (the
 reason is printed); 2 wrong arguments; 3 no answer inside the time limit.
@@ -26,12 +31,15 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
 
 OUT = os.environ.get("CFGMS_FSM_OUT") or "/fsm/out"
 CONTEXT = os.environ.get("CFGMS_FSM_CONTEXT") or "/fsm/context"
+WORKSPACE = os.environ.get("CFGMS_FSM_WORKSPACE") or "/workspace"
+DEVELOP_REF = "refs/remotes/origin/develop"
 CLAIM_CAP = 64 * 1024
 SUBJECT_MAX_CHARS = 150
 DEFAULT_WAIT_SECS = 900
@@ -43,13 +51,49 @@ def fail(code, text):
     sys.exit(code)
 
 
+def git(*args):
+    """(exit code, stdout) of git in the workspace."""
+    try:
+        proc = subprocess.run(["git", "-C", WORKSPACE, *args], capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(2, f"cannot run git in {WORKSPACE}: {exc}")
+    return proc.returncode, proc.stdout.decode("utf-8", "replace").strip()
+
+
+def workspace_base():
+    """The origin/develop commit the workspace is built on, read from git.
+
+    It is an ancestor of HEAD, so the work tree started from a commit that
+    holds all of develop up to it. The supervisor measures the slice against
+    it; a base that is newer than the workspace would make the slice undo
+    develop commits, and that cannot come from here."""
+    code, _ = git("rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if code != 0:
+        fail(2, f"{WORKSPACE} has no HEAD commit that git can read. No request was sent.")
+    for name, what in (("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick"),
+                       ("REVERT_HEAD", "revert"), ("REBASE_HEAD", "rebase")):
+        code, _ = git("rev-parse", "--verify", "-q", name)
+        if code == 0:
+            fail(2, f"a {what} in {WORKSPACE} is not finished. Finish it and commit it (or "
+                    f"abort it), then submit again. No request was sent.")
+    code, _ = git("rev-parse", "--verify", "-q", DEVELOP_REF + "^{commit}")
+    if code != 0:
+        fail(2, f"{WORKSPACE} has no origin/develop (git fetch origin develop). "
+                f"No request was sent.")
+    code, base = git("merge-base", "HEAD", DEVELOP_REF)
+    if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", base):
+        fail(2, f"HEAD of {WORKSPACE} has no common commit with origin/develop. "
+                f"No request was sent.")
+    return base
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="slice-submit", add_help=True,
                                  description="Hand one slice of the epic to the supervisor.")
     ap.add_argument("--slice", type=int, required=True)
     ap.add_argument("--claim", required=True)
     ap.add_argument("--subject", required=True)
-    ap.add_argument("--base", required=True)
+    ap.add_argument("--base", default="", help="not used: the base is read from git")
     ap.add_argument("--builds-on", type=int, default=0)
     ap.add_argument("--wait", type=int, default=DEFAULT_WAIT_SECS,
                     help="seconds to wait for the supervisor (default %(default)s)")
@@ -59,8 +103,6 @@ def main(argv=None):
         fail(2, "--slice must be a number from 1 to 999")
     if not 0 <= args.builds_on <= 999 or args.builds_on == args.slice:
         fail(2, "--builds-on must be the number of another slice")
-    if not re.fullmatch(r"[0-9a-f]{40}", args.base):
-        fail(2, "--base must be a full 40-character commit id (git rev-parse origin/develop)")
     subject = args.subject.strip()
     if "\n" in subject or not re.fullmatch(r"[a-z0-9][a-z0-9/_.-]*: \S.*", subject):
         fail(2, '--subject must be one line of the form "<scope>: <what changed>"')
@@ -78,6 +120,12 @@ def main(argv=None):
     if not claim.strip():
         fail(2, "--claim is empty")
 
+    base = workspace_base()
+    if args.base and args.base != base:
+        print(f"slice-submit: --base {args.base[:12]} is not used. /workspace is built on "
+              f"origin/develop commit {base[:12]} (git merge-base HEAD origin/develop). To "
+              f"build on a newer one, merge origin/develop and commit the merge.", flush=True)
+
     request_id = uuid.uuid4().hex
     submit_dir = os.path.join(OUT, "submit")
     try:
@@ -93,8 +141,8 @@ def main(argv=None):
     with open(os.path.join(tmp, "subject.txt"), "w", encoding="utf-8") as fh:
         fh.write(subject + "\n")
     with open(os.path.join(tmp, "request.json"), "w", encoding="utf-8") as fh:
-        json.dump({"slice": args.slice, "request_id": request_id, "base": args.base,
-                   "builds_on": args.builds_on}, fh)
+        json.dump({"slice": args.slice, "request_id": request_id, "base": base,
+                   "base_from": "git", "builds_on": args.builds_on}, fh)
     final = None
     for k in range(1, 10000):
         candidate = os.path.join(submit_dir, f"{args.slice}-{k}")

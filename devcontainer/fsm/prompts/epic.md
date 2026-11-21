@@ -48,7 +48,7 @@ by itself: it builds, its tests pass, and it can merge alone.
 
    ```
    slice-submit --slice <n> --claim <file> --subject "<scope>: <what changed>" \
-                --base <origin/develop commit> [--builds-on <m>]
+                [--builds-on <m>]
    ```
 
    It means "take my workspace as it is now". Do not change `/workspace`
@@ -57,11 +57,12 @@ by itself: it builds, its tests pass, and it can merge alone.
    validation in a clean container, and opens the pull request. You keep
    working meanwhile.
 
-`--base` is the full `origin/develop` commit id your workspace is built on:
-the last one you merged in (`git merge-base HEAD origin/develop`; commit a
-merge of `develop` before you read it). A fetch alone does not change it. A
-base that is newer than your workspace makes the slice undo the `develop`
-commits you did not merge. Use `--builds-on <m>` when
+The command reads from git which `origin/develop` commit your workspace is
+built on (`git merge-base HEAD origin/develop`). The slice is measured
+against that commit. You do not give it; `--base` is not used. To build on
+a newer `develop` commit, run `git fetch origin develop`, merge
+`origin/develop`, and commit the merge. A fetch alone changes nothing. The
+command refuses while a merge is not committed. Use `--builds-on <m>` when
 this slice needs slice `m` and slice `m` has not merged: the slice is then
 validated at once on top of slice `m`, and published after slice `m` merges.
 

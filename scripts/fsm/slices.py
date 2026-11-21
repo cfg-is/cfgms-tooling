@@ -30,7 +30,7 @@ book from the file. The story-run reader (`RunDir.last_transition`) only
 reads `transition` records and does not see them.
 
 Parent rule. `resolve_parent()` decides what a slice's diff is measured
-against: the `--base` commit, or the candidate commit of the current round of
+against: the base commit, or the snapshot commit of the current round of
 the slice it builds on while that slice has not merged.
 
 Parent events. `parent_merged`, `parent_new_round` and `parent_closed` are
@@ -349,16 +349,17 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
                                        (what the owner built, not what SYNC made
                                        of it); the base must be on develop. The
                                        caller brings that commit onto the base
-                                       when the base is not in it.
+                                       when the base is newer.
       builds_on m, m already merged -> as if builds_on was not given
 
-    Every value of the request comes from the owner. A value of the wrong
+    Every value of the request comes from the owner container (the base is
+    what slice-submit read from git in the workspace). A value of the wrong
     type is a BadRequest like any other wrong value.
     """
     if not _is_slice_number(slice_no):
         raise BadRequest("the slice number must be a number from 1 to 999")
     if not isinstance(base, str) or not _SHA_RE.fullmatch(base):
-        raise BadRequest("--base must be a full 40-character commit id")
+        raise BadRequest("the base must be a full 40-character commit id")
     if builds_on is None:
         builds_on = 0
     if builds_on != 0 and not _is_slice_number(builds_on):
@@ -394,10 +395,10 @@ def resolve_parent(book, slice_no, base, builds_on, is_on_develop):
             # workspace against "slice m on this base", and it builds that
             # from the owner's own tree of slice m.
             if not is_on_develop(base):
-                raise BadRequest(f"--base {base[:12]} is not a commit on origin/develop")
+                raise BadRequest(f"the base {base[:12]} is not a commit on origin/develop")
             return Parent(cand["snap_commit"], builds_on)
     if not is_on_develop(base):
-        raise BadRequest(f"--base {base[:12]} is not a commit on origin/develop")
+        raise BadRequest(f"the base {base[:12]} is not a commit on origin/develop")
     return Parent(base, 0)
 
 

@@ -97,19 +97,83 @@ def develop_tip():
     return proc.stdout.decode().split("\t")[0]
 
 
+def agent_git(ws, *args, check=True):
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(STATE))
+    return subprocess.run([REAL_GIT, "-C", str(ws), *args], capture_output=True, env=env,
+                          check=check)
+
+
+def built_on(ws, base):
+    """The plans write the files of a develop merge with `write`. This makes
+    the git history of the workspace say the same: HEAD is `base` (the
+    develop commit the owner merged up to), the files stay as they are.
+    slice-submit reads the base from this history."""
+    agent_git(ws, "fetch", "-q", "--no-tags", os.environ["FSM_FAKE_REMOTE"],
+              "+refs/heads/*:refs/remotes/origin/*")
+    if len(base) != 40:
+        # a name in the remote, for a commit the plan cannot know: "develop~1"
+        base = subprocess.run([REAL_GIT, "-C", os.environ["FSM_FAKE_REMOTE"], "rev-parse", base],
+                              capture_output=True, check=True).stdout.decode().strip()
+    agent_git(ws, "reset", "-q", "--soft", base)
+
+
+def raw_submit(act, out, ctx):
+    """A request that slice-submit cannot write: the plan gives the base.
+    The answer of the supervisor goes to the log like a slice-submit run."""
+    import uuid
+    rid = uuid.uuid4().hex
+    d = out / "submit" / f".{act['slice']}-{rid}.tmp"
+    d.mkdir(parents=True)
+    (d / "claim.md").write_text("The slice delivers the change.\n")
+    (d / "subject.txt").write_text("src: change\n")
+    (d / "request.json").write_text(json.dumps(
+        {"slice": act["slice"], "request_id": rid, "base": act["base"], "base_from": "git",
+         "builds_on": act.get("builds_on", 0)}))
+    final = out / "submit" / f"{act['slice']}-{act.get('k', 99)}"
+    os.rename(d, final)
+    answer_file = ctx / "slices" / str(act["slice"]) / "submitted.json"
+    end = time.time() + 60
+    while time.time() < end:
+        try:
+            answer = json.loads(answer_file.read_text())
+        except (OSError, ValueError):
+            answer = {}
+        if answer.get("request_id") == rid:
+            subprocess.run(["rm", "-rf", str(final)])
+            log({"tool": "slice-submit", "slice": act["slice"],
+                 "exit": 0 if answer.get("accepted") else 1,
+                 "output": "snapshot taken" if answer.get("accepted")
+                           else f"REFUSED: {answer.get('reason')}"})
+            return
+        time.sleep(0.1)
+    log({"tool": "slice-submit", "slice": act["slice"], "exit": 3, "output": "no answer"})
+
+
 def submit(act, ws, out, ctx):
     """The owner runs the real slice-submit. Its exit code and output go to
     the log; "expect" (default 0) is the exit code the plan expects, and a
-    different one fails the turn (exit 97) so a test cannot miss it."""
+    different one fails the turn (exit 97) so a test cannot miss it.
+
+    "base" is the develop commit the workspace is built on (default: the
+    develop tip). "git": "keep" leaves the git history of the workspace as
+    the turn made it."""
+    if act.get("git") != "keep":
+        built_on(ws, act.get("base") or develop_tip())
     claim = ws.parent / f"claim-{os.getpid()}.md"
     claim.write_text(act.get("claim", "The slice delivers the change.\n"))
     argv = [sys.executable, str(SLICE_SUBMIT), "--slice", str(act["slice"]), "--claim", str(claim),
-            "--subject", act.get("subject", "src: change"), "--base", act.get("base") or develop_tip(),
-            "--wait", str(act.get("wait", 60))]
+            "--subject", act.get("subject", "src: change"), "--wait", str(act.get("wait", 60))]
+    if act.get("flag_base"):
+        # what an owner types; slice-submit does not use it
+        argv += ["--base", develop_tip() if act["flag_base"] == "tip" else act["flag_base"]]
     if act.get("builds_on"):
         argv += ["--builds-on", str(act["builds_on"])]
     proc = subprocess.run(argv, capture_output=True,
-                          env=dict(os.environ, CFGMS_FSM_OUT=str(out), CFGMS_FSM_CONTEXT=str(ctx)))
+                          env=dict(os.environ, CFGMS_FSM_OUT=str(out), CFGMS_FSM_CONTEXT=str(ctx),
+                                   CFGMS_FSM_WORKSPACE=str(ws), GIT_CONFIG_NOSYSTEM="1",
+                                   HOME=str(STATE),
+                                   # the owner's git, not the supervisor's logged one
+                                   PATH="/usr/bin:" + os.environ.get("PATH", "")))
     claim.unlink()
     log({"tool": "slice-submit", "slice": act["slice"], "exit": proc.returncode,
          "output": (proc.stdout + proc.stderr).decode()})
@@ -188,8 +252,15 @@ def apply_agent(actions, ws, out, sess=None, ctx=None, private=None):
             (hooks / "pre-commit").write_text("#!/bin/sh\necho PWNED > /dev/null\n")
             with open(ws / ".git" / "config", "a") as fh:
                 fh.write("[core]\n\tfsmonitor = /bin/false\n")
+        elif op == "git":
+            # the owner runs git in its workspace: {"op": "git", "args": [...]}
+            proc = agent_git(ws, *act["args"], check=False)
+            log({"tool": "git", "args": act["args"], "exit": proc.returncode,
+                 "output": (proc.stdout + proc.stderr).decode("utf-8", "replace")})
         elif op == "sleep":
             time.sleep(float(act["secs"]))
+        elif op == "raw_submit":
+            raw_submit(act, out, ctx)
         elif op == "submit":
             code = submit(act, ws, out, ctx) or code
         elif op == "wait_pr":

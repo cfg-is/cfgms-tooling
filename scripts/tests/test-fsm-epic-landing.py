@@ -161,7 +161,7 @@ class TestLanding(EpicCase):
         head = self.f.remote_head("feature/epic-900-slice-1")
         self.set_pr(pr["number"], rollup="FAILURE", rollupOid=head)
         self.wait_for("two refused submits", lambda: len(self.submits()) == 3)
-        self.assertIn("no change since this slice's last snapshot. Slice 1 stays NEEDS_OWNER.",
+        self.assertIn("no change since this slice's last snapshot. Slice 1 stays NEEDS_OWNER: round",
                       self.submits()[1]["output"])
         self.assertEqual((self.status(1)["state"], self.status(1)["round"], self.status(1)["rounds_left"]),
                          ("NEEDS_OWNER", 1, 2))
