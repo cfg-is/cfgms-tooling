@@ -467,7 +467,8 @@ class TestTexts(unittest.TestCase):
     def test_merged_and_closed(self):
         self.assertEqual(O.slice_event_text(1, 2, S.MERGED, commit="a" * 40),
                          f"slice 1: MERGED (merged as {'a' * 40}). "
-                         "Fetch origin/develop before the next submit.")
+                         "Before the next submit: commit your work, fetch origin/develop, merge it, "
+                         "commit the merge.")
         self.assertIn("(merged)", O.slice_event_text(1, 2, S.MERGED, commit="$(reboot)"))
         self.assertEqual(O.slice_event_text(1, 2, S.CLOSED, pr=12),
                          "slice 1: CLOSED (its pull request #12 was closed without a merge).")

@@ -165,8 +165,8 @@ def slice_event_text(number, rnd, state, reason="", pr=0, commit=""):
             if reason in ("earlier_round_merged", "earlier_round_closed") else "")
     if state == S.MERGED:
         tail = f"merged as {commit[:40]}" if _is_sha(commit) else "merged"
-        return (f"slice {int(number)}: MERGED ({tail}). Fetch origin/develop before the "
-                f"next submit.{late}")
+        return (f"slice {int(number)}: MERGED ({tail}). Before the next submit: commit your "
+                f"work, fetch origin/develop, merge it, commit the merge.{late}")
     if state == S.CLOSED:
         return (f"slice {int(number)}: CLOSED (its pull request #{int(pr)} was closed "
                 f"without a merge).{late}")

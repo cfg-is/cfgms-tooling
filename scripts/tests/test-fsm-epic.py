@@ -149,8 +149,8 @@ class TestEpicRun(EpicCase):
         return {"op": "git", "args": list(args)}
 
     def test_real_git_a_slice_of_the_owner_merged_and_the_next_submit_needs_a_merge(self):
-        # Slice 1 merges: develop has a.go, and so has the workspace, with no
-        # merge in git. slice-submit sends nothing until the owner merges.
+        # Slice 1 merges. The owner fetches develop and does not merge it:
+        # slice-submit sends nothing until the owner merges.
         self.f.plan({"owner": [
             [write("src/a.go", "package src\n// a\n"), submit(1, git="keep")],
             [self.g("add", "-A"), self.g("commit", "-qm", "slice 1"), self.fetch(),
@@ -165,7 +165,7 @@ class TestEpicRun(EpicCase):
         dev = self.f.remote_head("develop")
         pr2 = self.wait_pr(2)
         out = self.submits()[1]["output"]
-        self.assertIn("holds changes of origin/develop that git has no merge of: src/a.go.", out)
+        self.assertIn(f"has fetched origin/develop commit {dev[:12]} and git has no merge of it", out)
         self.assertIn("No request was sent.", out)
         self.assertEqual(self.status(2)["round"], 1)
         head2 = self.f.remote_head("feature/epic-900-slice-2")
@@ -190,7 +190,7 @@ class TestEpicRun(EpicCase):
              self.g("merge", "--squash", "origin/develop"),
              write("src/util.go", self.U_BOTH), self.g("add", "-A"),
              self.g("commit", "-qm", "develop, squashed"),
-             submit(1, git="keep", expect=2),                   # develop's files, no merge
+             submit(1, git="keep", expect=2),                   # fetched, and no merge in git
              self.g("merge", "--no-edit", "origin/develop"),
              submit(1, git="keep", expect=2),                   # a merge that is not finished
              write("src/util.go", self.U_BOTH), self.g("add", "-A"),
@@ -202,8 +202,8 @@ class TestEpicRun(EpicCase):
         pr = self.wait_pr(1)
         outs = [s["output"] for s in self.submits()]
         self.assertEqual([s["exit"] for s in self.submits()], [0, 2, 2, 0])
-        self.assertIn("holds changes of origin/develop that git has no merge of: "
-                      "src/new_on_develop.go.", outs[1])
+        self.assertIn(f"has fetched origin/develop commit {dev[:12]} and git has no merge of it",
+                      outs[1])
         self.assertIn("a merge in", outs[2])
         self.assertIn((1, "conflict", "REJECTED"), self.path_of(1))
         self.assertEqual((self.status(1)["round"], self.status(1)["rounds_left"]), (2, 1))
@@ -452,6 +452,7 @@ class TestEpicRun(EpicCase):
         tip = self.develop_moves_before_turn_1()
         pr1 = self.wait_pr(1)
         self.wait_state(2, "WAIT_PARENT")
+        self.wait_for("two submits", lambda: len(self.submits()) == 2)   # the log of the command
         self.assertIn(f"--base {tip[:12]} is not used. /workspace is built on origin/develop "
                       f"commit {base0[:12]}", self.submits()[1]["output"])
         c1 = [r for r in self.recs("slice_candidate") if r["slice"] == 1][-1]
@@ -587,6 +588,7 @@ class TestEpicRun(EpicCase):
         self.f.commit_on("develop", {"src/second.go": "package src\n// second\n"})
         self.flag("second")
         self.wait_state(2, "WAIT_PARENT")
+        self.wait_for("two submits", lambda: len(self.submits()) == 2)
         self.assertIn(f"/workspace is built on origin/develop commit {dev1[:12]}",
                       self.submits()[1]["output"])
         self.assertEqual((self.status(2)["round"], self.status(2)["rounds_left"]), (1, 2))

@@ -107,13 +107,15 @@ def built_on(ws, base):
     """The plans write the files of a develop merge with `write`. This makes
     the git history of the workspace say the same: HEAD is `base` (the
     develop commit the owner merged up to), the files stay as they are.
-    slice-submit reads the base from this history."""
+    slice-submit reads the base from this history. origin/develop is `base`
+    too: the owner merged what it fetched, and fetched nothing after."""
     agent_git(ws, "fetch", "-q", "--no-tags", os.environ["FSM_FAKE_REMOTE"],
-              "+refs/heads/*:refs/remotes/origin/*")
+              "+refs/heads/*:refs/fake/*")
     if len(base) != 40:
         # a name in the remote, for a commit the plan cannot know: "develop~1"
         base = subprocess.run([REAL_GIT, "-C", os.environ["FSM_FAKE_REMOTE"], "rev-parse", base],
                               capture_output=True, check=True).stdout.decode().strip()
+    agent_git(ws, "update-ref", "refs/remotes/origin/develop", base)
     agent_git(ws, "reset", "-q", "--soft", base)
 
 
