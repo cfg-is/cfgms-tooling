@@ -57,6 +57,29 @@ assert_resolves "item-branch with Closes #<epic> in body (#1804 case)" \
   $'Some PR body\n\nCloses #1801\n\nMore notes.' \
   "ITEM:BX5ezzgt5raU"
 
+# A slice of an owner-run epic (fsm/epic.py). The branch decides; a closing
+# reference in the body must not make it a story (the fix cycle would take it).
+assert_resolves "slice branch" \
+  "feature/epic-6380-slice-1" \
+  "the claim" \
+  "SLICE:6380:1"
+assert_resolves "slice branch with Fixes #<epic> in body stays a slice" \
+  "feature/epic-6380-slice-12" \
+  $'the claim\n\nFixes #6380' \
+  "SLICE:6380:12"
+assert_resolves "slice-like branch with a suffix is not a slice" \
+  "feature/epic-6380-slice-1-agent" \
+  "no link" \
+  "REFUSED:no_story_link"
+assert_resolves "slice-like branch with a prefix is not a slice" \
+  "x/feature/epic-6380-slice-1" \
+  "no link" \
+  "REFUSED:no_story_link"
+assert_resolves "slice number 0 is not a slice" \
+  "feature/epic-6380-slice-0" \
+  "no link" \
+  "REFUSED:no_story_link"
+
 # Item-branch with no auto-close keyword in body (typical Path A PR).
 assert_resolves "item-branch with no body keyword" \
   "feature/item-BX5ezzgt5rcg-agent" \
@@ -598,12 +621,16 @@ git -C "$PR_ROOT/origin" branch feature/story-4242-agent
 # list-by-status scan below; otherwise the launch falls back to the body's
 # "Fixes #4242" and the item-branch prompt is never generated.
 git -C "$PR_ROOT/origin" branch feature/item-promptitem01-agent
+git -C "$PR_ROOT/origin" branch feature/epic-77-slice-2
 git clone -q "$PR_ROOT/origin" "$PR_ROOT/repo"
 seed_trusted_sources "$PR_ROOT/repo"
 cat > "$PR_ROOT/repo/.claude/tooling/scripts/project-queue.sh" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-  add-issue)      echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  add-issue)      echo "add-issue $2" >> "$PR_ROOT/queue-calls.txt"
+                  echo '{"item_id":"PVTI_adv_test","linked_issue":4242}' ;;
+  item-for-issue) [[ "$2" == 77 && -z "${NO_EPIC_ITEM:-}" ]] || exit 3
+                  echo PVTI_epicitem77 ;;
   list-by-status) echo '[{"item_id":"PVTI_promptitem01"}]' ;;
   update-field)   echo '{"updated": true}' ;;
   *)              echo '[]' ;;
@@ -658,6 +685,32 @@ for kind in story:feature/story-4242-agent item:feature/item-promptitem01-agent;
 done
 run_prompt_launch feature/story-4242-agent story
 assert_adv "story prompt enqueues by the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/po-act.sh enqueue" "$PR_ROOT/prompt.md"'
+
+echo
+echo "--- review-pr: a slice of an owner-run epic ---"
+
+# The body holds "Fixes #4242" (run_prompt_launch): the slice branch must win.
+rm -f "$PR_ROOT/queue-calls.txt"
+run_prompt_launch feature/epic-77-slice-2 slice
+assert_adv "slice launch is dispatched" 'grep -q "^REVIEW_DISPATCHED:4242:0:" "$PR_ROOT/launch-slice.out"'
+assert_adv "slice prompt names the slice, the epic and the epic item" 'grep -qF "pr:4242 slice:2 epic:77 --project-item PVTI_epicitem77" "$PR_ROOT/prompt.md"'
+assert_adv "slice launch does not add the epic to the board (read-only lookup)" '[[ ! -e "$PR_ROOT/queue-calls.txt" ]]'
+assert_adv "slice prompt reads the epic item from the trusted path" 'grep -qF "/opt/cfgms-trusted/.claude/tooling/scripts/project-queue.sh get-item PVTI_epicitem77" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt reads the agent definition from the trusted path" 'grep -qF "\`/opt/cfgms-trusted/.claude/agents/acceptance-reviewer.md\`" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt enqueues with no story argument" 'grep -qE "po-act\.sh enqueue 4242.\$" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt has no enqueue with a second argument" '! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt writes no board field" '! grep -qF "update-field" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt assigns nobody" '! grep -qF "add-assignee" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt has no workspace-relative tooling command" '! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
+# The two lines fsm/landing.py reads to wake the owner.
+assert_adv "slice prompt gives the marker line" 'grep -qF "<!-- cfgms-acceptance-review -->" "$PR_ROOT/prompt.md"'
+assert_adv "slice prompt gives the FAIL heading the supervisor reads" 'grep -qF "## Acceptance Review — FAIL" "$PR_ROOT/prompt.md"'
+assert_adv "slice container is labelled story=0" 'grep -qx "story=0" "$PR_ROOT/docker-args.txt"'
+
+# An epic that is not on the project: refused, nothing launched.
+NO_EPIC_ITEM=1 run_prompt_launch feature/epic-77-slice-2 slice-noitem
+assert_adv "slice of an epic with no project item is refused" 'grep -q "REVIEW_REFUSED:4242:no_project_item_for_epic_77" "$PR_ROOT/launch-slice-noitem.out"'
+assert_adv "slice of an epic with no project item starts no container" '[[ ! -e "$PR_ROOT/docker-args.txt" ]]'
 
 echo
 echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"

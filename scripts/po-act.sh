@@ -916,6 +916,17 @@ _pr_story_num() {
   esac
 }
 
+# _pr_is_slice <pr>  — true when the PR's branch is a slice of an owner-run
+#   epic (feature/epic-<N>-slice-<n>). The epic run's supervisor pushes that
+#   branch and the owner repairs it: the pipeline never pushes to it. A PR
+#   that cannot be read is not a slice here; every caller has its own
+#   fail-closed read of the PR.
+_pr_is_slice() {
+  local branch
+  branch=$(gh pr view "$1" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null) || return 1
+  [[ "$(resolve_pr_story_or_item "$branch" "")" == SLICE:* ]]
+}
+
 # _item_for_issue <issue>  — the project item of an issue (project-queue.sh
 #   item-for-issue), or returns 1.
 _item_for_issue() {
@@ -1330,6 +1341,10 @@ except Exception: print('')" 2>/dev/null || echo "")
   dispatch-fix)
     pr="${1:?PR number required}"
     [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 2; }
+    if _pr_is_slice "$pr"; then
+      echo "DISPATCH_FIX_REFUSED:${pr}:slice_pr_owner_repairs"
+      exit 3
+    fi
     # External-author gate (Issue #1786): refuse before touching any PR content.
     # Read the head once and bind the trust check to it (Issue #5401). The
     # supervisor re-checks author trust and refuses if the head moved.
@@ -1377,6 +1392,10 @@ except Exception: print('')" 2>/dev/null || echo "")
   resolve-conflict)
     pr="${1:?PR number required}"
     [[ "$pr" =~ ^[0-9]+$ ]] || { echo "ERROR: PR number must be numeric, got: ${pr}"; exit 1; }
+    if _pr_is_slice "$pr"; then
+      echo "RESOLVE_CONFLICT_REFUSED:${pr}:slice_pr_owner_repairs"
+      exit 3
+    fi
     # Subcommand-level author gate (defense in depth — must run before any
     # fetch or launch). Uses #1786's permission-level helper
     # (push/maintain/admin); the supervisor re-checks it at PREPARE.
@@ -1433,6 +1452,13 @@ except Exception: print('')" 2>/dev/null || echo "")
   enqueue)
     pr="${1:?PR number required}"
     story="${2:-}"
+    # A slice of an owner-run epic has no story. A closing reference would
+    # close the epic when the slice merges, and would hand the PR to the fix
+    # cycle. The argument is dropped, not refused: the merge is still wanted.
+    if [ -n "$story" ] && _pr_is_slice "$pr"; then
+      echo "ENQUEUE_NOTE:${pr}:slice_pr_story_argument_ignored"
+      story=""
+    fi
     # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
     # the merge to it with --match-head-commit. The trust check is passed this
     # SHA so it cannot re-read a different head (an author swapping heads

@@ -411,11 +411,13 @@ owner that wants to leak.
   in `epic` mode. The turn timeout, the round and wake budgets and the idle
   rule bound the owner's work. They do not bound a wait: a slice in LANDING
   or NEEDS_OWNER is in flight, and the run waits for its pull request with
-  no limit. Because nothing reviews or enqueues a slice pull request yet
-  (section 9), a published slice waits until a person does that. The
-  owner's event text and prompt say that the pipeline answers a queue
-  removal with a re-enqueue; for a slice pull request that is not built. A
-  cost limit per epic is an open point.
+  no limit. The pipeline cycle reviews and enqueues a slice pull request
+  (section 9); when no cycle runs, a published slice waits until a person
+  does that. (The first test epic, 6380, was before this: its slice waited
+  a day.) The owner's event text and prompt say that the pipeline answers a
+  queue removal with a re-enqueue: the preflight recommends that for a
+  slice with a PASS review, up to the second removal. A cost limit per epic
+  is an open point.
 - **Other ways a run ends**: `REFUSED(<gate>)` when a PREPARE gate says
   no; `FAILED(prepare_error)`; `FAILED(owner_error)` (an error in the
   supervisor's loop, a credential found where none may be);
@@ -446,13 +448,14 @@ owner that wants to leak.
 | run index | an `epic-<N>` run: its owner container, the OWNER state, the 336-hour retention | built |
 | preflight | the epic's project item is in flight while the run is | built (general run view) |
 | preflight | an epic that an owner holds is in `epics_owner_run`, not in `epics_undecomposed`. Held means: an epic-mode run in this host's run index that is not ended, or that ended after its gates passed, until the run dir is collected (24 hours after REPORT, 336 hours otherwise); or an unexpired `epic-<N>` lease (seen from every host, released when the run ends). A run refused at a gate holds nothing | built in the tooling. The `cfgms` prompts (`po.md` Step 7, `/po decompose`) still choose epics by "no sub-issues" and do not read this list: not built |
-| preflight | every slice PR the run opened is in flight | not built |
+| preflight | a slice PR (`feature/epic-<N>-slice-<n>`, internal author) is known as a slice: `is_slice`, `epic_number`, `slice_number` in the PR summary; never a story, whatever its body says | built |
 | pipeline-watch | epic run ended; `container_stalled` from the heartbeat | built (general run rows) |
 | pipeline-watch | new events: slice published, slice merged | not built |
 | capacity | the owner container counts as one agent | built (by the label `cfg-agent=true`) |
 | cleanup, isoagents | new name class `cfg-owner-<N>` | not built; the supervisor removes its own container |
-| acceptance reviewer | reviews a slice PR against the slice claim and the epic, not a story | not built |
-| review, merge and lock sweeps | pick up a slice PR | not built: the preflight links a PR to work by a `feature/story-<N>` branch or a closing reference, and the lock pass takes `feature/story-*` and `feature/item-*` branches; a slice PR has none of these |
+| acceptance reviewer | reviews a slice PR against the slice claim and the epic, not a story | built in the tooling: `review-pr` on a slice branch gives the reviewer the epic's project item and a slice prompt (PASS: `po-act.sh enqueue <PR>` with no story; FAIL: the verdict comment and nothing else; no board field, no assignee). `acceptance-reviewer.md` in `cfgms` has no slice section: the prompt overrides it. Not run with a real reviewer yet |
+| review and merge sweeps | pick up a slice PR | built in the tooling: `review_recommendations` gives a slice `spawn_acceptance_reviewer`, `enqueue_merge` (no story), `rerun_failed_checks`, `defer` or `skip`; every recommendation that pushes to the branch or starts a fix agent (`rebase`, `rebase_then_investigate`, `investigate_queue_failures`, `ci_stuck` with a rebase) becomes `skip`. `po-act.sh dispatch-fix`, `po-act.sh resolve-conflict` and `rebase-pr.sh` refuse a slice branch (`slice_pr_owner_repairs`); `po-act.sh enqueue` drops a story argument. The `cfgms` prompts (`po.md`, `pipeline.md`) still describe the story path for a red or removed PR: not changed |
+| lock sweep | pick up a slice PR | not built: the lock pass takes `feature/story-*` and `feature/item-*` branches |
 | ledger, token_report | one record per owner turn, keyed `(container, run_id, turn)`; slices recorded with their rounds | not built: an epic run writes no ledger record |
 | board | the epic item moves; there are no story items | not built: the run reads the item and writes no field |
 
@@ -467,15 +470,16 @@ result files; the launch path, the `## Protected Paths` input, follow-ups as
 deferred fix issues, run index support; Docker or Podman as the runtime.
 
 Not built: the owner's read-only GitHub token; a WIP draft of a failed run's
-work; ledger and board records; slice events in `pipeline-watch` and slice
-PRs in the preflight; review, enqueue and lock of slice PRs by the existing
-sweeps; a cost limit per epic.
+work; ledger and board records; slice events in `pipeline-watch` (a slice
+PR gives the general `checks_green` event); the lock of slice PRs; a slice section in the `cfgms`
+prompts; a cost limit per epic.
 
 In `cfgms`, not checked from this repository **[not verified]**: the
 submodule bump, `owner.md` and `judge.md` in `.claude/agents/`, the epic
 template with `## Protected Paths`.
 
-Not done: one watched test epic (step 7 of the build plan).
+Done: one watched test epic (6380, one slice, merged). It did not use the
+judge, a second round or a second slice.
 
 ## 11. Decisions by the founder (2026-11-15)
 

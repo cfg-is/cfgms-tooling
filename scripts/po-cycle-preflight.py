@@ -150,6 +150,11 @@ BRANCH_STORY_RE = re.compile(r"feature/(?:story-(\d+)|item-([a-zA-Z0-9]+)-agent)
 #: decide pipeline ownership would claim genuine manual work.
 AGENT_BRANCH_RE = re.compile(r"^feature/(?:story-\d+|item-[A-Za-z0-9]+)-agent$")
 
+#: The branch of one slice of an epic that an owner session builds
+#: (fsm/epic.py: `feature/epic-<N>-slice-<n>`). The epic run's supervisor
+#: pushes it and the owner repairs it; see `_apply_slice_rules`.
+SLICE_BRANCH_RE = re.compile(r"feature/epic-([1-9]\d*)-slice-([1-9]\d*)")
+
 # Markers identifying a WIP draft PR left by an agent run that did not finish.
 # Both a body prefix and a title-suffix form are accepted because either alone
 # is sufficient evidence.
@@ -2518,7 +2523,49 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "action": "rebase_then_investigate",
                 "reason": f"CI red: {', '.join(failed)} (mergeStateStatus={ms or 'UNKNOWN'}) — try `rebase-pr.sh` first; if REBASE_NOOP (branch is current), failure is real → diagnose + dispatch-fix",
             })
-    return recs
+    return _apply_slice_rules(recs, pr_summaries)
+
+
+#: What the pipeline may do with a slice pull request. Everything else in the
+#: review vocabulary pushes to the branch or starts an agent that does.
+_SLICE_ACTIONS = frozenset({
+    "spawn_acceptance_reviewer", "enqueue_merge", "rerun_failed_checks", "defer", "skip"})
+
+
+def _apply_slice_rules(recs, pr_summaries):
+    """Rewrite the recommendations for slice pull requests of an owner-run epic.
+
+    A slice branch belongs to the epic run: its supervisor pushes it (and
+    closes the pull request when the branch moves under it), and the owner
+    repairs it after the supervisor's LANDING watcher wakes it (failed checks,
+    a FAIL review, a queue removal, a conflict; fsm/landing.py). So the
+    pipeline's part is: review it, enqueue it after a PASS, re-run a failed
+    check once. It never rebases it and never starts a fix or resolve-conflict
+    agent on it: those become `skip`.
+    """
+    slices = {p["pr"]: p for p in pr_summaries if p.get("is_slice")}
+    out = []
+    for rec in recs:
+        pr = slices.get(rec["pr"])
+        if pr is None:
+            out.append(rec)
+            continue
+        rec = dict(rec, story=None, epic=pr["epic_number"], slice=pr["slice_number"])
+        note = (f"slice {pr['slice_number']} of epic #{pr['epic_number']} (the epic's owner repairs it: "
+                "no rebase-pr.sh, dispatch-fix or resolve-conflict)")
+        action = rec["action"]
+        if action in _SLICE_ACTIONS or (action == "ci_stuck" and rec.get("remedy") == "rerun"):
+            rec["reason"] = f"{note}: {rec['reason']}"
+        else:
+            rec["action"] = "skip"
+            rec.pop("remedy", None)
+            rec.pop("rerun_run_ids", None)
+            rec["reason"] = (f"{note}: the pipeline would `{action}` a story pull request here; "
+                             "for a slice the epic run's supervisor wakes the owner"
+                             + (" — except for checks that never start: that needs a person"
+                                if action == "ci_stuck" else ""))
+        out.append(rec)
+    return out
 
 
 def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=None, queued_pr_numbers=None):
@@ -2766,6 +2813,15 @@ def _build_pr_summaries(prs):
                         story_number = cin
                         break
 
+        # A slice of an owner-run epic. It has no story: a closing reference in
+        # its body must not give it one, or the fix cycle would take it.
+        epic_number = slice_number = None
+        if not pr_is_external:
+            sm = SLICE_BRANCH_RE.fullmatch(head)
+            if sm:
+                epic_number, slice_number = int(sm.group(1)), int(sm.group(2))
+                story_number = None
+
         comments = pr.get("comments") or []
         has_review_comment = any(is_trusted_review_comment(c) for c in comments)
         review_verdict_val, review_comment_date = latest_review(comments)
@@ -2783,6 +2839,9 @@ def _build_pr_summaries(prs):
             "is_external": pr_is_external,
             "is_released": pr_is_released,
             "story_number": story_number,
+            "is_slice": epic_number is not None,
+            "epic_number": epic_number,
+            "slice_number": slice_number,
             "comment_count": len(comments),
             "has_acceptance_review_comment": has_review_comment,
             "latest_review_verdict": review_verdict_val,
