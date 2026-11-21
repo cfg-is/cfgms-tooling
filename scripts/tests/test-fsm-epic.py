@@ -254,7 +254,8 @@ class TestEpicRun(EpicCase):
             [write("src/a.go", "package src\n// a\n"), submit(1),
              {"op": "wait_pr", "slice": 1}, {"op": "wait_flag", "name": "moved"},
              write("src/new_on_develop.go", "package src\n// new\n"),
-             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1)],
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1),
+             submit(2, builds_on=1, expect=1)],
             [],
             [DONE],
         ]})
@@ -263,6 +264,8 @@ class TestEpicRun(EpicCase):
         dev1 = self.f.commit_on("develop", {"src/new_on_develop.go": "package src\n// new\n"})
         self.flag("moved")
         self.wait_state(2, "WAIT_PARENT")
+        self.wait_for("three submits", lambda: len(self.submits()) == 3)
+        self.assertIn("no change since this slice's last snapshot", self.submits()[2]["output"])
         c1 = [r for r in self.recs("slice_candidate") if r["slice"] == 1]
         c2 = [r for r in self.recs("slice_candidate") if r["slice"] == 2][-1]
         repo = self.run_dir / "R"
@@ -295,8 +298,9 @@ class TestEpicRun(EpicCase):
         out = self.submits()[1]["output"]
         self.assertIn(f"slice 1 as it was submitted does not apply on --base {dev1[:12]} "
                       f"(src/util.go)", out)
-        self.assertIn("Submit slice 1 again from this workspace with that --base first", out)
-        self.wait_state(2, "REJECTED")
+        self.assertIn("Submit slice 1 again first", out)
+        self.assertIn("This request used no round", out)
+        self.assertEqual(self.path_of(2), [])                 # no round, no slice record
         self.assertEqual(self.status(1)["state"], "LANDING")
 
     def test_the_synced_tree_submitted_again_after_a_merge_of_develop_uses_no_round(self):
@@ -321,6 +325,59 @@ class TestEpicRun(EpicCase):
         self.assertEqual((self.status(1)["round"], self.status(1)["rounds_left"]), (1, 2))
         self.assertEqual(self.f.remote_head("feature/epic-900-slice-1"), head)
         self.merge(pr)
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+
+    def test_a_child_with_the_develop_tip_as_base_from_a_workspace_that_did_not_merge(self):
+        # develop moved; the owner fetched but did not merge, and gives the tip
+        # as the base of slice 2. The workspace holds none of develop's change,
+        # so slice 2 is measured against slice 1 as it was submitted.
+        base0 = self.f.remote_head("develop")
+        self.f.plan({"owner": [
+            [{"op": "wait_flag", "name": "go"},
+             write("src/a.go", "package src\n// a\n"), submit(1, base=base0),
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1)],   # base: the tip
+            [],
+            [DONE],
+        ]})
+        self.develop_moves_before_turn_1()
+        pr1 = self.wait_pr(1)
+        self.wait_state(2, "WAIT_PARENT")
+        c1 = [r for r in self.recs("slice_candidate") if r["slice"] == 1][-1]
+        c2 = [r for r in self.recs("slice_candidate") if r["slice"] == 2][-1]
+        self.assertEqual(c2["parent"], c1["snap_commit"])
+        self.assertTrue([r for r in self.recs("note")
+                         if "holds no develop change" in str(r.get("info", ""))])
+        self.merge(pr1)
+        self.wait_pr(2)
+        self.assert_child_keeps_develop(self.f.remote_head("feature/epic-900-slice-2"))
+
+    def test_a_stale_slice_gets_its_new_round_when_the_parent_is_back_at_the_old_tree(self):
+        # Slice 2 waits on slice 1. The owner changes slice 1 (slice 2 is
+        # STALE), then takes the change back: round 3 of slice 1 has the tree
+        # of round 1. Slice 2 submitted again is the same tree on the same
+        # parent tree, and must still get a new round.
+        self.f.plan({"owner": [
+            [write("src/a.go", "package src\n// a\n"), submit(1),
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1),
+             {"op": "wait_flag", "name": "waiting"},
+             {"op": "delete", "path": "src/b.go"},            # slice 2's file is parked
+             write("src/a.go", "package src\n// a2\n"), submit(1),
+             write("src/a.go", "package src\n// a\n"), submit(1),
+             write("src/b.go", "package src\n// b\n"), submit(2, builds_on=1)],
+            [],
+            [DONE],
+        ]})
+        self.launch()
+        self.wait_state(2, "WAIT_PARENT")
+        self.flag("waiting")
+        self.wait_for("five submits", lambda: len(self.submits()) == 5)
+        self.assertEqual([s["exit"] for s in self.submits()], [0, 0, 0, 0, 0])
+        self.assertIn((1, "parent_new_round", "STALE"), self.path_of(2))
+        self.assertIn((2, "submitted", "SNAPSHOT"), self.path_of(2))
+        self.wait_state(2, "WAIT_PARENT")
+        self.merge(self.wait_pr(1))
+        self.merge(self.wait_pr(2))
         rc, out = self.finish()
         self.assertEqual(rc, 0, out)
 

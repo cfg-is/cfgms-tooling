@@ -418,8 +418,9 @@ class Slice:
         #: "snap_parent"}. The first three are what is validated and
         #: published; SYNC replaces them. The `snap_` values are the snapshot
         #: of the owner's workspace on the owner's parent and never change in
-        #: a round. A slice that builds on this one stands on `snap_commit`;
-        #: the "no change" rule reads both.
+        #: a round. A slice that builds on this one is measured against
+        #: `snap_commit`, or a merge of it onto a later develop commit; the
+        #: "no change" rule reads both.
         self.candidates = {}
         self.pr = 0
         self.branch = ""

@@ -304,10 +304,18 @@ Cases that the table above does not show. All **[P]**.
   uses no round.
 - **A submit that cannot be placed** (`bad_request`: unknown `--builds-on`,
   a base that is not on `develop`, a parent that is CLOSED, FAILED or STALE,
-  a loop, a parent whose snapshot does not apply on the base) → REJECTED,
-  with the reason. It uses a round.
+  a loop) → REJECTED, with the reason. It uses a round.
+- **A `--builds-on` slice whose parent does not apply on its base** (the
+  snapshot of the parent conflicts with the `--base` commit) is refused
+  with the files. It uses no round and the slice stays as it is. The owner
+  submits the parent again first.
+- **A `--builds-on` slice with a base it did not merge** (the workspace
+  holds the old content at every path `develop` changed between the
+  parent's snapshot and the base) is measured against the parent's
+  snapshot, as if the base was the parent's. The run records a note.
 - **A submit with no change** (the same tree on the same parent as the
-  slice's last snapshot) is refused in every state, and uses no round: a
+  slice's last snapshot) is refused in every state but STALE (a STALE slice
+  must get a new round on its parent's new round), and uses no round: a
   round in flight goes on, a pull request stays as it is, a rejected round
   stays rejected. A workspace with no change against the slice's parent →
   REJECTED (`no_change`); that uses a round.

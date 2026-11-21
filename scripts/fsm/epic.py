@@ -117,6 +117,10 @@ def token_must_be_read(why):
     return why != "absent" and os.environ.get(ALLOW_CREDENTIALS_FILE_ENV) != "1"
 
 
+class ParentConflict(Exception):
+    """The slice a `--builds-on` slice builds on does not apply on its base."""
+
+
 class TokenUnreadable(Exception):
     """The long-life token is on the host and cannot be read. `why` is the
     reason from Services.claude_token (decrypt_failed, timeout)."""
@@ -630,14 +634,23 @@ class EpicSupervisor(sup.Supervisor):
             self.answer(req, False, reason="the request was withdrawn before the snapshot. "
                                            "Submit again.")
             return "withdrawn"
-        bad, parent = "", None
+        bad, parent, stood = "", None, None
         try:
-            parent = S.resolve_parent(self.book, n, req.base, req.builds_on, self.on_develop)
+            parent = stood = S.resolve_parent(self.book, n, req.base, req.builds_on,
+                                              self.on_develop)
             if parent.builds_on:
                 parent = self.parent_on_base(parent, req.base)
         except S.BadRequest as exc:
             bad, parent = str(exc), None
-        if parent is not None and s is not None and s.candidates:
+        except ParentConflict as exc:
+            # Known before anything is taken: no round, and the slice (it can
+            # be a validated round that waits for its parent) stays as it is.
+            self.answer(req, False, reason=str(exc))
+            return "refused"
+        # A STALE slice must get a new round: what it stood on has a new
+        # round, and that round can have the tree of the old one.
+        was_stale = s is not None and s.state == S.STALE
+        if parent is not None and s is not None and s.candidates and not was_stale:
             # A request that brings the same tree on the same parent changes
             # nothing. It uses no round: a round in flight goes on, a pull
             # request stays as it is, a rejected round stays rejected.
@@ -665,10 +678,25 @@ class EpicSupervisor(sup.Supervisor):
 
         base_tree = self.repo.tree_of(parent.commit)
         where = f"Read {O.SLICES_DIR}/{n}/rejected.md"
-        try:
-            snap = snapshot.snapshot(self.repo, self.run.path, self.run.workspace, base_tree,
+
+        def take(tree):
+            return snapshot.snapshot(self.repo, self.run.path, self.run.workspace, tree,
                                      allowlist=self.x.get("allowlist", []),
                                      extra_protected=self.x.get("gate_scripts", []))
+        try:
+            snap = take(base_tree)
+            if stood.commit != parent.commit and self.holds_none_of(
+                    self.repo.tree_of(stood.commit), base_tree, snap.tree):
+                # The parent was built on --base, but the workspace holds none
+                # of what develop changed up to that commit: the owner gave a
+                # base it did not merge. Measured against the built parent,
+                # the slice would undo those develop commits.
+                self.run.append("note", info=f"slice {n}: the workspace holds no develop "
+                                             f"change up to --base {req.base[:12]}; it is "
+                                             f"measured against slice {stood.builds_on} as "
+                                             f"that slice was submitted")
+                parent, base_tree = stood, self.repo.tree_of(stood.commit)
+                snap = take(base_tree)
         except snapshot.SnapshotTooLarge as exc:
             self.write_rejected(n, "Snapshot refused", [f"- {exc}", "",
                                 "Remove build output and large generated files from the workspace."])
@@ -709,7 +737,7 @@ class EpicSupervisor(sup.Supervisor):
                                                          "snapshot was taken. Submit again.")
             return "withdrawn"
         last = s.candidates[max(s.candidates)] if s.candidates else None
-        if snap.tree == base_tree or (last and (base_tree, snap.tree)
+        if snap.tree == base_tree or (last and not was_stale and (base_tree, snap.tree)
                                       in self.known_trees(last)):
             self.stake(n, "unchanged", quiet=True)
             self.answer(req, False, round_no=rnd,
@@ -776,12 +804,22 @@ class EpicSupervisor(sup.Supervisor):
         tree, conflicted = self.merge_onto(base, parent.commit)
         if conflicted:
             m = parent.builds_on
-            raise S.BadRequest(
+            raise ParentConflict(
                 f"--builds-on {m}: slice {m} as it was submitted does not apply on --base "
                 f"{base[:12]} (" + ", ".join(conflicted[:10]) + f"). Submit slice {m} again "
-                f"from this workspace with that --base first")
+                f"first, with its own files as they are on that develop commit and that "
+                f"--base. This request used no round")
         commit = self.repo.commit_tree(tree, [base], "fsm slice parent (internal)\n")
         return S.Parent(commit, parent.builds_on)
+
+    def holds_none_of(self, old_tree, new_tree, ws_tree):
+        """True when `ws_tree` has the content of `old_tree` at every path
+        that differs between `old_tree` and `new_tree` (and there is one)."""
+        def names(a, b):
+            out = self.repo.git("diff", "--no-renames", "--name-only", "-z", a, b).stdout
+            return {p for p in out.split(b"\0") if p}
+        changed = names(old_tree, new_tree)
+        return bool(changed) and not (changed & names(old_tree, ws_tree))
 
     def request_there(self, req):
         """The request directory is still where slice-submit put it."""
