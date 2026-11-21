@@ -128,6 +128,38 @@ def scope_allowlist(tooling_root, body):
 
 # --- default injectable services ------------------------------------------------
 
+#: GitHub author associations whose PR reviews and comments reach an agent's
+#: context. Anyone can comment on a public pull request, and the fix agent is
+#: told to act on review and comment text, so text from any other author is
+#: left out: it is counted, never shown.
+TRUSTED_FEEDBACK_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+
+def _trusted_feedback(entry):
+    return str((entry or {}).get("authorAssociation") or "").upper() in TRUSTED_FEEDBACK_ASSOCIATIONS
+
+
+def pr_feedback_markdown(pr):
+    """reviews.md for an agent: the PR's reviews and conversation comments by
+    trusted authors only (TRUSTED_FEEDBACK_ASSOCIATIONS). An entry without an
+    association counts as untrusted, so a missing field fails closed."""
+    parts, left_out = [], 0
+    for r in pr.get("reviews") or []:
+        if not _trusted_feedback(r):
+            left_out += 1
+            continue
+        parts.append(f"## Review ({r.get('state', '')})\n\n{r.get('body', '')}\n")
+    for c in pr.get("comments") or []:
+        if not _trusted_feedback(c):
+            left_out += 1
+            continue
+        parts.append(f"## Comment\n\n{c.get('body', '')}\n")
+    if left_out:
+        parts.append(f"({left_out} review(s) or comment(s) by authors outside the repository's "
+                     "members and collaborators were left out.)\n")
+    return "\n".join(parts) or "(none)\n"
+
+
 class Services:
     """Everything with a side effect outside the run dir. Tests replace these
     through PATH fakes and the CFGMS_FSM_* environment."""
@@ -504,12 +536,7 @@ class Supervisor:
     def _write_pr_context(self, pr):
         cdir = self.run.context_dir
         safefs.write_file(cdir, "pr.md", f"# PR #{pr.get('number')}: {pr.get('title', '')}\n\n{pr.get('body', '')}\n")
-        parts = []
-        for r in pr.get("reviews") or []:
-            parts.append(f"## Review ({r.get('state', '')})\n\n{r.get('body', '')}\n")
-        for c in pr.get("comments") or []:
-            parts.append(f"## Comment\n\n{c.get('body', '')}\n")
-        safefs.write_file(cdir, "reviews.md", "\n".join(parts) or "(none)\n")
+        safefs.write_file(cdir, "reviews.md", pr_feedback_markdown(pr))
         checks = self.svc.gh.failing_checks(pr.get("number"))
         safefs.write_file(cdir, "ci.md", "\n".join(f"- {c.get('name')}: {c.get('state')} {c.get('link', '')}"
                                                     for c in checks) or "(no failing checks)\n")
