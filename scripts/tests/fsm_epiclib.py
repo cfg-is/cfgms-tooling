@@ -155,3 +155,50 @@ class EpicCase(unittest.TestCase):
 
     def changed(self, sha):
         return sorted(git(self.f.remote, "diff", "--name-only", "refs/heads/develop", sha).split())
+
+
+class EpicRunCase(EpicCase):
+    """What the run tests of test-fsm-epic.py and test-fsm-epic-chain.py share."""
+
+    # --- real git in the workspace ("git": "keep": the fake leaves the history alone)
+    def fetch(self):
+        # origin of the workspace is the public URL; the tests fetch the fixture
+        return {"op": "git", "args": ["fetch", "-q", "--no-tags", str(self.f.remote),
+                                      "+refs/heads/*:refs/remotes/origin/*"]}
+
+    @staticmethod
+    def g(*args):
+        return {"op": "git", "args": list(args)}
+
+    U_MINE = "package src\n\nfunc U() int {\n\treturn 7\n}\n"
+    U_BOTH = "package src\n\n// develop moved\nfunc U() int {\n\treturn 7\n}\n"
+
+    DEVELOP_MOVED = {"src/util.go": "package src\n\n// develop moved\nfunc U() int {\n\treturn 2\n}\n",
+                     "src/new_on_develop.go": "package src\n// new\n"}
+
+    def flag(self, name):
+        self.f.docker_state.mkdir(parents=True, exist_ok=True)
+        (self.f.docker_state / f"flag-{name}").write_text("1")
+
+    def develop_moves_before_turn_1(self, files=None):
+        """The workspace is on the develop commit of the launch; develop gets a
+        commit of another author before the owner submits anything."""
+        self.launch()
+        self.wait_for("turn 1", lambda: self.recs("owner_turn_start"))
+        new = self.f.commit_on("develop", files or self.DEVELOP_MOVED)
+        self.flag("go")
+        return new
+
+    def path_of(self, n):
+        return [(r["round"], r["event"], r["to"]) for r in self.recs("slice_transition")
+                if r["slice"] == n]
+
+    def assert_child_keeps_develop(self, head2):
+        self.assertEqual(self.changed(head2), ["src/b.go"])
+        self.assertIn("develop moved", self.f.remote_show(head2, "src/util.go"))
+        self.assertIn("// new", self.f.remote_show(head2, "src/new_on_develop.go"))
+
+    UTIL0 = "package src\n\nfunc U() int {\n\treturn 1\n}\n"
+    UTIL1 = "package src\n\n// develop moved\nfunc U() int {\n\treturn 2\n}\n"
+
+    NEW = "package src\n// new\n"
