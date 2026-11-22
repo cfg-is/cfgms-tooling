@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Regression test for the epic dispatch gate in po-cycle-preflight.py.
 #
-# An epic is decomposed into stories, never dispatched: it owns no branch, no
-# Files In Scope, and no container of its own. Before this gate an epic-labelled
+# An epic never gets a story dispatch: it owns no branch and no Files In
+# Scope. An owner builds it (owner_start_recommendations, po-act.sh dispatch
+# --epic). A Ready epic item is the founder's start signal, so the hold does
+# not flag a stale board. Before this gate an epic-labelled
 # board item sitting at In Progress matched every stalled-dispatch condition
 # permanently, so the cron recommended re-dispatch on every cycle — and a
 # dispatch that got through put an agent on a whole epic as if it were one story
@@ -81,7 +83,9 @@ recs = m.compute_dispatch_recommendations(
 by_num = {r["number"]: r for r in recs}
 check("epic item is held", by_num[2911]["action"], "hold")
 check("hold reason names the epic", "epic" in by_num[2911]["reason"], True)
-check("epic hold flags stale board", by_num[2911].get("stale_board"), True)
+check("hold reason names the owner path", "owner_start_recommendations" in by_num[2911]["reason"], True)
+check("epic hold is marked as an epic", by_num[2911].get("epic"), True)
+check("a Ready epic is not a stale board item", "stale_board" in by_num[2911], False)
 check("story item still dispatches", by_num[3370]["action"], "dispatch")
 
 # The epic gate precedes env/dep/file-conflict gates, so the board anomaly is
@@ -89,13 +93,13 @@ check("story item still dispatches", by_num[3370]["action"], "dispatch")
 recs = m.compute_dispatch_recommendations(
     [story(2911, is_epic=True, env="windows")], [], {}, {"linux"}
 )
-check("epic gate precedes env gate", recs[0].get("stale_board"), True)
+check("epic gate precedes env gate", recs[0].get("epic"), True)
 check("epic hold carries no route hint", recs[0].get("route"), None)
 
 recs = m.compute_dispatch_recommendations(
     [story(2911, is_epic=True, deps=[999])], [], {999: "OPEN"}, {"linux"}
 )
-check("epic gate precedes dep gate", recs[0].get("stale_board"), True)
+check("epic gate precedes dep gate", recs[0].get("epic"), True)
 
 recs = m.compute_dispatch_recommendations(
     [story(2911, is_epic=True, files=["pkg/shared.go"])],
@@ -103,7 +107,7 @@ recs = m.compute_dispatch_recommendations(
     {},
     {"linux"},
 )
-check("epic gate precedes file-conflict gate", recs[0].get("stale_board"), True)
+check("epic gate precedes file-conflict gate", recs[0].get("epic"), True)
 
 # Backwards compatibility: a story dict predating the is_epic field must
 # dispatch normally rather than being read as an epic.
