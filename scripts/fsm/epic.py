@@ -376,6 +376,10 @@ class EpicSupervisor(sup.Supervisor):
                                 state=self.state)
                 self.log(f"host error in PREPARE: {type(exc).__name__}: {exc}")
                 self._phase("error", T.FAILED, "prepare_error")
+                # FAILED before the gates: if the item stayed Ready, the next
+                # cycle starts the same run again, each cycle. REFUSED and
+                # deferred write nothing: they are retried.
+                self.board_status("Blocked")
         if self.state == OWNER:
             try:
                 state, reason = self.loop()

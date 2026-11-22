@@ -515,6 +515,19 @@ class TestRefusals(EpicCase):
         self.assertEqual(self.f.records("docker-owner-start"), [])
         self.assertEqual(self.board_writes(), [])       # refused at a gate: the item stays Ready
 
+    def test_a_failure_before_the_gates_sets_blocked(self):
+        """FAILED(prepare_error) sets the item Blocked: at Ready, the next
+        cycle would start the same run again, each cycle."""
+        self.f.board_item.write_text("[1]")             # not an item: an error in PREPARE
+        self.launch()
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.f.path_states(self.run_dir.name), [("PREPARE", "error", "FAILED")])
+        self.assertEqual(self.recs("transition")[-1]["reason"], "prepare_error")
+        self.assertTrue(any("AttributeError" in (r.get("error") or "") for r in self.recs("note")))
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), ["Blocked"])
+
     def test_a_board_that_cannot_be_written_does_not_fail_the_run(self):
         self.f.plan({"owner": [[{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
         self.launch(env={"FSM_FAKE_PQ_UPDATE_FAIL": "1"})
