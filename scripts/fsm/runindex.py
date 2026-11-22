@@ -133,10 +133,11 @@ def describe(run_id, base=None, now=None):
         return None
     if not run.exists():
         return None
+    params_unreadable = False
     try:
         params = run.params()
     except (OSError, ValueError):
-        params = {}
+        params, params_unreadable = {}, True
     recs = run.records()
     state, reason, frm = "PREPARE", "", ""
     for rec in recs:
@@ -184,6 +185,8 @@ def describe(run_id, base=None, now=None):
         # it runs, and for a run that was abandoned with no recorded end
         "ended_at": (ended[-1].get("ts") or None) if ended else None,
         "path": str(run.path),
+        # run.json could not be read: mode, key and target are not known
+        "params_unreadable": params_unreadable,
     }
 
 

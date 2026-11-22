@@ -819,6 +819,9 @@ PYEOF
 
   lease-list)
     # lease-list  →  one TSV line per live lease ref: <key>\t<holder>\t<exp>\t<expired>
+    # Exits 1 with LEASE_LIST_FAILED on stderr when the ref list cannot be
+    # read: "no lease" and "not known" must not look the same to a caller
+    # that counts leases (the preflight's owner limit).
     owner="${REPO%%/*}"; name="${REPO##*/}"
     now=$(date +%s)
     # Pure bash + local jq (Issue #3686), mirroring lease-status above: native
@@ -828,7 +831,11 @@ PYEOF
     # PATH-interception test mocks. Piping through the system `jq` binary
     # directly (not `gh api --jq`) avoids spawning a second process per ref,
     # so there is nothing here for that failure mode to attach to.
-    refs_json=$(gh api "repos/${owner}/${name}/git/matching-refs/cfgms-lease/" 2>/dev/null || echo '[]')
+    if ! refs_json=$(gh api "repos/${owner}/${name}/git/matching-refs/cfgms-lease/" 2>/dev/null) \
+       || ! printf '%s' "$refs_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      echo "LEASE_LIST_FAILED:matching-refs" >&2
+      exit 1
+    fi
     while IFS=$'\t' read -r ref sha; do
       [ -n "$ref" ] || continue
       key="${ref#refs/cfgms-lease/}"

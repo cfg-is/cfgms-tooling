@@ -1210,6 +1210,57 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
     return recs
 
 
+def load_owner_holders(degraded_reasons):
+    """(lease_rows, runs, holders_unknown): the lease list and this host's
+    run index, and whether the number of epics that owners hold is known.
+
+    Not known when the lease list cannot be read (`lease-list` exits
+    non-zero when its API call fails), when the run index cannot be read, or
+    when a run that is not ended has a run.json that cannot be read (its
+    mode and epic are not known, so it could be an owner). Each case adds a
+    degraded reason."""
+    unknown = False
+    lease_rows = _lease_list_rows()
+    try:
+        runs = _load_runindex().list_runs()
+    except Exception as e:
+        runs, unknown = [], True
+        degraded_reasons.append(
+            f"FSM run index unreadable ({e}) — an epic that an owner session "
+            "builds can show in epics_undecomposed; do not decompose from this run")
+    unreadable = sorted(str(r.get("run_id")) for r in runs
+                        if r.get("params_unreadable") and r.get("status") in _OWNER_RUN_ACTIVE)
+    if unreadable:
+        unknown = True
+        degraded_reasons.append(
+            "run.json unreadable for FSM run " + ", ".join(unreadable[:5])
+            + " — it can be an owner run; no owner is started from this run")
+    if lease_rows is None:
+        unknown = True
+        degraded_reasons.append(
+            "lease-list unavailable — an epic that an owner session on another "
+            "host builds can show in epics_undecomposed")
+    return lease_rows, runs, unknown
+
+
+def apply_owner_epics(out, code_health, degraded_reasons):
+    """The owner part of the preflight: read the holders, move each held
+    epic to out["epics_owner_run"] (apply_owner_run_epics) and write
+    out["owner_start_recommendations"]. Returns (lease_rows, runs) for the
+    other readers in main()."""
+    lease_rows, runs, holders_unknown = load_owner_holders(degraded_reasons)
+    # An epic that an owner session builds has no stories and is not
+    # "undecomposed": keep it away from the Planning Team.
+    apply_owner_run_epics(out, runs, lease_rows)
+    # An epic whose project item is Ready gets an owner (EPIC-DESIGN.md §9).
+    out["owner_start_recommendations"] = compute_owner_start_recommendations(
+        out["epics_undecomposed"], out.get("pipeline_state"), runs, lease_rows,
+        develop_broken=dispatch_blocked(code_health),
+        holders_unknown=holders_unknown,
+        limit=owner_run_limit())
+    return lease_rows, runs
+
+
 def project_queue_list_by_status(status):
     """Call project-queue.sh list-by-status; return [{number, title, item_id}].
 
@@ -3629,30 +3680,8 @@ def main():
     # FSM runs (DESIGN.md §11): an unfinished run holds its story / PR whether
     # or not one of its containers is running right now. pr-<N> leases held
     # by any host mean the same for a PR (review, fix and resolve share it).
-    lease_rows = _lease_list_rows()
-    runs_readable = True
-    try:
-        all_fsm_runs = _load_runindex().list_runs()
-    except Exception as e:
-        all_fsm_runs = []
-        runs_readable = False
-        degraded_reasons.append(
-            f"FSM run index unreadable ({e}) — an epic that an owner session "
-            "builds can show in epics_undecomposed; do not decompose from this run")
-    if lease_rows is None:
-        degraded_reasons.append(
-            "lease-list unavailable — an epic that an owner session on another "
-            "host builds can show in epics_undecomposed")
+    lease_rows, all_fsm_runs = apply_owner_epics(out, code_health, degraded_reasons)
     fsm_view = fsm_run_view(all_fsm_runs, lease_rows)
-    # An epic that an owner session builds has no stories and is not
-    # "undecomposed": keep it away from the Planning Team.
-    apply_owner_run_epics(out, all_fsm_runs, lease_rows)
-    # An epic whose project item is Ready gets an owner (EPIC-DESIGN.md §9).
-    out["owner_start_recommendations"] = compute_owner_start_recommendations(
-        out["epics_undecomposed"], out["pipeline_state"], all_fsm_runs, lease_rows,
-        develop_broken=dispatch_blocked(code_health),
-        holders_unknown=not runs_readable or lease_rows is None,
-        limit=owner_run_limit())
     out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
     out["fsm_recommendations"] = fsm_view["recommendations"]
     # In-flight fix-pr / resolve-conflict FSM runs hold their PR like a running
@@ -3726,8 +3755,14 @@ def write_output(out, mode):
         return
 
     # Default: emit a short summary to stdout + path reference
+    json.dump(build_summary(out, cache_path), sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+
+
+def build_summary(out, cache_path):
+    """The short summary that the default mode prints."""
     code_health = out.get("code_health") or {}
-    summary = {
+    return {
         "cache_file": str(cache_path),
         "cycle_generated_at": out["cycle_generated_at"],
         "degraded": out["degraded"],
@@ -3772,8 +3807,6 @@ def write_output(out, mode):
         "fsm_runs": out.get("fsm_runs", {"in_flight": [], "resumable": []}),
         "fsm_recommendations": out.get("fsm_recommendations", []),
     }
-    json.dump(summary, sys.stdout, indent=2, default=str)
-    sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

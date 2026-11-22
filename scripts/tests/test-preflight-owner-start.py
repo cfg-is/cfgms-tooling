@@ -205,19 +205,139 @@ class OwnerStart(unittest.TestCase):
         self.assertIn("owner_start_recommendations", rec["reason"])
         self.assertNotIn("stale_board", rec)
 
-    def test_main_wires_the_list_and_the_summary(self):
-        src = Path(PREFLIGHT_PATH).read_text()
-        body = src[src.index("\ndef main("):]
-        apply_at = body.index("apply_owner_run_epics(out, all_fsm_runs, lease_rows)")
-        start_at = body.index('out["owner_start_recommendations"] = compute_owner_start_recommendations(')
-        self.assertLess(apply_at, start_at)
-        call = body[start_at:body.index("\n", body.index("limit=owner_run_limit()", start_at))]
-        self.assertIn('out["epics_undecomposed"], out["pipeline_state"], all_fsm_runs, lease_rows', call)
-        self.assertIn("develop_broken=dispatch_blocked(code_health)", call)
-        self.assertIn("holders_unknown=not runs_readable or lease_rows is None", call)
-        self.assertIn('"owner_start_epics": sum(', body)
-        self.assertIn('"owner_start_recommendations": out.get("owner_start_recommendations", [])', body)
+    def test_ready_wins_when_an_issue_has_two_items(self):
+        board = _board()
+        board["drafts"] = [{"number": 7, "title": "epic 7", "item_id": "PVTI_draft"}]
+        board["ready"] = [{"number": 7, "title": "epic 7", "item_id": "PVTI_ready"}]
+        (rec,) = self.recs([7], board)
+        self.assertEqual((rec["action"], rec["item_id"]), ("start", "PVTI_ready"))
 
+
+GH_FAKE = """#!/bin/sh
+# stands in for gh: the lease refs of pipeline-helper.sh lease-list
+if [ "$FAKE_GH_MODE" = fail ]; then echo "gh: HTTP 502" >&2; exit 1; fi
+case "$*" in
+  *matching-refs/cfgms-lease/*) cat "$FAKE_GH_REFS" ;;
+  *git/commits/*) echo "lease holder=other-host exp=9999999999" ;;
+  *) exit 1 ;;
+esac
+"""
+
+
+class OwnerStartWiring(unittest.TestCase):
+    """apply_owner_epics as main() calls it: the real pipeline-helper.sh
+    lease-list (gh is a stand-in on PATH) and the real run index over a temp
+    runs dir."""
+
+    def setUp(self):
+        self.pf = _load_preflight()
+        self.root = Path(tempfile.mkdtemp(prefix="pf-wire-"))
+        self.base = self.root / "runs"
+        self.base.mkdir()
+        (self.root / "bin").mkdir()
+        gh = self.root / "bin" / "gh"
+        gh.write_text(GH_FAKE)
+        gh.chmod(0o755)
+        self.refs = self.root / "refs.json"
+        self.refs.write_text("[]")
+        self.old_env = dict(os.environ)
+        os.environ.pop("CFGMS_TEST_PIPELINE_HELPER", None)
+        os.environ.pop("CFGMS_OWNER_MAX_RUNS", None)
+        os.environ.update(PATH="%s%s%s" % (self.root / "bin", os.pathsep, os.environ["PATH"]),
+                          CFGMS_FSM_RUNS_DIR=str(self.base), FAKE_GH_REFS=str(self.refs),
+                          FAKE_GH_MODE="ok", PO_CACHE_DIR=str(self.root / "cache"))
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.old_env)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def make_run(self, run_id, epic, done=False):
+        r = statemod.RunDir(run_id, base=self.base)
+        r.create({"mode": supervisor.EPIC_MODE, "epic": epic, "target": f"epic-{epic}",
+                  "key": f"epic-{epic}"})
+        if done:
+            for frm, event, to in REPORTED:
+                r.append("transition", frm=frm, event=event, to=to, kind="", reason="")
+            r.append("terminal_done", state="REPORT")
+        return r
+
+    def apply(self, epics=(7,), ready=(7,), code_health=None):
+        out = {"epics_undecomposed": [_epic(n) for n in epics], "pipeline_state": _board(ready=ready)}
+        reasons = []
+        lease_rows, runs = self.pf.apply_owner_epics(out, code_health or {"ok": True}, reasons)
+        recs = [(r["number"], r["action"], r["reason"]) for r in out["owner_start_recommendations"]]
+        return out, recs, reasons, lease_rows
+
+    def test_no_lease_and_no_run_a_ready_epic_is_started(self):
+        out, recs, reasons, lease_rows = self.apply()
+        self.assertEqual((recs, reasons, lease_rows), ([(7, "start", "ready")], [], []))
+
+    def test_a_lease_list_that_fails_holds_the_epic_as_degraded(self):
+        os.environ["FAKE_GH_MODE"] = "fail"
+        out, recs, reasons, lease_rows = self.apply()
+        self.assertIsNone(lease_rows)
+        self.assertEqual(recs, [(7, "hold", "degraded")])
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("lease-list unavailable", reasons[0])
+
+    def test_a_lease_answer_that_is_no_list_is_a_failure(self):
+        self.refs.write_text('{"message": "Bad credentials"}')
+        out, recs, reasons, lease_rows = self.apply()
+        self.assertEqual((lease_rows, recs), (None, [(7, "hold", "degraded")]))
+
+    def test_a_lease_of_another_host_takes_the_place(self):
+        self.refs.write_text('[{"ref": "refs/cfgms-lease/epic-5", "object": {"sha": "abc"}}]')
+        out, recs, reasons, lease_rows = self.apply()
+        self.assertEqual(lease_rows, [("epic-5", "other-host", False)])
+        self.assertEqual((recs, reasons), ([(7, "hold", "owner_limit")], []))
+
+    def test_a_run_on_this_host_takes_the_place_and_its_epic_leaves_the_list(self):
+        self.make_run("epic-5-a", 5)
+        out, recs, reasons, _ = self.apply(epics=(5, 7), ready=(5, 7))
+        self.assertEqual([e["number"] for e in out["epics_owner_run"]], [5])
+        self.assertEqual(recs, [(7, "hold", "owner_limit")])
+
+    def test_a_run_that_is_not_ended_with_an_unreadable_run_json_is_degraded(self):
+        r = self.make_run("epic-5-a", 5)
+        r.p("run.json").write_text("{ not json")
+        out, recs, reasons, _ = self.apply()
+        self.assertEqual(recs, [(7, "hold", "degraded")])
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("run.json unreadable for FSM run epic-5-a", reasons[0])
+
+    def test_an_ended_run_with_an_unreadable_run_json_holds_no_place(self):
+        r = self.make_run("epic-5-a", 5, done=True)
+        r.p("run.json").write_text("{ not json")
+        out, recs, reasons, _ = self.apply()
+        self.assertEqual((recs, reasons), ([(7, "start", "ready")], []))
+
+    def test_an_unreadable_run_index_is_degraded(self):
+        shutil.rmtree(self.base)
+        self.base.write_text("a file where the runs dir must be")
+        out, recs, reasons, _ = self.apply()
+        self.assertEqual(recs, [(7, "hold", "degraded")])
+        self.assertIn("FSM run index unreadable", reasons[0])
+
+    def test_a_broken_develop_holds_the_epic(self):
+        out, recs, reasons, _ = self.apply(code_health={"ok": False, "checks": {}})
+        self.assertEqual(recs, [(7, "hold", "develop_broken")])
+
+    def test_the_limit_is_read_from_the_environment(self):
+        os.environ["CFGMS_OWNER_MAX_RUNS"] = "2"
+        self.refs.write_text('[{"ref": "refs/cfgms-lease/epic-5", "object": {"sha": "abc"}}]')
+        out, recs, reasons, _ = self.apply(epics=(7, 8), ready=(7, 8))
+        self.assertEqual(recs, [(7, "start", "ready"), (8, "hold", "owner_limit")])
+
+    def test_the_summary_counts_the_starts_and_carries_the_list(self):
+        os.environ["CFGMS_OWNER_MAX_RUNS"] = "2"
+        out, recs, reasons, _ = self.apply(epics=(7, 8, 9), ready=(7, 8, 9))
+        out.update(cycle_generated_at="t", degraded=False, degraded_reasons=reasons)
+        summary = self.pf.build_summary(out, self.root / "cache" / "preflight.json")
+        self.assertEqual(summary["counts"]["owner_start_epics"], 2)
+        self.assertEqual(summary["owner_start_recommendations"], out["owner_start_recommendations"])
+        self.assertEqual([r["action"] for r in summary["owner_start_recommendations"]],
+                         ["start", "start", "hold"])
 
 if __name__ == "__main__":
     unittest.main()
