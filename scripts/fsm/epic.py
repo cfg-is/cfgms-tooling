@@ -425,6 +425,10 @@ class EpicSupervisor(sup.Supervisor):
             d = p.get(name)
             if not d or not os.path.isabs(d) or os.path.islink(d) or not os.path.isdir(d):
                 raise sup.Refused(f"no_{name}")
+        # agents write the memory folder: a `.git` entry in it is never
+        # trusted (po-act.sh notes-setup puts the git directory outside it)
+        if os.path.lexists(os.path.join(p["memory_dir"], ".git")):
+            raise sup.Refused("memory_dir_has_git")
         real = [os.path.realpath(p["canon_dir"]), os.path.realpath(p["memory_dir"]),
                 os.path.realpath(str(self.run.path))]
         for i, a_ in enumerate(real):

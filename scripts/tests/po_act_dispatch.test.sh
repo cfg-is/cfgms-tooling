@@ -227,6 +227,37 @@ check_eq "T9f: a set variable that names no folder -> exits 3, the default is no
 check_contains "T9f: the refusal names the set path" "$t9_out" "no_canon_or_memory_dir (canon ${SANDBOX}/no-such-canon,"
 rm -rf "${SANDBOX}/cfgms-canon" "${SANDBOX}/cfgms-memory"
 
+printf '\n== T9g: a memory folder with a .git entry is refused ==\n'
+# Agents write the memory folder: its .git is never trusted.
+mkdir -p "${SANDBOX}/memory-git/.git" "${SANDBOX}/memory-gitfile" "${SANDBOX}/memory-gitlink"
+: > "${SANDBOX}/memory-gitfile/.git"
+ln -s "${SANDBOX}/points-nowhere" "${SANDBOX}/memory-gitlink/.git"
+for t9_kind in git gitfile gitlink; do
+  t9_rc=0
+  t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory-${t9_kind}" run_epic 4242) || t9_rc=$?
+  check_eq "T9g (${t9_kind}): exits 3" "$t9_rc" "3"
+  check_eq "T9g (${t9_kind}): the refusal names the entry and the way out" "$t9_out" \
+    "DISPATCH_REFUSED:epic-4242:memory_dir_has_git (${SANDBOX}/memory-${t9_kind}/.git; run: po-act.sh notes-setup)"
+  check_eq "T9g (${t9_kind}): the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+done
+# A host with no room: the capacity gate defers. The .git refusal comes first.
+printf '#!/usr/bin/env bash\n[[ "$1" == capacity ]] && { echo "ram 99%%"; exit 1; }\nexit 0\n' > "${SANDBOX}/dispatch-full.sh"
+chmod +x "${SANDBOX}/dispatch-full.sh"
+run_epic_full_host() {  # run_epic_full_host <memory dir>: run_epic with the capacity gate on
+  rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"
+  : > "${SANDBOX}/supervisor.log"
+  PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=on \
+  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-full.sh" CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="$1" \
+  bash "$POACT" dispatch --epic 4242 2>&1
+}
+t9_out=$(run_epic_full_host "${SANDBOX}/memory") || true
+check_contains "T9g: the stand-in host is full (a clean folder is deferred)" "$t9_out" "DISPATCH_DEFERRED:epic-4242:resources"
+t9_out=$(run_epic_full_host "${SANDBOX}/memory-git") || true
+check_contains "T9g: refused before the capacity gate" "$t9_out" "DISPATCH_REFUSED:epic-4242:memory_dir_has_git"
+check_not_contains "T9g: not deferred" "$t9_out" "DISPATCH_DEFERRED"
+
 printf '\n== T10: a second dispatch of an epic that runs is skipped ==\n'
 t10_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242)
 : > "${SANDBOX}/supervisor.log"
@@ -289,6 +320,28 @@ check_contains "T12b: with the variable the supervisor is started" "$(cat "${SAN
 t12_out=$(CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-yes" resume_epic) || true
 check_contains "T12c: token readable -> the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
 check_not_contains "T12c: the token value is not printed" "$t12_out" "fake-token-value"
+
+printf '\n== T13: resume of an epic run whose memory folder got a .git entry ==\n'
+# the run recorded ${SANDBOX}/memory at its launch (run.json)
+t13_resume() {
+  CFGMS_SYSTEMD_CREDS_BIN="${SANDBOX}/bin/creds-yes" resume_epic
+}
+for t13_kind in dir file link; do
+  case "$t13_kind" in
+    dir)  mkdir "${SANDBOX}/memory/.git" ;;
+    file) : > "${SANDBOX}/memory/.git" ;;
+    link) ln -s "${SANDBOX}/points-nowhere" "${SANDBOX}/memory/.git" ;;
+  esac
+  t13_rc=0
+  t13_out=$(t13_resume) || t13_rc=$?
+  check_eq "T13 (${t13_kind}): exits 3" "$t13_rc" "3"
+  check_eq "T13 (${t13_kind}): refused with the entry and the way out" "$t13_out" \
+    "FSM_RESUME_REFUSED:${t12_run}:memory_dir_has_git (${SANDBOX}/memory/.git; run: po-act.sh notes-setup)"
+  check_eq "T13 (${t13_kind}): the supervisor was not started" "$(cat "${SANDBOX}/supervisor.log")" ""
+  rm -rf "${SANDBOX}/memory/.git"
+done
+t13_out=$(t13_resume) || true
+check_contains "T13: with the entry gone the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
 
 echo ""
 echo "-----------------------------------------"

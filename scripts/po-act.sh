@@ -45,10 +45,15 @@
 #                                   Folder CFGMS_MEMORY_DIR (default as for dispatch --epic), git dir
 #                                   CFGMS_MEMORY_GIT_DIR (default ~/.local/state/cfgms/memory-git).
 #                                   Last line: NOTES_SYNC_OK / NOTES_SYNC_ATTENTION
-#                                   :committed=<n>:unpushed=<n>:alerts=<n> (exit 0), NOTES_SYNC_SKIPPED
-#                                   (exit 0), NOTES_SYNC_REFUSED:not_detached (exit 3),
-#                                   NOTES_SYNC_FAILED:exit_<rc> or :timeout_<secs>s (exit 1;
-#                                   CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
+#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>[:fetch=failed]
+#                                   (exit 0), NOTES_SYNC_SKIPPED (exit 0), NOTES_SYNC_REFUSED:not_detached
+#                                   (exit 3; run notes-setup), NOTES_SYNC_FAILED:exit_<rc> or
+#                                   :timeout_<secs>s (exit 1; CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
+#   notes-setup                     One time on a host: make the git dir of the notes folder from a new
+#                                   clone of CFGMS_MEMORY_REMOTE (default
+#                                   https://github.com/cfg-is/cfgms-memory.git). A .git in the folder is
+#                                   never read: it is moved away. NOTES_SETUP_OK (exit 0),
+#                                   NOTES_SETUP_REFUSED:<reason> (exit 3), NOTES_SETUP_FAILED:<step> (exit 1)
 #   preflight                       Run preflight (writes ~/.cache/cfgms-po/preflight.json, prints summary)
 #   state [jq_filter]               Read cached preflight and apply optional jq filter
 #   cycle-start [MODE]              Open a per-cycle manifest (Issue #3053). MODE is a free label
@@ -108,6 +113,36 @@ _host_clone_dir() {
   parent="$(cd "${REPO_ROOT}/.." 2>/dev/null && pwd)" || parent="${REPO_ROOT}/.."
   printf '%s/cfgms-%s\n' "$parent" "$name"
 }
+
+# _path_inside <path> <dir>: true when <path> is <dir> or below it (real
+# paths; neither has to exist).
+_path_inside() {
+  local c d
+  c="$(realpath -m -- "$1" 2>/dev/null)" || return 1
+  d="$(realpath -m -- "$2" 2>/dev/null)" || return 1
+  [[ "$c" == "$d" || "$c" == "${d%/}"/* ]]
+}
+
+# _notes_paths: the notes folder, its git directory (never inside the folder,
+# never mounted into a container), the state directory of memory-sync.py and
+# the time limit of one git or memory-sync.py call. For notes-sync and
+# notes-setup.
+_notes_paths() {
+  notes_dir="$(_host_clone_dir memory)"
+  notes_git="${CFGMS_MEMORY_GIT_DIR:-${HOME}/.local/state/cfgms/memory-git}"
+  notes_state="${CFGMS_MEMORY_STATE_DIR:-${HOME}/.local/state/cfgms/memory-sync}"
+  notes_timeout="${CFGMS_NOTES_SYNC_TIMEOUT_SECS:-300}"
+  [[ "$notes_timeout" =~ ^[1-9][0-9]*$ ]] || notes_timeout=300
+}
+
+# _notes_host_git <git args...>: git on the notes git directory with the
+# host's config (the login for the remote), under the time limit. It reads
+# the git directory only, never the folder that agents write.
+_notes_host_git() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE GIT_TERMINAL_PROMPT=0 \
+    timeout -k 5 "$notes_timeout" git -c core.hooksPath=/dev/null --git-dir "$notes_git" "$@"
+}
+
 # CFGMS_TEST_PROJECT_QUEUE: same test-hook shape as CFGMS_TEST_DISPATCH /
 # CFGMS_TEST_PIPELINE_HELPER -- lets hermetic tests stand in for the real
 # script (gh-backed, no test hooks of its own) rather than hitting GitHub.
@@ -1075,6 +1110,18 @@ except Exception: print('')" 2>/dev/null || true)
       return 3
     fi
   fi
+  # An epic run mounts its memory folder again when it must start a new
+  # owner container. The folder is the one in the run's run.json. The same
+  # rule as at the launch: no `.git` entry in it.
+  if [[ "$mode" == "epic" ]]; then
+    local resume_memory
+    resume_memory=$(python3 -c "import json,sys
+print(json.load(open(sys.argv[1])).get('memory_dir') or '')" "${FSM_RUNS_BASE}/${run_id}/run.json" 2>/dev/null || true)
+    if [[ -n "$resume_memory" && ( -e "${resume_memory}/.git" || -L "${resume_memory}/.git" ) ]]; then
+      echo "FSM_RESUME_REFUSED:${run_id}:memory_dir_has_git (${resume_memory}/.git; run: po-act.sh notes-setup)"
+      return 3
+    fi
+  fi
   if ! cap=$(_capacity_ok); then
     echo "DISPATCH_DEFERRED:${run_id}:resources (${cap})"
     return 0
@@ -1268,6 +1315,13 @@ case "$cmd" in
         epic_memory="$(_host_clone_dir memory)"
         if [[ ! -d "$epic_canon" || ! -d "$epic_memory" ]]; then
           echo "DISPATCH_REFUSED:${epic_label}:no_canon_or_memory_dir (canon ${epic_canon}, memory ${epic_memory}: one is not a directory; set CFGMS_CANON_DIR and CFGMS_MEMORY_DIR to the host clones)"
+          exit 3
+        fi
+        # A `.git` in the memory folder means the folder is not set up (the
+        # git directory must be outside it) or that an agent put one there.
+        # Agents write that folder, so its `.git` is never trusted.
+        if [[ -e "${epic_memory}/.git" || -L "${epic_memory}/.git" ]]; then
+          echo "DISPATCH_REFUSED:${epic_label}:memory_dir_has_git (${epic_memory}/.git; run: po-act.sh notes-setup)"
           exit 3
         fi
         if ! cap=$(_capacity_ok); then
@@ -1893,12 +1947,17 @@ EOF
     # Commit and push what owners wrote into the shared notes folder: one
     # `memory-sync.py once`. Its checks (allow-list, secret scan, quarantine)
     # are memory-sync.py's own; this only starts it and says what happened.
+    # One host runs notes-sync. Two hosts that push the same notes are not
+    # supported: the second sees `behind` and does not merge.
     #   NOTES_SYNC_SKIPPED:no_memory_dir (<path>)   exit 0  no folder on this host
     #   NOTES_SYNC_SKIPPED:already_running          exit 0  another memory-sync.py holds
     #                                               the lock: its run does the work
     #   NOTES_SYNC_REFUSED:not_detached (<what>)    exit 3  there is no usable git
-    #                                               directory outside the folder.
-    #                                               `detach` is never run from here.
+    #                                               directory outside the folder. The
+    #                                               text names `po-act.sh notes-setup`.
+    #                                               It never names `detach`: that
+    #                                               would make an agent-written `.git`
+    #                                               the host's git directory.
     #   NOTES_SYNC_NOTE:git_entry_in_folder (<path>)        an extra line before the
     #                                               last one: the git directory is in
     #                                               place and the folder has a `.git`
@@ -1907,51 +1966,52 @@ EOF
     #                                               save for all: the sync runs (git
     #                                               never adds a `.git` entry) and the
     #                                               last line is ATTENTION.
-    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:alerts=0          exit 0
-    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:alerts=<n>  exit 0  a push
-    #                                               failed, a file was refused or put
-    #                                               in quarantine, or the NOTE line
-    #                                               below was printed
+    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:behind=0:alerts=0   exit 0
+    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>[:fetch=failed]
+    #                                               exit 0  a number is not 0, the fetch
+    #                                               failed, or the NOTE line was printed
     #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
     #   NOTES_SYNC_FAILED:timeout_<secs>s           exit 1  memory-sync.py ran longer
     #                                               than CFGMS_NOTES_SYNC_TIMEOUT_SECS
     #                                               (default 300) and was stopped
+    # origin/main is fetched first (host config for the login), so the numbers
+    # are about the remote as it is now, not about what this host pushed last.
     # committed: commits made by this call. unpushed: origin/main..HEAD after
-    # it. alerts: files this call added to <state dir>/alerts. A refused file
-    # that stays in the folder gives an alert one time, not each call.
-    notes_dir="$(_host_clone_dir memory)"
-    notes_git="${CFGMS_MEMORY_GIT_DIR:-${HOME}/.local/state/cfgms/memory-git}"
-    notes_state="${CFGMS_MEMORY_STATE_DIR:-${HOME}/.local/state/cfgms/memory-sync}"
-    notes_py="$(cd "$(dirname "$0")" && pwd)/memory-sync.py"
+    # it. behind: HEAD..origin/main (commits on the remote that this host does
+    # not have; nothing is merged). alerts: the ALERT lines of this call. A
+    # refused file that stays in the folder gives an alert one time, not each
+    # call. fetch=failed: the remote could not be read, so unpushed and behind
+    # are from the last time it could.
+    _notes_paths
+    notes_py="${CFGMS_TEST_MEMORY_SYNC:-$(cd "$(dirname "$0")" && pwd)/memory-sync.py}"
     if [[ ! -d "$notes_dir" ]]; then
       echo "NOTES_SYNC_SKIPPED:no_memory_dir (${notes_dir})"
       exit 0
     fi
     notes_git_do() { env -u GIT_WORK_TREE -u GIT_INDEX_FILE git --git-dir "$notes_git" "$@" 2>/dev/null; }
+    if _path_inside "$notes_git" "$notes_dir"; then
+      echo "NOTES_SYNC_REFUSED:not_detached (the git directory ${notes_git} is inside the notes folder ${notes_dir}: set CFGMS_MEMORY_GIT_DIR to a place outside it, then run once: po-act.sh notes-setup)"
+      exit 3
+    fi
     if [[ ! -e "$notes_git" ]]; then
-      if [[ -d "${notes_dir}/.git" ]]; then
-        echo "NOTES_SYNC_REFUSED:not_detached (run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
-      else
-        echo "NOTES_SYNC_REFUSED:not_detached (no git directory ${notes_git} and no ${notes_dir}/.git: clone cfgms-memory to ${notes_dir}, then run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
-      fi
+      echo "NOTES_SYNC_REFUSED:not_detached (no git directory ${notes_git}; run once: po-act.sh notes-setup)"
       exit 3
     fi
     if [[ ! -d "$notes_git" ]] || ! notes_git_do rev-parse --git-dir >/dev/null; then
-      echo "NOTES_SYNC_REFUSED:not_detached (${notes_git} is not a usable git directory)"
+      echo "NOTES_SYNC_REFUSED:not_detached (${notes_git} is not a usable git directory: move it away, then run once: po-act.sh notes-setup)"
       exit 3
     fi
     notes_git_entry=""
     [[ -e "${notes_dir}/.git" || -L "${notes_dir}/.git" ]] && notes_git_entry="${notes_dir}/.git"
-    notes_timeout="${CFGMS_NOTES_SYNC_TIMEOUT_SECS:-300}"
-    [[ "$notes_timeout" =~ ^[1-9][0-9]*$ ]] || notes_timeout=300
-    notes_alert_count() { { find "${notes_state}/alerts" -maxdepth 1 -type f 2>/dev/null || true; } | wc -l | tr -d ' '; }
+    notes_fetch=ok
+    _notes_host_git fetch -q --no-tags origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null 2>&1 || notes_fetch=failed
     notes_head_before="$(notes_git_do rev-parse -q --verify HEAD || true)"
-    notes_alerts_before="$(notes_alert_count)"
     notes_args=(once --git-dir "$notes_git" --work-tree "$notes_dir")
     [[ -n "${CFGMS_MEMORY_STATE_DIR:-}" ]] && notes_args+=(--state-dir "$CFGMS_MEMORY_STATE_DIR")
     notes_rc=0
     # `timeout` stops memory-sync.py and what it started (a push that hangs).
-    notes_out="$(timeout -k 10 "$notes_timeout" python3 "$notes_py" "${notes_args[@]}" 2>&1)" || notes_rc=$?
+    # 124: stopped at the limit. 137: it did not stop and was killed.
+    notes_out="$(timeout -k 5 "$notes_timeout" python3 "$notes_py" "${notes_args[@]}" 2>&1)" || notes_rc=$?
     [[ -n "$notes_out" ]] && printf '%s\n' "$notes_out"
     if [[ "$notes_rc" == 124 || "$notes_rc" == 137 ]]; then
       echo "NOTES_SYNC_FAILED:timeout_${notes_timeout}s"
@@ -1973,14 +2033,88 @@ EOF
     fi
     # No origin/main to compare with: every commit counts as not pushed.
     notes_unpushed="$(notes_git_do rev-list --count origin/main..HEAD || notes_git_do rev-list --count HEAD || echo 1)"
-    notes_alerts=$(( $(notes_alert_count) - notes_alerts_before ))
-    [[ "$notes_alerts" -lt 0 ]] && notes_alerts=0
+    notes_behind="$(notes_git_do rev-list --count HEAD..origin/main || echo 0)"
+    # memory-sync.py logs one "<time> ALERT <kind>: ..." line for each alert.
+    notes_alerts="$(printf '%s\n' "$notes_out" | grep -cE '^[0-9T:+-]+ ALERT ' || true)"
+    notes_counts="committed=${notes_committed}:unpushed=${notes_unpushed}:behind=${notes_behind}:alerts=${notes_alerts}"
     [[ -n "$notes_git_entry" ]] && echo "NOTES_SYNC_NOTE:git_entry_in_folder (${notes_git_entry})"
-    if [[ "$notes_unpushed" == 0 && "$notes_alerts" == 0 && -z "$notes_git_entry" ]]; then
-      echo "NOTES_SYNC_OK:committed=${notes_committed}:unpushed=0:alerts=0"
+    if [[ "$notes_unpushed" == 0 && "$notes_behind" == 0 && "$notes_alerts" == 0 \
+          && "$notes_fetch" == ok && -z "$notes_git_entry" ]]; then
+      echo "NOTES_SYNC_OK:${notes_counts}"
+    elif [[ "$notes_fetch" == ok ]]; then
+      echo "NOTES_SYNC_ATTENTION:${notes_counts}"
     else
-      echo "NOTES_SYNC_ATTENTION:committed=${notes_committed}:unpushed=${notes_unpushed}:alerts=${notes_alerts}"
+      echo "NOTES_SYNC_ATTENTION:${notes_counts}:fetch=failed"
     fi
+    ;;
+
+  notes-setup)
+    # One time on a host: make the git directory of the notes folder. Owner
+    # containers write the folder, so a `.git` in it is never trusted: no git
+    # command runs in it or on it, and its config, hooks and remotes are never
+    # read. The git directory comes from a NEW clone of the remote
+    # (CFGMS_MEMORY_REMOTE; the URL is never taken from the folder). A `.git`
+    # in the folder is moved, by a rename, to the state directory.
+    # After this the folder's files are compared with the remote's main: the
+    # first notes-sync commits what is different in the folder, also a note
+    # that the folder does not have (a removal). The folder is the truth.
+    #   NOTES_SETUP_NOTE:moved_untrusted_git (<from> -> <to>)   an extra line
+    #   NOTES_SETUP_OK:git_dir=<path>:head=<commit>   exit 0
+    #   NOTES_SETUP_REFUSED:no_memory_dir (<path>)    exit 3
+    #   NOTES_SETUP_REFUSED:git_dir_exists (<path>)   exit 3  set up before; nothing changed
+    #   NOTES_SETUP_REFUSED:git_dir_in_folder (...)   exit 3  the git or state directory
+    #                                                 would be inside the folder
+    #   NOTES_SETUP_FAILED:<step> (...)               exit 1  step: state_dir, clone,
+    #                                                 no_origin_main, move_untrusted_git,
+    #                                                 move_git_dir. A failure before
+    #                                                 move_git_dir leaves no git directory.
+    _notes_paths
+    notes_remote="${CFGMS_MEMORY_REMOTE:-https://github.com/cfg-is/cfgms-memory.git}"
+    if [[ ! -d "$notes_dir" ]]; then
+      echo "NOTES_SETUP_REFUSED:no_memory_dir (${notes_dir})"
+      exit 3
+    fi
+    if _path_inside "$notes_git" "$notes_dir" || _path_inside "$notes_state" "$notes_dir"; then
+      echo "NOTES_SETUP_REFUSED:git_dir_in_folder (git directory ${notes_git}, state directory ${notes_state}, notes folder ${notes_dir})"
+      exit 3
+    fi
+    if [[ -e "$notes_git" || -L "$notes_git" ]]; then
+      echo "NOTES_SETUP_REFUSED:git_dir_exists (${notes_git})"
+      exit 3
+    fi
+    if ! mkdir -p -m 700 "$notes_state" "$(dirname "$notes_git")" \
+       || ! notes_tmp="$(mktemp -d "${notes_state}/setup-XXXXXX")"; then
+      echo "NOTES_SETUP_FAILED:state_dir (${notes_state})"
+      exit 1
+    fi
+    notes_new="${notes_tmp}/clone/.git"
+    notes_setup_fail() {  # <step> <detail>: remove the temp clone, say why, exit 1
+      rm -rf "$notes_tmp"
+      echo "NOTES_SETUP_FAILED:$1 ($2)"
+      exit 1
+    }
+    if ! notes_out="$(cd "$notes_tmp" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE GIT_TERMINAL_PROMPT=0 \
+          timeout -k 5 "$notes_timeout" git -c core.hooksPath=/dev/null clone -q --no-checkout --no-tags \
+          -- "$notes_remote" clone 2>&1)"; then
+      [[ -n "$notes_out" ]] && printf '%s\n' "$notes_out" | tail -n 5
+      notes_setup_fail clone "$notes_remote"
+    fi
+    notes_main="$(git --git-dir "$notes_new" rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null)" \
+      || notes_setup_fail no_origin_main "$notes_remote"
+    git --git-dir "$notes_new" update-ref refs/heads/main "$notes_main" \
+      && git --git-dir "$notes_new" symbolic-ref HEAD refs/heads/main \
+      && git --git-dir "$notes_new" config core.bare false \
+      || notes_setup_fail no_origin_main "$notes_remote"
+    if [[ -e "${notes_dir}/.git" || -L "${notes_dir}/.git" ]]; then
+      notes_aside="${notes_state}/untrusted-git-$(date -u +%Y%m%dT%H%M%SZ)"
+      [[ -e "$notes_aside" || -L "$notes_aside" ]] && notes_aside="${notes_aside}-$$"
+      mv -T -- "${notes_dir}/.git" "$notes_aside" 2>/dev/null \
+        || notes_setup_fail move_untrusted_git "${notes_dir}/.git"
+      echo "NOTES_SETUP_NOTE:moved_untrusted_git (${notes_dir}/.git -> ${notes_aside}); it is not used. Look at it or delete it."
+    fi
+    mv -T -- "$notes_new" "$notes_git" 2>/dev/null || notes_setup_fail move_git_dir "$notes_git"
+    rm -rf "$notes_tmp"
+    echo "NOTES_SETUP_OK:git_dir=${notes_git}:head=${notes_main:0:12}"
     ;;
 
   preflight)

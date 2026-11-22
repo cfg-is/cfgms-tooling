@@ -496,6 +496,16 @@ class TestRefusals(EpicCase):
         self.assertIn("FSM_REFUSED:epic-900:no_canon_dir", out)
         self.assertEqual(self.f.records("docker-owner-start"), [])
 
+    def test_a_memory_folder_with_a_git_entry_is_refused(self):
+        """Agents write the memory folder: a `.git` in it is never trusted
+        (a directory, a file, or a link that points nowhere)."""
+        os.symlink(self.f.root / "nowhere", self.memory / ".git")
+        self.launch()
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:memory_dir_has_git", out)
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+
 
 class TestParts(unittest.TestCase):
     def test_a_token_read_that_timed_out_is_read_again_and_no_other_reason_is(self):
