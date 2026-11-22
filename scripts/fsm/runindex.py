@@ -142,7 +142,8 @@ def describe(run_id, base=None, now=None):
     for rec in recs:
         if rec.get("type") == "transition":
             state, reason, frm = rec.get("to", state), rec.get("reason") or "", rec.get("frm", "")
-    done = any(r.get("type") == "terminal_done" for r in recs)
+    ended = [r for r in recs if r.get("type") == "terminal_done"]
+    done = bool(ended)
     abandoned = [r for r in recs if r.get("type") == "abandoned"]
     launched = [r for r in recs if r.get("type") == "agent_launched"]
     gates_passed = any(r.get("type") == "transition" and r.get("frm") == "PREPARE"
@@ -179,6 +180,9 @@ def describe(run_id, base=None, now=None):
         "heartbeat_age": None if hb is None else round(hb, 1),
         "agent_launched": bool(launched), "sessions": len(launched),
         "gates_passed": gates_passed, "created": created, "last_activity": last,
+        # when the supervisor recorded the end of the run (ISO, UTC). None while
+        # it runs, and for a run that was abandoned with no recorded end
+        "ended_at": (ended[-1].get("ts") or None) if ended else None,
         "path": str(run.path),
     }
 

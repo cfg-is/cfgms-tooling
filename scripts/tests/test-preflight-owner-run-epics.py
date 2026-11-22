@@ -128,6 +128,64 @@ class OwnerRunEpics(unittest.TestCase):
         out = self.pf.apply_owner_run_epics(_out(7, 8), [], [])
         self.assertEqual([e["number"] for e in out["epics_undecomposed"]], [7, 8])
         self.assertEqual(out["epics_owner_run"], [])
+        self.assertEqual(out["epics_audit_due"], [])
+
+    REPORTED = [("PREPARE", "gates_ok", "OWNER"), ("OWNER", "done", "REPORT")]
+    FAILED = [("PREPARE", "gates_ok", "OWNER"), ("OWNER", "error", "FAILED")]
+
+    def test_apply_gives_the_run_as_fields(self):
+        self.make_run("epic-7-a", epic=7, done=True, transitions=self.REPORTED)
+        self.make_run("epic-8-a", epic=8, transitions=[("PREPARE", "gates_ok", "OWNER")], age=3600)
+        out = self.pf.apply_owner_run_epics(_out(7, 8, 9), self.rows(), [("epic-9", "other-host", False)])
+        by = {e["number"]: e for e in out["epics_owner_run"]}
+        self.assertEqual((by[7]["run_id"], by[7]["run_status"], by[7]["run_state"]),
+                         ("epic-7-a", "done", "REPORT"))
+        self.assertRegex(by[7]["run_ended_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual((by[8]["run_id"], by[8]["run_status"], by[8]["run_state"], by[8]["run_ended_at"]),
+                         ("epic-8-a", "crashed", "OWNER", None))
+        # a lease from another host: there is no run on this host to describe
+        self.assertEqual((by[9]["run_id"], by[9]["run_status"], by[9]["run_state"], by[9]["run_ended_at"]),
+                         (None, None, None, None))
+
+    def test_audit_is_due_for_a_run_that_ended_in_report_only(self):
+        self.make_run("epic-7-a", epic=7, done=True, transitions=self.REPORTED)
+        self.make_run("epic-8-a", epic=8, done=True, transitions=self.FAILED)
+        self.make_run("epic-9-a", epic=9, transitions=[("PREPARE", "gates_ok", "OWNER")], age=3600)
+        self.make_run("epic-10-a", epic=10, done=True, transitions=[("PREPARE", "refuse", "REFUSED")])
+        out = self.pf.apply_owner_run_epics(_out(7, 8, 9, 10, 11), self.rows(),
+                                            [("epic-11", "other-host", False)])
+        self.assertEqual([d["number"] for d in out["epics_audit_due"]], [7])
+        due = out["epics_audit_due"][0]
+        self.assertEqual(sorted(due), ["number", "run_ended_at", "run_id"])
+        self.assertEqual(due["run_id"], "epic-7-a")
+        self.assertTrue(due["run_ended_at"])
+
+    def test_audit_is_not_due_while_a_lease_holds_the_epic(self):
+        """Another host started a new owner run for the epic after the run on
+        this host ended: the epic is being built, an audit could close it."""
+        self.make_run("epic-7-a", epic=7, done=True, transitions=self.REPORTED)
+        self.make_run("epic-8-a", epic=8, done=True, transitions=self.REPORTED)
+        out = self.pf.apply_owner_run_epics(
+            _out(7, 8), self.rows(), [("epic-7", "other-host", False), ("epic-8", "other-host", True)])
+        self.assertEqual([d["number"] for d in out["epics_audit_due"]], [8])
+        self.assertEqual([e["number"] for e in out["epics_owner_run"]], [7, 8])
+
+    def test_audit_is_not_due_for_a_run_at_report_that_did_not_record_its_end(self):
+        self.make_run("epic-7-a", epic=7, transitions=self.REPORTED, age=3600)
+        row = self.rows()[0]
+        self.assertEqual((row["status"], row["state"], row["ended_at"]), ("crashed", "REPORT", None))
+        out = self.pf.apply_owner_run_epics(_out(7), self.rows(), [])
+        self.assertEqual(out["epics_audit_due"], [])
+
+    def test_a_new_run_after_a_reported_run_is_the_one_that_counts(self):
+        # the names are in the other order than the times: the time decides
+        self.make_run("epic-7-b", epic=7, done=True, transitions=self.REPORTED, age=7200)
+        self.make_run("epic-7-a", epic=7, transitions=[("PREPARE", "gates_ok", "OWNER")], age=3600)
+        self.assertEqual([r["run_id"] for r in self.rows()], ["epic-7-a", "epic-7-b"])
+        out = self.pf.apply_owner_run_epics(_out(7), self.rows(), [])
+        self.assertEqual(out["epics_owner_run"][0]["run_id"], "epic-7-a")
+        self.assertEqual(out["epics_audit_due"], [])
+        self.assertIn("epic-7-a", out["epics_owner_run"][0]["owner_run"])
 
     def test_main_calls_apply_and_flags_an_unreadable_index(self):
         """The wiring in main(): the split is applied, and an unreadable run
@@ -138,6 +196,7 @@ class OwnerRunEpics(unittest.TestCase):
         self.assertIn("FSM run index unreadable", body)
         self.assertIn("lease-list unavailable", body)
         self.assertIn('"owner_run_epics": len(out.get("epics_owner_run", []))', body)
+        self.assertIn('"audit_due_epics": len(out.get("epics_audit_due", []))', body)
 
 
 if __name__ == "__main__":
