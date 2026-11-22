@@ -151,6 +151,9 @@ class TestRestart(EpicCase):
         self.assertEqual([x["turn"] for x in t], [1, 2])
         self.assertEqual(len({x["owner"]["session_id"] for x in t}), 1)
         self.assertNotIn("restarted", t[1]["text"])
+        # the board: written one time, at the first launch. The resume does
+        # not write In Progress again (a person can have moved the item).
+        self.assertEqual(self.board_writes(), ["In Progress"])
 
     def test_a_lost_container_is_started_again_and_the_owner_is_told(self):
         pr = self.stop_while_waiting()

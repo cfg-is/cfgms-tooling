@@ -70,6 +70,11 @@ class TestEpicRun(EpicRunCase):
         # the run: phases, result file, container gone, no GitHub credential near a container
         self.assertEqual(self.f.path_states(self.run_dir.name),
                          [("PREPARE", "gates_ok", "OWNER"), ("OWNER", "done", "REPORT")])
+        # the board: In Progress when the owner starts; REPORT writes nothing
+        # (the epic audit sets Done or Blocked)
+        self.assertEqual(self.board_writes(), ["In Progress"])
+        self.assertEqual([(r["board_status"], r["ok"]) for r in self.recs("note") if "board_status" in r],
+                         [("In Progress", True)])
         res = json.loads((self.run_dir / "epic-result.json").read_text())
         self.assertEqual((res["final_state"], res["turns"], [s["state"] for s in res["slices"]]),
                          ("REPORT", 2, ["MERGED"]))
@@ -424,6 +429,10 @@ class TestRefusals(EpicCase):
         self.assertIn("`docs/notes.md`: the content is the same as a file in /canon or /memory", rej)
         self.assertIn("`docs/plan.md`", rej)
         self.assertEqual(self.recs("transition")[-1]["reason"], "owner_blocked")
+        # the board: a run that ends FAILED after the gates sets Blocked, and
+        # posts nothing on the issue
+        self.assertEqual(self.board_writes(), ["In Progress", "Blocked"])
+        self.assertEqual([r for r in self.f.records("gh") if "comment" in r.get("argv", [])], [])
         self.assertNotIn(PRIVATE[:30], self.f.remote_all_text())
         self.assertEqual((self.run_dir / "owner-blocked.md").read_text().strip(), "I cannot continue.")
 
@@ -495,6 +504,20 @@ class TestRefusals(EpicCase):
         self.assertEqual(rc, 3, out)
         self.assertIn("FSM_REFUSED:epic-900:no_canon_dir", out)
         self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), [])       # refused at a gate: the item stays Ready
+
+    def test_a_board_that_cannot_be_written_does_not_fail_the_run(self):
+        self.f.plan({"owner": [[{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
+        self.launch(env={"FSM_FAKE_PQ_UPDATE_FAIL": "1"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.f.path_states(self.run_dir.name),
+                         [("PREPARE", "gates_ok", "OWNER"), ("OWNER", "failed", "FAILED")])
+        self.assertEqual(self.recs("transition")[-1]["reason"], "owner_blocked")
+        self.assertEqual([(r["board_status"], r["ok"]) for r in self.recs("note") if "board_status" in r],
+                         [("In Progress", False), ("Blocked", False)])
+        log = (self.run_dir / "logs" / "supervisor.log").read_text()
+        self.assertIn("board: the epic item was not set to In Progress; set it by hand", log)
 
     def test_a_memory_folder_with_a_git_entry_is_refused(self):
         """Agents write the memory folder: a `.git` in it is never trusted

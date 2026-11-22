@@ -338,6 +338,22 @@ class EpicSupervisor(sup.Supervisor):
                         guard="", info={}, ctx=self.ctx.to_dict())
         self.log(f"{frm} --{event}--> {to}{' reason=' + reason if reason else ''}")
 
+    def board_status(self, status):
+        """Set the epic's project item to `status`. The preflight reads the
+        item: Ready means "an owner may start", so a run that started or that
+        ended FAILED must not leave it at Ready. The write is best effort: a
+        write that fails is recorded and logged, and never fails the run.
+        Nothing is posted on the issue."""
+        item = self.params.get("item_id")
+        ok = False
+        try:
+            ok = bool(item) and bool(self.svc.board.update_field(item, "status", status))
+        except Exception as exc:
+            self.log(f"board: {type(exc).__name__}: {str(exc)[:300]}")
+        self.run.append("note", board_status=status, ok=ok)
+        if not ok:
+            self.log(f"board: the epic item was not set to {status}; set it by hand")
+
     def note_once(self, key, **fields):
         if key not in self._noted:
             self._noted.add(key)
@@ -372,6 +388,10 @@ class EpicSupervisor(sup.Supervisor):
                 state, reason = T.FAILED, "owner_error"
             self.shutdown()
             self._phase("done" if state == T.REPORT else "failed", state, reason)
+            # FAILED after the gates: nobody builds the epic now. REPORT writes
+            # nothing: the item stays In Progress until the epic audit.
+            if state == T.FAILED:
+                self.board_status("Blocked")
         return self.finish()
 
     # --- PREPARE --------------------------------------------------------------------
@@ -474,6 +494,9 @@ class EpicSupervisor(sup.Supervisor):
         x["session_dir"] = str(sdir)
         self.run.register_active(p["key"])
         self._phase("gates_ok", OWNER)
+        # Only here, one time for a run: a resume starts in OWNER and does not
+        # come back, so a status that a person set later is not written over.
+        self.board_status("In Progress")
 
     def turn_timeout(self):
         return int(self.params.get("turn_timeout_min", owner_session.DEFAULT_TURN_TIMEOUT_MIN))

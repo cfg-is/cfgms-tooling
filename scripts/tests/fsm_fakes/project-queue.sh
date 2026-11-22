@@ -33,6 +33,8 @@ if str(d.get("issue_num")) == os.environ["WANT"] and d.get("item_id"):
     print(d["item_id"]); sys.exit(0)
 sys.exit(3)' ;;
   update-field)
+    # FSM_FAKE_PQ_UPDATE_FAIL=1: the board cannot be written
+    [[ "${FSM_FAKE_PQ_UPDATE_FAIL:-}" == "1" ]] && { echo "update-field failed" >&2; exit 1; }
     if [[ "$3" == "status" ]]; then mkdir -p "$(dirname "$status_file")"; printf '%s\n' "$4" > "$status_file"; fi
     echo OK ;;
   *) echo OK ;;

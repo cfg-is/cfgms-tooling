@@ -96,6 +96,11 @@ class EpicCase(unittest.TestCase):
     def run_dir(self):
         return sorted(d for d in self.f.runs.iterdir() if d.name.startswith("epic-"))[0]
 
+    def board_writes(self):
+        """The statuses the run wrote to the epic's project item, in order."""
+        return [r["argv"][3] for r in self.f.records("project-queue")
+                if r["argv"][:1] == ["update-field"] and r["argv"][1:3] == [ITEM, "status"]]
+
     def recs(self, rtype=None):
         try:
             return self.f.state_records(self.run_dir.name, rtype)
