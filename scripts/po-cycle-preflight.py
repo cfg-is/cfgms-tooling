@@ -954,6 +954,23 @@ def _load_runindex():
 _EPIC_KEY_RE = re.compile(r"^epic-(\d+)$")
 
 
+def owner_run_rows(runs):
+    """{epic number: run index row} for each epic that an epic-mode run on
+    this host holds (the first signal of owner_run_epics). An epic with
+    more than one such run gets the run that was made last."""
+    rows = {}
+    for r in sorted(runs or [], key=lambda r: r.get("created") or 0):
+        if r.get("mode") != "epic":
+            continue
+        if r.get("status") in ("done", "abandoned") and not r.get("gates_passed"):
+            continue
+        m = (_EPIC_KEY_RE.match(str(r.get("key") or ""))
+             or _EPIC_KEY_RE.match(str(r.get("target") or "")))
+        if m:
+            rows[int(m.group(1))] = r
+    return rows
+
+
 def owner_run_epics(runs, lease_rows=None):
     """{epic number: why} for each epic that an owner session holds
     (scripts/fsm/EPIC-DESIGN.md). An owner builds its epic in slices and makes
@@ -974,16 +991,9 @@ def owner_run_epics(runs, lease_rows=None):
       another host sees an ended run's epic as free at once.
     """
     held = {}
-    for r in runs or []:
-        if r.get("mode") != "epic":
-            continue
-        if r.get("status") in ("done", "abandoned") and not r.get("gates_passed"):
-            continue
-        m = (_EPIC_KEY_RE.match(str(r.get("key") or ""))
-             or _EPIC_KEY_RE.match(str(r.get("target") or "")))
-        if m:
-            held[int(m.group(1))] = (f"epic run {r.get('run_id') or '?'} on this host "
-                                     f"is {r.get('status') or '?'} in {r.get('state') or '?'}")
+    for n, r in owner_run_rows(runs).items():
+        held[n] = (f"epic run {r.get('run_id') or '?'} on this host "
+                   f"is {r.get('status') or '?'} in {r.get('state') or '?'}")
     for key, holder, expired in lease_rows or []:
         m = _EPIC_KEY_RE.match(str(key or ""))
         if m and not expired:
@@ -995,16 +1005,38 @@ def apply_owner_run_epics(out, runs, lease_rows=None):
     """Move each owner-held epic from out["epics_undecomposed"] to
     out["epics_owner_run"] (with the reason). An owner-held epic must not be
     offered for decomposition: the Planning Team would make stories for work
-    the owner is building."""
+    the owner is building.
+
+    Each entry also has the run as fields: `run_id`, `run_status` (a
+    runindex status), `run_state` (REPORT, FAILED, OWNER, ...) and
+    `run_ended_at` (ISO, UTC; None while the run is not ended). All four
+    are None when only a lease holds the epic (the run is on another host).
+
+    out["epics_audit_due"] lists the open epics whose owner run on this host
+    ended in REPORT: every submitted slice is merged or closed and the owner
+    says the epic is done. The epic audit decides whether to close it; the
+    caller leaves out an epic it has audited after `run_ended_at`. An epic
+    stays in the list only while its run dir is kept (runindex.gc: by
+    default 24 hours after REPORT). After that the epic is in
+    epics_undecomposed again."""
     held = owner_run_epics(runs, lease_rows)
-    keep, owned = [], []
+    rows = owner_run_rows(runs)
+    keep, owned, due = [], [], []
     for e in out.get("epics_undecomposed", []):
-        if e.get("number") in held:
-            owned.append(dict(e, owner_run=held[e["number"]]))
-        else:
+        n = e.get("number")
+        if n not in held:
             keep.append(e)
+            continue
+        r = rows.get(n) or {}
+        owned.append(dict(e, owner_run=held[n], run_id=r.get("run_id"),
+                          run_status=r.get("status"), run_state=r.get("state"),
+                          run_ended_at=r.get("ended_at")))
+        if r.get("status") == "done" and r.get("state") == "REPORT":
+            due.append({"number": n, "run_id": r.get("run_id"),
+                        "run_ended_at": r.get("ended_at")})
     out["epics_undecomposed"] = keep
     out["epics_owner_run"] = owned
+    out["epics_audit_due"] = due
     return out
 
 
@@ -3620,6 +3652,7 @@ def write_output(out, mode):
             "merge_queue": len(out.get("merge_queue", [])),
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
             "owner_run_epics": len(out.get("epics_owner_run", [])),
+            "audit_due_epics": len(out.get("epics_audit_due", [])),
         },
         "host_caps": out.get("host_caps", [DEFAULT_ENV]),
         "capacity": out.get("capacity", {}),
