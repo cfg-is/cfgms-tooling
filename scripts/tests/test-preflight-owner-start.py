@@ -265,7 +265,7 @@ class OwnerStartWiring(unittest.TestCase):
     def apply(self, epics=(7,), ready=(7,), code_health=None):
         out = {"epics_undecomposed": [_epic(n) for n in epics], "pipeline_state": _board(ready=ready)}
         reasons = []
-        lease_rows, runs = self.pf.apply_owner_epics(out, code_health or {"ok": True}, reasons)
+        lease_rows, runs, self.active = self.pf.apply_owner_epics(out, code_health or {"ok": True}, reasons)
         recs = [(r["number"], r["action"], r["reason"]) for r in out["owner_start_recommendations"]]
         return out, recs, reasons, lease_rows
 
