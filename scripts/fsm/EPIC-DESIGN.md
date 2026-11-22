@@ -487,10 +487,17 @@ owner that wants to leak.
 ## 8. Start, stop, crash
 
 - **Launch**: `po-act.sh dispatch --epic <N> [--item-id ID]`. The epic text
-  comes from its project item; `CFGMS_CANON_DIR` and `CFGMS_MEMORY_DIR` name
-  the host clones. Gates: project item, capacity, image staleness,
-  unfinished run, lease. Lease key `epic-<N>`. A path of its own for a fix
-  issue: not built.
+  comes from its project item. Canon and memory are host clones.
+  `CFGMS_CANON_DIR` and `CFGMS_MEMORY_DIR` name them. When a variable is not
+  set, the default is the folder next to the `cfgms` checkout:
+  `<checkout>/../cfgms-canon` and `<checkout>/../cfgms-memory`. A set
+  variable wins. The launch is refused (`no_canon_or_memory_dir`, with both
+  paths) when one of the two is not a directory. A `cfgms` checkout that is a
+  git worktree in another place has no such folders next to it: set the
+  variables there. The run records both paths in its `run.json`; a
+  `dispatch resume` uses those and reads no variable. Gates: project item,
+  canon and memory folders, capacity, image staleness, unfinished run,
+  lease. Lease key `epic-<N>`. A path of its own for a fix issue: not built.
 - **Capacity**: one owner container counts as one agent. Each running
   validator counts as in a story run. One validator runs at a time in an epic
   run; a second slice waits, and a validator waits when the host is full.
@@ -536,6 +543,7 @@ owner that wants to leak.
 | run index | an `epic-<N>` run: its owner container, the OWNER state, the 336-hour retention | built |
 | preflight | the epic's project item is in flight while the run is | built (general run view) |
 | preflight | an epic that an owner holds is in `epics_owner_run`, not in `epics_undecomposed`. Held means: an epic-mode run in this host's run index that is not ended, or that ended after its gates passed, until the run dir is collected (24 hours after REPORT, 336 hours otherwise); or an unexpired `epic-<N>` lease (seen from every host, released when the run ends). A run refused at a gate holds nothing. Each entry has `run_id`, `run_status`, `run_state` and `run_ended_at` (all null when only a lease holds the epic). `epics_audit_due` lists `{number, run_id, run_ended_at}` for each open epic with no sub-issues whose last run on this host (of those that passed the gates) ended in REPORT, while the run dir is kept and no unexpired `epic-<N>` lease holds the epic. It is the signal for the epic audit | built in the tooling. Nothing reads `epics_audit_due` yet: not built. The `cfgms` prompts (`po.md` Step 7, `/po decompose`) still choose epics by "no sub-issues" and do not read this list: not built |
+| preflight | `owner_start_recommendations`: one entry for each open epic that has no sub-issues and that no owner holds (the epics in `epics_undecomposed`), sorted by number: `{number, title, item_id, action, reason}`. The founder, through Reeve, sets the epic's project item to `Ready` when an owner may build the epic. Each epic gets the first reason that applies. `hold` / `no_project_item`: the preflight found no item for the epic. It reads the statuses Draft, Ready, Fix, In Progress, Failed and Blocked, so an item at Reviewing or Done also gets this reason. `hold` / `not_ready`: the item is at another status (`status` names it). `hold` / `develop_broken`: the code-health gate blocks dispatch. `hold` / `degraded`: the run index or the lease list could not be read. `hold` / `owner_limit`: the epics that owners hold now, plus the `start` entries before this one, are at or above the limit. Held now means an epic-mode run on this host that is live, hung, starting or crashed, or an unexpired `epic-<N>` lease; a run that ended holds no place. The limit is `CFGMS_OWNER_MAX_RUNS` (default 1; a value that is not a whole number of 0 or more counts as 1; 0 starts no owner). Else `start` / `ready`, with `command`: `po-act.sh dispatch --epic <N> --item-id <ITEM_ID>`. The summary counts the `start` entries as `owner_start_epics`. A Ready epic item gets `hold` in `dispatch_recommendations` (the story path), with a reason that names this list. The run writes no board field, so the item stays at Ready: when an ended run's dir is collected and the epic is still open, the epic gets `start` again | built in the tooling. Nothing runs the command yet: the `/orc` cycle in `cfgms` is not built there yet |
 | preflight | a slice PR (`feature/epic-<N>-slice-<n>`, internal author) is known as a slice: `is_slice`, `epic_number`, `slice_number` in the PR summary; never a story, whatever its body says. `<N>` is not checked to be an epic with a run | built |
 | pipeline-watch | epic run ended; `container_stalled` from the heartbeat | built (general run rows) |
 | pipeline-watch | new events: slice published, slice merged | not built |
@@ -546,6 +554,9 @@ owner that wants to leak.
 | lock sweep | pick up a slice PR | not built: the lock pass takes `feature/story-*` and `feature/item-*` branches |
 | ledger, token_report | one record per owner turn, keyed `(container, run_id, turn)`; slices recorded with their rounds | not built: an epic run writes no ledger record |
 | board | the epic item moves; there are no story items | not built: the run reads the item and writes no field |
+| shared notes | the notes that owners write in `/memory` are committed and pushed: `po-act.sh notes-sync` runs one `memory-sync.py once` on the host. Folder: `CFGMS_MEMORY_DIR` (default as for the launch, section 8). Git directory: `CFGMS_MEMORY_GIT_DIR` (default `~/.local/state/cfgms/memory-git`). Last line and exit code: `NOTES_SYNC_OK:committed=<n>:unpushed=0:alerts=0` (0); `NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:alerts=<n>` (0) when a push failed or a file was refused or put in quarantine; `NOTES_SYNC_SKIPPED:no_memory_dir` (0); `NOTES_SYNC_SKIPPED:already_running` (0) when another `memory-sync.py` holds the lock; `NOTES_SYNC_REFUSED:not_detached` (3) when the git directory is not outside the folder, with the `detach` command to run one time (it never runs `detach`); `NOTES_SYNC_FAILED:exit_<rc>` (1). In a cycle manifest the step is a no-op for `committed=0` and for SKIPPED, work for `committed` above 0, and an error for ATTENTION, REFUSED and FAILED. A refused file that stays in the folder gives an alert one time: the next call says OK | built in the tooling, tested with a real git repository and stand-in secret scanners. It is run by the orchestrator cycle: the `/orc` cycle in `cfgms` starts it, and that cycle is not built there yet. No timer runs it. Not run on the real notes folder yet |
+| Reeve | a new held question reaches Reeve without the founder asking | not built |
+| cycle manifest | `po-act.sh cycle-start orc`: the mode is a free label, stored as given | built (no mode was ever refused) |
 
 ## 10. What is built, what is not
 
