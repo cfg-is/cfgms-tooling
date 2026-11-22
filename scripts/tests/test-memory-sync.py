@@ -248,6 +248,97 @@ exit 9''')
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(b"inside the mounted folder", r.stderr)
 
+    # --- a `.git` entry below the folder ------------------------------------------
+    # An agent can run `git init` in a sub-folder. `git add` stops with an error
+    # at a nested repository that has no commit, so one such folder stopped the
+    # save for every owner.
+
+    def nested_cycle(self, rel):
+        """One cycle with a `.git` entry in `rel` and a note beside it."""
+        (self.work / rel / "inside.md").write_text(NOTE)
+        self.note("areas/beside.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        files = self.head_files()
+        self.assertIn("areas/beside.md", files)
+        self.assertEqual([f for f in files if f.startswith(rel)], [])
+        self.assertEqual(self.alerts(), ["refused_nested_git"])
+        self.assertEqual(self.g("ls-files", "-s", "--", ":(literal)" + rel), b"")     # no link to a repository
+        # the folder stays: one alert for the path, not one each cycle
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+        self.assertEqual(self.alerts(), ["refused_nested_git"])
+
+    def test_nested_repository_with_no_commit_does_not_stop_the_save(self):
+        (self.work / "areas" / "sub").mkdir(parents=True)
+        _git("init", "-q", cwd=self.work / "areas" / "sub")
+        self.nested_cycle("areas/sub")
+
+    def test_nested_repository_with_a_commit_is_left_out(self):
+        (self.work / "areas" / "sub").mkdir(parents=True)
+        _git("init", "-q", cwd=self.work / "areas" / "sub")
+        _git("commit", "-q", "--allow-empty", "-m", "x", cwd=self.work / "areas" / "sub")
+        self.nested_cycle("areas/sub")
+
+    def test_nested_git_file_is_left_out(self):
+        (self.work / "areas" / "sub").mkdir(parents=True)
+        (self.work / "areas" / "sub" / ".git").write_text("gitdir: /nowhere\n")
+        self.nested_cycle("areas/sub")
+
+    def test_nested_git_link_is_left_out_and_not_followed(self):
+        outside = self.root / "outside"
+        (outside / "deep").mkdir(parents=True)
+        (outside / "deep" / ".git").mkdir()
+        (self.work / "areas" / "sub").mkdir(parents=True)
+        os.symlink(self.root / "nowhere", self.work / "areas" / "sub" / ".git")
+        os.symlink(outside, self.work / "areas" / "link")
+        # the link to a folder is not walked: outside/deep/.git is not found
+        self.assertEqual(self.ms.nested_git_dirs(str(self.work)), ["areas/sub"])
+        os.unlink(self.work / "areas" / "link")     # (a link is refused by its own rule)
+        self.nested_cycle("areas/sub")
+
+    def test_git_entry_at_the_top_is_not_a_nested_one(self):
+        (self.work / ".git" / "areas").mkdir(parents=True)
+        (self.work / ".git" / "areas" / ".git").mkdir()
+        self.note("areas/beside.md")
+        self.assertEqual(self.ms.nested_git_dirs(str(self.work)), [])
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertEqual(self.alerts(), [])
+        self.assertEqual([f for f in self.head_files() if ".git" in f], [])
+
+    def test_nested_folder_with_a_pattern_name_leaves_out_only_itself(self):
+        """A folder named `*`: as a pattern it would leave out every note in
+        `areas/`. The name is taken as it is written."""
+        rel = "areas/*"
+        (self.work / rel).mkdir(parents=True)
+        _git("init", "-q", cwd=self.work / rel)
+        self.nested_cycle(rel)
+
+    def test_a_note_that_was_committed_stays_when_its_folder_gets_a_git_entry(self):
+        self.note("areas/sub/kept.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        _git("init", "-q", cwd=self.work / "areas" / "sub")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+        self.assertIn("areas/sub/kept.md", self.head_files())
+
+    def test_a_stopped_cycle_leaves_nothing_for_the_next_start(self):
+        """A cycle that was killed leaves its scan folder (copies of notes)
+        and its private index. The next start removes them."""
+        self.state.mkdir(exist_ok=True)
+        (self.state / "scan-old" / "tree").mkdir(parents=True)
+        (self.state / "scan-old" / "tree" / "n.md").write_text(NOTE)
+        (self.state / "index-old").write_text("x")
+        (self.state / "refused.json").write_text("[]")
+        r = subprocess.run(["python3", SYNC_PATH, "once", "--git-dir", str(self.gitdir),
+                            "--work-tree", str(self.work), "--state-dir", str(self.state), "--no-push"],
+                           capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()
+                                if p.name.startswith(("scan-", "index-"))), [])
+        self.assertTrue((self.state / "refused.json").exists())
+
+    def test_detach_help_says_when_it_may_be_used(self):
+        r = subprocess.run(["python3", SYNC_PATH, "--help"], capture_output=True)
+        self.assertIn(b"no container ever", b" ".join(r.stdout.split()))
+
 
 if __name__ == "__main__":
     unittest.main()

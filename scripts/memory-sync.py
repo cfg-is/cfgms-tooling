@@ -11,7 +11,9 @@ somewhere else on the host and is never mounted, so a container cannot write
 hooks, remotes or credential settings.
 
 Each cycle:
-  1. stage what changed in the folder (git config isolated from the host's)
+  1. stage what changed in the folder (git config isolated from the host's).
+     A folder below the top that holds a `.git` entry is left out, with an
+     alert: git cannot add it, and it must not stop the save of the rest.
   2. refuse anything that is not a plain note file (allow-list below)
   3. scan the staged content for secrets: gitleaks, then truffleHog
      (verified secrets); a hit moves the file out of the shared folder into a
@@ -28,6 +30,11 @@ Usage:
   memory-sync.py once   --git-dir G --work-tree W [--state-dir S] [--no-push]
   memory-sync.py run    --git-dir G --work-tree W [--state-dir S] [--interval 60]
   memory-sync.py detach --work-tree W --git-dir G     one-time: move W/.git to G
+
+`detach` trusts W/.git: its config, hooks and remotes become the host's.
+Use it only for a folder that no container ever mounted. For a folder that
+a container could write, use `po-act.sh notes-setup`: it makes the git
+directory from a new clone and never reads W/.git.
 """
 import argparse
 import fcntl
@@ -175,6 +182,24 @@ class Repo:
         self.alert(reason, path, "moved to quarantine")
 
 
+def nested_git_dirs(work_tree):
+    """Folders below the notes folder that hold a `.git` entry (a directory,
+    a file or a link), as paths from the folder, sorted. `git add` stops with
+    an error at such a folder when it has no commit, and adds it as a link to
+    another repository when it has one. The walk follows no symlink and does
+    not go into such a folder, or into a `.git` at the top (git skips that)."""
+    found = []
+    for here, dirs, files in os.walk(work_tree, followlinks=False):
+        if here == work_tree:
+            if ".git" in dirs:
+                dirs.remove(".git")
+            continue
+        if ".git" in dirs or ".git" in files:
+            found.append(os.path.relpath(here, work_tree))
+            dirs[:] = []
+    return sorted(found)
+
+
 def refuse_reason(status, mode, path):
     if ".git" in path.split("/"):
         return "git_path"
@@ -299,7 +324,8 @@ def commit_checked(repo, author, entries):
 
 
 def cycle(repo, push=True):
-    repo.git("add", "-A", "--", ":/")
+    nested = nested_git_dirs(repo.work_tree)
+    repo.git("add", "-A", "--", ":/", *[":(exclude,literal)" + d for d in nested])
     changes = repo.staged()
 
     # A refused file stays in the folder and is refused again every cycle.
@@ -318,6 +344,12 @@ def cycle(repo, push=True):
         now_refused.add(key)
         if key not in seen:
             repo.alert(kind, path, detail)
+
+    for path in nested:
+        key = "refused_nested_git:" + path
+        now_refused.add(key)
+        if key not in seen:
+            repo.alert("refused_nested_git", path, "a .git entry is in this folder: the folder is left out")
 
     ok = []
     for status, mode, blob, path in changes:
@@ -382,7 +414,9 @@ def cmd_detach(a):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["once", "run", "detach"])
+    p.add_argument("command", choices=["once", "run", "detach"],
+                   help="detach trusts W/.git: only for a folder that no container ever "
+                        "mounted; else use `po-act.sh notes-setup`")
     p.add_argument("--git-dir", required=True)
     p.add_argument("--work-tree", required=True)
     p.add_argument("--state-dir", default=os.path.expanduser("~/.local/state/cfgms/memory-sync"))
@@ -399,13 +433,24 @@ def main():
     gd, wt = os.path.realpath(a.git_dir), os.path.realpath(a.work_tree)
     if gd == wt or gd.startswith(wt + os.sep):
         sys.exit("refusing to run: the git directory %s is inside the mounted folder %s "
-                 "(see `detach`)." % (gd, wt))
+                 "(see `po-act.sh notes-setup`)." % (gd, wt))
     repo = Repo(a.git_dir, a.work_tree, a.state_dir)
     lock = open(os.path.join(repo.state_dir, "lock"), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit("another memory-sync is running")
+    # A cycle that was stopped (a time limit, a host restart) leaves its scan
+    # folder, with copies of notes, and its private index. The lock is held:
+    # no other cycle uses them.
+    for name in os.listdir(repo.state_dir):
+        if name.startswith("scan-"):
+            shutil.rmtree(os.path.join(repo.state_dir, name), ignore_errors=True)
+        elif name.startswith("index-"):
+            try:
+                os.unlink(os.path.join(repo.state_dir, name))
+            except OSError:
+                pass
 
     if a.command == "once":
         cycle(repo, push=not a.no_push)
