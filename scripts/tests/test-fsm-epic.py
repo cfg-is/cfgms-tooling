@@ -432,7 +432,16 @@ class TestRefusals(EpicCase):
         # the board: a run that ends FAILED after the gates sets Blocked, and
         # posts nothing on the issue
         self.assertEqual(self.board_writes(), ["In Progress", "Blocked"])
-        self.assertEqual([r for r in self.f.records("gh") if "comment" in r.get("argv", [])], [])
+        # The fake gh logs one record for each call: {"tool": "gh", "argv": [...]}.
+        # A post is `gh issue|pr comment ...` or a `gh api .../comments` with a field.
+        gh_calls = self.f.records("gh")
+        self.assertTrue(gh_calls, "the fake gh log is empty: the check below would prove nothing")
+        writes = ("-f", "-F", "--field", "--raw-field", "--input", "-X", "--method")
+        posts = [r["argv"] for r in gh_calls
+                 if r["argv"][1:2] == ["comment"]
+                 or (r["argv"][:1] == ["api"] and any(a.endswith("/comments") for a in r["argv"])
+                     and any(a in writes for a in r["argv"]))]
+        self.assertEqual(posts, [])
         self.assertNotIn(PRIVATE[:30], self.f.remote_all_text())
         self.assertEqual((self.run_dir / "owner-blocked.md").read_text().strip(), "I cannot continue.")
 
