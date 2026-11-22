@@ -8,7 +8,9 @@
 #   dispatch <STORY_NUM>            Fresh story: gates (image, capacity, Dependencies, unfinished run) +
 #                                   lease + claim (Ready->In Progress) + FSM supervisor run (DESIGN.md §11)
 #   dispatch --branch <BRANCH> [--issue N]   Branch-mode FSM run
-#   dispatch --epic <N> [--item-id ID]       Epic-mode FSM run (one owner session)
+#   dispatch --epic <N> [--item-id ID]       Epic-mode FSM run (one owner session). Canon and memory
+#                                   are host clones: CFGMS_CANON_DIR / CFGMS_MEMORY_DIR, default
+#                                   <cfgms checkout>/../cfgms-canon and ../cfgms-memory
 #   dispatch status [RUN_ID]        List FSM runs, or show one
 #   dispatch resume <RUN_ID>        Resume a crashed FSM run after re-running its PREPARE gates;
 #                                   abandons it when its work finished elsewhere
@@ -39,9 +41,18 @@
 #   block <ISSUE> <reason>          Set project status Blocked, post escalation comment
 #   unblock <ISSUE> <reason> [--as-fix]  Set project status Ready (or Fix), post unblock comment
 #   sync                            Fast-forward local develop checkout (keeps cron scripts current)
+#   notes-sync                      Commit and push the shared notes folder: one `memory-sync.py once`.
+#                                   Folder CFGMS_MEMORY_DIR (default as for dispatch --epic), git dir
+#                                   CFGMS_MEMORY_GIT_DIR (default ~/.local/state/cfgms/memory-git).
+#                                   Last line: NOTES_SYNC_OK / NOTES_SYNC_ATTENTION
+#                                   :committed=<n>:unpushed=<n>:alerts=<n> (exit 0), NOTES_SYNC_SKIPPED
+#                                   (exit 0), NOTES_SYNC_REFUSED:not_detached (exit 3),
+#                                   NOTES_SYNC_FAILED:exit_<rc> (exit 1)
 #   preflight                       Run preflight (writes ~/.cache/cfgms-po/preflight.json, prints summary)
 #   state [jq_filter]               Read cached preflight and apply optional jq filter
-#   cycle-start [MODE]              Open a per-cycle manifest (Issue #3053); every other subcommand
+#   cycle-start [MODE]              Open a per-cycle manifest (Issue #3053). MODE is a free label
+#                                   that is stored in the manifest (cron, cycle, pipeline, orc;
+#                                   default cron); every other subcommand
 #                                   below auto-records a step into it -- with its work/no-op/error
 #                                   outcome -- until cycle-end closes it
 #   cycle-end                       Close the current cycle: correlate measured cost per step via
@@ -73,6 +84,29 @@ if [[ -z "$WORKTREE_BASE" ]]; then
   WORKTREE_BASE="$(cd "$WORKTREE_BASE" 2>/dev/null && pwd || echo "/home/jrdn/git/cfg.is/worktrees")"
 fi
 PREFLIGHT="$(dirname "$0")/po-cycle-preflight.py"
+
+# _host_clone_dir <canon|memory>
+#   The host clone of cfgms-canon or cfgms-memory, for an epic run (canon is
+#   mounted read-only, memory read-write) and for notes-sync. CFGMS_CANON_DIR
+#   / CFGMS_MEMORY_DIR when set; else the folder next to the cfgms checkout,
+#   <checkout>/../cfgms-<name> (the layout reeve-launch.sh uses). Prints the
+#   path; the caller checks that it is a directory. A cfgms checkout that is
+#   a git worktree in another place has no such folder next to it: set the
+#   variables there.
+_host_clone_dir() {
+  local name="$1" explicit="" parent
+  case "$name" in
+    canon)  explicit="${CFGMS_CANON_DIR:-}" ;;
+    memory) explicit="${CFGMS_MEMORY_DIR:-}" ;;
+    *) return 2 ;;
+  esac
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  parent="$(cd "${REPO_ROOT}/.." 2>/dev/null && pwd)" || parent="${REPO_ROOT}/.."
+  printf '%s/cfgms-%s\n' "$parent" "$name"
+}
 # CFGMS_TEST_PROJECT_QUEUE: same test-hook shape as CFGMS_TEST_DISPATCH /
 # CFGMS_TEST_PIPELINE_HELPER -- lets hermetic tests stand in for the real
 # script (gh-backed, no test hooks of its own) rather than hitting GitHub.
@@ -406,7 +440,9 @@ path, idx_raw, rc_raw, out_path = sys.argv[1:5]
 
 # This script's status markers, by what they mean about the step's outcome.
 NOOP_HINTS = ("SKIP", "DEFER", "REFUS", "LOST", "ALREADY", "FULL")
-ERROR_HINTS = ("FAIL", "ERROR", "ROLLED_BACK")
+ERROR_HINTS = ("FAIL", "ERROR", "ROLLED_BACK", "ATTENTION")
+# A marker that counts what the step did: zero is "nothing to do".
+NOOP_COUNT_RE = re.compile(r"^NOTES_SYNC_OK:committed=0(?::|$)")
 # Paths that report "nothing to do" without a marker-shaped line.
 NOOP_PLAIN = ("no_failing_jobs", "no_failing_runs", "No cycles recorded yet")
 MARKER_RE = re.compile(r"^[A-Z][A-Z0-9_]*(?::|$)")
@@ -439,6 +475,8 @@ elif token and any(hint in token for hint in NOOP_HINTS):
     outcome = "no-op"
 elif token and any(hint in token for hint in ERROR_HINTS):
     outcome = "error"
+elif NOOP_COUNT_RE.match(marker):
+    outcome = "no-op"
 elif any(line.startswith(plain) for plain in NOOP_PLAIN for line in lines):
     outcome = "no-op"
 else:
@@ -1207,9 +1245,11 @@ case "$cmd" in
         ;;
       --epic)
         # One owner session for a whole epic (scripts/fsm/epic.py). The epic
-        # text comes from its project item. Canon and memory are host clones,
-        # named by CFGMS_CANON_DIR and CFGMS_MEMORY_DIR: canon is mounted
-        # read-only, memory read-write.
+        # text comes from its project item. Canon and memory are host clones
+        # (_host_clone_dir: CFGMS_CANON_DIR / CFGMS_MEMORY_DIR, default the
+        # folders next to the cfgms checkout): canon is mounted read-only,
+        # memory read-write. A resume needs neither: the run has both paths
+        # in its run.json (supervisor.py _params_from_args).
         epic="${2:?epic number required}"
         [[ "$epic" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --epic must be numeric"; exit 2; }
         epic_label="epic-${epic}"
@@ -1223,9 +1263,10 @@ case "$cmd" in
           echo "DISPATCH_REFUSED:${epic_label}:no_epic_item"
           exit 3
         fi
-        if [[ -z "${CFGMS_CANON_DIR:-}" || ! -d "${CFGMS_CANON_DIR:-}" \
-              || -z "${CFGMS_MEMORY_DIR:-}" || ! -d "${CFGMS_MEMORY_DIR:-}" ]]; then
-          echo "DISPATCH_REFUSED:${epic_label}:no_canon_or_memory_dir (set CFGMS_CANON_DIR and CFGMS_MEMORY_DIR to the host clones)"
+        epic_canon="$(_host_clone_dir canon)"
+        epic_memory="$(_host_clone_dir memory)"
+        if [[ ! -d "$epic_canon" || ! -d "$epic_memory" ]]; then
+          echo "DISPATCH_REFUSED:${epic_label}:no_canon_or_memory_dir (canon ${epic_canon}, memory ${epic_memory}: one is not a directory; set CFGMS_CANON_DIR and CFGMS_MEMORY_DIR to the host clones)"
           exit 3
         fi
         if ! cap=$(_capacity_ok); then
@@ -1238,7 +1279,7 @@ case "$cmd" in
         _acquire_lease "$epic_label" "$LEASE_TTL_STORY" "$epic_label" || exit 0
         trap '_release_lease "$epic_label"' ERR
         rc=0; _fsm_launch "$epic_label" epic "$epic" "$epic_label" --item-id "$epic_item" \
-          --canon-dir "$CFGMS_CANON_DIR" --memory-dir "$CFGMS_MEMORY_DIR" || rc=$?
+          --canon-dir "$epic_canon" --memory-dir "$epic_memory" || rc=$?
         trap - ERR
         _fsm_outcome "$rc" "$epic_label" "DISPATCHED_EPIC:${epic}" DISPATCH_REFUSED DISPATCH_DEFERRED \
           "$epic_label"
@@ -1844,6 +1885,78 @@ EOF
     else
       echo "SYNC_FAILED:$out" >&2
       exit 1
+    fi
+    ;;
+
+  notes-sync)
+    # Commit and push what owners wrote into the shared notes folder: one
+    # `memory-sync.py once`. Its checks (allow-list, secret scan, quarantine)
+    # are memory-sync.py's own; this only starts it and says what happened.
+    #   NOTES_SYNC_SKIPPED:no_memory_dir (<path>)   exit 0  no folder on this host
+    #   NOTES_SYNC_SKIPPED:already_running          exit 0  another memory-sync.py holds
+    #                                               the lock: its run does the work
+    #   NOTES_SYNC_REFUSED:not_detached (<what>)    exit 3  the git directory is not
+    #                                               outside the folder. `detach` is
+    #                                               never run from here.
+    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:alerts=0          exit 0
+    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:alerts=<n>  exit 0  a push
+    #                                               failed, or a file was refused or
+    #                                               put in quarantine
+    #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
+    # committed: commits made by this call. unpushed: origin/main..HEAD after
+    # it. alerts: files this call added to <state dir>/alerts. A refused file
+    # that stays in the folder gives an alert one time, not each call.
+    notes_dir="$(_host_clone_dir memory)"
+    notes_git="${CFGMS_MEMORY_GIT_DIR:-${HOME}/.local/state/cfgms/memory-git}"
+    notes_state="${CFGMS_MEMORY_STATE_DIR:-${HOME}/.local/state/cfgms/memory-sync}"
+    notes_py="$(cd "$(dirname "$0")" && pwd)/memory-sync.py"
+    if [[ ! -d "$notes_dir" ]]; then
+      echo "NOTES_SYNC_SKIPPED:no_memory_dir (${notes_dir})"
+      exit 0
+    fi
+    if [[ -d "${notes_dir}/.git" && -e "$notes_git" ]]; then
+      echo "NOTES_SYNC_REFUSED:not_detached (${notes_dir}/.git is a directory and ${notes_git} exists too: a person must look and remove one)"
+      exit 3
+    fi
+    if [[ -d "${notes_dir}/.git" ]]; then
+      echo "NOTES_SYNC_REFUSED:not_detached (run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
+      exit 3
+    fi
+    if [[ ! -d "$notes_git" ]]; then
+      echo "NOTES_SYNC_REFUSED:not_detached (no git directory ${notes_git} and no ${notes_dir}/.git: clone cfgms-memory to ${notes_dir}, then run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
+      exit 3
+    fi
+    notes_git_do() { env -u GIT_WORK_TREE -u GIT_INDEX_FILE git --git-dir "$notes_git" "$@" 2>/dev/null; }
+    notes_alert_count() { { find "${notes_state}/alerts" -maxdepth 1 -type f 2>/dev/null || true; } | wc -l | tr -d ' '; }
+    notes_head_before="$(notes_git_do rev-parse -q --verify HEAD || true)"
+    notes_alerts_before="$(notes_alert_count)"
+    notes_args=(once --git-dir "$notes_git" --work-tree "$notes_dir")
+    [[ -n "${CFGMS_MEMORY_STATE_DIR:-}" ]] && notes_args+=(--state-dir "$CFGMS_MEMORY_STATE_DIR")
+    notes_rc=0
+    notes_out="$(python3 "$notes_py" "${notes_args[@]}" 2>&1)" || notes_rc=$?
+    [[ -n "$notes_out" ]] && printf '%s\n' "$notes_out"
+    if [[ "$notes_rc" != 0 ]]; then
+      if [[ "$notes_out" == *"another memory-sync is running"* ]]; then
+        echo "NOTES_SYNC_SKIPPED:already_running"
+        exit 0
+      fi
+      echo "NOTES_SYNC_FAILED:exit_${notes_rc}"
+      exit 1
+    fi
+    notes_head_after="$(notes_git_do rev-parse -q --verify HEAD || true)"
+    if [[ "$notes_head_before" == "$notes_head_after" ]]; then
+      notes_committed=0
+    else
+      notes_committed="$(notes_git_do rev-list --count "${notes_head_before:+${notes_head_before}..}HEAD" || echo 0)"
+    fi
+    # No origin/main to compare with: every commit counts as not pushed.
+    notes_unpushed="$(notes_git_do rev-list --count origin/main..HEAD || notes_git_do rev-list --count HEAD || echo 1)"
+    notes_alerts=$(( $(notes_alert_count) - notes_alerts_before ))
+    [[ "$notes_alerts" -lt 0 ]] && notes_alerts=0
+    if [[ "$notes_unpushed" == 0 && "$notes_alerts" == 0 ]]; then
+      echo "NOTES_SYNC_OK:committed=${notes_committed}:unpushed=0:alerts=0"
+    else
+      echo "NOTES_SYNC_ATTENTION:committed=${notes_committed}:unpushed=${notes_unpushed}:alerts=${notes_alerts}"
     fi
     ;;
 

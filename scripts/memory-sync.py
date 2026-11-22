@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """memory-sync: commit and push the shared agent memory folder.
 
-Runs on the HOST, never in a container. No timer or service starts it yet:
-a person or the host's own scheduler runs it.
+Runs on the HOST, never in a container. `po-act.sh notes-sync` runs one
+cycle (`once`); the orchestrator cycle calls that. No timer or service
+starts it.
 
 Owners write note files into a folder that is mounted read-write into every
 owner container. That folder holds files only. Its git directory lives

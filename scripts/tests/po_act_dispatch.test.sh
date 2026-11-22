@@ -197,6 +197,36 @@ t9_rc=0
 t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic abc) || t9_rc=$?
 check_eq "T9e: a non-numeric epic -> exits 2" "$t9_rc" "2"
 
+printf '\n== T9f: canon and memory default to the folders next to the cfgms checkout ==\n'
+# CFGMS_TEST_REPO_ROOT is ${SANDBOX}/img-repo, so the defaults are
+# ${SANDBOX}/cfgms-canon and ${SANDBOX}/cfgms-memory.
+run_epic_noenv() { ( unset CFGMS_CANON_DIR CFGMS_MEMORY_DIR; run_epic "$@" ); }
+t9_rc=0
+t9_out=$(run_epic_noenv 4242) || t9_rc=$?
+check_eq "T9f: no variable and no default folder -> exits 3" "$t9_rc" "3"
+check_contains "T9f: the refusal names both resolved paths" "$t9_out" \
+  "DISPATCH_REFUSED:epic-4242:no_canon_or_memory_dir (canon ${SANDBOX}/cfgms-canon, memory ${SANDBOX}/cfgms-memory:"
+mkdir -p "${SANDBOX}/cfgms-canon"
+t9_rc=0
+t9_out=$(run_epic_noenv 4242) || t9_rc=$?
+check_eq "T9f: only the canon default is there -> exits 3" "$t9_rc" "3"
+check_eq "T9f: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+mkdir -p "${SANDBOX}/cfgms-memory"
+t9_rc=0
+t9_out=$(run_epic_noenv 4242) || t9_rc=$?
+check_eq "T9f: both defaults are there -> exits 0" "$t9_rc" "0"
+check_eq "T9f: the supervisor gets the default folders" "$(cat "${SANDBOX}/supervisor.log")" \
+  "run epic 4242 --lease-key epic-4242 --lease-handoff --detach --item-id PVTI_fakeitem --canon-dir ${SANDBOX}/cfgms-canon --memory-dir ${SANDBOX}/cfgms-memory"
+t9_rc=0
+t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t9_rc=$?
+check_contains "T9f: a set variable wins over a default that is there" "$(cat "${SANDBOX}/supervisor.log")" \
+  "--canon-dir ${SANDBOX}/canon --memory-dir ${SANDBOX}/memory"
+t9_rc=0
+t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/no-such-canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t9_rc=$?
+check_eq "T9f: a set variable that names no folder -> exits 3, the default is not used" "$t9_rc" "3"
+check_contains "T9f: the refusal names the set path" "$t9_out" "no_canon_or_memory_dir (canon ${SANDBOX}/no-such-canon,"
+rm -rf "${SANDBOX}/cfgms-canon" "${SANDBOX}/cfgms-memory"
+
 printf '\n== T10: a second dispatch of an epic that runs is skipped ==\n'
 t10_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242)
 : > "${SANDBOX}/supervisor.log"
