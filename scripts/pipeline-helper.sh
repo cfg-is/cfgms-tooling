@@ -590,6 +590,10 @@ SPLICE_EOF
     # creation chokepoint), and re-lock any unlocked `internal` issue (covers the
     # create->lock race in materialize/create-epic). Locked items take no external
     # comments — the injection surface stays closed.
+    # A slice PR of an owner-run epic (feature/epic-<N>-slice-<n>) is taken too,
+    # but only from an internal author: a branch in this repository (not a
+    # fork) whose author has push, maintain or admin permission. The name
+    # alone is not proof, as in the preflight (SLICE_BRANCH_RE + is_external).
     python3 - "$REPO" <<'PYEOF'
 import json, re, subprocess, sys
 
@@ -618,11 +622,37 @@ def lock(node_id):
 
 locked_count = 0
 
-# 1. Open pipeline PRs (feature/story-* or feature/item-*): lock + internal label.
+SLICE_BRANCH_RE = re.compile(r'feature/epic-([1-9][0-9]*)-slice-[1-9][0-9]*')
+TRUSTED_PERMS = ('push', 'maintain', 'admin')
+_perms = {}
+
+
+def internal_author(pr):
+    """A PR from a branch of this repository whose author can push to it.
+    Any answer that is not a clear yes is a no."""
+    if pr.get('isCrossRepository') is not False:
+        return False
+    login = ((pr.get('author') or {}).get('login') or '').strip()
+    if not login:
+        return False
+    if login not in _perms:
+        r = subprocess.run(['gh', 'api', f'repos/{repo}/collaborators/{login}/permission',
+                            '--jq', '.permission'], capture_output=True, text=True)
+        _perms[login] = r.stdout.strip() if r.returncode == 0 else ''
+    return _perms[login] in TRUSTED_PERMS
+
+
+# 1. Open pipeline PRs (feature/story-*, feature/item-*, and a slice of an
+#    owner-run epic from an internal author): lock + internal label.
 prs = gh_json(['pr', 'list', '--repo', repo, '--state', 'open',
-               '--json', 'number,headRefName,id,labels', '--limit', '100']) or []
+               '--json', 'number,headRefName,id,labels,author,isCrossRepository', '--limit', '100']) or []
 for pr in prs:
-    if not pr['headRefName'].startswith(('feature/story-', 'feature/item-')):
+    slice_m = SLICE_BRANCH_RE.fullmatch(pr['headRefName'])
+    if slice_m:
+        if not internal_author(pr):
+            print(f"LOCK_SKIPPED_PR:#{pr['number']} (slice branch name, author not internal)")
+            continue
+    elif not pr['headRefName'].startswith(('feature/story-', 'feature/item-')):
         continue
     locked = graphql('query($o:String!,$n:String!,$num:Int!){repository(owner:$o,name:$n){'
                      'pullRequest(number:$num){locked}}}', o=owner, n=name, num=pr['number'])
@@ -634,7 +664,8 @@ for pr in prs:
     # Carry the linked story's cap:* capability tags onto the PR (issue -> PR).
     # feature/story-<N> branches key on the story issue number; feature/item-*
     # branches have no issue to read from, so cap carry only applies to story-*.
-    m = re.match(r'feature/story-(\d+)', pr['headRefName'])
+    # A slice carries the tags of its epic.
+    m = slice_m or re.match(r'feature/story-(\d+)', pr['headRefName'])
     if m:
         iss = gh_json(['issue', 'view', m.group(1), '--repo', repo, '--json', 'labels'])
         iss_caps = [l['name'] for l in (iss or {}).get('labels', []) if l['name'].startswith('cap:')]
