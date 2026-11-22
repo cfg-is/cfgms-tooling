@@ -104,11 +104,11 @@ read -r -a detach_argv <<< "$printed"
 "${detach_argv[@]}" >/dev/null
 check "the printed command moves the git directory out" "$([[ ! -e "$MEM/.git" && -d "$GITDIR" ]] && echo moved)" "moved"
 
-mkdir "$MEM/.git"
-run "${detached[@]}"
-check "a .git directory in the folder with the git dir in place -> exits 3" "$rc" "3"
-check_contains "refused, a person must look" "$(last)" "NOTES_SYNC_REFUSED:not_detached (${MEM}/.git is a directory and ${GITDIR} exists too"
-rmdir "$MEM/.git"
+mkdir "$TMP/not-a-git-dir"
+run CFGMS_MEMORY_GIT_DIR="$TMP/not-a-git-dir" CFGMS_MEMORY_STATE_DIR="$STATE"
+check "a git dir that git cannot use -> exits 3" "$rc" "3"
+check "refused, the path is named" "$(last)" \
+  "NOTES_SYNC_REFUSED:not_detached (${TMP}/not-a-git-dir is not a usable git directory)"
 
 printf '\n== nothing to do ==\n'
 run "${detached[@]}"
@@ -122,6 +122,31 @@ check "one commit, pushed" "$(last)" "NOTES_SYNC_OK:committed=1:unpushed=0:alert
 check "exits 0" "$rc" "0"
 check "the note is on origin main" "$(origin_has areas/build/first.md)" "yes"
 check_contains "memory-sync.py's own output is shown" "$out" "committed 1 file(s) from owner/epic-1"
+
+printf '\n== a .git entry that an agent puts in the folder does not stop the save ==\n'
+mkdir -p "$MEM/.git/hooks"
+printf '[core]\n\thooksPath = /tmp/evil\n' > "$MEM/.git/config"
+printf '#!/bin/sh\ntouch %s\n' "$TMP/hook-ran" > "$MEM/.git/hooks/pre-push"
+chmod +x "$MEM/.git/hooks/pre-push"
+note areas/build/beside.md "a real note beside the planted .git"
+run "${detached[@]}"
+check "the sync runs: exits 0" "$rc" "0"
+check "the extra line names the entry" "$(printf '%s\n' "$out" | tail -n 2 | head -n 1)" \
+  "NOTES_SYNC_NOTE:git_entry_in_folder (${MEM}/.git)"
+check "the last line is ATTENTION, with the commit" "$(last)" "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:alerts=0"
+check "the real note is on origin main" "$(origin_has areas/build/beside.md)" "yes"
+check "nothing of the planted .git is on origin" \
+  "$(git --git-dir "$TMP/origin.git" ls-tree -r --name-only main | grep -c '\.git' || true)" "0"
+check "the planted hook did not run" "$([[ -e "$TMP/hook-ran" ]] && echo ran || echo no)" "no"
+rm -rf "$MEM/.git"
+: > "$MEM/.git"
+run "${detached[@]}"
+check "a .git file: the same extra line" "$(printf '%s\n' "$out" | tail -n 2 | head -n 1)" \
+  "NOTES_SYNC_NOTE:git_entry_in_folder (${MEM}/.git)"
+check "a .git file: ATTENTION, nothing to commit" "$(last)" "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:alerts=0"
+rm "$MEM/.git"
+run "${detached[@]}"
+check "the entry is gone -> OK again, no extra line" "$out" "NOTES_SYNC_OK:committed=0:unpushed=0:alerts=0"
 
 printf '\n== a file that is not a note: refused, alert ==\n'
 echo "not a note" > "$MEM/run.sh"
@@ -151,6 +176,16 @@ note areas/build/third.md "a note the scanner cannot check"
 run "${detached[@]}"
 check "scanner error -> FAILED with the exit code" "$(last)" "NOTES_SYNC_FAILED:exit_1"
 check "FAILED exits 1" "$rc" "1"
+check "nothing was pushed" "$(origin_has areas/build/third.md)" "no"
+
+printf '\n== memory-sync.py runs too long ==\n'
+scanners "sleep 60" "exit 0"
+t0=$(date +%s)
+run "${detached[@]}" CFGMS_NOTES_SYNC_TIMEOUT_SECS=1
+t1=$(date +%s)
+check "stopped at the limit -> FAILED with the limit" "$(last)" "NOTES_SYNC_FAILED:timeout_1s"
+check "timeout exits 1" "$rc" "1"
+check "the call did not wait for the stand-in" "$(( t1 - t0 < 20 ))" "1"
 check "nothing was pushed" "$(origin_has areas/build/third.md)" "no"
 scanners "exit 0" "exit 0"
 

@@ -47,7 +47,8 @@
 #                                   Last line: NOTES_SYNC_OK / NOTES_SYNC_ATTENTION
 #                                   :committed=<n>:unpushed=<n>:alerts=<n> (exit 0), NOTES_SYNC_SKIPPED
 #                                   (exit 0), NOTES_SYNC_REFUSED:not_detached (exit 3),
-#                                   NOTES_SYNC_FAILED:exit_<rc> (exit 1)
+#                                   NOTES_SYNC_FAILED:exit_<rc> or :timeout_<secs>s (exit 1;
+#                                   CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
 #   preflight                       Run preflight (writes ~/.cache/cfgms-po/preflight.json, prints summary)
 #   state [jq_filter]               Read cached preflight and apply optional jq filter
 #   cycle-start [MODE]              Open a per-cycle manifest (Issue #3053). MODE is a free label
@@ -1895,14 +1896,26 @@ EOF
     #   NOTES_SYNC_SKIPPED:no_memory_dir (<path>)   exit 0  no folder on this host
     #   NOTES_SYNC_SKIPPED:already_running          exit 0  another memory-sync.py holds
     #                                               the lock: its run does the work
-    #   NOTES_SYNC_REFUSED:not_detached (<what>)    exit 3  the git directory is not
-    #                                               outside the folder. `detach` is
-    #                                               never run from here.
+    #   NOTES_SYNC_REFUSED:not_detached (<what>)    exit 3  there is no usable git
+    #                                               directory outside the folder.
+    #                                               `detach` is never run from here.
+    #   NOTES_SYNC_NOTE:git_entry_in_folder (<path>)        an extra line before the
+    #                                               last one: the git directory is in
+    #                                               place and the folder has a `.git`
+    #                                               entry too. An owner can write the
+    #                                               folder, so this must not stop the
+    #                                               save for all: the sync runs (git
+    #                                               never adds a `.git` entry) and the
+    #                                               last line is ATTENTION.
     #   NOTES_SYNC_OK:committed=<n>:unpushed=0:alerts=0          exit 0
     #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:alerts=<n>  exit 0  a push
-    #                                               failed, or a file was refused or
-    #                                               put in quarantine
+    #                                               failed, a file was refused or put
+    #                                               in quarantine, or the NOTE line
+    #                                               below was printed
     #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
+    #   NOTES_SYNC_FAILED:timeout_<secs>s           exit 1  memory-sync.py ran longer
+    #                                               than CFGMS_NOTES_SYNC_TIMEOUT_SECS
+    #                                               (default 300) and was stopped
     # committed: commits made by this call. unpushed: origin/main..HEAD after
     # it. alerts: files this call added to <state dir>/alerts. A refused file
     # that stays in the folder gives an alert one time, not each call.
@@ -1914,27 +1927,36 @@ EOF
       echo "NOTES_SYNC_SKIPPED:no_memory_dir (${notes_dir})"
       exit 0
     fi
-    if [[ -d "${notes_dir}/.git" && -e "$notes_git" ]]; then
-      echo "NOTES_SYNC_REFUSED:not_detached (${notes_dir}/.git is a directory and ${notes_git} exists too: a person must look and remove one)"
-      exit 3
-    fi
-    if [[ -d "${notes_dir}/.git" ]]; then
-      echo "NOTES_SYNC_REFUSED:not_detached (run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
-      exit 3
-    fi
-    if [[ ! -d "$notes_git" ]]; then
-      echo "NOTES_SYNC_REFUSED:not_detached (no git directory ${notes_git} and no ${notes_dir}/.git: clone cfgms-memory to ${notes_dir}, then run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
-      exit 3
-    fi
     notes_git_do() { env -u GIT_WORK_TREE -u GIT_INDEX_FILE git --git-dir "$notes_git" "$@" 2>/dev/null; }
+    if [[ ! -e "$notes_git" ]]; then
+      if [[ -d "${notes_dir}/.git" ]]; then
+        echo "NOTES_SYNC_REFUSED:not_detached (run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
+      else
+        echo "NOTES_SYNC_REFUSED:not_detached (no git directory ${notes_git} and no ${notes_dir}/.git: clone cfgms-memory to ${notes_dir}, then run once: python3 ${notes_py} detach --work-tree ${notes_dir} --git-dir ${notes_git})"
+      fi
+      exit 3
+    fi
+    if [[ ! -d "$notes_git" ]] || ! notes_git_do rev-parse --git-dir >/dev/null; then
+      echo "NOTES_SYNC_REFUSED:not_detached (${notes_git} is not a usable git directory)"
+      exit 3
+    fi
+    notes_git_entry=""
+    [[ -e "${notes_dir}/.git" || -L "${notes_dir}/.git" ]] && notes_git_entry="${notes_dir}/.git"
+    notes_timeout="${CFGMS_NOTES_SYNC_TIMEOUT_SECS:-300}"
+    [[ "$notes_timeout" =~ ^[1-9][0-9]*$ ]] || notes_timeout=300
     notes_alert_count() { { find "${notes_state}/alerts" -maxdepth 1 -type f 2>/dev/null || true; } | wc -l | tr -d ' '; }
     notes_head_before="$(notes_git_do rev-parse -q --verify HEAD || true)"
     notes_alerts_before="$(notes_alert_count)"
     notes_args=(once --git-dir "$notes_git" --work-tree "$notes_dir")
     [[ -n "${CFGMS_MEMORY_STATE_DIR:-}" ]] && notes_args+=(--state-dir "$CFGMS_MEMORY_STATE_DIR")
     notes_rc=0
-    notes_out="$(python3 "$notes_py" "${notes_args[@]}" 2>&1)" || notes_rc=$?
+    # `timeout` stops memory-sync.py and what it started (a push that hangs).
+    notes_out="$(timeout -k 10 "$notes_timeout" python3 "$notes_py" "${notes_args[@]}" 2>&1)" || notes_rc=$?
     [[ -n "$notes_out" ]] && printf '%s\n' "$notes_out"
+    if [[ "$notes_rc" == 124 || "$notes_rc" == 137 ]]; then
+      echo "NOTES_SYNC_FAILED:timeout_${notes_timeout}s"
+      exit 1
+    fi
     if [[ "$notes_rc" != 0 ]]; then
       if [[ "$notes_out" == *"another memory-sync is running"* ]]; then
         echo "NOTES_SYNC_SKIPPED:already_running"
@@ -1953,7 +1975,8 @@ EOF
     notes_unpushed="$(notes_git_do rev-list --count origin/main..HEAD || notes_git_do rev-list --count HEAD || echo 1)"
     notes_alerts=$(( $(notes_alert_count) - notes_alerts_before ))
     [[ "$notes_alerts" -lt 0 ]] && notes_alerts=0
-    if [[ "$notes_unpushed" == 0 && "$notes_alerts" == 0 ]]; then
+    [[ -n "$notes_git_entry" ]] && echo "NOTES_SYNC_NOTE:git_entry_in_folder (${notes_git_entry})"
+    if [[ "$notes_unpushed" == 0 && "$notes_alerts" == 0 && -z "$notes_git_entry" ]]; then
       echo "NOTES_SYNC_OK:committed=${notes_committed}:unpushed=0:alerts=0"
     else
       echo "NOTES_SYNC_ATTENTION:committed=${notes_committed}:unpushed=${notes_unpushed}:alerts=${notes_alerts}"
