@@ -160,19 +160,32 @@ class OwnerRunEpics(unittest.TestCase):
         self.assertEqual(due["run_id"], "epic-7-a")
         self.assertTrue(due["run_ended_at"])
 
-    def test_audit_is_not_due_for_an_epic_that_is_not_listed_as_open(self):
-        """The epic list comes from the open epics: a closed epic is not in it."""
+    def test_audit_is_not_due_while_a_lease_holds_the_epic(self):
+        """Another host started a new owner run for the epic after the run on
+        this host ended: the epic is being built, an audit could close it."""
         self.make_run("epic-7-a", epic=7, done=True, transitions=self.REPORTED)
-        out = self.pf.apply_owner_run_epics(_out(8), self.rows(), [])
+        self.make_run("epic-8-a", epic=8, done=True, transitions=self.REPORTED)
+        out = self.pf.apply_owner_run_epics(
+            _out(7, 8), self.rows(), [("epic-7", "other-host", False), ("epic-8", "other-host", True)])
+        self.assertEqual([d["number"] for d in out["epics_audit_due"]], [8])
+        self.assertEqual([e["number"] for e in out["epics_owner_run"]], [7, 8])
+
+    def test_audit_is_not_due_for_a_run_at_report_that_did_not_record_its_end(self):
+        self.make_run("epic-7-a", epic=7, transitions=self.REPORTED, age=3600)
+        row = self.rows()[0]
+        self.assertEqual((row["status"], row["state"], row["ended_at"]), ("crashed", "REPORT", None))
+        out = self.pf.apply_owner_run_epics(_out(7), self.rows(), [])
         self.assertEqual(out["epics_audit_due"], [])
 
     def test_a_new_run_after_a_reported_run_is_the_one_that_counts(self):
-        self.make_run("epic-7-a", epic=7, done=True, transitions=self.REPORTED, age=7200)
-        self.make_run("epic-7-b", epic=7, transitions=[("PREPARE", "gates_ok", "OWNER")], age=3600)
+        # the names are in the other order than the times: the time decides
+        self.make_run("epic-7-b", epic=7, done=True, transitions=self.REPORTED, age=7200)
+        self.make_run("epic-7-a", epic=7, transitions=[("PREPARE", "gates_ok", "OWNER")], age=3600)
+        self.assertEqual([r["run_id"] for r in self.rows()], ["epic-7-a", "epic-7-b"])
         out = self.pf.apply_owner_run_epics(_out(7), self.rows(), [])
-        self.assertEqual(out["epics_owner_run"][0]["run_id"], "epic-7-b")
+        self.assertEqual(out["epics_owner_run"][0]["run_id"], "epic-7-a")
         self.assertEqual(out["epics_audit_due"], [])
-        self.assertIn("epic-7-b", out["epics_owner_run"][0]["owner_run"])
+        self.assertIn("epic-7-a", out["epics_owner_run"][0]["owner_run"])
 
     def test_main_calls_apply_and_flags_an_unreadable_index(self):
         """The wiring in main(): the split is applied, and an unreadable run

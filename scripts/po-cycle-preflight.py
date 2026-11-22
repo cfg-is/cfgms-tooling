@@ -957,7 +957,8 @@ _EPIC_KEY_RE = re.compile(r"^epic-(\d+)$")
 def owner_run_rows(runs):
     """{epic number: run index row} for each epic that an epic-mode run on
     this host holds (the first signal of owner_run_epics). An epic with
-    more than one such run gets the run that was made last."""
+    more than one such run gets the run that was made last (`created`, the
+    time of its run.json; runs of the same second stay in listing order)."""
     rows = {}
     for r in sorted(runs or [], key=lambda r: r.get("created") or 0):
         if r.get("mode") != "epic":
@@ -1009,18 +1010,27 @@ def apply_owner_run_epics(out, runs, lease_rows=None):
 
     Each entry also has the run as fields: `run_id`, `run_status` (a
     runindex status), `run_state` (REPORT, FAILED, OWNER, ...) and
-    `run_ended_at` (ISO, UTC; None while the run is not ended). All four
-    are None when only a lease holds the epic (the run is on another host).
+    `run_ended_at` (ISO, UTC; None while the run is not ended, and for a
+    run abandoned with no recorded end). They describe the last run on this
+    host, also when a lease shows that another host now holds the epic. All
+    four are None when there is no run on this host (only a lease).
 
-    out["epics_audit_due"] lists the open epics whose owner run on this host
-    ended in REPORT: every submitted slice is merged or closed and the owner
-    says the epic is done. The epic audit decides whether to close it; the
-    caller leaves out an epic it has audited after `run_ended_at`. An epic
-    stays in the list only while its run dir is kept (runindex.gc: by
-    default 24 hours after REPORT). After that the epic is in
-    epics_undecomposed again."""
+    out["epics_audit_due"] lists the open epics with no sub-issues whose
+    last owner run on this host ended in REPORT (every submitted slice is
+    merged or closed and the owner says the epic is done), and that no
+    unexpired `epic-<N>` lease holds: a lease means a run is building the
+    epic now, here or on another host. The epic audit decides whether to
+    close the epic; the caller leaves out an epic it has audited after
+    `run_ended_at`. An epic stays in the list only while its run dir is
+    kept (runindex.gc: by default 24 hours after REPORT). After that the
+    epic is in epics_undecomposed again, and no audit is signalled."""
     held = owner_run_epics(runs, lease_rows)
     rows = owner_run_rows(runs)
+    leased = set()
+    for key, _holder, expired in lease_rows or []:
+        m = _EPIC_KEY_RE.match(str(key or ""))
+        if m and not expired:
+            leased.add(int(m.group(1)))
     keep, owned, due = [], [], []
     for e in out.get("epics_undecomposed", []):
         n = e.get("number")
@@ -1031,7 +1041,7 @@ def apply_owner_run_epics(out, runs, lease_rows=None):
         owned.append(dict(e, owner_run=held[n], run_id=r.get("run_id"),
                           run_status=r.get("status"), run_state=r.get("state"),
                           run_ended_at=r.get("ended_at")))
-        if r.get("status") == "done" and r.get("state") == "REPORT":
+        if r.get("status") == "done" and r.get("state") == "REPORT" and n not in leased:
             due.append({"number": n, "run_id": r.get("run_id"),
                         "run_ended_at": r.get("ended_at")})
     out["epics_undecomposed"] = keep

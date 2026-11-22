@@ -180,7 +180,8 @@ def describe(run_id, base=None, now=None):
         "heartbeat_age": None if hb is None else round(hb, 1),
         "agent_launched": bool(launched), "sessions": len(launched),
         "gates_passed": gates_passed, "created": created, "last_activity": last,
-        # when the supervisor recorded the end of the run (ISO, UTC); None while it runs
+        # when the supervisor recorded the end of the run (ISO, UTC). None while
+        # it runs, and for a run that was abandoned with no recorded end
         "ended_at": (ended[-1].get("ts") or None) if ended else None,
         "path": str(run.path),
     }
