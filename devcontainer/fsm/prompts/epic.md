@@ -40,10 +40,18 @@ You cannot publish anything yourself. The supervisor on the host does it for
 you, one slice at a time. A slice is one reviewable change that is complete
 by itself: it builds, its tests pass, and it can merge alone.
 
-1. Make the change in `/workspace`. Let every helper finish.
+1. Make the change in `/workspace`. Let every helper finish. A helper that
+   works in its own worktree may not start on your branch. Commit your
+   work first, name that commit in the brief as the start, and say how the
+   result comes back to you (a commit on a named local branch, or a patch
+   file).
 2. Write a claim file: what this slice delivers, one sentence on which part
    of the Goal it makes true, which success criteria it covers, and how you
-   checked it.
+   checked it. Keep the claim file in `/tmp`, and keep no copy of it under
+   `/memory/`. The claim is published, and it is compared with the files
+   in `/memory/` and `/canon/`: a claim that holds the whole content of
+   one of them, a copy of the claim itself too, is refused. Write the claim in
+   your own words, not with text copied from `state.md`, a verdict or canon.
 3. Run:
 
    ```
@@ -74,7 +82,9 @@ validated at once on top of slice `m`, and published after slice `m` merges.
 
 The same slice number again is a new round of that slice. A slice has 3
 rounds. A slice that uses all of them stops the whole epic, so check your work
-before you submit: run the fast checks that cover what you changed.
+before you submit: run the fast checks that cover what you changed. A submit
+that the supervisor refuses at the copy (`rejected.md` says "Snapshot
+refused") uses a round too.
 
 ## What comes back
 
