@@ -168,6 +168,42 @@ check "a remote with no main -> FAILED, exits 1" "${rc}:$(last)" "1:NOTES_SETUP_
 check "no_origin_main: no git directory, the folder's .git still there" \
   "$([[ ! -e "$GITDIR" && -d "$MEM/.git" ]] && echo clean)" "clean"
 
+printf '\n== notes-setup: the folder lacks files of the remote ==\n'
+setup_arg() {  # setup_arg [VAR=value ...] <arg>: notes-setup <arg>; sets $out and $rc
+  rc=0
+  out="$(env "${@:1:$#-1}" bash "$PO_ACT" notes-setup "${@: -1}" 2>&1)" || rc=$?
+}
+setup_arg "${detached[@]}" CFGMS_MEMORY_REMOTE="$ORIGIN" --allow-removal
+check "an unknown argument -> REFUSED, exits 3" "${rc}:$(last)" "3:NOTES_SETUP_REFUSED:bad_argument (--allow-removal)"
+mv "$MEM/areas/build/have.md" "$TMP/have.md.away"
+setup "${detached[@]}" CFGMS_MEMORY_REMOTE="$ORIGIN"
+check "a note of origin is not in the folder -> REFUSED, exits 3" "${rc}:$(last)" \
+  "3:NOTES_SETUP_REFUSED:folder_lacks_remote_files (1 files; first: areas/build/have.md)"
+check "refused: no git directory, the folder's .git still there, no temp clone left" \
+  "$([[ ! -e "$GITDIR" && -d "$MEM/.git" ]] && echo clean):$(find "$STATE" -maxdepth 1 -name 'setup-*' | wc -l | tr -d ' ')" "clean:0"
+check "refused: nothing was moved aside" "$(find "$STATE" -maxdepth 1 -name 'untrusted-git-*' | wc -l | tr -d ' ')" "0"
+mv "$TMP/have.md.away" "$MEM/areas/build/have.md"
+mv "$MEM/areas" "$TMP/areas.real"
+ln -s "$TMP/areas.real" "$MEM/areas"
+setup "${detached[@]}" CFGMS_MEMORY_REMOTE="$ORIGIN"
+check "a link on the way to the note counts as missing -> REFUSED" "${rc}:$(last)" \
+  "3:NOTES_SETUP_REFUSED:folder_lacks_remote_files (1 files; first: areas/build/have.md)"
+rm "$MEM/areas"
+mv "$TMP/areas.real" "$MEM/areas"
+MEM2="$TMP/mem-partial"
+mkdir -p "$MEM2"
+echo "shared notes" > "$MEM2/README.md"
+setup CFGMS_MEMORY_DIR="$MEM2" CFGMS_MEMORY_GIT_DIR="$TMP/state2/memory-git" \
+  CFGMS_MEMORY_STATE_DIR="$TMP/state2/memory-sync" CFGMS_MEMORY_REMOTE="$ORIGIN"
+check "a second folder without the note -> REFUSED" "${rc}:$(last)" \
+  "3:NOTES_SETUP_REFUSED:folder_lacks_remote_files (1 files; first: areas/build/have.md)"
+setup_arg CFGMS_MEMORY_DIR="$MEM2" CFGMS_MEMORY_GIT_DIR="$TMP/state2/memory-git" \
+  CFGMS_MEMORY_STATE_DIR="$TMP/state2/memory-sync" CFGMS_MEMORY_REMOTE="$ORIGIN" --allow-removals
+check "--allow-removals skips the check -> OK, exits 0" "${rc}:$(last | cut -d: -f1)" "0:NOTES_SETUP_OK"
+check "--allow-removals: the git directory is in place" \
+  "$([[ -d "$TMP/state2/memory-git" ]] && echo yes)" "yes"
+check "--allow-removals: setup itself changed nothing on origin" "$(origin_has areas/build/have.md)" "yes"
+
 origin_before="$(origin_commits)"
 setup "${detached[@]}" CFGMS_MEMORY_REMOTE="$ORIGIN"
 check "setup exits 0" "$rc" "0"

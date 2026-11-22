@@ -49,10 +49,13 @@
 #                                   (exit 0), NOTES_SYNC_SKIPPED (exit 0), NOTES_SYNC_REFUSED:not_detached
 #                                   (exit 3; run notes-setup), NOTES_SYNC_FAILED:exit_<rc> or
 #                                   :timeout_<secs>s (exit 1; CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
-#   notes-setup                     One time on a host: make the git dir of the notes folder from a new
+#   notes-setup [--allow-removals]  One time on a host: make the git dir of the notes folder from a new
 #                                   clone of CFGMS_MEMORY_REMOTE (default
 #                                   https://github.com/cfg-is/cfgms-memory.git). A .git in the folder is
-#                                   never read: it is moved away. NOTES_SETUP_OK (exit 0),
+#                                   never read: it is moved away. If the remote's main has files that
+#                                   the folder lacks, it refuses (the first notes-sync would remove
+#                                   them): NOTES_SETUP_REFUSED:folder_lacks_remote_files; --allow-removals
+#                                   skips that check. NOTES_SETUP_OK (exit 0),
 #                                   NOTES_SETUP_REFUSED:<reason> (exit 3), NOTES_SETUP_FAILED:<step> (exit 1)
 #   preflight                       Run preflight (writes ~/.cache/cfgms-po/preflight.json, prints summary)
 #   state [jq_filter]               Read cached preflight and apply optional jq filter
@@ -2058,18 +2061,36 @@ EOF
     # After this the folder's files are compared with the remote's main: the
     # first notes-sync commits what is different in the folder, also a note
     # that the folder does not have (a removal). The folder is the truth.
+    # So setup first checks that the folder has every file of the remote's
+    # main. If not, it refuses and changes nothing. --allow-removals skips
+    # this check: use it only when the removals are wanted.
     #   NOTES_SETUP_NOTE:moved_untrusted_git (<from> -> <to>)   an extra line
     #   NOTES_SETUP_OK:git_dir=<path>:head=<commit>   exit 0
+    #   NOTES_SETUP_REFUSED:bad_argument (<arg>)      exit 3
     #   NOTES_SETUP_REFUSED:no_memory_dir (<path>)    exit 3
     #   NOTES_SETUP_REFUSED:git_dir_exists (<path>)   exit 3  set up before; nothing changed
     #   NOTES_SETUP_REFUSED:git_dir_in_folder (...)   exit 3  the git or state directory
     #                                                 would be inside the folder
+    #   NOTES_SETUP_REFUSED:folder_lacks_remote_files (<n> files; first: <path>)
+    #                                                 exit 3  the first notes-sync would
+    #                                                 remove them from the remote. Nothing
+    #                                                 changed: no git directory, the
+    #                                                 folder's .git is where it was
     #   NOTES_SETUP_FAILED:<step> (...)               exit 1  step: state_dir, clone,
     #                                                 no_origin_main, move_untrusted_git,
     #                                                 move_git_dir. A failure before
     #                                                 move_git_dir leaves no git directory.
     _notes_paths
     notes_remote="${CFGMS_MEMORY_REMOTE:-https://github.com/cfg-is/cfgms-memory.git}"
+    notes_allow_removals=0
+    for notes_arg in "$@"; do
+      if [[ "$notes_arg" == "--allow-removals" ]]; then
+        notes_allow_removals=1
+      else
+        echo "NOTES_SETUP_REFUSED:bad_argument (${notes_arg})"
+        exit 3
+      fi
+    done
     if [[ ! -d "$notes_dir" ]]; then
       echo "NOTES_SETUP_REFUSED:no_memory_dir (${notes_dir})"
       exit 3
@@ -2105,6 +2126,36 @@ EOF
       && git --git-dir "$notes_new" symbolic-ref HEAD refs/heads/main \
       && git --git-dir "$notes_new" config core.bare false \
       || notes_setup_fail no_origin_main "$notes_remote"
+    if [[ "$notes_allow_removals" != 1 ]]; then
+      # The names come from the new clone only. The folder is read with plain
+      # file tests: no git command runs in it. A link on the way to a file
+      # (areas -> elsewhere) counts as missing: git sees a link, not the file.
+      # A file, not "$(...)": bash drops the NUL bytes of a command's output.
+      notes_listing="${notes_tmp}/remote-files"
+      git --git-dir "$notes_new" ls-tree -r -z --name-only "$notes_main" > "$notes_listing" 2>/dev/null \
+        || notes_setup_fail no_origin_main "$notes_remote"
+      notes_missing=0; notes_first=""
+      while IFS= read -r -d '' notes_path; do
+        notes_parent="$notes_dir"; notes_found=1
+        IFS=/ read -r -a notes_parts <<< "$notes_path"
+        for notes_part in "${notes_parts[@]:0:${#notes_parts[@]}-1}"; do
+          notes_parent="${notes_parent}/${notes_part}"
+          if [[ -L "$notes_parent" || ! -d "$notes_parent" ]]; then notes_found=0; break; fi
+        done
+        if [[ "$notes_found" == 1 && ! -e "${notes_dir}/${notes_path}" && ! -L "${notes_dir}/${notes_path}" ]]; then
+          notes_found=0
+        fi
+        if [[ "$notes_found" == 0 ]]; then
+          notes_missing=$((notes_missing + 1))
+          [[ -z "$notes_first" ]] && notes_first="$notes_path"
+        fi
+      done < "$notes_listing"
+      if [[ "$notes_missing" -gt 0 ]]; then
+        rm -rf "$notes_tmp"
+        echo "NOTES_SETUP_REFUSED:folder_lacks_remote_files (${notes_missing} files; first: ${notes_first})"
+        exit 3
+      fi
+    fi
     if [[ -e "${notes_dir}/.git" || -L "${notes_dir}/.git" ]]; then
       notes_aside="${notes_state}/untrusted-git-$(date -u +%Y%m%dT%H%M%SZ)"
       [[ -e "$notes_aside" || -L "$notes_aside" ]] && notes_aside="${notes_aside}-$$"
