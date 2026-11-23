@@ -88,5 +88,67 @@ class PrFeedbackWiringTest(unittest.TestCase):
         self.assertIn("2 review(s) or comment(s)", text)
 
 
+class FailingChecksTest(unittest.TestCase):
+    """The fix agent's context/ci.md lists the PR's failed checks, read from
+    `gh pr view --json statusCheckRollup` (gh 2.45 has no `pr checks --json`)."""
+
+    ROLLUP = [
+        {"__typename": "CheckRun", "name": "golangci-lint (windows)", "conclusion": "FAILURE",
+         "status": "COMPLETED", "detailsUrl": "https://ci.example/job/1"},
+        {"__typename": "CheckRun", "name": "unit-tests", "conclusion": "TIMED_OUT",
+         "status": "COMPLETED", "detailsUrl": "https://ci.example/job/2"},
+        {"__typename": "CheckRun", "name": "build", "conclusion": "SUCCESS",
+         "status": "COMPLETED", "detailsUrl": "https://ci.example/job/3"},
+        {"__typename": "CheckRun", "name": "e2e", "conclusion": "", "status": "IN_PROGRESS",
+         "detailsUrl": "https://ci.example/job/4"},
+        {"__typename": "CheckRun", "name": "docs", "conclusion": "SKIPPED",
+         "status": "COMPLETED", "detailsUrl": "https://ci.example/job/5"},
+        {"__typename": "StatusContext", "context": "external/scan", "state": "ERROR",
+         "targetUrl": "https://ci.example/status/6"},
+        {"__typename": "StatusContext", "context": "external/ok", "state": "SUCCESS",
+         "targetUrl": "https://ci.example/status/7"},
+    ]
+
+    def setUp(self):
+        self.f = L.Fixture("fsm-prci")
+        self.f.add_issue(42, "src: add N", L.STORY_BODY)
+
+    def tearDown(self):
+        self.f.cleanup()
+
+    def _run(self, rollup, env_extra=None):
+        self.f.commit_on(BRANCH, {"src/new.go": "package src\n// v1\n"})
+        self.f.add_pr(50, BRANCH, "src: add N (Issue #42)")
+        s = self.f.gh()
+        s["prs"][0]["statusCheckRollup"] = rollup
+        self.f.gh(s)
+        self.f.plan({"agent": [[{"op": "write", "path": "src/new.go", "content": "package src\n// v2\n"},
+                                {"op": "out", "name": "summary.md", "content": "fixed"}]]})
+        rc, out, rid = self.f.cli("run", "fix-pr", "50", "--model", "m", "--effort", "e", "--item-id", L.ITEM,
+                                  env_extra=env_extra)
+        self.assertIsNotNone(rid, out)
+        self.rid = rid
+        ci = self.f.run_dir(rid) / "context" / "ci.md"
+        return ci.read_text() if ci.exists() else None
+
+    def test_failed_checks_reach_ci_md(self):
+        text = self._run(self.ROLLUP)
+        self.assertIn("- golangci-lint (windows): FAILURE https://ci.example/job/1", text)
+        self.assertIn("- unit-tests: TIMED_OUT https://ci.example/job/2", text)
+        self.assertIn("- external/scan: ERROR https://ci.example/status/6", text)
+        for passed in ("build", "e2e", "docs", "external/ok"):
+            self.assertNotIn(f"- {passed}:", text)
+        self.assertNotIn("(no failing checks)", text)
+
+    def test_unreadable_rollup_fails_the_run_instead_of_reporting_green(self):
+        text = self._run(self.ROLLUP, env_extra={"FSM_FAKE_GH_FAIL": "pr-view-rollup"})
+        self.assertIsNone(text, "ci.md must not be written when the rollup cannot be read")
+        self.assertEqual(self.f.manifest(self.rid)["fsm_final_state"], "FAILED")
+        self.assertNotIn("AGENT", [to for _f, _e, to in self.f.path_states(self.rid)])
+
+    def test_all_green_says_no_failing_checks(self):
+        self.assertEqual(self._run(self.ROLLUP[2:5]).strip(), "(no failing checks)")
+
+
 if __name__ == "__main__":
     unittest.main()

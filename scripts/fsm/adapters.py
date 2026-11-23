@@ -313,14 +313,30 @@ class GhCLI:
                          "--jq", ".permission"], check=False)
         return proc.stdout.decode().strip() if proc.returncode == 0 else ""
 
+    # A check run's conclusion, or a commit status's state, that means the check failed.
+    FAILED_CHECK_STATES = ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
+                           "STARTUP_FAILURE")
+
     def failing_checks(self, number):
-        proc = self._gh(["pr", "checks", str(number), "--repo", self.repo, "--json",
-                         "name,state,link"], check=False)
-        try:
-            rows = json.loads(proc.stdout.decode() or "[]")
-        except json.JSONDecodeError:
-            return []
-        return [r for r in rows if str(r.get("state", "")).upper() in ("FAILURE", "ERROR")]
+        """[{"name", "state", "link"}] of the PR's failed checks.
+
+        Reads `statusCheckRollup` from `gh pr view`, which every supported gh
+        has; `gh pr checks --json` does not exist before gh 2.48. A gh error
+        raises, like every other `_json` read: an unreadable rollup must never
+        be reported to the fix agent as "no failing checks"."""
+        data = self._json(["pr", "view", str(number), "--repo", self.repo, "--json",
+                           "statusCheckRollup"])
+        out = []
+        for r in (data or {}).get("statusCheckRollup") or []:
+            if not isinstance(r, dict):
+                continue
+            if r.get("__typename") == "StatusContext":
+                name, state, link = r.get("context"), r.get("state"), r.get("targetUrl")
+            else:
+                name, state, link = r.get("name"), r.get("conclusion"), r.get("detailsUrl")
+            if str(state or "").upper() in self.FAILED_CHECK_STATES:
+                out.append({"name": name or "", "state": str(state).upper(), "link": link or ""})
+        return out
 
 
 def script_timeout(default):
