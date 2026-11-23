@@ -74,7 +74,8 @@ r = state.RunDir(rid)
 params = {"mode": run_mode, "target": target, "key": key, "lease_key": key,
           "item_id": argv[argv.index("--item-id") + 1] if "--item-id" in argv else None}
 if run_mode == "epic":
-    params.update(target="epic-" + target, epic=int(target))
+    params.update(target="epic-" + target, epic=int(target),
+                  memory_dir=argv[argv.index("--memory-dir") + 1] if "--memory-dir" in argv else None)
 r.create(params)
 print("FSM_RUN:" + rid, flush=True)
 container = {"fix-pr": "cfg-agent-pr-fix-", "resolve-conflict": "cfg-agent-resolve-conflict-"}.get(

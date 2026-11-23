@@ -151,6 +151,9 @@ class TestRestart(EpicCase):
         self.assertEqual([x["turn"] for x in t], [1, 2])
         self.assertEqual(len({x["owner"]["session_id"] for x in t}), 1)
         self.assertNotIn("restarted", t[1]["text"])
+        # the board: written one time, at the first launch. The resume does
+        # not write In Progress again (a person can have moved the item).
+        self.assertEqual(self.board_writes(), ["In Progress"])
 
     def test_a_lost_container_is_started_again_and_the_owner_is_told(self):
         pr = self.stop_while_waiting()
@@ -165,6 +168,32 @@ class TestRestart(EpicCase):
         self.assertIn("slice 1: MERGED", t[1]["text"])
         self.assertIn(O.RESTART_TEXT, t[1]["text"])
         self.assertEqual(len({x["owner"]["session_id"] for x in t}), 1)
+
+    def test_a_git_entry_in_the_memory_folder_does_not_stop_a_container_start_in_the_run(self):
+        """A container that is started again in the middle of a run runs the
+        same move as the gates, and is never stopped by it: one owner must
+        not stop the run of another. Not set up: the entry stays and a note
+        says so. Set up: the entry is moved."""
+        for setup in (False, True):
+            with self.subTest(notes_setup=setup):
+                self.setUp()
+                env = {"CFGMS_MEMORY_GIT_DIR": str(self.f.root / "notes-git"),
+                       "CFGMS_MEMORY_STATE_DIR": str(self.f.root / "notes-state")}
+                if setup:
+                    subprocess.run(["git", "init", "-q", "--bare", env["CFGMS_MEMORY_GIT_DIR"]], check=True)
+                pr = self.stop_while_waiting()
+                run_id = self.run_dir.name
+                (self.f.docker_state / "containers.json").write_text("{}")         # a host restart
+                (self.memory / ".git").write_text("planted by an owner\n")
+                self.merge(pr)
+                self.launch("resume", run_id, env=env)
+                rc, out = self.finish()
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(len(self.f.records("docker-owner-start")), 2)
+                notes = [(r["memory_git_rc"], r["memory_git"][:6]) for r in self.recs("note") if "memory_git" in r]
+                self.assertEqual(notes, [(0, "MOVED:")] if setup else [(3, "NO_GIT")])
+                self.assertEqual(os.path.lexists(self.memory / ".git"), not setup)
+                self.tearDown()
 
     def test_a_token_that_cannot_be_read_any_more_stops_the_run_and_it_can_be_resumed(self):
         # readable at the launch; not readable when the lost container must be

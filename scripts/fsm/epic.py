@@ -160,6 +160,65 @@ def slice_branch(epic, number):
     return f"feature/epic-{int(epic)}-slice-{int(number)}"
 
 
+#: Parts of git's error text (LC_ALL=C, lower case) for a gate fetch that
+#: cannot reach the remote now: the run is deferred (base_branch_fetch_failed).
+#: git prints "unable to access '<url>': <cause>"; the cause is matched.
+#: Every other fetch error (a login that fails, a repository that is not
+#: found, ...) is prepare_error, and the item is set Blocked.
+NETWORK_FETCH_ERRORS = (
+    "could not resolve host",
+    "connection timed out",
+    "operation timed out",
+    "connection refused",
+    "failed to connect to",
+    "network is unreachable",
+)
+
+
+def fetch_error_kind(stderr):
+    """"missing_ref" (the remote has no such branch), "network"
+    (NETWORK_FETCH_ERRORS) or None (any other error) for the stderr bytes of
+    a failed fetch. gitops runs git with LC_ALL=C, so the text is git's own
+    English text on every host."""
+    err = (stderr or b"").decode("utf-8", "replace").lower()
+    if "couldn't find remote ref" in err:
+        return "missing_ref"
+    if any(m in err for m in NETWORK_FETCH_ERRORS):
+        return "network"
+    return None
+
+MEMORY_SYNC = Path(__file__).resolve().parent.parent / "memory-sync.py"
+
+
+def quarantine_memory_git(memory_dir):
+    """Move a `.git` entry at the top of the memory folder away with
+    `memory-sync.py quarantine-top-git` (the one helper that the launch and
+    resume gates of po-act.sh use too). Returns (exit code, line): 0 moved
+    or nothing there, 3 no trusted git directory of the notes (notes-setup
+    not done), 4 the entry cannot be moved, 5 the state directory of
+    notes-sync overlaps the memory folder. The git directory and the state
+    directory are the ones that notes-sync uses."""
+    home = os.path.expanduser("~")
+    git_dir = os.environ.get("CFGMS_MEMORY_GIT_DIR") or os.path.join(home, ".local/state/cfgms/memory-git")
+    state = os.environ.get("CFGMS_MEMORY_STATE_DIR") or os.path.join(home, ".local/state/cfgms/memory-sync")
+    sd, md = os.path.realpath(state), os.path.realpath(memory_dir)
+    if sd == md or sd.startswith(md + os.sep) or md.startswith(sd + os.sep):
+        return 5, "STATE_DIR_IN_FOLDER"          # agents would write the host's records
+    if not os.path.lexists(os.path.join(memory_dir, ".git")):
+        return 0, "NONE"
+    try:
+        r = subprocess.run([sys.executable, str(MEMORY_SYNC), "quarantine-top-git", "--git-dir", git_dir,
+                            "--work-tree", memory_dir, "--state-dir", state],
+                           capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 4, f"NOT_MOVABLE:{type(exc).__name__}"
+    line = (r.stdout.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
+    if r.returncode not in (0, 3, 4, 5):
+        err = r.stderr.decode("utf-8", "replace").strip().replace("\n", " | ")
+        return 4, f"NOT_MOVABLE:memory-sync.py exited {r.returncode}: {err[-200:]}"
+    return r.returncode, line[:300]
+
+
 def protected_allowlist(tooling_root, body):
     """Paths of the epic's `## Protected Paths` section (design §7)."""
     try:
@@ -338,6 +397,23 @@ class EpicSupervisor(sup.Supervisor):
                         guard="", info={}, ctx=self.ctx.to_dict())
         self.log(f"{frm} --{event}--> {to}{' reason=' + reason if reason else ''}")
 
+    def board_status(self, status):
+        """Set the epic's project item to `status`. The preflight reads the
+        item: Ready means "an owner may start", so a run that started or that
+        ended FAILED must not leave it at Ready. The write is best effort: a
+        write that fails is recorded and logged, and never fails the run.
+        Nothing is posted on the issue."""
+        item = self.params.get("item_id")
+        ok = False
+        try:
+            ok = bool(item) and bool(self.svc.board.update_field(item, "status", status))
+        except Exception as exc:
+            self.log(f"board: {type(exc).__name__}: {str(exc)[:300]}")
+        self.run.append("note", board_status=status, ok=ok)
+        if not ok:
+            self.log(f"board: the epic item was not set to {status}; set it by hand")
+        return ok
+
     def note_once(self, key, **fields):
         if key not in self._noted:
             self._noted.add(key)
@@ -354,12 +430,19 @@ class EpicSupervisor(sup.Supervisor):
             except sup.Refused as r:
                 self.x["refused_deferred"] = r.deferred
                 self.x["refused_exit"] = r.exit_code
+                # for the run index: a deferral is tried again, a refusal
+                # needs a person (preflight owner_attention)
+                self.run.append("note", refused_deferred=bool(r.deferred))
                 self._phase("gate_refused", T.REFUSED, r.reason)
             except Exception as exc:
                 self.run.append("note", error=f"{type(exc).__name__}: {str(exc)[:800]}",
                                 state=self.state)
                 self.log(f"host error in PREPARE: {type(exc).__name__}: {exc}")
                 self._phase("error", T.FAILED, "prepare_error")
+                # FAILED before the gates: if the item stayed Ready, the next
+                # cycle starts the same run again, each cycle. REFUSED and
+                # deferred write nothing: they are retried.
+                self.board_status("Blocked")
         if self.state == OWNER:
             try:
                 state, reason = self.loop()
@@ -372,9 +455,24 @@ class EpicSupervisor(sup.Supervisor):
                 state, reason = T.FAILED, "owner_error"
             self.shutdown()
             self._phase("done" if state == T.REPORT else "failed", state, reason)
+            # FAILED after the gates: nobody builds the epic now. REPORT writes
+            # nothing: the item stays In Progress until the epic audit.
+            # lease_lost writes nothing: another holder can own the item now.
+            if state == T.FAILED and reason != "lease_lost":
+                self.board_status("Blocked")
         return self.finish()
 
     # --- PREPARE --------------------------------------------------------------------
+    def github_gate(self, what, fn, *args):
+        """fn(*args) for a PREPARE gate that asks GitHub (a lease or the
+        project item). A call that runs out of time can work at the next
+        cycle: the run is deferred, not FAILED."""
+        try:
+            return fn(*args)
+        except subprocess.TimeoutExpired:
+            self.log(f"{what}: no answer from GitHub in time")
+            raise sup.Refused("github_timeout", deferred=True)
+
     def prepare(self):
         p, x = self.params, self.x
         x.update({"lease_acquired": bool(p.get("lease_handoff") and p.get("lease_key"))})
@@ -390,15 +488,19 @@ class EpicSupervisor(sup.Supervisor):
         if key:
             ttl = int(p.get("lease_ttl", sup.LEASE_TTL))
             if p.get("acquire_lease"):
-                ok, _line = self.svc.helper.lease_acquire(key, ttl)
+                # Set before the call: when the call runs out of time, the
+                # lease can be ours. release() releases it only when the
+                # lease status says it is held by this host.
+                was_acquired, x["lease_acquired"] = x["lease_acquired"], True
+                ok, _line = self.github_gate("lease-acquire", self.svc.helper.lease_acquire, key, ttl)
                 if not ok:
+                    x["lease_acquired"] = was_acquired
                     raise sup.Refused("lease_held", deferred=True)
-                x["lease_acquired"] = True
             else:
-                st, _ = self.svc.helper.lease_status(key)
+                st, _ = self.github_gate("lease-status", self.svc.helper.lease_status, key)
                 if st != "held_by_me":
                     raise sup.Refused("lease_not_held")
-                rs, _line = self.svc.helper.lease_renew(key, ttl)
+                rs, _line = self.github_gate("lease-renew", self.svc.helper.lease_renew, key, ttl)
                 if rs == "not_holder":
                     raise sup.Refused("lease_not_held")
             self._last_renew = time.time()
@@ -416,7 +518,7 @@ class EpicSupervisor(sup.Supervisor):
         # the epic text comes from the project item, never from issue text
         if not p.get("item_id"):
             raise sup.Refused("no_epic_item")
-        item = self.svc.board.get_item(p["item_id"])
+        item = self.github_gate("project item", self.svc.board.get_item, p["item_id"])
         if item is None:
             raise sup.Refused("epic_item_unreadable")
         if item.get("issue_num") not in (None, self.epic):
@@ -425,6 +527,21 @@ class EpicSupervisor(sup.Supervisor):
             d = p.get(name)
             if not d or not os.path.isabs(d) or os.path.islink(d) or not os.path.isdir(d):
                 raise sup.Refused(f"no_{name}")
+        # Agents write the memory folder: a `.git` entry at its top is never
+        # trusted. When the trusted git directory of the notes is there, the
+        # entry is moved into the quarantine and the run goes on; one owner
+        # must not stop the runs of the others.
+        qrc, qline = quarantine_memory_git(p["memory_dir"])
+        if qrc == 5:
+            raise sup.Refused("state_dir_in_folder")
+        if qrc == 3:
+            raise sup.Refused("memory_dir_has_git")
+        if qrc != 0:
+            self.log(f"memory folder .git: {qline}")
+            raise sup.Refused("memory_dir_git_not_movable")
+        if qline.startswith("MOVED:"):
+            self.run.append("note", memory_git_quarantined=qline[len("MOVED:"):])
+            self.log(f"memory folder: a .git entry was moved to {qline[len('MOVED:'):]}")
         real = [os.path.realpath(p["canon_dir"]), os.path.realpath(p["memory_dir"]),
                 os.path.realpath(str(self.run.path))]
         for i, a_ in enumerate(real):
@@ -437,7 +554,20 @@ class EpicSupervisor(sup.Supervisor):
             shutil.rmtree(self.run.repo_dir)
         gitops.init_bare(self.run.repo_dir, self.run.path, self.run.gitconfig)
         publish.write_askpass(self.run.path)
-        develop = self.fetch_develop()
+        try:
+            develop = self.fetch_develop()
+        except subprocess.TimeoutExpired as exc:
+            self.log(f"fetch of {p['base_branch']} ran out of time: {str(exc)[:200]}")
+            raise sup.Refused("base_branch_fetch_failed", deferred=True)
+        except gitops.GitError as exc:
+            kind = fetch_error_kind(exc.stderr)
+            if kind == "missing_ref":
+                raise sup.Refused("base_branch_missing")
+            if kind == "network":
+                # the remote cannot be reached now: it can be at the next cycle
+                self.log(f"fetch of {p['base_branch']} failed (network): {str(exc)[:300]}")
+                raise sup.Refused("base_branch_fetch_failed", deferred=True)
+            raise              # a login that fails, no such repository, ...: prepare_error
         if not develop:
             raise sup.Refused("base_branch_missing")
         title, body = item.get("title", ""), item.get("body", "")
@@ -468,6 +598,12 @@ class EpicSupervisor(sup.Supervisor):
         sdir = agent_session.prepare_session_dir(self.name, 1, {
             "mode": "epic", "epic": self.epic, "run_id": self.run.run_id, "kind": "owner"})
         x["session_dir"] = str(sdir)
+        # The last gate, one time for a run: a resume starts in OWNER and does
+        # not come back, so a status that a person set later is not written
+        # over. An item that stays Ready would get a second owner later, so a
+        # write that fails ends the run as a deferral: no owner is started.
+        if not self.board_status("In Progress"):
+            raise sup.Refused("board_write_failed", deferred=True)
         self.run.register_active(p["key"])
         self._phase("gates_ok", OWNER)
 
@@ -1307,6 +1443,14 @@ class EpicSupervisor(sup.Supervisor):
         cred_args = agent_session.claude_credential_args(bool(token), self.svc.credentials_file())
         if not token:
             self.run.append("note", warning=f"agent token {why}: using credentials file mount")
+        # The same move of a `.git` entry at the top of the memory folder as at
+        # the gates. It never stops the run: that would let one owner stop the
+        # run of another. When it cannot move the entry, the container starts
+        # and the note says so; notes-sync moves or holds the entry later.
+        qrc, qline = quarantine_memory_git(p["memory_dir"])
+        if qline != "NONE":
+            self.run.append("note", memory_git=qline, memory_git_rc=qrc)
+            self.log(f"memory folder .git at container start: {qline}")
         env_extra = {"CLAUDE_CODE_OAUTH_TOKEN": token} if token else {}
         metrics = Path(p["tooling_root"]) / "metrics"
         self.containers += 1

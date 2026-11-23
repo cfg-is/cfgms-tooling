@@ -988,8 +988,11 @@ def owner_run_epics(runs, lease_rows=None):
       epic audit has not closed it yet.
     - an unexpired `epic-<N>` lease, which po-act.sh takes for the run and
       which every host can see. (`epic-decompose-<N>` is a different lease.)
-      The lease is released when the run ends, in every end state, so
-      another host sees an ended run's epic as free at once.
+      The run releases the lease when it ends, so another host then sees
+      the epic as free. Not released: a lease that the run lost
+      (lease_lost), and a lease whose status or release call ran out of time
+      at the end (the run notes lease_not_released=timeout). Those stay
+      until their TTL ends.
     """
     held = {}
     for n, r in owner_run_rows(runs).items():
@@ -1000,6 +1003,16 @@ def owner_run_epics(runs, lease_rows=None):
         if m and not expired:
             held.setdefault(int(m.group(1)), f"lease {key} held by {holder}")
     return held
+
+
+def leased_epics(lease_rows):
+    """Epic numbers that an unexpired `epic-<N>` lease holds."""
+    leased = set()
+    for key, _holder, expired in lease_rows or []:
+        m = _EPIC_KEY_RE.match(str(key or ""))
+        if m and not expired:
+            leased.add(int(m.group(1)))
+    return leased
 
 
 def apply_owner_run_epics(out, runs, lease_rows=None):
@@ -1026,11 +1039,7 @@ def apply_owner_run_epics(out, runs, lease_rows=None):
     epic is in epics_undecomposed again, and no audit is signalled."""
     held = owner_run_epics(runs, lease_rows)
     rows = owner_run_rows(runs)
-    leased = set()
-    for key, _holder, expired in lease_rows or []:
-        m = _EPIC_KEY_RE.match(str(key or ""))
-        if m and not expired:
-            leased.add(int(m.group(1)))
+    leased = leased_epics(lease_rows)
     keep, owned, due = [], [], []
     for e in out.get("epics_undecomposed", []):
         n = e.get("number")
@@ -1125,6 +1134,285 @@ def live_story_lease_item_ids(rows=False):
     return live
 
 
+#: owner_run_limit() for a CFGMS_OWNER_MAX_RUNS that is set and not a whole
+#: number of 0 or more: every start is held (a typo must not remove the brake).
+OWNER_LIMIT_INVALID = "invalid"
+#: Launch slots a new owner needs: its own container and one for its
+#: validator (the same gate; `po-act.sh dispatch --epic` asks for 2).
+OWNER_LAUNCH_SLOTS = 2
+#: A run with one of these statuses has an owner now (runindex.UNFINISHED).
+_OWNER_RUN_ACTIVE = ("live", "hung", "starting", "crashed")
+
+
+def active_owner_epics(runs, lease_rows):
+    """Epic numbers that an owner holds NOW: an epic-mode run on this host
+    that is live, hung, starting or crashed, or an unexpired `epic-<N>`
+    lease. A run that ended is not in it."""
+    active = leased_epics(lease_rows)
+    active.update(n for n, r in owner_run_rows(runs).items() if r.get("status") in _OWNER_RUN_ACTIVE)
+    return active
+
+
+def owner_start_candidates(out, runs, lease_rows):
+    """The open epics with no sub-issues that no ACTIVE owner holds: the
+    epics in epics_undecomposed, and the epics in epics_owner_run whose last
+    run on this host ended (those stay in epics_owner_run until the run dir
+    is collected, so that they are not decomposed). Sorted by number."""
+    active = active_owner_epics(runs, lease_rows)
+    pool = list(out.get("epics_undecomposed") or []) + [
+        e for e in out.get("epics_owner_run") or [] if e.get("number") not in active]
+    return sorted(pool, key=lambda e: e.get("number") or 0)
+
+
+def compute_owner_attention(out, runs, lease_rows, holders_unknown=False):
+    """The epics that nobody is told about: [{number, run_id, run_status,
+    run_state, why}], sorted by number, one entry for each epic. Only open
+    epics.
+
+    - the last epic-mode run of the epic on this host is `hung`, is
+      `abandoned`, or is `done` in a state other than REPORT and REFUSED
+      (FAILED, also a FAILED before the gates).
+    - the last run ended REFUSED and was not a deferral (for example
+      base_branch_missing or item_mismatch): its item is still Ready, so the
+      start list offers it again each cycle, and the same gate refuses it.
+    - the last 3 runs of the epic (the run dirs that are still there, oldest
+      gone first) all ended as deferrals with the same reason. A deferral
+      alone is not listed: it is tried again. A REFUSED run that did not
+      record whether it was a deferral (a run dir from before the record)
+      is not listed: the preflight does not know.
+    - the epic has no sub-issues, its project item is In Progress, no active
+      run and no lease holds it, and it is not in epics_audit_due. Nothing
+      works on it and nothing will. Left out when the holders are not known.
+    """
+    open_nums = {e.get("number") for e in out.get("epics_open") or []}
+    history = {}
+    for r in sorted(runs or [], key=lambda r: r.get("created") or 0):
+        m = (_EPIC_KEY_RE.match(str(r.get("key") or ""))
+             or _EPIC_KEY_RE.match(str(r.get("target") or "")))
+        if r.get("mode") == "epic" and m:
+            history.setdefault(int(m.group(1)), []).append(r)
+    last = {n: rs[-1] for n, rs in history.items()}
+    found = {}
+    for n, r in last.items():
+        status, state = r.get("status"), r.get("state")
+        reason = r.get("reason") or "no reason recorded"
+        last3 = history[n][-3:]
+        if status == "hung":
+            why = "the run is hung: its supervisor holds the run and gives no heartbeat"
+        elif status == "abandoned":
+            why = f"the run was abandoned ({reason})"
+        elif status == "done" and state not in ("REPORT", "REFUSED"):
+            why = f"the run ended in {state} ({reason})"
+        elif status == "done" and state == "REFUSED" and r.get("refused_deferred") is False:
+            why = f"the run was refused ({reason}): the same gate refuses each new start"
+        elif (len(last3) == 3 and all(x.get("status") == "done" and x.get("state") == "REFUSED"
+                                      and x.get("refused_deferred") is True
+                                      and x.get("reason") == r.get("reason") for x in last3)):
+            why = f"the last 3 runs were deferred for the same reason ({reason})"
+        else:
+            continue
+        if n in open_nums:
+            found[n] = {"number": n, "run_id": r.get("run_id"), "run_status": status,
+                        "run_state": state, "why": why}
+    if not holders_unknown:
+        active = active_owner_epics(runs, lease_rows)
+        audit_due = {d.get("number") for d in out.get("epics_audit_due") or []}
+        in_progress = {i.get("number") for i in (out.get("pipeline_state") or {}).get("in_progress") or []}
+        for e in list(out.get("epics_undecomposed") or []) + list(out.get("epics_owner_run") or []):
+            n = e.get("number")
+            if n in in_progress and n not in active and n not in audit_due and n not in found:
+                r = last.get(n) or {}
+                found[n] = {"number": n, "run_id": r.get("run_id"), "run_status": r.get("status"),
+                            "run_state": r.get("state"),
+                            "why": "the project item is In Progress and no owner run is active"}
+    return [found[n] for n in sorted(found)]
+
+
+def epic_item_numbers(parsed_items, open_epics):
+    """Issue numbers that are epics: an item whose issue has the `epic`
+    label, or a number in the open-epic list. Two sources: each one can be
+    empty when its query failed."""
+    nums = {s["number"] for s in parsed_items or [] if s.get("is_epic") and s.get("number") is not None}
+    nums.update(e["number"] for e in open_epics or [] if e.get("number") is not None)
+    return nums
+
+
+def blocked_issue_numbers(blocked_items):
+    """Issue numbers whose project item is Blocked. The items are the rows of
+    project_queue_list_by_status: the issue number is `number`."""
+    return {i.get("number") for i in blocked_items or [] if i.get("number") is not None}
+
+
+def owner_run_limit(environ=None):
+    """How many epics owners may hold at one time, from CFGMS_OWNER_MAX_RUNS.
+    Not set or empty: None, no limit (the host resource gate of
+    `po-act.sh dispatch --epic` decides). A whole number of 0 or more: that
+    number (0 starts no owner). Any other value: OWNER_LIMIT_INVALID."""
+    raw = (os.environ if environ is None else environ).get("CFGMS_OWNER_MAX_RUNS")
+    if raw is None or not str(raw).strip():
+        return None
+    raw = str(raw).strip()
+    return int(raw) if raw.isdecimal() and raw.isascii() else OWNER_LIMIT_INVALID
+
+
+def capacity_free_slots(capacity):
+    """The launch slots that new owners and their validators can use, from
+    the preflight's capacity snapshot (`agent-dispatch.sh capacity --json`),
+    or None when the snapshot has no number. The gate keeps the review
+    reserve free once one agent runs, also on a host that is idle now, so
+    this is raw_free_slots - review_reserve when the snapshot has both (the
+    same rule as `po-act.sh dispatch --epic`, _capacity_owner_ok); else
+    free_slots."""
+    def num(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+    c = capacity or {}
+    raw, reserve = num(c.get("raw_free_slots")), num(c.get("review_reserve"))
+    if raw is not None and reserve is not None:
+        return max(0, raw - reserve)
+    return num(c.get("free_slots"))
+
+
+def dispatch_blocked(code_health):
+    """True when the code-health gate ran and develop is broken."""
+    code_health = code_health or {}
+    return not code_health.get("ok", False) and not code_health.get("skipped", False)
+
+
+def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows, *,
+                                        develop_broken=False, holders_unknown=False,
+                                        limit=None, free_slots=None):
+    """One entry for each epic in `epics` (owner_start_candidates: open, no
+    sub-issues, no active owner), sorted by number: {number, title, item_id,
+    action, reason}. A `start` entry also has `command`; a `not_ready` entry
+    also has `status`.
+
+    The founder (through Reeve) sets an epic's project item to Ready when an
+    owner may build the epic. An epic run sets the item to In Progress when
+    its owner starts, and to Blocked when it ends FAILED (fsm/epic.py). So a
+    Ready item of an epic whose last run ended means: a person asks for a new
+    run. Each epic gets the first reason that applies:
+
+    - hold `no_project_item`: no item for the epic in `pipeline_state`. The
+      preflight reads Draft, Ready, Fix, In Progress, Failed and Blocked, so
+      an item at Reviewing or Done also gets this reason.
+    - hold `not_ready`: the item is at another board status. `status` names it.
+    - hold `develop_broken`: the code-health gate blocks dispatch.
+    - hold `degraded`: the run index or the lease list could not be read, so
+      the number of epics that owners hold is not known.
+    - hold `owner_limit_invalid`: `limit` is OWNER_LIMIT_INVALID
+      (CFGMS_OWNER_MAX_RUNS is set to a value that is not a whole number of
+      0 or more).
+    - hold `owner_limit`: `limit` is a number, and the epics that owners hold
+      now, plus the `start` entries before this one, are at or above it.
+      Held now: an epic-mode run on this host that is live, hung, starting
+      or crashed, or an unexpired `epic-<N>` lease. A run that ended holds
+      no place. `limit` None: no limit.
+    - hold `resources`: the `start` entries before this one use all
+      `free_slots` (capacity_free_slots: the launch slots that the gate
+      gives while an agent runs). A new owner needs OWNER_LAUNCH_SLOTS (2)
+      of them: its own and one for its validator, so at most
+      `free_slots // 2` epics get `start`. A planning hint:
+      `po-act.sh dispatch --epic` asks the host gate again (for 2 slots).
+      `free_slots` None (no capacity data): not held for this.
+    - else `start` (reason `ready`), with the launch command.
+    """
+    by_num = {}
+    for key, status in (("drafts", "Draft"), ("fix_cycle", "Fix"), ("in_progress", "In Progress"),
+                        ("failed", "Failed"), ("blocked", "Blocked"), ("ready", "Ready")):
+        for item in (pipeline_state or {}).get(key) or []:
+            if item.get("number") is not None and item.get("item_id"):
+                by_num[item["number"]] = (status, item["item_id"])   # Ready is last: it wins
+    in_use = len(active_owner_epics(runs, lease_rows))
+    starts = 0
+    recs = []
+    for e in sorted(epics or [], key=lambda e: e.get("number") or 0):
+        n = e.get("number")
+        status, item_id = by_num.get(n, (None, None))
+        rec = {"number": n, "title": e.get("title", ""), "item_id": item_id, "action": "hold"}
+        if item_id is None:
+            rec["reason"] = "no_project_item"
+        elif status != "Ready":
+            rec.update(reason="not_ready", status=status)
+        elif develop_broken:
+            rec["reason"] = "develop_broken"
+        elif holders_unknown:
+            rec["reason"] = "degraded"
+        elif limit == OWNER_LIMIT_INVALID:
+            rec["reason"] = "owner_limit_invalid"
+        elif limit is not None and in_use >= limit:
+            rec["reason"] = "owner_limit"
+        elif free_slots is not None and starts >= free_slots // OWNER_LAUNCH_SLOTS:
+            rec["reason"] = "resources"
+        else:
+            in_use += 1
+            starts += 1
+            rec.update(action="start", reason="ready",
+                       command=f"po-act.sh dispatch --epic {n} --item-id {item_id}")
+        recs.append(rec)
+    return recs
+
+
+def load_owner_holders(degraded_reasons):
+    """(lease_rows, runs, holders_unknown): the lease list and this host's
+    run index, and whether the number of epics that owners hold is known.
+
+    Not known when the lease list cannot be read (`lease-list` exits
+    non-zero when its API call fails), when the run index cannot be read, or
+    when a run that is not ended has a run.json that cannot be read (its
+    mode and epic are not known, so it could be an owner). Each case adds a
+    degraded reason."""
+    unknown = False
+    lease_rows = _lease_list_rows()
+    try:
+        runs = _load_runindex().list_runs()
+    except Exception as e:
+        runs, unknown = [], True
+        degraded_reasons.append(
+            f"FSM run index unreadable ({e}) — an epic that an owner session "
+            "builds can show in epics_undecomposed; do not decompose from this run")
+    unreadable = sorted(str(r.get("run_id")) for r in runs
+                        if r.get("params_unreadable") and r.get("status") in _OWNER_RUN_ACTIVE)
+    if unreadable:
+        unknown = True
+        degraded_reasons.append(
+            "run.json unreadable for FSM run " + ", ".join(unreadable[:5])
+            + " — it can be an owner run; no owner is started from this run")
+    if lease_rows is None:
+        unknown = True
+        degraded_reasons.append(
+            "lease-list unavailable — an epic that an owner session on another "
+            "host builds can show in epics_undecomposed")
+    return lease_rows, runs, unknown
+
+
+def apply_owner_epics(out, code_health, degraded_reasons):
+    """The owner part of the preflight: read the holders, move each held
+    epic to out["epics_owner_run"] (apply_owner_run_epics) and write
+    out["owner_start_recommendations"] and out["owner_attention"]. Returns
+    (lease_rows, runs, active) for the other readers in main(); `active` is
+    active_owner_epics, or None when the holders are not known."""
+    lease_rows, runs, holders_unknown = load_owner_holders(degraded_reasons)
+    # An epic that an owner session builds has no stories and is not
+    # "undecomposed": keep it away from the Planning Team.
+    apply_owner_run_epics(out, runs, lease_rows)
+    # An epic whose project item is Ready gets an owner (EPIC-DESIGN.md §9).
+    limit = owner_run_limit()
+    if limit == OWNER_LIMIT_INVALID:
+        raw = str(os.environ.get("CFGMS_OWNER_MAX_RUNS", ""))
+        shown = "".join(c if c.isprintable() and c.isascii() else "?" for c in raw)
+        degraded_reasons.append(
+            "CFGMS_OWNER_MAX_RUNS is not a whole number of 0 or more (%r%s): every owner start is "
+            "held (owner_limit_invalid)" % (shown[:40], "..." if len(shown) > 40 else ""))
+    out["owner_start_recommendations"] = compute_owner_start_recommendations(
+        owner_start_candidates(out, runs, lease_rows), out.get("pipeline_state"), runs, lease_rows,
+        develop_broken=dispatch_blocked(code_health),
+        holders_unknown=holders_unknown,
+        limit=limit,
+        free_slots=capacity_free_slots(out.get("capacity")))
+    out["owner_attention"] = compute_owner_attention(out, runs, lease_rows, holders_unknown)
+    return lease_rows, runs, (None if holders_unknown else active_owner_epics(runs, lease_rows))
+
+
 def project_queue_list_by_status(status):
     """Call project-queue.sh list-by-status; return [{number, title, item_id}].
 
@@ -1154,8 +1442,14 @@ def project_queue_list_by_status(status):
     ]
 
 
-def auto_close_merged_items(degraded_reasons=None):
+def auto_close_merged_items(degraded_reasons=None, epic_nums=frozenset()):
     """Scan In Progress items and mark Done if their linked PR has been merged.
+
+    An epic item is never set Done here: an owner run sets it In Progress, a
+    merged pull request of an epic is one slice of it, and the epic audit
+    decides when the epic is done. `epic_nums` are the open epics' issue
+    numbers. None means they are not known (the overview query failed):
+    then no item is set Done this cycle, and a degraded reason says so.
 
     Non-fatal: all subprocess failures are caught and appended to degraded_reasons.
     Returns the count of items closed.
@@ -1163,6 +1457,10 @@ def auto_close_merged_items(degraded_reasons=None):
     if degraded_reasons is None:
         degraded_reasons = []
     count = 0
+    if epic_nums is None:
+        degraded_reasons.append(
+            "auto_close_merged_items: the open epics are not known — no item is set Done this cycle")
+        return count
     script = _pq_script_path()
 
     result = subprocess.run(
@@ -1189,6 +1487,8 @@ def auto_close_merged_items(degraded_reasons=None):
     for item in items:
         item_id = item.get("item_id")
         if not item_id:
+            continue
+        if item.get("issue_num") in epic_nums:
             continue
         try:
             get_result = subprocess.run(
@@ -2065,18 +2365,18 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
             })
             continue
 
-        # Epic gate. An epic is decomposed, never dispatched: it has no single
-        # branch, no Files In Scope, and dispatching one burns an agent session
-        # on a container of other people's stories. Runs alongside the
-        # self-closure gate so the board anomaly is reported regardless of
-        # routing, deps or file overlap.
+        # Epic gate. An epic never gets a story dispatch: it has no single
+        # branch and no Files In Scope. A Ready epic item is the founder's
+        # signal that an owner may build the epic; it is not a stale board
+        # item. The owner path is owner_start_recommendations. Runs before
+        # the env, dep and file-overlap gates so the reason is always this one.
         if s.get("is_epic"):
             recommendations.append({
                 "number": num,
                 "item_id": item_id,
                 "action": "hold",
-                "reason": "item is an epic, not a dispatchable story — epics are decomposed (Step 7), never dispatched",
-                "stale_board": True,
+                "reason": "item is an epic, not a dispatchable story — an owner builds it (see owner_start_recommendations: po-act.sh dispatch --epic), never a story dispatch",
+                "epic": True,
             })
             continue
 
@@ -2211,7 +2511,7 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
 
 
 def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_pr_nums=None,
-                                   blocked_story_nums=None):
+                                   blocked_story_nums=None, active_epics=None):
     """Decide what to do with each open story PR.
 
     Action vocabulary:
@@ -2347,11 +2647,18 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 "pr": pr["pr"], "story": None,
                 "epic": pr["epic_number"], "slice": pr["slice_number"],
                 "action": "skip",
-                "reason": "slice of an epic whose project status is Blocked — fenced off from the autonomous pipeline; cron will not review or enqueue it",
+                "reason": (
+                    f"slice {pr['slice_number']} of epic #{pr['epic_number']}: the epic's project item is "
+                    "Blocked (an owner run that ended FAILED sets that, or a person did) — the pipeline "
+                    "does not review or enqueue it; it needs a person: set the item to Ready for a new "
+                    "owner run, or merge or close this pull request by hand"),
             })
             continue
         if pr.get("is_slice"):
-            recs.append(_slice_review_rec(pr, in_queue))
+            # active_epics None: the holders are not known this cycle.
+            recs.append(_slice_review_rec(
+                pr, in_queue,
+                owner_active=active_epics is None or pr.get("epic_number") in active_epics))
             continue
         if pr.get("story_number") in blocked_story_nums:
             recs.append({
@@ -2610,7 +2917,7 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
     return recs
 
 
-def _slice_review_rec(pr, in_queue):
+def _slice_review_rec(pr, in_queue, owner_active=True):
     """The recommendation for one slice pull request of an owner-run epic.
 
     A slice branch belongs to the epic run: its supervisor pushes it (and
@@ -2634,9 +2941,14 @@ def _slice_review_rec(pr, in_queue):
     head = pr.get("head_oid") or ""
     verdict = pr.get("latest_review_verdict")
     what = f"slice {pr['slice_number']} of epic #{pr['epic_number']}"
-    woken = ("the epic run's supervisor wakes the owner (up to its wake limit for the round), "
-             "who repairs it with a new round")
     person = "nothing wakes the owner for this: it needs a person"
+    if owner_active:
+        woken = ("the epic run's supervisor wakes the owner (up to its wake limit for the round), "
+                 "who repairs it with a new round")
+    else:
+        # `owner_active` False: no run of this epic on this host that is not
+        # ended, and no epic lease. No supervisor watches the slice.
+        woken = f"no owner run is active for this epic — {person}"
 
     def rec(action, reason, **more):
         return {"pr": pr["pr"], "story": None, "epic": pr["epic_number"], "slice": pr["slice_number"],
@@ -2719,7 +3031,8 @@ def _slice_review_rec(pr, in_queue):
     if pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", ""):
         return rec("enqueue_merge",
                    "reviewed PASS on this commit + checks green + mergeable — run "
-                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`")
+                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`",
+                   head=head)
     return rec("skip", f"reviewed PASS but not mergeable (mergeable={pr.get('mergeable')}, "
                        f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
 
@@ -3127,7 +3440,9 @@ def main():
             }
 
     # Auto-close project items whose linked PRs have been merged (done-on-merge).
-    done_on_merge_count = auto_close_merged_items(degraded_reasons)
+    done_on_merge_count = auto_close_merged_items(
+        degraded_reasons,
+        epic_nums={e["number"] for e in epics_summary} if overview_ok else None)
 
     out["pipeline_state"] = {
         "drafts": draft_issues,
@@ -3141,6 +3456,8 @@ def main():
     out["capacity"] = host_capacity()
     out["merge_queue"] = merge_queue
     out["code_health"] = code_health
+    # also in the cache, for `po-act.sh state '.dispatch_blocked'`
+    out["dispatch_blocked"] = dispatch_blocked(code_health)
     out["done_on_merge_count"] = done_on_merge_count
     if not code_health.get("ok"):
         if code_health.get("skipped"):
@@ -3544,22 +3861,8 @@ def main():
     # FSM runs (DESIGN.md §11): an unfinished run holds its story / PR whether
     # or not one of its containers is running right now. pr-<N> leases held
     # by any host mean the same for a PR (review, fix and resolve share it).
-    lease_rows = _lease_list_rows()
-    try:
-        all_fsm_runs = _load_runindex().list_runs()
-    except Exception as e:
-        all_fsm_runs = []
-        degraded_reasons.append(
-            f"FSM run index unreadable ({e}) — an epic that an owner session "
-            "builds can show in epics_undecomposed; do not decompose from this run")
-    if lease_rows is None:
-        degraded_reasons.append(
-            "lease-list unavailable — an epic that an owner session on another "
-            "host builds can show in epics_undecomposed")
+    lease_rows, all_fsm_runs, active_epics = apply_owner_epics(out, code_health, degraded_reasons)
     fsm_view = fsm_run_view(all_fsm_runs, lease_rows)
-    # An epic that an owner session builds has no stories and is not
-    # "undecomposed": keep it away from the Planning Team.
-    apply_owner_run_epics(out, all_fsm_runs, lease_rows)
     out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
     out["fsm_recommendations"] = fsm_view["recommendations"]
     # In-flight fix-pr / resolve-conflict FSM runs hold their PR like a running
@@ -3577,23 +3880,20 @@ def main():
     # Story numbers with project status Blocked — their PRs are fenced off from
     # the autonomous pipeline (founder-managed / manual work). The review
     # recommender skips them so the cron never clobbers manual branches.
-    blocked_story_nums = {
-        item.get("issue_num")
-        for item in blocked_issues
-        if item.get("issue_num") is not None
-    }
+    blocked_story_nums = blocked_issue_numbers(blocked_issues)
     out["review_recommendations"] = compute_review_recommendations(
         pr_summaries, queued_pr_numbers, active_fix_pr_nums, blocked_story_nums,
+        active_epics=active_epics,
     )
     out["fix_recommendations"] = compute_fix_recommendations(
         fix_issues, pr_summaries, active_fix_pr_nums, queued_pr_numbers,
     )
     out["stalled_dispatches"] = compute_stalled_dispatches(
         in_progress_issues, containers, pr_summaries,
-        epic_nums={
-            s["number"] for s in in_progress_parsed
-            if s.get("is_epic") and s.get("number") is not None
-        },
+        # An owner run sets its epic's item to In Progress. An epic item is
+        # never a stalled story dispatch (`dispatch --recover` would start a
+        # story agent on it).
+        epic_nums=epic_item_numbers(in_progress_parsed, epics_summary),
         closed_nums={
             s["number"] for s in in_progress_parsed
             if s.get("state") in ("CLOSED", "MERGED") and s.get("number") is not None
@@ -3633,8 +3933,14 @@ def write_output(out, mode):
         return
 
     # Default: emit a short summary to stdout + path reference
+    json.dump(build_summary(out, cache_path), sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+
+
+def build_summary(out, cache_path):
+    """The short summary that the default mode prints."""
     code_health = out.get("code_health") or {}
-    summary = {
+    return {
         "cache_file": str(cache_path),
         "cycle_generated_at": out["cycle_generated_at"],
         "degraded": out["degraded"],
@@ -3649,7 +3955,7 @@ def write_output(out, mode):
                 if not c.get("ok")
             ],
         },
-        "dispatch_blocked": not code_health.get("ok", False) and not code_health.get("skipped", False),
+        "dispatch_blocked": dispatch_blocked(code_health),
         "done_on_merge_count": out.get("done_on_merge_count", 0),
         "counts": {
             "ready": len(out.get("ready_stories", [])),
@@ -3663,6 +3969,9 @@ def write_output(out, mode):
             "undecomposed_epics": len(out.get("epics_undecomposed", [])),
             "owner_run_epics": len(out.get("epics_owner_run", [])),
             "audit_due_epics": len(out.get("epics_audit_due", [])),
+            "owner_start_epics": sum(
+                1 for r in out.get("owner_start_recommendations", []) if r.get("action") == "start"),
+            "owner_attention_epics": len(out.get("owner_attention", [])),
         },
         "host_caps": out.get("host_caps", [DEFAULT_ENV]),
         "capacity": out.get("capacity", {}),
@@ -3671,13 +3980,13 @@ def write_output(out, mode):
         "running_containers": out.get("running_containers", []),
         "merge_queue": out.get("merge_queue", []),
         "dispatch_recommendations": out.get("dispatch_recommendations", []),
+        "owner_start_recommendations": out.get("owner_start_recommendations", []),
+        "owner_attention": out.get("owner_attention", []),
         "review_recommendations": out.get("review_recommendations", []),
         "fix_recommendations": out.get("fix_recommendations", []),
         "fsm_runs": out.get("fsm_runs", {"in_flight": [], "resumable": []}),
         "fsm_recommendations": out.get("fsm_recommendations", []),
     }
-    json.dump(summary, sys.stdout, indent=2, default=str)
-    sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

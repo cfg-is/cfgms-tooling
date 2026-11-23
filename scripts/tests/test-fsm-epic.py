@@ -70,6 +70,11 @@ class TestEpicRun(EpicRunCase):
         # the run: phases, result file, container gone, no GitHub credential near a container
         self.assertEqual(self.f.path_states(self.run_dir.name),
                          [("PREPARE", "gates_ok", "OWNER"), ("OWNER", "done", "REPORT")])
+        # the board: In Progress when the owner starts; REPORT writes nothing
+        # (the epic audit sets Done or Blocked)
+        self.assertEqual(self.board_writes(), ["In Progress"])
+        self.assertEqual([(r["board_status"], r["ok"]) for r in self.recs("note") if "board_status" in r],
+                         [("In Progress", True)])
         res = json.loads((self.run_dir / "epic-result.json").read_text())
         self.assertEqual((res["final_state"], res["turns"], [s["state"] for s in res["slices"]]),
                          ("REPORT", 2, ["MERGED"]))
@@ -424,6 +429,19 @@ class TestRefusals(EpicCase):
         self.assertIn("`docs/notes.md`: the content is the same as a file in /canon or /memory", rej)
         self.assertIn("`docs/plan.md`", rej)
         self.assertEqual(self.recs("transition")[-1]["reason"], "owner_blocked")
+        # the board: a run that ends FAILED after the gates sets Blocked, and
+        # posts nothing on the issue
+        self.assertEqual(self.board_writes(), ["In Progress", "Blocked"])
+        # The fake gh logs one record for each call: {"tool": "gh", "argv": [...]}.
+        # A post is `gh issue|pr comment ...` or a `gh api .../comments` with a field.
+        gh_calls = self.f.records("gh")
+        self.assertTrue(gh_calls, "the fake gh log is empty: the check below would prove nothing")
+        writes = ("-f", "-F", "--field", "--raw-field", "--input", "-X", "--method")
+        posts = [r["argv"] for r in gh_calls
+                 if r["argv"][1:2] == ["comment"]
+                 or (r["argv"][:1] == ["api"] and any(a.endswith("/comments") for a in r["argv"])
+                     and any(a in writes for a in r["argv"]))]
+        self.assertEqual(posts, [])
         self.assertNotIn(PRIVATE[:30], self.f.remote_all_text())
         self.assertEqual((self.run_dir / "owner-blocked.md").read_text().strip(), "I cannot continue.")
 
@@ -495,9 +513,220 @@ class TestRefusals(EpicCase):
         self.assertEqual(rc, 3, out)
         self.assertIn("FSM_REFUSED:epic-900:no_canon_dir", out)
         self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), [])       # refused at a gate: the item stays Ready
+        # the run index learns that it was not a deferral (preflight owner_attention)
+        self.assertEqual([r["refused_deferred"] for r in self.recs("note") if "refused_deferred" in r],
+                         [False])
+
+    def launch_with_lease(self, env, how="--lease-handoff"):
+        """As po-act.sh starts a run: the lease is handed to it. With
+        how="--acquire-lease" the run takes the lease itself."""
+        self.launch("run", "epic", "900", "--item-id", ITEM, "--canon-dir", str(self.canon),
+                    "--memory-dir", str(self.memory), "--lease-key", "epic-900", how,
+                    env=env)
+
+    def assert_deferred(self, reason):
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"DISPATCH_DEFERRED:epic-900:{reason}", out)
+        self.assertEqual(self.f.path_states(self.run_dir.name), [("PREPARE", "gate_refused", "REFUSED")])
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), [])       # deferred: the item stays Ready
+        self.assertIn(["lease-release", "epic-900"],
+                      [r["argv"] for r in self.f.records("pipeline-helper")])
+        self.assertEqual([r["refused_deferred"] for r in self.recs("note") if "refused_deferred" in r],
+                         [True])
+
+    def test_transient_causes_before_the_gates_are_deferred_and_release_the_lease(self):
+        """A fetch that cannot reach the remote, and a lease or project item
+        call that does not answer in time, can work at the next cycle: the
+        run is deferred, writes nothing to the board and releases the lease."""
+        slow = {"CFGMS_FSM_SCRIPT_TIMEOUT_SECS": "2"}
+        cases = [
+            # nothing listens on port 1: "Failed to connect to 127.0.0.1 port 1"
+            ("base_branch_fetch_failed", {"CFGMS_FSM_REMOTE_URL": "https://127.0.0.1:1/cfgms.git"},
+             "--lease-handoff"),
+            ("github_timeout", dict(slow, FSM_FAKE_HANG="get-item"), "--lease-handoff"),
+            ("github_timeout", dict(slow, FSM_FAKE_HANG="lease-renew"), "--lease-handoff"),
+            # the acquire ran out of time: the lease can be ours, so it is released
+            ("github_timeout", dict(slow, FSM_FAKE_HANG="lease-acquire"), "--acquire-lease"),
+        ]
+        for reason, env, how in cases:
+            with self.subTest(reason=reason, hang=env.get("FSM_FAKE_HANG")):
+                self.setUp()
+                t0 = time.time()
+                self.launch_with_lease(env, how)
+                self.assert_deferred(reason)
+                self.assertLess(time.time() - t0, 25)   # the hung call was stopped, not waited for
+                self.tearDown()
+
+    def test_a_lease_that_another_host_holds_is_not_released(self):
+        """--acquire-lease and the lease is held: deferred lease_held, and
+        the run does not release the lease of the other holder."""
+        self.launch_with_lease({"FSM_FAKE_ACQUIRE": "held"}, how="--acquire-lease")
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_DEFERRED:epic-900:lease_held", out)
+        argv = [r["argv"] for r in self.f.records("pipeline-helper")]
+        self.assertIn(["lease-acquire", "epic-900"], [a[:2] for a in argv])
+        self.assertNotIn("lease-release", [a[0] for a in argv])
+
+    def test_a_lease_status_that_does_not_answer_is_deferred_and_the_run_ends(self):
+        """The lease cannot be read, also not at the end: the run is deferred
+        and ends; the lease is not released (it ends at its TTL)."""
+        t0 = time.time()
+        self.launch_with_lease({"FSM_FAKE_HANG": "lease-status", "CFGMS_FSM_SCRIPT_TIMEOUT_SECS": "2"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_DEFERRED:epic-900:github_timeout", out)
+        self.assertLess(time.time() - t0, 25)
+        self.assertEqual(self.board_writes(), [])
+        self.assertIn("timeout", [r.get("lease_not_released") for r in self.recs("note")])
+        self.assertNotIn(["lease-release", "epic-900"],
+                         [r["argv"] for r in self.f.records("pipeline-helper")])
+        self.assertEqual(len(self.recs("terminal_done")), 1)
+
+    def test_a_base_branch_that_the_remote_lacks_is_refused_not_deferred(self):
+        self.launch_with_lease({"CFGMS_FSM_BASE_BRANCH": "no-such-branch"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:base_branch_missing", out)
+        self.assertEqual(self.board_writes(), [])
+
+    def test_a_fetch_error_that_is_not_the_network_is_a_failure(self):
+        """A repository that is not there (or a login that fails) does not
+        come back at the next cycle: FAILED(prepare_error), Blocked."""
+        self.launch_with_lease({"CFGMS_FSM_REMOTE_URL": str(self.f.root / "no-remote.git")})
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.recs("transition")[-1]["reason"], "prepare_error")
+        self.assertEqual(self.board_writes(), ["Blocked"])
+
+    def test_a_failure_before_the_gates_sets_blocked(self):
+        """FAILED(prepare_error) sets the item Blocked: at Ready, the next
+        cycle would start the same run again, each cycle."""
+        self.f.board_item.write_text("[1]")             # not an item: an error in PREPARE
+        self.launch()
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.f.path_states(self.run_dir.name), [("PREPARE", "error", "FAILED")])
+        self.assertEqual(self.recs("transition")[-1]["reason"], "prepare_error")
+        self.assertTrue(any("AttributeError" in (r.get("error") or "") for r in self.recs("note")))
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), ["Blocked"])
+
+    def test_an_in_progress_write_that_fails_defers_the_run(self):
+        """An item that stays Ready would get a second owner later: the write
+        is the last gate. No owner, the lease is released, nothing else is
+        written."""
+        self.launch_with_lease({"FSM_FAKE_PQ_UPDATE_FAIL": "In Progress"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_DEFERRED:epic-900:board_write_failed", out)
+        self.assertEqual(self.f.path_states(self.run_dir.name), [("PREPARE", "gate_refused", "REFUSED")])
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), ["In Progress"])           # the one try, which failed
+        self.assertEqual([(r["board_status"], r["ok"]) for r in self.recs("note") if "board_status" in r],
+                         [("In Progress", False)])
+        self.assertIn(["lease-release", "epic-900"], [r["argv"] for r in self.f.records("pipeline-helper")])
+
+    def test_a_blocked_write_that_fails_does_not_change_the_end_of_the_run(self):
+        self.f.plan({"owner": [[{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
+        self.launch(env={"FSM_FAKE_PQ_UPDATE_FAIL": "Blocked"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.f.path_states(self.run_dir.name),
+                         [("PREPARE", "gates_ok", "OWNER"), ("OWNER", "failed", "FAILED")])
+        self.assertEqual(self.recs("transition")[-1]["reason"], "owner_blocked")
+        self.assertEqual([(r["board_status"], r["ok"]) for r in self.recs("note") if "board_status" in r],
+                         [("In Progress", True), ("Blocked", False)])
+        log = (self.run_dir / "logs" / "supervisor.log").read_text()
+        self.assertIn("board: the epic item was not set to Blocked; set it by hand", log)
+
+    def test_a_lost_lease_writes_no_blocked(self):
+        """FAILED(lease_lost): another holder can own the item now."""
+        self.f.plan({"owner": [[write("src/a.go", "package src\n"), submit(1)], [DONE]]})
+        # lease-status: held at the gate, free when the slice is published
+        self.launch_with_lease({"FSM_FAKE_LEASE_HELD_CALLS": "1"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.recs("transition")[-1]["reason"], "lease_lost")
+        self.assertEqual(self.board_writes(), ["In Progress"])
+
+    def test_a_memory_folder_with_a_git_entry_and_no_notes_setup_is_refused(self):
+        """Agents write the memory folder: a `.git` in it is never trusted.
+        With no trusted git directory of the notes (notes-setup not done)
+        the run is refused."""
+        os.symlink(self.f.root / "nowhere", self.memory / ".git")
+        self.launch(env={"CFGMS_MEMORY_GIT_DIR": str(self.f.root / "no-notes-git")})
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:memory_dir_has_git", out)
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertTrue(os.path.lexists(self.memory / ".git"))
+
+    def test_a_state_dir_that_overlaps_the_memory_folder_is_refused(self):
+        self.launch(env={"CFGMS_MEMORY_STATE_DIR": str(self.memory / "st")})
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:state_dir_in_folder", out)
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+
+    def test_a_git_entry_in_the_memory_folder_is_moved_away_and_the_run_goes_on(self):
+        """With the notes set up, PREPARE moves the entry into the
+        quarantine of notes-sync and the run starts its owner; when the move
+        fails, the run is refused."""
+        notes_git = self.f.root / "notes-git"
+        subprocess.run(["git", "init", "-q", "--bare", str(notes_git)], check=True)
+        state = self.f.root / "notes-state"
+        (self.memory / ".git").write_text("gitdir: /x\n")
+        self.f.plan({"owner": [[{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
+        env = {"CFGMS_MEMORY_GIT_DIR": str(notes_git), "CFGMS_MEMORY_STATE_DIR": str(state)}
+        self.launch(env=env)
+        rc, out = self.finish()
+        self.assertEqual(rc, 1, out)                      # owner_blocked: the owner ran
+        self.assertEqual(len(self.f.records("docker-owner-start")), 1)
+        self.assertFalse(os.path.lexists(self.memory / ".git"))
+        moved = [r["memory_git_quarantined"] for r in self.recs("note") if "memory_git_quarantined" in r]
+        self.assertEqual(len(moved), 1)
+        self.assertTrue(moved[0].startswith(str(state / "quarantine" / "git-")), moved)
+        self.tearDown()
+        self.setUp()
+        (self.memory / ".git").write_text("gitdir: /x\n")
+        (state / "quarantine").chmod(0o500)
+        self.addCleanup((state / "quarantine").chmod, 0o700)
+        self.launch(env=env)
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:memory_dir_git_not_movable", out)
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertTrue(os.path.lexists(self.memory / ".git"))
 
 
 class TestParts(unittest.TestCase):
+    def test_fetch_errors_by_kind(self):
+        """Real git texts (LC_ALL=C). Only the network ones are deferred."""
+        cases = {
+            b"fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com":
+                "network",
+            b"fatal: unable to access 'https://h/x/': Failed to connect to h port 443 after 3 ms: "
+            b"Couldn't connect to server": "network",
+            b"fatal: unable to access 'https://h/x/': Connection timed out after 300000 milliseconds":
+                "network",
+            b"ssh: connect to host h port 22: Connection refused": "network",
+            b"fatal: unable to access 'https://h/x/': Operation timed out after 1 ms": "network",
+            b"connect to host h port 22: Network is unreachable": "network",
+            b"fatal: couldn't find remote ref refs/heads/develop": "missing_ref",
+            b"remote: Invalid username or password.\nfatal: Authentication failed for 'https://h/x/'": None,
+            b"remote: Repository not found.\nfatal: repository 'https://h/x/' not found": None,
+            b"fatal: '/x/no-remote.git' does not appear to be a git repository": None,
+            b"fatal: unable to access 'https://h/x/': The requested URL returned error: 403": None,
+            b"": None,
+        }
+        for text, kind in cases.items():
+            self.assertEqual(epic.fetch_error_kind(text), kind, text)
+        self.assertIsNone(epic.fetch_error_kind(None))
+
     def test_a_token_read_that_timed_out_is_read_again_and_no_other_reason_is(self):
         import types
         saved = epic.TOKEN_RETRY_SECS

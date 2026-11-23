@@ -3,6 +3,9 @@
 # list-by-status and item-for-issue from $FSM_FAKE_BOARD_ITEM, and keeps the
 # item's status in $FSM_FAKE_STATE/board-status once update-field sets it.
 printf '{"tool":"project-queue","argv":%s}\n' "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "$@")" >> "${FSM_FAKE_LOG:-/dev/null}"
+# FSM_FAKE_HANG=<subcommand>: that call does not answer (the test sets a short
+# CFGMS_FSM_SCRIPT_TIMEOUT_SECS). exec: the caller's kill stops the sleep too.
+[[ -n "${FSM_FAKE_HANG:-}" && "${FSM_FAKE_HANG}" == "$1" ]] && exec sleep 30
 status_file="${FSM_FAKE_STATE:-/nonexistent}/board-status"
 item_json() {
   if [[ -n "${FSM_FAKE_BOARD_ITEM:-}" && -f "$FSM_FAKE_BOARD_ITEM" ]]; then cat "$FSM_FAKE_BOARD_ITEM"
@@ -33,6 +36,11 @@ if str(d.get("issue_num")) == os.environ["WANT"] and d.get("item_id"):
     print(d["item_id"]); sys.exit(0)
 sys.exit(3)' ;;
   update-field)
+    # FSM_FAKE_PQ_UPDATE_FAIL=1: the board cannot be written; =<value>: a
+    # write of that value fails (for example "In Progress")
+    if [[ -n "${FSM_FAKE_PQ_UPDATE_FAIL:-}" && ( "$FSM_FAKE_PQ_UPDATE_FAIL" == "1" || "$FSM_FAKE_PQ_UPDATE_FAIL" == "${4:-}" ) ]]; then
+      echo "update-field failed" >&2; exit 1
+    fi
     if [[ "$3" == "status" ]]; then mkdir -p "$(dirname "$status_file")"; printf '%s\n' "$4" > "$status_file"; fi
     echo OK ;;
   *) echo OK ;;

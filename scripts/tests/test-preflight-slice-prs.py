@@ -187,6 +187,12 @@ class SlicePullRequests(unittest.TestCase):
         _, r = self.rec(raw_pr(comments=[review("PASS")]))
         self.assertEqual(r["action"], "enqueue_merge")
         self.assertIn(f"po-act.sh enqueue 6382 --head {HEAD}`", r["reason"])
+        self.assertEqual(r["head"], HEAD)        # the reviewed commit, as a field
+
+    def test_only_an_enqueue_has_the_head_field(self):
+        _, r = self.rec(raw_pr())
+        self.assertEqual(r["action"], "spawn_acceptance_reviewer")
+        self.assertNotIn("head", r)
 
     def test_reviewed_head_in_backticks_counts(self):
         body = f"{MARKER}## Acceptance Review — PASS\nReviewed head: `{HEAD}`\n"
