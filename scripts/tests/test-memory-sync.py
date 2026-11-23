@@ -559,6 +559,12 @@ exit 9''')
         self.assertEqual(self.ms.cycle(self.repo, push=False), 1)        # now it is a removal
         self.assertNotIn("areas/gone.md", self.head_files())
 
+    def test_the_blobs_written_must_have_the_ids_of_the_bytes_read(self):
+        self.ms.write_blobs(self.repo, {self.ms.git_blob_id(b"note\n"): b"note\n"})
+        self.assertEqual(self.g("cat-file", "blob", self.ms.git_blob_id(b"note\n")), b"note\n")
+        with self.assertRaises(RuntimeError):
+            self.ms.write_blobs(self.repo, {"0" * 40: b"other bytes\n"})
+
     def test_a_huge_sparse_file_is_refused_without_a_read(self):
         self.note("areas/other.md")
         with open(self.work / "areas" / "huge.md", "wb") as fh:
