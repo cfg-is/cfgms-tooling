@@ -40,10 +40,12 @@ Usage:
   memory-sync.py detach --work-tree W --git-dir G     one-time: move W/.git to G
 
 `once` exits 75 when another memory-sync holds the lock (nothing was done).
-With --result-file it writes {"committed", "alerts", "refused"} there as JSON
-when the cycle ran to its end. `refused` is the number of entries that are
-held back now: refused files that are still in the folder, and entries left
-out of `git add`. A caller counts from this file, never from the log text:
+With --result-file it writes {"committed", "alerts", "refused", "pending"}
+there as JSON when the cycle ran to its end. `refused` is the number of
+entries that are held back now: refused files that are still in the folder,
+and entries left out of `git add`. `pending` is the number of changed notes
+that wait for the next call: one call handles at most BATCH_SIZE of them, in
+path order. A caller counts from this file, never from the log text:
 the log holds names that agents chose.
 
 `quarantine-top-git` is for the launch, resume and PREPARE gates of an epic
@@ -75,6 +77,10 @@ MAX_FILE_BYTES = 1024 * 1024
 EXIT_NO_GIT_DIR = 3
 EXIT_NOT_MOVABLE = 4
 EXIT_LOCKED = 75
+#: Changed paths (not refused) that one call reads, scans and commits; the
+#: rest wait for the next call (`pending`). Bounds the time of a call by the
+#: number of files (EPIC-DESIGN.md, shared notes row, measured there).
+BATCH_SIZE = 500
 ALLOWED = re.compile(r"^(README\.md|(areas|held)/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.md)$")
 AUTHOR_OK = re.compile(r"^[a-z0-9][a-z0-9/_.-]{0,62}$")
 FALLBACK_AUTHOR = "unknown"
@@ -368,6 +374,48 @@ def refuse_reason(status, mode, path):
     return None
 
 
+def read_blobs(repo, shas):
+    """{blob id: bytes} for `shas`, read by one `git cat-file --batch`."""
+    want = sorted(set(shas))
+    if not want:
+        return {}
+    out = repo.git("cat-file", "--batch", stdin=("\n".join(want) + "\n").encode()).stdout
+    res, i = {}, 0
+    for sha in want:
+        nl = out.index(b"\n", i)
+        head = out[i:nl].split()
+        if len(head) != 3 or head[0].decode() != sha:
+            raise RuntimeError("cat-file --batch: unexpected answer for %s" % sha)
+        size = int(head[2])
+        res[sha] = out[nl + 1:nl + 1 + size]
+        i = nl + 1 + size + 1
+    return res
+
+
+def blob_sizes(repo, shas):
+    """{blob id: size} for `shas`, read by one `git cat-file --batch-check`."""
+    want = sorted(set(shas))
+    if not want:
+        return {}
+    out = repo.git("cat-file", "--batch-check", stdin=("\n".join(want) + "\n").encode()).stdout
+    res = {}
+    for line in out.decode().splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            res[parts[0]] = int(parts[2])
+    return res
+
+
+def author_of(data):
+    """`author:` from the header of a note's bytes."""
+    for line in data[:4096].decode(errors="replace").splitlines()[:25]:
+        m = re.match(r"^author:\s*(\S+)\s*$", line)
+        if m:
+            a = m.group(1).strip("\"'").lower()
+            return a if AUTHOR_OK.match(a) else FALLBACK_AUTHOR
+    return FALLBACK_AUTHOR
+
+
 def note_author(repo, blob):
     """`author:` from the note's header, read from the checked blob."""
     r = repo.git("cat-file", "blob", blob, check=False)
@@ -381,9 +429,9 @@ def note_author(repo, blob):
     return FALLBACK_AUTHOR
 
 
-def scan_secrets(repo, blobs):
+def scan_secrets(repo, blobs, contents=None):
     """Return {path: tool} for checked files that hold a secret. `blobs` is
-    {path: blob id}.
+    {path: blob id}; `contents` ({blob id: bytes}) is read when not given.
 
     Both tools read the bytes of the blobs that would be committed, written
     to a private folder. They never read the live shared folder, which an
@@ -398,13 +446,15 @@ def scan_secrets(repo, blobs):
     for tool in ("gitleaks", "trufflehog"):
         if not shutil.which(tool):
             raise RuntimeError("%s is not installed; refusing to commit without a secret scan" % tool)
+    if contents is None:
+        contents = read_blobs(repo, blobs.values())
     with tempfile.TemporaryDirectory(dir=repo.state_dir, prefix="scan-") as tmp:
         export = os.path.join(tmp, "tree") + "/"
         for path in paths:              # an allow-listed path: plain name parts only
             dst = os.path.join(export, path)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(dst, "wb") as out:
-                out.write(repo.git("cat-file", "blob", blobs[path]).stdout)
+                out.write(contents[blobs[path]])
         report = os.path.join(tmp, "gitleaks.json")
         r = subprocess.run(["gitleaks", "detect", "--no-git", "--source", export, "--redact",
                             "--report-format", "json", "--report-path", report,
@@ -455,14 +505,17 @@ def commit_checked(repo, author, entries):
     os.unlink(index)
     try:
         repo.git("read-tree", "HEAD", index=index)
-        # Removals first, and --replace on each add: a note can take the
-        # place of a folder with the same name, or the reverse.
+        # One update-index for all entries (NUL-separated, so a name can
+        # hold any byte). Removals first (mode 0), and --replace: a note can
+        # take the place of a folder with the same name, or the reverse.
+        lines = b""
         for status, mode, blob, path in sorted(entries, key=lambda e: e[0] != "D"):
             if status == "D":
-                repo.git("update-index", "--force-remove", "--", path, index=index)
+                head = b"0 " + b"0" * 40
             else:
-                repo.git("update-index", "--add", "--replace", "--cacheinfo",
-                         "%s,%s,%s" % (mode, blob, path), index=index)
+                head = ("%s %s" % (mode, blob)).encode()
+            lines += head + b"\t" + os.fsencode(path) + b"\0"
+        repo.git("update-index", "--add", "--replace", "-z", "--index-info", stdin=lines, index=index)
         tree = repo.git("write-tree", index=index).stdout.decode().strip()
     finally:
         if os.path.exists(index):
@@ -496,8 +549,10 @@ def cycle(repo, push=True):
         seen = set()
     now_refused = set()
 
+    to_unstage = []
+
     def refuse(kind, path, detail):
-        repo.unstage([path])
+        to_unstage.append(path)
         key = kind + ":" + path
         now_refused.add(key)
         if key not in seen:
@@ -515,32 +570,50 @@ def cycle(repo, push=True):
         if key not in seen:
             repo.alert("refused_" + kind, path or "(top)", details[kind])
 
-    ok = []
+    # The refusals are checked for every change (a rule on the path and one
+    # size query for all blobs), so a refused file never takes a place in
+    # the batch. Of the rest, at most BATCH_SIZE paths, in path order, are
+    # read, scanned and committed in this call; the others wait for the
+    # next call (`pending`). So the work of a call has a bound.
+    candidates = []
     for status, mode, blob, path in changes:
         reason = refuse_reason(status, mode, path)
         if reason:
             refuse("refused_" + reason, path, "left out of the commit")
             continue
-        if status != "D":
-            size = int(repo.git("cat-file", "-s", blob).stdout)
-            if size > MAX_FILE_BYTES:
-                refuse("refused_too_large", path, "%d bytes" % size)
-                continue
+        candidates.append((status, mode, blob, path))
+    sizes = blob_sizes(repo, [e[2] for e in candidates if e[0] != "D"])
+    ok = []
+    for status, mode, blob, path in candidates:
+        if status != "D" and sizes.get(blob, MAX_FILE_BYTES + 1) > MAX_FILE_BYTES:
+            refuse("refused_too_large", path, "%d bytes" % sizes.get(blob, -1))
+            continue
         ok.append((status, mode, blob, path))
     with open(seen_file, "w") as f:
         json.dump(sorted(now_refused), f)
+    # `ok` is in path order (the bytes of the path): `git diff --cached`
+    # lists the index in that order. So the next call goes on where this one
+    # stopped.
+    pending = max(0, len(ok) - BATCH_SIZE)
+    ok = ok[:BATCH_SIZE]
+    if pending:
+        log("%d changed path(s) wait for the next call (a call takes at most %d)" % (pending, BATCH_SIZE))
 
-    hits = scan_secrets(repo, {e[3]: e[2] for e in ok if e[0] != "D"})
+    contents = read_blobs(repo, [e[2] for e in ok if e[0] != "D"])
+    hits = scan_secrets(repo, {e[3]: e[2] for e in ok if e[0] != "D"}, contents)
     for path, tool in hits.items():
-        repo.unstage([path])
+        to_unstage.append(path)
         repo.quarantine_file(path, "secret_" + tool)
     ok = [e for e in ok if e[3] not in hits]
+    if to_unstage:
+        repo.git("reset", "-q", "HEAD", "--pathspec-from-file=-", "--pathspec-file-nul",
+                 stdin=b"".join(b":(literal)" + os.fsencode(p) + b"\0" for p in to_unstage))
 
     committed = 0
     if ok:
         by_author = {}
         for entry in ok:
-            author = FALLBACK_AUTHOR if entry[0] == "D" else note_author(repo, entry[2])
+            author = FALLBACK_AUTHOR if entry[0] == "D" else author_of(contents[entry[2]])
             by_author.setdefault(author, []).append(entry)
         # The removals (author "unknown") go first: an add by one author can
         # need the place that a removal makes free.
@@ -560,7 +633,8 @@ def cycle(repo, push=True):
             else:
                 repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
                 log("pushed")
-    repo.result = {"committed": committed, "alerts": repo.alert_count, "refused": len(now_refused)}
+    repo.result = {"committed": committed, "alerts": repo.alert_count, "refused": len(now_refused),
+                   "pending": pending}
     return committed
 
 

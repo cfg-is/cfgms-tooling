@@ -278,10 +278,10 @@ exit 9''')
         self.assertEqual(self.alerts(), ["git_entry_quarantined"])
         self.assertFalse(os.path.lexists(self.work / rel / ".git"))
         self.assertEqual(len(self.quarantined()), 1)
-        self.assertEqual(self.repo.result, {"committed": 2, "alerts": 1, "refused": 0})
+        self.assertEqual(self.repo.result, {"committed": 2, "alerts": 1, "refused": 0, "pending": 0})
         self.assertEqual(self.g("ls-files", "-s", "--", ":(literal)" + rel + "/inside.md")[:6], b"100644")
         self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 0})
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 0, "pending": 0})
 
     def test_a_git_file_beside_notes_does_not_hold_them_back(self):
         """`touch areas/.git` and a note of another owner in areas/: the note
@@ -374,7 +374,7 @@ exit 9''')
             self.assertEqual(self.repo.result["refused"], 1)
             self.assertEqual(self.alerts(), ["refused_git_entry_not_movable"])
             self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-            self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1})
+            self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1, "pending": 0})
         files = self.head_files()
         self.assertIn("areas/beside.md", files)
         self.assertNotIn("areas/sub/inside.md", files)
@@ -399,7 +399,7 @@ exit 9''')
         self.assertEqual(self.alerts(), [alert or "refused_" + kind])
         self.assertEqual(self.repo.result["refused"], 1)
         self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1})
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1, "pending": 0})
 
     def test_an_unreadable_file_is_left_out(self):
         p = self.note("areas/locked.md")
@@ -461,6 +461,49 @@ exit 9''')
                 self.assertIn("areas/%s/kept.md" % name, files)                 # not taken as removed
                 self.assertNotIn("areas/%s/new.md" % name, files)
 
+    # --- a bounded batch ----------------------------------------------------------
+
+    def small_batch(self, n):
+        saved = self.ms.BATCH_SIZE
+        self.ms.BATCH_SIZE = n
+        self.addCleanup(setattr, self.ms, "BATCH_SIZE", saved)
+
+    def test_more_changes_than_the_batch_are_saved_over_two_calls(self):
+        self.small_batch(3)
+        for i in range(5):
+            self.note("areas/b/n%d.md" % i, NOTE.replace("owner/epic-7", "owner/epic-%d" % (i % 2)))
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 2)          # two authors: two commits
+        self.assertEqual(self.repo.result["pending"], 2)
+        self.assertEqual(sorted(f for f in self.head_files() if f.startswith("areas/b/")),
+                         ["areas/b/n0.md", "areas/b/n1.md", "areas/b/n2.md"])   # the first 3 by path
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 2)
+        self.assertEqual(self.repo.result["pending"], 0)
+        self.assertEqual(len([f for f in self.head_files() if f.startswith("areas/b/")]), 5)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+
+    def test_refused_files_take_no_place_in_the_batch(self):
+        self.small_batch(2)
+        for i in range(4):
+            (self.work / ("a%d.sh" % i)).write_text("x")                  # sorts before areas/
+        self.note("areas/x.md")
+        self.note("areas/y.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertEqual(self.repo.result["pending"], 0)
+        self.assertIn("areas/y.md", self.head_files())
+        self.assertEqual(self.repo.result["refused"], 4)
+
+    def test_removals_and_adds_in_one_update_index(self):
+        """Many removals and adds go into one commit (one update-index)."""
+        for i in range(4):
+            self.note("areas/r.md/%d.md" % i)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        shutil.rmtree(self.work / "areas" / "r.md")
+        self.note("areas/r.md", NOTE)                                      # a note where the folder was
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 2)          # the removals, then the add
+        files = self.head_files()
+        self.assertIn("areas/r.md", files)
+        self.assertEqual([f for f in files if f.startswith("areas/r.md/")], [])
+
     # --- what a caller reads ------------------------------------------------------
 
     def run_once(self, *extra):
@@ -474,9 +517,9 @@ exit 9''')
         (self.work / "areas" / "run.sh").write_text("x")
         r = self.run_once("--result-file", str(result))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(result.read_text()), {"committed": 1, "alerts": 1, "refused": 1})
+        self.assertEqual(json.loads(result.read_text()), {"committed": 1, "alerts": 1, "refused": 1, "pending": 0})
         r = self.run_once("--result-file", str(result))
-        self.assertEqual(json.loads(result.read_text()), {"committed": 0, "alerts": 0, "refused": 1})
+        self.assertEqual(json.loads(result.read_text()), {"committed": 0, "alerts": 0, "refused": 1, "pending": 0})
 
     def test_a_name_with_a_newline_makes_one_log_line(self):
         (self.work / "areas").mkdir()

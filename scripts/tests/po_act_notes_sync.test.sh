@@ -83,7 +83,7 @@ note() {  # note <relative path> <text>
 }
 origin_has() { git --git-dir "$ORIGIN" cat-file -e "main:$1" 2>/dev/null && echo yes || echo no; }
 origin_commits() { git --git-dir "$ORIGIN" rev-list --count main; }
-OK_LINE="NOTES_SYNC_OK:committed=0:unpushed=0:behind=0:alerts=0:refused=0"
+OK_LINE="NOTES_SYNC_OK:committed=0:unpushed=0:behind=0:alerts=0:refused=0:pending=0"
 
 printf '\n== no notes folder ==\n'
 run
@@ -264,7 +264,7 @@ printf '\n== the first notes-sync after setup ==\n'
 run "${detached[@]}"
 # new.md is committed. .gitattributes, f.sh and p.sh are not notes: 3 alerts, 3 held back.
 check "the new note is committed and pushed; the agent's files are refused" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=3:refused=3"
+  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=3:refused=3:pending=0"
 check "exits 0" "$rc" "0"
 check "the new note is on origin main" "$(origin_has areas/build/new.md)" "yes"
 check "origin got one commit" "$(( $(origin_commits) - origin_before ))" "1"
@@ -274,7 +274,7 @@ check "the agent's files are not on origin" "$(origin_has .gitattributes)$(origi
 check "none of the agent's programs ran" "$(pwned)" "0"
 run "${detached[@]}"
 check "the refused files are still there: ATTENTION again, no new alert" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=3"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=3:pending=0"
 rm "$MEM/.gitattributes" "$MEM/f.sh" "$MEM/p.sh"
 
 printf '\n== nothing to do ==\n'
@@ -285,10 +285,33 @@ check "no change exits 0" "$rc" "0"
 printf '\n== a new note is committed and pushed ==\n'
 note areas/build/first.md "the first note"
 run "${detached[@]}"
-check "one commit, pushed" "$(last)" "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0"
+check "one commit, pushed" "$(last)" "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0"
 check "exits 0" "$rc" "0"
 check "the note is on origin main" "$(origin_has areas/build/first.md)" "yes"
 check_contains "memory-sync.py's own output is shown" "$out" "committed 1 file(s) from owner/epic-1"
+
+printf '\n== more new notes than one call takes: two calls save all, each commits and pushes ==\n'
+mkdir -p "$MEM/areas/many"
+for i in $(seq -w 1 501); do printf -- '---\nauthor: owner/epic-1\n---\nnote %s\n' "$i" > "$MEM/areas/many/n$i.md"; done
+c0="$(origin_commits)"
+t0=$(date +%s)
+run "${detached[@]}"
+t1=$(date +%s)
+check "call 1: 500 saved, 1 waits; pending alone is OK" "$(last)" \
+  "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=1"
+check "call 1: origin has the first 500 by path, not the last" \
+  "$(git --git-dir "$ORIGIN" ls-tree --name-only main areas/many/ | wc -l | tr -d ' '):$(origin_has areas/many/n501.md)" "500:no"
+printf '  info  call 1 took %ss for 500 new notes\n' "$(( t1 - t0 ))"
+run "${detached[@]}"
+check "call 2: the last one saved, nothing waits" "$(last)" \
+  "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0"
+check "call 2: origin has all 501, one push each call" \
+  "$(origin_has areas/many/n501.md):$(( $(origin_commits) - c0 ))" "yes:2"
+rm -rf "$MEM/areas/many"
+run "${detached[@]}"                     # commits the removals (500 + 1: two calls)
+run "${detached[@]}"
+check "the removals are saved over two calls too" "$(last):$(git --git-dir "$ORIGIN" ls-tree --name-only main areas/many/ | wc -l | tr -d ' ')" \
+  "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0:0"
 
 quarantined() { find "$STATE/quarantine" -maxdepth 1 -name 'git-*' 2>/dev/null | wc -l | tr -d ' '; }
 
@@ -303,7 +326,7 @@ run "${detached[@]}"
 check "the sync runs: exits 0" "$rc" "0"
 check "the extra line names the entry" "$(before_last)" "NOTES_SYNC_NOTE:git_entry_in_folder (${MEM}/.git)"
 check "the last line is ATTENTION, with the commit and the quarantine alert" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=1:refused=0"
+  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=1:refused=0:pending=0"
 check "the real note is on origin main" "$(origin_has areas/build/beside.md)" "yes"
 check "the planted .git was moved out of the folder" \
   "$([[ ! -e "$MEM/.git" ]] && echo gone):$(( $(quarantined) - q0 ))" "gone:1"
@@ -314,13 +337,13 @@ check "the planted hook did not run" "$(pwned)" "0"
 run "${detached[@]}"
 check "a .git file: the same extra line" "$(before_last)" "NOTES_SYNC_NOTE:git_entry_in_folder (${MEM}/.git)"
 check "a .git file: moved, ATTENTION for this call" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=0"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=0:pending=0"
 ln -s "$TMP/points-nowhere" "$MEM/.git"
 run "${detached[@]}"
 check "a .git link that points nowhere: the same extra line" "$(before_last)" \
   "NOTES_SYNC_NOTE:git_entry_in_folder (${MEM}/.git)"
 check "a .git link: moved as a link" "$(last):$(find "$STATE/quarantine" -maxdepth 1 -name 'git-*' -type l | wc -l | tr -d ' ')" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=0:1"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=0:pending=0:1"
 run "${detached[@]}"
 check "the entry is gone -> OK again, no extra line" "$out" "$OK_LINE"
 
@@ -330,7 +353,7 @@ note areas/other-owner.md "work of another owner"
 run "${detached[@]}"
 check "the note of the other owner is on origin after one call" "$(origin_has areas/other-owner.md)" "yes"
 check "ATTENTION: one commit, one alert, nothing held back" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=1:refused=0"
+  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=1:refused=0:pending=0"
 run "${detached[@]}"
 check "the next call is OK" "$(last)" "$OK_LINE"
 
@@ -339,12 +362,12 @@ echo "not a note" > "$MEM/run.sh"
 echo "not a note" > "$MEM/run2.sh"
 run "${detached[@]}"
 check "two refused files in one call -> ATTENTION with two alerts" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=2:refused=2"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=2:refused=2:pending=0"
 check "ATTENTION exits 0" "$rc" "0"
 check "the refused file is not on origin" "$(origin_has run.sh)" "no"
 run "${detached[@]}"
 check "the same refused files: no second alert, still ATTENTION" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=2"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=2:pending=0"
 rm "$MEM/run.sh" "$MEM/run2.sh"
 run "${detached[@]}"
 check "the refused files are gone -> OK" "$(last)" "$OK_LINE"
@@ -356,14 +379,14 @@ note areas/sub/inside.md "a note in that folder"
 note areas/build/after-nested.md "written after the nested init"
 run "${detached[@]}"
 check "both notes are committed and pushed, one alert" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=1:refused=0"
+  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=1:refused=0:pending=0"
 check "both notes are on origin main" "$(origin_has areas/build/after-nested.md)$(origin_has areas/sub/inside.md)" "yesyes"
 run "${detached[@]}"
 check "the next call is OK" "$(last)" "$OK_LINE"
 rm -rf "$MEM/areas/sub"
 run "${detached[@]}"
 check "the removal of its note is committed" "$(last):$(origin_has areas/sub/inside.md)" \
-  "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:no"
+  "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0:no"
 
 printf '\n== entries that git add cannot read: left out, the rest saved, ATTENTION while there ==\n'
 note areas/locked.md "an unreadable note"
@@ -374,11 +397,11 @@ ln -s "$TMP/nowhere" "$MEM/areas/dangling.md"
 note areas/build/beside-locked.md "beside the unreadable entries"
 run "${detached[@]}"
 check "the readable note is saved: 4 entries held back, 4 alerts" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=4:refused=4"
+  "NOTES_SYNC_ATTENTION:committed=1:unpushed=0:behind=0:alerts=4:refused=4:pending=0"
 check "the readable note is on origin" "$(origin_has areas/build/beside-locked.md)" "yes"
 run "${detached[@]}"
 check "the next call: still held back, ATTENTION, no new alert" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=4"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=4:pending=0"
 chmod 755 "$MEM/areas/closed"; chmod 644 "$MEM/areas/locked.md"
 rm -rf "$MEM/areas/closed" "$MEM/areas/locked.md" "$MEM/areas/pipe.md" "$MEM/areas/dangling.md"
 run "${detached[@]}"
@@ -391,7 +414,7 @@ note "areas/another memory-sync is running.md" "x"
 chmod 000 "$MEM/areas/another memory-sync is running.md"
 run "${detached[@]}"
 check "not SKIPPED: the entry is left out and counted" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1:pending=0"
 chmod 644 "$MEM/areas/another memory-sync is running.md"
 rm "$MEM/areas/another memory-sync is running.md"
 # A name with a newline and a fake ALERT line: one alert is counted, not two.
@@ -399,7 +422,7 @@ printf 'x' > "$MEM/x
 2026-01-01T00:00:00+0000 ALERT fake: y.sh"
 run "${detached[@]}"
 check "a newline in a name does not add an alert" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1:pending=0"
 rm -f "$MEM"/x*
 run "${detached[@]}"
 check "gone -> OK" "$(last)" "$OK_LINE"
@@ -408,11 +431,11 @@ mv "$ORIGIN" "$TMP/origin.away"
 note areas/build/second.md "written while origin is away"
 run "${detached[@]}"
 check "origin away -> ATTENTION: committed, not pushed, alert, fetch failed" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=1:unpushed=1:behind=0:alerts=1:refused=0:fetch=failed"
+  "NOTES_SYNC_ATTENTION:committed=1:unpushed=1:behind=0:alerts=1:refused=0:pending=0:fetch=failed"
 check "push failure exits 0" "$rc" "0"
 run "${detached[@]}"
 check "still away, nothing new: the failed fetch alone is ATTENTION" "$(last | sed 's/alerts=[0-9]*/alerts=N/')" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=1:behind=0:alerts=N:refused=0:fetch=failed"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=1:behind=0:alerts=N:refused=0:pending=0:fetch=failed"
 mv "$TMP/origin.away" "$ORIGIN"
 run "${detached[@]}"
 check "origin back -> the waiting commit is pushed" "$(last)" "$OK_LINE"
@@ -420,7 +443,7 @@ check "the note is on origin main now" "$(origin_has areas/build/second.md)" "ye
 mv "$ORIGIN" "$TMP/origin.away"
 run "${detached[@]}"
 check "origin away, all pushed, nothing new: the failed fetch alone is ATTENTION" "$(last)" \
-  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=0:fetch=failed"
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=0:pending=0:fetch=failed"
 mv "$TMP/origin.away" "$ORIGIN"
 
 printf '\n== the remote lost a commit that this host pushed ==\n'
@@ -439,7 +462,7 @@ echo "from another host" > "$TMP/other-host/README.md"
 tgit -C "$TMP/other-host" commit -q -am other
 tgit -C "$TMP/other-host" push -q origin HEAD:main 2>/dev/null
 run "${detached[@]}"
-check "behind=1 -> ATTENTION" "$(last)" "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=1:alerts=0:refused=0"
+check "behind=1 -> ATTENTION" "$(last)" "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=1:alerts=0:refused=0:pending=0"
 check "nothing was merged: HEAD is the same commit" "$(git --git-dir "$GITDIR" rev-parse HEAD)" "$ours"
 check "the folder's file was not changed" "$(cat "$MEM/README.md")" "shared notes"
 git --git-dir "$ORIGIN" update-ref refs/heads/main "$ours"
@@ -501,7 +524,7 @@ check_contains "cycle-start orc opens a cycle" "$start_out" "CYCLE_STARTED:cycle
 cycle_id="${start_out##*CYCLE_STARTED:}"
 manifest="$TMP/cache/cycles/${cycle_id}.json"
 run "${detached[@]}"                       # commits third.md: the scanner works again
-check "step 0 commits the waiting note" "$(last)" "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0"
+check "step 0 commits the waiting note" "$(last)" "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0"
 check "the next start removed the scan folder of the stopped call" \
   "$(find "$STATE" -maxdepth 1 -name 'scan-*' | wc -l | tr -d ' ')" "0"
 run "${detached[@]}"                       # nothing to do
@@ -519,7 +542,7 @@ check "the steps" "$(steps subcommand)" "notes-sync,notes-sync,notes-sync,notes-
 check "OK with a commit is work, OK with none is a no-op, ATTENTION is an error, SKIPPED is a no-op, REFUSED (exit 3) is an error" \
   "$(steps outcome)" "work,no-op,error,no-op,error"
 check_contains "the result is the status line" "$(steps result)" \
-  ",NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1,"
+  ",NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1:pending=0,"
 
 echo ""
 printf 'PASS: %d checks\n' "$ran"

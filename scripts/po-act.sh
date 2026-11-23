@@ -45,7 +45,7 @@
 #                                   Folder CFGMS_MEMORY_DIR (default as for dispatch --epic), git dir
 #                                   CFGMS_MEMORY_GIT_DIR (default ~/.local/state/cfgms/memory-git).
 #                                   Last line: NOTES_SYNC_OK / NOTES_SYNC_ATTENTION
-#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>[:fetch=failed]
+#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>:pending=<n>[:fetch=failed]
 #                                   (exit 0), NOTES_SYNC_SKIPPED (exit 0), NOTES_SYNC_REFUSED:not_detached
 #                                   (exit 3; run notes-setup), NOTES_SYNC_FAILED:exit_<rc> or
 #                                   :timeout_<secs>s (exit 1; CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
@@ -2017,11 +2017,17 @@ EOF
     #                                               the entry into its quarantine (an
     #                                               alert), the sync runs, and the last
     #                                               line is ATTENTION.
-    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:behind=0:alerts=0:refused=0   exit 0
-    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>[:fetch=failed]
+    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:behind=0:alerts=0:refused=0:pending=<n>   exit 0
+    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>:pending=<n>[:fetch=failed]
     #                                               exit 0  a number other than
-    #                                               committed is not 0, the fetch
-    #                                               failed, or the NOTE line was printed
+    #                                               committed and pending is not 0,
+    #                                               the fetch failed, or the NOTE line
+    #                                               was printed
+    # pending: changed notes that wait for the next call. One call handles at
+    # most memory-sync.py's BATCH_SIZE (500) of them, so that a folder with
+    # very many new files is saved over several calls and no call runs into
+    # the time limit by file count. pending above 0 alone is normal progress
+    # (OK), not ATTENTION.
     #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
     #   NOTES_SYNC_FAILED:no_result                 exit 1  it ended with 0 and wrote
     #                                               no usable result file
@@ -2093,18 +2099,18 @@ EOF
       echo "NOTES_SYNC_FAILED:exit_${notes_rc}"
       exit 1
     fi
-    # "<alerts> <refused>" from the result file; no file or a bad one: FAILED.
+    # "<alerts> <refused> <pending>" from the result file; no file or a bad
+    # one: FAILED.
     if ! notes_ar="$(printf '%s' "$notes_counts_json" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-a, r = d["alerts"], d["refused"]
-assert all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (a, r))
-print(a, r)' 2>/dev/null)"; then
+v = [d["alerts"], d["refused"], d["pending"]]
+assert all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in v)
+print(*v)' 2>/dev/null)"; then
       echo "NOTES_SYNC_FAILED:no_result"
       exit 1
     fi
-    notes_alerts="${notes_ar% *}"
-    notes_refused="${notes_ar#* }"
+    read -r notes_alerts notes_refused notes_pending <<< "$notes_ar"
     notes_head_after="$(notes_git_do rev-parse -q --verify HEAD || true)"
     if [[ "$notes_head_before" == "$notes_head_after" ]]; then
       notes_committed=0
@@ -2114,7 +2120,7 @@ print(a, r)' 2>/dev/null)"; then
     # No origin/main to compare with: every commit counts as not pushed.
     notes_unpushed="$(notes_git_do rev-list --count origin/main..HEAD || notes_git_do rev-list --count HEAD || echo 1)"
     notes_behind="$(notes_git_do rev-list --count HEAD..origin/main || echo 0)"
-    notes_counts="committed=${notes_committed}:unpushed=${notes_unpushed}:behind=${notes_behind}:alerts=${notes_alerts}:refused=${notes_refused}"
+    notes_counts="committed=${notes_committed}:unpushed=${notes_unpushed}:behind=${notes_behind}:alerts=${notes_alerts}:refused=${notes_refused}:pending=${notes_pending}"
     [[ -n "$notes_git_entry" ]] && echo "NOTES_SYNC_NOTE:git_entry_in_folder (${notes_git_entry})"
     if [[ "$notes_unpushed" == 0 && "$notes_behind" == 0 && "$notes_alerts" == 0 && "$notes_refused" == 0 \
           && "$notes_fetch" == ok && -z "$notes_git_entry" ]]; then
