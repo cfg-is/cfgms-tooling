@@ -41,12 +41,18 @@ def _git(*args, cwd):
                           cwd=cwd, check=True, capture_output=True).stdout.decode()
 
 
+class _TooLong(BaseException):
+    """The per-test time limit (setUp)."""
+
+
 class MemorySync(unittest.TestCase):
     def setUp(self):
         # a time limit for each test: a read that blocks (a FIFO opened
         # without O_NONBLOCK) fails the test instead of stopping the suite
         def too_long(signum, frame):
-            raise TimeoutError("the test ran longer than 60 s")
+            # not an OSError (TimeoutError is one): the code under test must
+            # not be able to catch it as a failed read
+            raise _TooLong("the test ran longer than 60 s")
         signal.signal(signal.SIGALRM, too_long)
         signal.alarm(60)
         self.ms = _load()
@@ -719,7 +725,8 @@ exit 9''')
         self.assertEqual(self.repo.result["pending"], 0)
         shutil.rmtree(self.state / "alerts")
         (self.state / "alerts").mkdir()
-        self.note("areas/b/x.md", NOTE.replace("owner/epic-7", "bee"))
+        # as large as a flood note: in path order it would not fit the rest
+        self.note("areas/b/x.md", "---\nauthor: bee\n---\n" + "b" * 1000)
         for call in range(3):
             for i in range(16):
                 p = self.work / "areas" / "00" / ("f%02d.md" % i)
@@ -745,6 +752,16 @@ exit 9''')
                 self.note("areas/a%d-%02d/n.md" % (call, i), NOTE.replace("owner/epic-7", "spam"))
             self.ms.cycle(self.repo, push=False)
         self.assertIn("areas/zzzz-b/x.md", self.head_files())
+
+    def test_a_call_serves_at_most_the_cap_of_new_groups(self):
+        self.patch("NEW_GROUPS_PER_CALL", 2)
+        state = {"waiting": {"areas/old": 1}, "salt": "s", "cursor": {}}
+        paths = ["areas/old/x.md"] + ["areas/n%d/x.md" % i for i in range(5)]
+        order, later = self.ms.fair_order(paths, state)
+        served = [g for g, _p in order]
+        self.assertEqual(served[0], "areas/old")                          # the waiting group first
+        self.assertEqual(len(served), 3)                                  # and 2 new ones
+        self.assertEqual(len(later), 3)
 
     def test_the_group_state_keeps_only_groups_that_wait(self):
         self.small_batch(1)
@@ -845,14 +862,15 @@ done
 echo LATER >> "%s"
 printf '[{"File": "%%sareas/leak.md"}]' "$src" > "$rep"
 exit 9''' % leak)
-        self.ms.cycle(self.repo, push=False)
-        (kept,) = [p for p in (self.state / "quarantine").iterdir() if p.name.startswith("secret-")]
-        self.assertEqual(kept.read_text(), NOTE)                   # not the later bytes
         q = self.state / "quarantine"
         for i in range(4):
-            (q / ("secret-2020010%d-old" % i)).write_text("x")
-        self.ms.prune_quarantine(str(q), "secret-", 2, 10 ** 9)
-        self.assertEqual(len([p for p in q.iterdir() if p.name.startswith("secret-")]), 2)
+            (q / ("secret-2020010%d-old" % i)).write_text("x")               # older ones
+        self.ms.cycle(self.repo, push=False)
+        kept = sorted(p for p in q.iterdir() if p.name.startswith("secret-"))
+        self.assertEqual(len(kept), 2)                                      # the oldest are deleted
+        new = [p for p in kept if not p.name.endswith("-old")]
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0].read_text(), NOTE)                          # not the later bytes
 
     def test_a_state_dir_that_overlaps_the_folder_is_refused(self):
         inside = self.work / "st"
