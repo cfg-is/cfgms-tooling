@@ -753,6 +753,89 @@ exit 9''')
             self.ms.cycle(self.repo, push=False)
         self.assertIn("areas/zzzz-b/x.md", self.head_files())
 
+    def test_groups_that_always_have_work_do_not_stay_ahead_of_a_newer_group(self):
+        """The review's n9, smaller: W groups that always have work left
+        (their notes are rewritten before each call) and, one call later, a
+        newer group B. A group that got a path served goes to the back, so B
+        is saved within ceil((W + 1) / BATCH_SIZE) + 1 calls after it
+        appears (here W = 7, BATCH_SIZE = 5: 3 calls), whatever the salt."""
+        self.small_batch(5)
+        self.patch("NEW_GROUPS_PER_CALL", 2)
+        W = 7
+        bound = -(-(W + 1) // 5) + 1
+
+        def spam(call):
+            for g in range(W):
+                for n in range(2):
+                    self.note("areas/g%d/n%d.md" % (g, n), "---\nauthor: spam\n---\n%d %d %d\n" % (call, g, n))
+        for salt_try in range(5):
+            with self.subTest(salt_try=salt_try):
+                self.tearDown()
+                self.setUp()
+                self.small_batch(5)
+                self.patch("NEW_GROUPS_PER_CALL", 2)
+                spam(0)
+                self.ms.cycle(self.repo, push=False)
+                self.note("held/b/x.md", NOTE.replace("owner/epic-7", "bee"))
+                saved_at = None
+                for call in range(1, bound + 1):
+                    spam(call)
+                    self.ms.cycle(self.repo, push=False)
+                    if "held/b/x.md" in self.head_files():
+                        saved_at = call
+                        break
+                self.assertIsNotNone(saved_at, "B waited more than %d calls" % bound)
+
+    def test_waiting_groups_are_ordered_by_call_number_not_by_name(self):
+        state = {"waiting": {"areas/z": 1, "areas/a": 2}, "salt": "s", "cursor": {}}
+        order, _later = self.ms.fair_order(["areas/a/x.md", "areas/z/x.md"], state)
+        self.assertEqual([g for g, _p in order], ["areas/z", "areas/a"])
+
+    def test_new_groups_are_ordered_by_the_salted_hash_not_by_name(self):
+        groups = ["areas/n%d" % i for i in range(6)]
+        for salt in ("s%d" % i for i in range(50)):
+            by_rank = sorted(groups, key=lambda g: self.ms._rank(salt, g))
+            if by_rank != sorted(groups):
+                break
+        state = {"waiting": {}, "salt": salt, "cursor": {}}
+        order, _later = self.ms.fair_order([g + "/x.md" for g in groups], state)
+        self.assertEqual([g for g, _p in order], by_rank)
+        self.assertNotEqual(by_rank, sorted(groups))
+
+    def test_each_prune_keeps_to_its_own_prefix(self):
+        q = self.state / "quarantine"
+        for i in range(3):
+            (q / ("secret-2020010%d-x" % i)).write_text("s")
+        for i in range(5):
+            (q / ("git-2020010%d-x" % i)).mkdir()
+        self.ms.prune_quarantine(str(q), "git-", 1, 10 ** 9)
+        self.ms.prune_quarantine(str(q), "secret-", 1, 10 ** 9)
+        names = sorted(p.name for p in q.iterdir())
+        self.assertEqual(names, ["git-20200104-x", "secret-20200102-x"])
+        for i in range(3):
+            (q / ("secret-2021010%d-x" % i)).write_text("s")
+        self.ms.prune_quarantine(str(q), "secret-", 10, 10 ** 9)          # nothing to prune
+        self.ms.prune_quarantine(str(q), "git-", 0, 10 ** 9)              # all git-* go
+        self.assertEqual(len([p for p in q.iterdir() if p.name.startswith("secret-")]), 4)
+        self.assertEqual([p for p in q.iterdir() if p.name.startswith("git-")], [])
+
+    def test_a_folder_swapped_for_a_link_before_the_walk_opens_it(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "x.md").write_text("---\nauthor: a\n---\nHOST SECRET\n")
+        (self.work / "areas" / "d").mkdir(parents=True)
+        self.note("areas/other.md")
+
+        def swap(p):
+            if p == "areas/d":
+                os.rmdir(self.work / "areas" / "d")
+                os.symlink(outside, self.work / "areas" / "d")
+        self.ms._before_open_dir = swap
+        self.addCleanup(setattr, self.ms, "_before_open_dir", None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertNotIn(b"HOST SECRET", self.g("log", "-p", "--all"))
+        self.assertEqual(self.alerts(), ["refused_unreadable_dir"])       # not walked into
+
     def test_a_call_serves_at_most_the_cap_of_new_groups(self):
         self.patch("NEW_GROUPS_PER_CALL", 2)
         state = {"waiting": {"areas/old": 1}, "salt": "s", "cursor": {}}

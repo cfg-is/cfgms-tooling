@@ -53,12 +53,15 @@ Each cycle (git never reads the folder; the host reads it itself):
   6. push to main
 
 What one owner can still do to the others: make many groups or change very
-many notes, so that the others wait longer. A group with work waits until
-the groups that started waiting in the same call or earlier are served:
-each call serves the oldest waiting groups first, at least one path of
-each as long as the batch (BATCH_SIZE) and the read budget (READ_BUDGET,
-so 64 groups when every note is 1 MiB) allow; new groups cannot push it
-back (they come after it, at most NEW_GROUPS_PER_CALL of them in a call).
+many notes, so that the others wait longer. Each call serves the groups
+that wait since the oldest call first; a group that got a path served and
+still has work goes to the back (this call's number), a group that got
+nothing keeps its place, and new groups come after the waiting ones (at most
+NEW_GROUPS_PER_CALL of them in a call). So when S groups get a path in each
+call (S is BATCH_SIZE when the notes are small; 64 when the read budget
+binds with 1 MiB notes) and W groups always have work, a newer group is
+served within ceil((W + 1) / S) + 1 calls after it appears (tested at a
+small scale: W = 7, S = 5, 3 calls).
 From the 3rd call in a row with notes that wait, the notes-sync line says
 ATTENTION and one alert a call (budget_exhausted or batch_full) names the
 5 groups that used the most bytes or entries. A person clears it by
@@ -365,6 +368,9 @@ def prune_quarantine(quarantine, prefix, max_entries, max_bytes):
 #: A test sets this to a function(path) that runs before the host opens a
 #: note (the place where an agent can change the file or a folder on its way).
 _before_read = None
+#: A test sets this to a function(path) that runs before the walk opens a
+#: folder it found (the place where an agent can swap it for a link).
+_before_open_dir = None
 #: A test sets this to a function(path) that runs after the fstat checks of
 #: an open note and before its bytes are read.
 _after_fstat = None
@@ -564,6 +570,8 @@ def walk_tree(repo, tracked, cache):
                     held.append(("too_deep", path))
                     blocked.add(path)
                     continue
+                if _before_open_dir:
+                    _before_open_dir(path)
                 try:
                     sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
                 except FileNotFoundError:
@@ -915,7 +923,7 @@ def cycle(repo, push=True):
     gone = removals(tracked, walk)
     order, later = fair_order(list(candidates) + gone, groups)
     gone_set = set(gone)
-    batch_adds, batch_gone, served = {}, [], set()
+    batch_adds, batch_gone, served, served_groups = {}, [], set(), set()
     budget = READ_BUDGET
     used_bytes, used_entries = {}, {}
     budget_hit = batch_hit = False
@@ -938,6 +946,7 @@ def cycle(repo, push=True):
             if kind != "ok":
                 held.append((kind, path))
                 served.add(path)
+                served_groups.add(g)
                 continue
             budget -= len(data)
             used_bytes[g] = used_bytes.get(g, 0) + len(data)
@@ -948,15 +957,19 @@ def cycle(repo, push=True):
                 batch_adds[path] = (entry[4], data)
             walk["cache"][path] = entry
         served.add(path)
+        served_groups.add(g)
         used_entries[g] = used_entries.get(g, 0) + 1
         groups["cursor"][g] = path
     waiting_paths = [p for p in list(candidates) + gone if p not in served]
     pending = len(waiting_paths)
 
-    # A group keeps its place while it has work left; the record goes when
-    # it has none (so the state has one entry for each waiting group only).
+    # A group with work left that got a path served in this call goes to
+    # the back (this call's number); a group that got nothing keeps its
+    # place. The record goes when a group has no work left (so the state has
+    # one entry for each waiting group only).
     left = {group_of(p) for p in waiting_paths}
-    groups["waiting"] = {g: groups["waiting"].get(g, groups["call"]) for g in left}
+    groups["waiting"] = {g: (groups["call"] if g in served_groups else groups["waiting"].get(g, groups["call"]))
+                         for g in left}
     groups["cursor"] = {g: c for g, c in groups["cursor"].items() if g in left}
 
     # A refused file stays in the folder and is refused again every cycle.
