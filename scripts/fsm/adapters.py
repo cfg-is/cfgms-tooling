@@ -323,6 +323,14 @@ class GhCLI:
         return [r for r in rows if str(r.get("state", "")).upper() in ("FAILURE", "ERROR")]
 
 
+def script_timeout(default):
+    """Seconds one project-queue.sh or pipeline-helper.sh call may take:
+    `default`, or CFGMS_FSM_SCRIPT_TIMEOUT_SECS when it is a whole number
+    above 0 (the tests use it to make a call run out of time quickly)."""
+    v = os.environ.get("CFGMS_FSM_SCRIPT_TIMEOUT_SECS", "")
+    return int(v) if v.isdigit() and int(v) > 0 else default
+
+
 class Board:
     """Project board via scripts/project-queue.sh."""
 
@@ -331,7 +339,8 @@ class Board:
             TOOLING_ROOT / "scripts" / "project-queue.sh")
 
     def _run(self, *args):
-        return subprocess.run(["bash", self.script] + list(args), capture_output=True, timeout=120)
+        return subprocess.run(["bash", self.script] + list(args), capture_output=True,
+                              timeout=script_timeout(120))
 
     def get_item(self, item_id):
         proc = self._run("get-item", item_id)
@@ -358,7 +367,8 @@ class Helper:
         self.holder = holder or os.environ.get("CFGMS_HOST_ID") or os.uname().nodename
 
     def _run(self, *args):
-        return subprocess.run(["bash", self.script] + list(args), capture_output=True, timeout=180)
+        return subprocess.run(["bash", self.script] + list(args), capture_output=True,
+                              timeout=script_timeout(180))
 
     def lease_status(self, key):
         """("held_by_me" | "held_by_other" | "free" | "expired" | "error", raw)."""

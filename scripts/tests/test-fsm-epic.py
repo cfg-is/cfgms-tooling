@@ -515,6 +515,67 @@ class TestRefusals(EpicCase):
         self.assertEqual(self.f.records("docker-owner-start"), [])
         self.assertEqual(self.board_writes(), [])       # refused at a gate: the item stays Ready
 
+    def launch_with_lease(self, env, how="--lease-handoff"):
+        """As po-act.sh starts a run: the lease is handed to it. With
+        how="--acquire-lease" the run takes the lease itself."""
+        self.launch("run", "epic", "900", "--item-id", ITEM, "--canon-dir", str(self.canon),
+                    "--memory-dir", str(self.memory), "--lease-key", "epic-900", how,
+                    env=env)
+
+    def assert_deferred(self, reason):
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"DISPATCH_DEFERRED:epic-900:{reason}", out)
+        self.assertEqual(self.f.path_states(self.run_dir.name), [("PREPARE", "gate_refused", "REFUSED")])
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), [])       # deferred: the item stays Ready
+        self.assertIn(["lease-release", "epic-900"],
+                      [r["argv"] for r in self.f.records("pipeline-helper")])
+
+    def test_transient_causes_before_the_gates_are_deferred_and_release_the_lease(self):
+        """A fetch that cannot reach the remote, and a lease or project item
+        call that does not answer in time, can work at the next cycle: the
+        run is deferred, writes nothing to the board and releases the lease."""
+        slow = {"CFGMS_FSM_SCRIPT_TIMEOUT_SECS": "2"}
+        cases = [
+            ("base_branch_fetch_failed", {"CFGMS_FSM_REMOTE_URL": str(self.f.root / "no-remote.git")},
+             "--lease-handoff"),
+            ("github_timeout", dict(slow, FSM_FAKE_HANG="get-item"), "--lease-handoff"),
+            ("github_timeout", dict(slow, FSM_FAKE_HANG="lease-renew"), "--lease-handoff"),
+            # the acquire ran out of time: the lease can be ours, so it is released
+            ("github_timeout", dict(slow, FSM_FAKE_HANG="lease-acquire"), "--acquire-lease"),
+        ]
+        for reason, env, how in cases:
+            with self.subTest(reason=reason, hang=env.get("FSM_FAKE_HANG")):
+                self.setUp()
+                t0 = time.time()
+                self.launch_with_lease(env, how)
+                self.assert_deferred(reason)
+                self.assertLess(time.time() - t0, 25)   # the hung call was stopped, not waited for
+                self.tearDown()
+
+    def test_a_lease_status_that_does_not_answer_is_deferred_and_the_run_ends(self):
+        """The lease cannot be read, also not at the end: the run is deferred
+        and ends; the lease is not released (it ends at its TTL)."""
+        t0 = time.time()
+        self.launch_with_lease({"FSM_FAKE_HANG": "lease-status", "CFGMS_FSM_SCRIPT_TIMEOUT_SECS": "2"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DISPATCH_DEFERRED:epic-900:github_timeout", out)
+        self.assertLess(time.time() - t0, 25)
+        self.assertEqual(self.board_writes(), [])
+        self.assertIn("timeout", [r.get("lease_not_released") for r in self.recs("note")])
+        self.assertNotIn(["lease-release", "epic-900"],
+                         [r["argv"] for r in self.f.records("pipeline-helper")])
+        self.assertEqual(len(self.recs("terminal_done")), 1)
+
+    def test_a_base_branch_that_the_remote_lacks_is_refused_not_deferred(self):
+        self.launch_with_lease({"CFGMS_FSM_BASE_BRANCH": "no-such-branch"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:base_branch_missing", out)
+        self.assertEqual(self.board_writes(), [])
+
     def test_a_failure_before_the_gates_sets_blocked(self):
         """FAILED(prepare_error) sets the item Blocked: at Ready, the next
         cycle would start the same run again, each cycle."""

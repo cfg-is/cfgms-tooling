@@ -399,6 +399,16 @@ class EpicSupervisor(sup.Supervisor):
         return self.finish()
 
     # --- PREPARE --------------------------------------------------------------------
+    def github_gate(self, what, fn, *args):
+        """fn(*args) for a PREPARE gate that asks GitHub (a lease or the
+        project item). A call that runs out of time can work at the next
+        cycle: the run is deferred, not FAILED."""
+        try:
+            return fn(*args)
+        except subprocess.TimeoutExpired:
+            self.log(f"{what}: no answer from GitHub in time")
+            raise sup.Refused("github_timeout", deferred=True)
+
     def prepare(self):
         p, x = self.params, self.x
         x.update({"lease_acquired": bool(p.get("lease_handoff") and p.get("lease_key"))})
@@ -414,15 +424,19 @@ class EpicSupervisor(sup.Supervisor):
         if key:
             ttl = int(p.get("lease_ttl", sup.LEASE_TTL))
             if p.get("acquire_lease"):
-                ok, _line = self.svc.helper.lease_acquire(key, ttl)
+                # Set before the call: when the call runs out of time, the
+                # lease can be ours. release() releases it only when the
+                # lease status says it is held by this host.
+                was_acquired, x["lease_acquired"] = x["lease_acquired"], True
+                ok, _line = self.github_gate("lease-acquire", self.svc.helper.lease_acquire, key, ttl)
                 if not ok:
+                    x["lease_acquired"] = was_acquired
                     raise sup.Refused("lease_held", deferred=True)
-                x["lease_acquired"] = True
             else:
-                st, _ = self.svc.helper.lease_status(key)
+                st, _ = self.github_gate("lease-status", self.svc.helper.lease_status, key)
                 if st != "held_by_me":
                     raise sup.Refused("lease_not_held")
-                rs, _line = self.svc.helper.lease_renew(key, ttl)
+                rs, _line = self.github_gate("lease-renew", self.svc.helper.lease_renew, key, ttl)
                 if rs == "not_holder":
                     raise sup.Refused("lease_not_held")
             self._last_renew = time.time()
@@ -440,7 +454,7 @@ class EpicSupervisor(sup.Supervisor):
         # the epic text comes from the project item, never from issue text
         if not p.get("item_id"):
             raise sup.Refused("no_epic_item")
-        item = self.svc.board.get_item(p["item_id"])
+        item = self.github_gate("project item", self.svc.board.get_item, p["item_id"])
         if item is None:
             raise sup.Refused("epic_item_unreadable")
         if item.get("issue_num") not in (None, self.epic):
@@ -465,7 +479,15 @@ class EpicSupervisor(sup.Supervisor):
             shutil.rmtree(self.run.repo_dir)
         gitops.init_bare(self.run.repo_dir, self.run.path, self.run.gitconfig)
         publish.write_askpass(self.run.path)
-        develop = self.fetch_develop()
+        try:
+            develop = self.fetch_develop()
+        except (gitops.GitError, subprocess.TimeoutExpired) as exc:
+            # A base branch that the remote does not have does not come back
+            # at the next cycle; a fetch that cannot reach the remote can.
+            if isinstance(exc, gitops.GitError) and b"couldn't find remote ref" in (exc.stderr or b""):
+                raise sup.Refused("base_branch_missing")
+            self.log(f"fetch of {p['base_branch']} failed: {str(exc)[:300]}")
+            raise sup.Refused("base_branch_fetch_failed", deferred=True)
         if not develop:
             raise sup.Refused("base_branch_missing")
         title, body = item.get("title", ""), item.get("body", "")

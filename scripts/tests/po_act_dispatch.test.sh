@@ -286,6 +286,19 @@ t11_out=$(FAKE_SUP_MODE="refused:lease_not_held" CFGMS_CANON_DIR="${SANDBOX}/can
   CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || true
 check_not_contains "T11c: another refusal has no token text" "$t11_out" "Claude token"
 
+printf '\n== T11d: a transient cause before the gates of an epic run is a deferral ==\n'
+# The supervisor defers a fetch that cannot reach the remote and a GitHub call
+# that runs out of time (test-fsm-epic.py: also that it releases the lease).
+for t11_why in base_branch_fetch_failed github_timeout; do
+  t11_rc=0
+  t11_out=$(FAKE_SUP_MODE="deferred:${t11_why}" CFGMS_CANON_DIR="${SANDBOX}/canon" \
+    CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t11_rc=$?
+  check_eq "T11d: ${t11_why} -> exits 0" "$t11_rc" "0"
+  check_eq "T11d: ${t11_why} -> the last line" "$(printf '%s\n' "$t11_out" | tail -n 1)" \
+    "DISPATCH_DEFERRED:epic-4242:${t11_why}"
+  check_not_contains "T11d: ${t11_why} -> not dispatched" "$t11_out" "DISPATCHED_EPIC"
+done
+
 printf '\n== T12: resume of an epic run asks for the token before it starts the supervisor ==\n'
 # a run that passed its gates and whose supervisor is gone: crashed
 FAKE_SUP_MODE=gates_only CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" \

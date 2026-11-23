@@ -4,6 +4,9 @@
 #   FSM_FAKE_LEASE_HELD_CALLS=N       lease-status answers HELD for the first N calls, then FREE
 #   FSM_FAKE_RENEW=ok|lost            lease-renew answer (default ok)
 printf '{"tool":"pipeline-helper","argv":%s}\n' "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "$@")" >> "${FSM_FAKE_LOG:-/dev/null}"
+# FSM_FAKE_HANG=<subcommand>: that call does not answer (the test sets a short
+# CFGMS_FSM_SCRIPT_TIMEOUT_SECS). exec: the caller's kill stops the sleep too.
+[[ -n "${FSM_FAKE_HANG:-}" && "${FSM_FAKE_HANG}" == "$1" ]] && exec sleep 30
 held() {
   if [[ -n "${FSM_FAKE_LEASE_HELD_CALLS:-}" ]]; then
     local f="${FSM_FAKE_STATE:-/nonexistent}/lease-status-calls" n=0

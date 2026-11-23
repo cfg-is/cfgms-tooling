@@ -995,11 +995,17 @@ class Supervisor:
         if key and self.lease_lost:
             self.run.append("note", lease_not_released="lost")
         elif key and (self.state != T.REFUSED or x.get("lease_acquired")):
-            st, _ = self.svc.helper.lease_status(key)
-            if st == "held_by_me":
-                self.svc.helper.lease_release(key)
-            else:
-                self.run.append("note", lease_not_released=st)
+            # A call that runs out of time must not stop the end of the run:
+            # the lease then ends at its TTL.
+            try:
+                st, _ = self.svc.helper.lease_status(key)
+                if st == "held_by_me":
+                    self.svc.helper.lease_release(key)
+                else:
+                    self.run.append("note", lease_not_released=st)
+            except subprocess.TimeoutExpired:
+                self.run.append("note", lease_not_released="timeout")
+                self.log(f"lease {key}: no answer in time; it is not released and ends at its TTL")
         if p.get("key"):
             self.run.clear_active(p["key"])
 
