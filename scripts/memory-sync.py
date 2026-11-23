@@ -19,8 +19,12 @@ Each cycle (git never reads the folder; the host reads it itself):
      A note at an allowed path (allow-list below), not executable, at most
      MAX_FILE_BYTES, is a candidate to read, unless its stat (size, times,
      inode) is as cached, its blob is HEAD's and its times are more than
-     RACY_NS older than the read that made the cache entry.
-  2. removals: a note of HEAD that the walk did not see, but never below a
+     RACY_NS older than the read that made the cache entry. An empty
+     `.gitkeep` (a regular file of size 0, not executable) in `areas/`,
+     `held/` or a folder below them is ignored (GITKEEP): no note, no
+     refusal; any other `.gitkeep` is refused like other files.
+  2. removals: a note of HEAD that the walk did not see, never a `.gitkeep`
+     (it stays on the remote), never below a
      folder that was not fully read, and none when the walk stopped at
      MAX_ENTRIES.
   3. a fair order (fair_order) over the candidates and removals: groups
@@ -151,6 +155,12 @@ RACY_NS = 2 * 1000 ** 3
 #: Alerts written one by one in a call; the rest are counted in one line.
 ALERT_DETAIL_LIMIT = 50
 ALLOWED = re.compile(r"^(README\.md|(areas|held)/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.md)$")
+#: An empty `.gitkeep` in `areas/` or `held/` or a folder below them (the
+#: notes repository has them from its first commit): not a note and not a
+#: refusal. The walk ignores it when it is an empty regular file, not
+#: executable; anything else with that name is refused as before (no channel
+#: for content). It is never committed and never removed.
+GITKEEP = re.compile(r"^(areas|held)(/[A-Za-z0-9._-]+)*/\.gitkeep$")
 AUTHOR_OK = re.compile(r"^[a-z0-9][a-z0-9/_.-]{0,62}$")
 FALLBACK_AUTHOR = "unknown"
 COMMITTER_NAME = "cfgms-memory-sync"
@@ -589,6 +599,9 @@ def walk_tree(repo, tracked, cache):
                     blocked.add(path)
                     continue
                 stack.append((sub, path, depth + 1, iter(sub_names)))
+            elif (stat.S_ISREG(mode) and st.st_size == 0 and not mode & 0o111
+                  and GITKEEP.fullmatch(path)):
+                continue                                 # an empty .gitkeep: ignored
             elif stat.S_ISREG(mode):
                 reason = refuse_path(path, "100755" if mode & 0o111 else "100644")
                 if reason:
@@ -613,14 +626,15 @@ def removals(tracked, walk):
     """Paths of HEAD that the walk did not see, for a commit as removals.
     Never a path below a folder that was not fully read (unreadable, too
     deep, a `.git` that could not be moved), and none at all when the walk
-    stopped at MAX_ENTRIES."""
+    stopped at MAX_ENTRIES. Never a `.gitkeep` (GITKEEP): it stays on the
+    remote as it is, also when it is gone from the folder."""
     if walk["truncated"]:
         return []
     present, blocked = walk["present"], walk["blocked"]
     out = []
     for path in tracked:
-        if path in present:
-            continue
+        if path in present or GITKEEP.fullmatch(path):
+            continue                                     # a .gitkeep is never removed
         parts = path.split("/")
         prefixes = ["/".join(parts[:i]) for i in range(0, len(parts))]
         if any(p in blocked for p in prefixes):
