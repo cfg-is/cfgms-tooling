@@ -58,6 +58,7 @@ def pr_out(pr):
     d = dict(pr)
     d["headRefOid"] = head_oid(pr["headRefName"])
     d.setdefault("reviews", [])
+    d.setdefault("statusCheckRollup", [])
     d.setdefault("isCrossRepository", False)
     return d
 
@@ -149,6 +150,9 @@ def main():
         print(json.dumps(rows))
         return 0
     if argv[:2] == ["pr", "view"]:
+        if fail == "pr-view-rollup" and "statusCheckRollup" in argv:
+            print("HTTP 502: Bad Gateway", file=sys.stderr)
+            return 1
         n = int(argv[2])
         for p in s["prs"]:
             if p["number"] == n:
@@ -238,8 +242,12 @@ def main():
         return 0
     if argv[:2] == ["issue", "comment"]:
         return 0
+    if argv[:2] == ["pr", "checks"] and "--json" in argv:
+        # The host's gh (2.45) has no `pr checks --json`; behave like it so a
+        # caller that depends on the flag fails here as it does there.
+        print("unknown flag: --json", file=sys.stderr)
+        return 1
     if argv[:2] == ["pr", "checks"]:
-        print("[]")
         return 0
     return 0
 
