@@ -114,9 +114,38 @@ class OwnerStart(unittest.TestCase):
         self.assertEqual(self.by([7], board), {7: ("hold", "no_project_item")})
 
     def test_entries_are_sorted_by_epic_number_and_the_first_gets_the_place(self):
-        recs = self.recs([9, 7, 8], _board(ready=[7, 8, 9]))
+        recs = self.recs([9, 7, 8], _board(ready=[7, 8, 9]), limit=1)
         self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
                          [(7, "start", "ready"), (8, "hold", "owner_limit"), (9, "hold", "owner_limit")])
+
+    def test_no_limit_starts_every_ready_epic_also_while_an_owner_runs(self):
+        self.make_run(5)                                 # an owner runs now
+        recs = self.recs([8, 7], _board(ready=[7, 8]))
+        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
+                         [(7, "start", "ready"), (8, "start", "ready")])
+
+    def test_an_invalid_limit_holds_every_start(self):
+        recs = self.recs([7, 8], _board(ready=[7], drafts=[8]), limit=self.pf.OWNER_LIMIT_INVALID)
+        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
+                         [(7, "hold", "owner_limit_invalid"), (8, "hold", "not_ready")])
+
+    def test_free_launch_slots_bound_the_starts(self):
+        recs = self.recs([9, 7, 8], _board(ready=[7, 8, 9]), free_slots=1)
+        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
+                         [(7, "start", "ready"), (8, "hold", "resources"), (9, "hold", "resources")])
+        self.assertEqual(self.by([7], _board(ready=[7]), free_slots=0), {7: ("hold", "resources")})
+
+    def test_no_capacity_data_holds_nothing_for_resources(self):
+        recs = self.recs([7, 8, 9], _board(ready=[7, 8, 9]), free_slots=None)
+        self.assertEqual([r["action"] for r in recs], ["start", "start", "start"])
+
+    def test_free_slots_from_the_capacity_snapshot(self):
+        f = self.pf.capacity_free_slots
+        self.assertEqual(f({"available": True, "free_slots": 2, "raw_free_slots": 3}), 2)
+        self.assertEqual(f({"available": False, "free_slots": 0}), 0)
+        for cap in (None, {}, {"available": None}, {"free_slots": "2"}, {"free_slots": -1},
+                    {"free_slots": True}):
+            self.assertIsNone(f(cap), cap)
 
     def test_the_limit_counts_the_starts_given_in_this_list(self):
         recs = self.recs([7, 8, 9], _board(ready=[7, 8, 9]), limit=2)
@@ -133,14 +162,15 @@ class OwnerStart(unittest.TestCase):
                 shutil.rmtree(self.base, ignore_errors=True)
                 self.make_run(5, **kw)
                 self.assertEqual({r["status"] for r in self.rows()}, {status})
-                self.assertEqual(self.by([7], _board(ready=[7])), {7: ("hold", "owner_limit")})
+                self.assertEqual(self.by([7], _board(ready=[7]), limit=1), {7: ("hold", "owner_limit")})
                 self.assertEqual(self.by([7], _board(ready=[7]), limit=2), {7: ("start", "ready")})
 
     def test_live_and_hung_rows_take_a_place(self):
         for status in ("live", "hung"):
             with self.subTest(status=status):
                 rows = [{"mode": "epic", "key": "epic-5", "status": status, "created": 1}]
-                recs = self.pf.compute_owner_start_recommendations([_epic(7)], _board(ready=[7]), rows, [])
+                recs = self.pf.compute_owner_start_recommendations([_epic(7)], _board(ready=[7]), rows, [],
+                                                                   limit=1)
                 self.assertEqual((recs[0]["action"], recs[0]["reason"]), ("hold", "owner_limit"))
 
     def test_a_run_that_ended_takes_no_place(self):
@@ -150,9 +180,11 @@ class OwnerStart(unittest.TestCase):
 
     def test_an_unexpired_epic_lease_takes_a_place(self):
         board = _board(ready=[7])
-        self.assertEqual(self.by([7], board, [("epic-5", "other-host", False)]), {7: ("hold", "owner_limit")})
-        self.assertEqual(self.by([7], board, [("epic-5", "other-host", True)]), {7: ("start", "ready")})
-        self.assertEqual(self.by([7], board, [("epic-decompose-5", "h", False), ("story-5", "h", False)]),
+        self.assertEqual(self.by([7], board, [("epic-5", "other-host", False)], limit=1),
+                         {7: ("hold", "owner_limit")})
+        self.assertEqual(self.by([7], board, [("epic-5", "other-host", True)], limit=1), {7: ("start", "ready")})
+        self.assertEqual(self.by([7], board, [("epic-decompose-5", "h", False), ("story-5", "h", False)],
+                                 limit=1),
                          {7: ("start", "ready")})
 
     def test_a_run_and_its_own_lease_are_one_place(self):
@@ -169,12 +201,14 @@ class OwnerStart(unittest.TestCase):
 
     def test_the_limit_from_the_environment(self):
         limit = self.pf.owner_run_limit
-        self.assertEqual(limit({}), 1)
+        self.assertIsNone(limit({}))                         # not set: no limit
+        self.assertIsNone(limit({"CFGMS_OWNER_MAX_RUNS": ""}))
+        self.assertIsNone(limit({"CFGMS_OWNER_MAX_RUNS": "  "}))
         self.assertEqual(limit({"CFGMS_OWNER_MAX_RUNS": "3"}), 3)
         self.assertEqual(limit({"CFGMS_OWNER_MAX_RUNS": " 2 "}), 2)
         self.assertEqual(limit({"CFGMS_OWNER_MAX_RUNS": "0"}), 0)
-        for bad in ("", "many", "1.5", "-1"):
-            self.assertEqual(limit({"CFGMS_OWNER_MAX_RUNS": bad}), 1, bad)
+        for bad in ("many", "1.5", "-1", "+1", "\u0663"):
+            self.assertEqual(limit({"CFGMS_OWNER_MAX_RUNS": bad}), self.pf.OWNER_LIMIT_INVALID, bad)
 
     def test_a_limit_of_zero_starts_nothing(self):
         self.assertEqual(self.by([7], _board(ready=[7]), limit=0), {7: ("hold", "owner_limit")})
@@ -192,7 +226,7 @@ class OwnerStart(unittest.TestCase):
         out = {"epics_undecomposed": [_epic(7), _epic(8)]}
         self.pf.apply_owner_run_epics(out, self.rows(), [])
         recs = self.pf.compute_owner_start_recommendations(
-            out["epics_undecomposed"], _board(ready=[7, 8]), self.rows(), [])
+            out["epics_undecomposed"], _board(ready=[7, 8]), self.rows(), [], limit=1)
         self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
                          [(8, "hold", "owner_limit")])
 
@@ -287,12 +321,14 @@ class OwnerStartWiring(unittest.TestCase):
         self.assertEqual((lease_rows, recs), (None, [(7, "hold", "degraded")]))
 
     def test_a_lease_of_another_host_takes_the_place(self):
+        os.environ["CFGMS_OWNER_MAX_RUNS"] = "1"
         self.refs.write_text('[{"ref": "refs/cfgms-lease/epic-5", "object": {"sha": "abc"}}]')
         out, recs, reasons, lease_rows = self.apply()
         self.assertEqual(lease_rows, [("epic-5", "other-host", False)])
         self.assertEqual((recs, reasons), ([(7, "hold", "owner_limit")], []))
 
     def test_a_run_on_this_host_takes_the_place_and_its_epic_leaves_the_list(self):
+        os.environ["CFGMS_OWNER_MAX_RUNS"] = "1"
         self.make_run("epic-5-a", 5)
         out, recs, reasons, _ = self.apply(epics=(5, 7), ready=(5, 7))
         self.assertEqual([e["number"] for e in out["epics_owner_run"]], [5])
@@ -322,6 +358,30 @@ class OwnerStartWiring(unittest.TestCase):
     def test_a_broken_develop_holds_the_epic(self):
         out, recs, reasons, _ = self.apply(code_health={"ok": False, "checks": {}})
         self.assertEqual(recs, [(7, "hold", "develop_broken")])
+
+    def test_no_limit_in_the_environment_starts_two_epics_while_an_owner_runs(self):
+        self.make_run("epic-5-a", 5)
+        out, recs, reasons, _ = self.apply(epics=(5, 7, 8), ready=(5, 7, 8))
+        self.assertEqual(recs, [(7, "start", "ready"), (8, "start", "ready")])
+
+    def test_a_limit_of_zero_or_an_invalid_limit_in_the_environment(self):
+        for value, reason in (("0", "owner_limit"), ("one", "owner_limit_invalid"),
+                              ("-1", "owner_limit_invalid")):
+            with self.subTest(value=value):
+                os.environ["CFGMS_OWNER_MAX_RUNS"] = value
+                out, recs, reasons, _ = self.apply(epics=(7, 8), ready=(7, 8))
+                self.assertEqual(recs, [(7, "hold", reason), (8, "hold", reason)])
+
+    def test_the_capacity_snapshot_bounds_the_starts(self):
+        out = {"epics_undecomposed": [_epic(n) for n in (7, 8, 9)], "pipeline_state": _board(ready=(7, 8, 9)),
+               "capacity": {"available": True, "free_slots": 1, "raw_free_slots": 2}}
+        self.pf.apply_owner_epics(out, {"ok": True}, [])
+        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in out["owner_start_recommendations"]],
+                         [(7, "start", "ready"), (8, "hold", "resources"), (9, "hold", "resources")])
+        out = {"epics_undecomposed": [_epic(n) for n in (7, 8, 9)], "pipeline_state": _board(ready=(7, 8, 9)),
+               "capacity": {"available": None}}           # no capacity data: not held for it
+        self.pf.apply_owner_epics(out, {"ok": True}, [])
+        self.assertEqual([r["action"] for r in out["owner_start_recommendations"]], ["start"] * 3)
 
     def test_the_limit_is_read_from_the_environment(self):
         os.environ["CFGMS_OWNER_MAX_RUNS"] = "2"

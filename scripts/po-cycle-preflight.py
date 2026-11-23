@@ -1131,7 +1131,9 @@ def live_story_lease_item_ids(rows=False):
     return live
 
 
-OWNER_MAX_RUNS_DEFAULT = 1
+#: owner_run_limit() for a CFGMS_OWNER_MAX_RUNS that is set and not a whole
+#: number of 0 or more: every start is held (a typo must not remove the brake).
+OWNER_LIMIT_INVALID = "invalid"
 #: A run with one of these statuses has an owner now (runindex.UNFINISHED).
 _OWNER_RUN_ACTIVE = ("live", "hung", "starting", "crashed")
 
@@ -1220,15 +1222,23 @@ def blocked_issue_numbers(blocked_items):
 
 
 def owner_run_limit(environ=None):
-    """How many epics owners may hold at one time: CFGMS_OWNER_MAX_RUNS, a
-    whole number of 0 or more (0 starts no owner). Not set, or a value that
-    is not such a number: 1."""
+    """How many epics owners may hold at one time, from CFGMS_OWNER_MAX_RUNS.
+    Not set or empty: None, no limit (the host resource gate of
+    `po-act.sh dispatch --epic` decides). A whole number of 0 or more: that
+    number (0 starts no owner). Any other value: OWNER_LIMIT_INVALID."""
     raw = (os.environ if environ is None else environ).get("CFGMS_OWNER_MAX_RUNS")
-    try:
-        n = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return OWNER_MAX_RUNS_DEFAULT
-    return n if n >= 0 else OWNER_MAX_RUNS_DEFAULT
+    if raw is None or not str(raw).strip():
+        return None
+    raw = str(raw).strip()
+    return int(raw) if raw.isdecimal() and raw.isascii() else OWNER_LIMIT_INVALID
+
+
+def capacity_free_slots(capacity):
+    """The free launch slots of the preflight's capacity snapshot
+    (`agent-dispatch.sh capacity --json`: `free_slots`, with the review
+    reserve already taken off), or None when the snapshot has no number."""
+    n = (capacity or {}).get("free_slots")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
 
 
 def dispatch_blocked(code_health):
@@ -1239,7 +1249,7 @@ def dispatch_blocked(code_health):
 
 def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows, *,
                                         develop_broken=False, holders_unknown=False,
-                                        limit=OWNER_MAX_RUNS_DEFAULT):
+                                        limit=None, free_slots=None):
     """One entry for each epic in `epics` (owner_start_candidates: open, no
     sub-issues, no active owner), sorted by number: {number, title, item_id,
     action, reason}. A `start` entry also has `command`; a `not_ready` entry
@@ -1258,10 +1268,18 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
     - hold `develop_broken`: the code-health gate blocks dispatch.
     - hold `degraded`: the run index or the lease list could not be read, so
       the number of epics that owners hold is not known.
-    - hold `owner_limit`: the epics that owners hold now, plus the `start`
-      entries before this one, are at or above `limit`. Held now: an
-      epic-mode run on this host that is live, hung, starting or crashed, or
-      an unexpired `epic-<N>` lease. A run that ended holds no place.
+    - hold `owner_limit_invalid`: `limit` is OWNER_LIMIT_INVALID
+      (CFGMS_OWNER_MAX_RUNS is set to a value that is not a whole number of
+      0 or more).
+    - hold `owner_limit`: `limit` is a number, and the epics that owners hold
+      now, plus the `start` entries before this one, are at or above it.
+      Held now: an epic-mode run on this host that is live, hung, starting
+      or crashed, or an unexpired `epic-<N>` lease. A run that ended holds
+      no place. `limit` None: no limit.
+    - hold `resources`: the `start` entries before this one use all
+      `free_slots` (the free launch slots of the host). A planning hint:
+      `po-act.sh dispatch --epic` asks the host gate again. `free_slots`
+      None (no capacity data): not held for this.
     - else `start` (reason `ready`), with the launch command.
     """
     by_num = {}
@@ -1271,6 +1289,7 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
             if item.get("number") is not None and item.get("item_id"):
                 by_num[item["number"]] = (status, item["item_id"])   # Ready is last: it wins
     in_use = len(active_owner_epics(runs, lease_rows))
+    starts = 0
     recs = []
     for e in sorted(epics or [], key=lambda e: e.get("number") or 0):
         n = e.get("number")
@@ -1284,10 +1303,15 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
             rec["reason"] = "develop_broken"
         elif holders_unknown:
             rec["reason"] = "degraded"
-        elif in_use >= limit:
+        elif limit == OWNER_LIMIT_INVALID:
+            rec["reason"] = "owner_limit_invalid"
+        elif limit is not None and in_use >= limit:
             rec["reason"] = "owner_limit"
+        elif free_slots is not None and starts >= free_slots:
+            rec["reason"] = "resources"
         else:
             in_use += 1
+            starts += 1
             rec.update(action="start", reason="ready",
                        command=f"po-act.sh dispatch --epic {n} --item-id {item_id}")
         recs.append(rec)
@@ -1342,7 +1366,8 @@ def apply_owner_epics(out, code_health, degraded_reasons):
         owner_start_candidates(out, runs, lease_rows), out.get("pipeline_state"), runs, lease_rows,
         develop_broken=dispatch_blocked(code_health),
         holders_unknown=holders_unknown,
-        limit=owner_run_limit())
+        limit=owner_run_limit(),
+        free_slots=capacity_free_slots(out.get("capacity")))
     out["owner_attention"] = compute_owner_attention(out, runs, lease_rows, holders_unknown)
     return lease_rows, runs, (None if holders_unknown else active_owner_epics(runs, lease_rows))
 
