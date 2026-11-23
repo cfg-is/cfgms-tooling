@@ -965,6 +965,64 @@ exit 9''' % leak)
                             "--work-tree", str(self.work), "--state-dir", str(self.root)], capture_output=True)
         self.assertEqual((r.returncode, r.stdout.decode().strip()), (5, "STATE_DIR_IN_FOLDER"))   # folder in state
 
+    # --- .gitkeep ----------------------------------------------------------------
+
+    def tracked_gitkeeps(self):
+        """The real notes repository: empty .gitkeep files from its first commit."""
+        for rel in ("areas/x/memory/.gitkeep", "held/.gitkeep"):
+            p = self.work / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"")
+            _git("--git-dir", str(self.gitdir), "--work-tree", str(self.work), "add", "-f", rel, cwd=self.root)
+        _git("--git-dir", str(self.gitdir), "--work-tree", str(self.work), "commit", "-q", "-m", "keep",
+             cwd=self.root)
+
+    def test_an_empty_tracked_gitkeep_is_ignored(self):
+        self.tracked_gitkeeps()
+        self.note("areas/x/memory/n.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertEqual(self.repo.result["refused"], 0)
+        self.assertEqual(self.alerts(), [])
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)            # no commit
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 0, "pending": 0,
+                                            "pending_calls": 0})
+        self.assertTrue({"areas/x/memory/.gitkeep", "held/.gitkeep"} <= self.head_files())
+
+    def test_a_new_empty_gitkeep_is_not_committed(self):
+        (self.work / "areas" / "new").mkdir(parents=True)
+        (self.work / "areas" / "new" / ".gitkeep").write_bytes(b"")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+        self.assertEqual((self.repo.result["refused"], self.alerts()), (0, []))
+        self.assertNotIn("areas/new/.gitkeep", self.head_files())
+
+    def test_a_gitkeep_with_content_a_link_or_executable_is_refused(self):
+        for kind in ("content", "link", "exec", "outside", "fifo"):
+            with self.subTest(kind=kind):
+                self.tearDown()
+                self.setUp()
+                rel = "notes/.gitkeep" if kind == "outside" else "areas/k/.gitkeep"
+                p = self.work / rel
+                p.parent.mkdir(parents=True)
+                if kind == "link":
+                    os.symlink(self.root / "nowhere", p)
+                elif kind == "fifo":
+                    os.mkfifo(p)                          # size 0, but not a regular file
+                else:
+                    p.write_bytes(b"" if kind in ("exec", "outside") else b"hidden text\n")
+                    if kind == "exec":
+                        p.chmod(0o755)
+                self.ms.cycle(self.repo, push=False)
+                self.assertEqual(self.repo.result["refused"], 1)
+                self.assertNotIn(rel, self.head_files())
+
+    def test_a_tracked_gitkeep_that_is_gone_stays_on_the_remote(self):
+        self.tracked_gitkeeps()
+        os.unlink(self.work / "held" / ".gitkeep")
+        shutil.rmtree(self.work / "areas" / "x")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)            # no removal commit
+        self.assertTrue({"areas/x/memory/.gitkeep", "held/.gitkeep"} <= self.head_files())
+        self.assertEqual(self.repo.result["refused"], 0)
+
     # --- a bounded batch ----------------------------------------------------------
 
     def small_batch(self, n):

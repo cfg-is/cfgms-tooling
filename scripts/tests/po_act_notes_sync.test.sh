@@ -505,6 +505,35 @@ for n in 2 3; do
   esac
 done
 
+printf '\n== a folder shaped like the real one: empty .gitkeep files are not refusals ==\n'
+ORIGIN5="$TMP/origin5.git"
+tgit init -q --bare "$ORIGIN5"
+tgit clone -q "$ORIGIN5" "$TMP/seed5" 2>/dev/null
+mkdir -p "$TMP/seed5/areas/x/memory" "$TMP/seed5/held"
+echo "shared notes" > "$TMP/seed5/README.md"
+: > "$TMP/seed5/areas/x/memory/.gitkeep"
+: > "$TMP/seed5/held/.gitkeep"
+printf -- '---\nauthor: a\n---\nfirst\n' > "$TMP/seed5/areas/x/memory/one.md"
+tgit -C "$TMP/seed5" add -A
+tgit -C "$TMP/seed5" commit -q -m init
+tgit -C "$TMP/seed5" push -q origin HEAD:main 2>/dev/null
+mkdir -p "$TMP/mem5"
+cp -a "$TMP/seed5/." "$TMP/mem5/"
+rm -rf "$TMP/mem5/.git"
+s5=(CFGMS_MEMORY_DIR="$TMP/mem5" CFGMS_MEMORY_GIT_DIR="$TMP/state5/memory-git"
+    CFGMS_MEMORY_STATE_DIR="$TMP/state5/memory-sync" CFGMS_MEMORY_REMOTE="$ORIGIN5")
+setup "${s5[@]}"
+check "setup of the real-shaped folder -> OK" "${rc}:$(last | cut -d: -f1)" "0:NOTES_SETUP_OK"
+printf -- '---\nauthor: a\n---\nsecond\n' > "$TMP/mem5/areas/x/memory/two.md"
+run "${s5[@]}"
+check "first call: the new note saved, the .gitkeep files are not refused" "$(last)" \
+  "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0"
+run "${s5[@]}"
+check "next call: OK, nothing to do" "$(last)" \
+  "NOTES_SYNC_OK:committed=0:unpushed=0:behind=0:alerts=0:refused=0:pending=0"
+check "the .gitkeep files are still on origin" \
+  "$(git --git-dir "$ORIGIN5" cat-file -e main:held/.gitkeep && git --git-dir "$ORIGIN5" cat-file -e main:areas/x/memory/.gitkeep && echo both)" "both"
+
 printf '\n== push failure ==\n'
 mv "$ORIGIN" "$TMP/origin.away"
 note areas/build/second.md "written while origin is away"
