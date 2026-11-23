@@ -195,13 +195,17 @@ def quarantine_memory_git(memory_dir):
     `memory-sync.py quarantine-top-git` (the one helper that the launch and
     resume gates of po-act.sh use too). Returns (exit code, line): 0 moved
     or nothing there, 3 no trusted git directory of the notes (notes-setup
-    not done), 4 the entry cannot be moved. The git directory and the state
+    not done), 4 the entry cannot be moved, 5 the state directory of
+    notes-sync overlaps the memory folder. The git directory and the state
     directory are the ones that notes-sync uses."""
-    if not os.path.lexists(os.path.join(memory_dir, ".git")):
-        return 0, "NONE"
     home = os.path.expanduser("~")
     git_dir = os.environ.get("CFGMS_MEMORY_GIT_DIR") or os.path.join(home, ".local/state/cfgms/memory-git")
     state = os.environ.get("CFGMS_MEMORY_STATE_DIR") or os.path.join(home, ".local/state/cfgms/memory-sync")
+    sd, md = os.path.realpath(state), os.path.realpath(memory_dir)
+    if sd == md or sd.startswith(md + os.sep) or md.startswith(sd + os.sep):
+        return 5, "STATE_DIR_IN_FOLDER"          # agents would write the host's records
+    if not os.path.lexists(os.path.join(memory_dir, ".git")):
+        return 0, "NONE"
     try:
         r = subprocess.run([sys.executable, str(MEMORY_SYNC), "quarantine-top-git", "--git-dir", git_dir,
                             "--work-tree", memory_dir, "--state-dir", state],
@@ -209,7 +213,7 @@ def quarantine_memory_git(memory_dir):
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 4, f"NOT_MOVABLE:{type(exc).__name__}"
     line = (r.stdout.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
-    if r.returncode not in (0, 3, 4):
+    if r.returncode not in (0, 3, 4, 5):
         err = r.stderr.decode("utf-8", "replace").strip().replace("\n", " | ")
         return 4, f"NOT_MOVABLE:memory-sync.py exited {r.returncode}: {err[-200:]}"
     return r.returncode, line[:300]
@@ -528,6 +532,8 @@ class EpicSupervisor(sup.Supervisor):
         # entry is moved into the quarantine and the run goes on; one owner
         # must not stop the runs of the others.
         qrc, qline = quarantine_memory_git(p["memory_dir"])
+        if qrc == 5:
+            raise sup.Refused("state_dir_in_folder")
         if qrc == 3:
             raise sup.Refused("memory_dir_has_git")
         if qrc != 0:

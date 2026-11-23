@@ -647,12 +647,20 @@ sys.exit(0 if raw >= need else 1)' 2>/dev/null); then
 #   <note prefix>:<label>:memory_git_quarantined (<from> -> <to>). Returns 3,
 #   with a <refuse prefix> line, when there is no trusted git directory
 #   (memory_dir_has_git; the cure is notes-setup) or the entry cannot be
-#   moved (memory_dir_git_not_movable). fsm/epic.py runs the same helper in
-#   PREPARE and when it starts an owner container again.
+#   moved (memory_dir_git_not_movable), and always when the state directory
+#   of notes-sync overlaps the memory folder (state_dir_in_folder). fsm/epic.py
+#   runs the same helper in PREPARE and when it starts an owner container
+#   again.
 _memory_git_gate() {
   local label="$1" refuse="$2" note="$3" mem="$4" out rc=0
-  [[ -e "${mem}/.git" || -L "${mem}/.git" ]] || return 0
   _notes_paths
+  # The state directory of notes-sync must not overlap the memory folder
+  # (agents would write the host's records): refused with or without a .git.
+  if _path_inside "$notes_state" "$mem" || _path_inside "$mem" "$notes_state"; then
+    echo "${refuse}:${label}:state_dir_in_folder (state directory ${notes_state}, memory folder ${mem})"
+    return 3
+  fi
+  [[ -e "${mem}/.git" || -L "${mem}/.git" ]] || return 0
   out=$(python3 "$(cd "$(dirname "$0")" && pwd)/memory-sync.py" quarantine-top-git \
         --git-dir "$notes_git" --work-tree "$mem" --state-dir "$notes_state" 2>/dev/null) || rc=$?
   case "$rc" in
@@ -661,6 +669,9 @@ _memory_git_gate() {
       return 0 ;;
     3)
       echo "${refuse}:${label}:memory_dir_has_git (${mem}/.git; no git directory of the notes at ${notes_git}; run: po-act.sh notes-setup)"
+      return 3 ;;
+    5)
+      echo "${refuse}:${label}:state_dir_in_folder (state directory ${notes_state}, memory folder ${mem})"
       return 3 ;;
     *)
       echo "${refuse}:${label}:memory_dir_git_not_movable (${mem}/.git; remove it by hand)"
@@ -2013,6 +2024,8 @@ EOF
     #   NOTES_SYNC_SKIPPED:already_running          exit 0  another memory-sync.py holds
     #                                               the lock (its exit code 75): its
     #                                               run does the work
+    #   NOTES_SYNC_REFUSED:state_dir_in_folder (...)  exit 3  the state directory and
+    #                                               the folder overlap (one in the other)
     #   NOTES_SYNC_REFUSED:not_detached (<what>)    exit 3  there is no usable git
     #                                               directory outside the folder. The
     #                                               text names `po-act.sh notes-setup`.
@@ -2036,13 +2049,16 @@ EOF
     #                                               (pending_calls), the fetch
     #                                               failed, or the NOTE line was
     #                                               printed
-    # pending: changed notes and removals that wait for the next call. One
-    # call handles at most memory-sync.py's BATCH_SIZE (500) of them, taken
-    # round-robin over the groups of the paths (areas/<x>, held/<x>), so one
-    # owner with very many changes gets its share and the others still go
-    # through. pending above 0 alone is normal progress (OK); from the 3rd
-    # call in a row that ends with pending above 0 the line is ATTENTION and
-    # ends with pending_calls=<n>.
+    # pending: notes not read, or read and changed but not committed, and
+    # removals not committed in this call; they wait for the next call. One
+    # call reads at most memory-sync.py's READ_BUDGET (64 MiB) and commits at
+    # most BATCH_SIZE (500), both in a fair order: the groups of the paths
+    # (areas/<x>, held/<x>) that wait since the oldest call first, at most 100
+    # new groups a call, one path of each group in turn. pending above 0
+    # alone is normal progress (OK); from the 3rd call in a row that ends with
+    # pending above 0 the line is ATTENTION and ends with pending_calls=<n>,
+    # and one alert (budget_exhausted or batch_full) names the groups that
+    # used the most of that call.
     #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
     #   NOTES_SYNC_FAILED:no_result                 exit 1  it ended with 0 and wrote
     #                                               no usable result file
@@ -2073,6 +2089,12 @@ EOF
       exit 0
     fi
     notes_git_do() { env -u GIT_WORK_TREE -u GIT_INDEX_FILE git --git-dir "$notes_git" "$@" 2>/dev/null; }
+    # The state directory holds the host's records (cache, cursor, alerts,
+    # quarantine): agents must not write it, so it must not overlap the folder.
+    if _path_inside "$notes_state" "$notes_dir" || _path_inside "$notes_dir" "$notes_state"; then
+      echo "NOTES_SYNC_REFUSED:state_dir_in_folder (state directory ${notes_state}, notes folder ${notes_dir}: set CFGMS_MEMORY_STATE_DIR to a place outside it)"
+      exit 3
+    fi
     if _path_inside "$notes_git" "$notes_dir"; then
       echo "NOTES_SYNC_REFUSED:not_detached (the git directory ${notes_git} is inside the notes folder ${notes_dir}: set CFGMS_MEMORY_GIT_DIR to a place outside it, then run once: po-act.sh notes-setup)"
       exit 3
@@ -2175,8 +2197,10 @@ print(*v)' 2>/dev/null)"; then
     #   NOTES_SETUP_REFUSED:bad_argument (<arg>)      exit 3
     #   NOTES_SETUP_REFUSED:no_memory_dir (<path>)    exit 3
     #   NOTES_SETUP_REFUSED:git_dir_exists (<path>)   exit 3  set up before; nothing changed
-    #   NOTES_SETUP_REFUSED:git_dir_in_folder (...)   exit 3  the git or state directory
-    #                                                 would be inside the folder
+    #   NOTES_SETUP_REFUSED:state_dir_in_folder (...) exit 3  the state directory and the
+    #                                                 folder overlap (one in the other)
+    #   NOTES_SETUP_REFUSED:git_dir_in_folder (...)   exit 3  the git directory would be
+    #                                                 inside the folder
     #   NOTES_SETUP_REFUSED:folder_lacks_remote_files (<n> files; first: <path>)
     #                                                 exit 3  the first notes-sync would
     #                                                 remove them from the remote. Nothing
@@ -2206,8 +2230,12 @@ print(*v)' 2>/dev/null)"; then
       echo "NOTES_SETUP_REFUSED:no_memory_dir (${notes_dir})"
       exit 3
     fi
-    if _path_inside "$notes_git" "$notes_dir" || _path_inside "$notes_state" "$notes_dir"; then
-      echo "NOTES_SETUP_REFUSED:git_dir_in_folder (git directory ${notes_git}, state directory ${notes_state}, notes folder ${notes_dir})"
+    if _path_inside "$notes_state" "$notes_dir" || _path_inside "$notes_dir" "$notes_state"; then
+      echo "NOTES_SETUP_REFUSED:state_dir_in_folder (state directory ${notes_state}, notes folder ${notes_dir})"
+      exit 3
+    fi
+    if _path_inside "$notes_git" "$notes_dir"; then
+      echo "NOTES_SETUP_REFUSED:git_dir_in_folder (git directory ${notes_git}, notes folder ${notes_dir})"
       exit 3
     fi
     if [[ -e "$notes_git" || -L "$notes_git" ]]; then

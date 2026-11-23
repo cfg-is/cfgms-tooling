@@ -136,6 +136,15 @@ printf '* filter=x\n' > "$MEM/.gitattributes"
 note areas/build/new.md "a note that origin does not have"
 pwned() { ls "$TMP" | grep -c '^PWNED' || true; }
 
+printf '\n== notes-sync: a state directory that overlaps the folder is refused ==\n'
+run CFGMS_MEMORY_GIT_DIR="$GITDIR" CFGMS_MEMORY_STATE_DIR="$MEM/areas/st"
+check "state dir inside the folder -> REFUSED, exits 3" "${rc}:$(last | cut -d' ' -f1)" \
+  "3:NOTES_SYNC_REFUSED:state_dir_in_folder"
+check "nothing was written into the folder" "$([[ -e "$MEM/areas/st" ]] && echo written || echo none)" "none"
+run CFGMS_MEMORY_GIT_DIR="$GITDIR" CFGMS_MEMORY_STATE_DIR="$TMP"
+check "the folder inside the state dir -> REFUSED, exits 3" "${rc}:$(last | cut -d' ' -f1)" \
+  "3:NOTES_SYNC_REFUSED:state_dir_in_folder"
+
 printf '\n== notes-sync with no git directory: refused, and it never names detach ==\n'
 mkdir "$TMP/plain"
 run CFGMS_MEMORY_DIR="$TMP/plain"
@@ -166,7 +175,10 @@ check "a git directory inside the folder -> REFUSED, exits 3" "${rc}:$(last | cu
   "3:NOTES_SETUP_REFUSED:git_dir_in_folder"
 setup CFGMS_MEMORY_GIT_DIR="$GITDIR" CFGMS_MEMORY_STATE_DIR="$MEM/state" CFGMS_MEMORY_REMOTE="$ORIGIN"
 check "a state directory inside the folder -> REFUSED, exits 3" "${rc}:$(last | cut -d' ' -f1)" \
-  "3:NOTES_SETUP_REFUSED:git_dir_in_folder"
+  "3:NOTES_SETUP_REFUSED:state_dir_in_folder"
+setup CFGMS_MEMORY_GIT_DIR="$GITDIR" CFGMS_MEMORY_STATE_DIR="$TMP" CFGMS_MEMORY_REMOTE="$ORIGIN"
+check "the folder inside the state directory -> REFUSED, exits 3" "${rc}:$(last | cut -d' ' -f1)" \
+  "3:NOTES_SETUP_REFUSED:state_dir_in_folder"
 setup "${detached[@]}" CFGMS_MEMORY_REMOTE="$TMP/no-such-remote.git"
 check "a remote that cannot be cloned -> FAILED" "$(last)" "NOTES_SETUP_FAILED:clone (${TMP}/no-such-remote.git)"
 check "clone failure exits 1" "$rc" "1"

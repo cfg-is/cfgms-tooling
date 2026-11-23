@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -42,6 +43,12 @@ def _git(*args, cwd):
 
 class MemorySync(unittest.TestCase):
     def setUp(self):
+        # a time limit for each test: a read that blocks (a FIFO opened
+        # without O_NONBLOCK) fails the test instead of stopping the suite
+        def too_long(signum, frame):
+            raise TimeoutError("the test ran longer than 60 s")
+        signal.signal(signal.SIGALRM, too_long)
+        signal.alarm(60)
         self.ms = _load()
         self.root = Path(tempfile.mkdtemp(prefix="memsync-"))
         self.work = self.root / "memory"
@@ -61,6 +68,7 @@ class MemorySync(unittest.TestCase):
         self.repo = self.ms.Repo(str(self.gitdir), str(self.work), str(self.state))
 
     def tearDown(self):
+        signal.alarm(0)
         os.environ["PATH"] = self.old_path
         for here, dirs, files in os.walk(self.root):       # tests take permissions away
             for d in dirs:
@@ -251,7 +259,7 @@ exit 9''')
     def test_long_path_can_be_quarantined(self):
         rel = "areas/" + "/".join(["d" * 60] * 5) + "/n.md"
         self.note(rel)
-        self.repo.quarantine_file(rel, "secret_test")
+        self.repo.quarantine_file(rel, "secret_test", NOTE.encode())
         self.assertFalse((self.work / rel).exists())
         self.assertEqual(len(list((self.state / "quarantine").iterdir())), 1)
 
@@ -612,7 +620,7 @@ exit 9''')
         for i in range(self.ms.QUARANTINE_MAX_ENTRIES + 10):
             (q / ("git-2026010%02d-x" % i)).mkdir()
         (q / "20260101-secret-kept").write_text("x")                      # a secret file: not touched
-        self.ms.prune_quarantine(str(q))
+        self.ms.prune_quarantine(str(q), "git-", self.ms.QUARANTINE_MAX_ENTRIES, self.ms.QUARANTINE_MAX_BYTES)
         names = sorted(p.name for p in q.iterdir() if p.name.startswith("git-"))
         self.assertEqual(len(names), self.ms.QUARANTINE_MAX_ENTRIES)
         self.assertEqual(names[0], "git-202601010-x")                     # the oldest 10 are gone
@@ -621,7 +629,7 @@ exit 9''')
         big.mkdir()
         with open(big / "f", "wb") as fh:
             fh.truncate(self.ms.QUARANTINE_MAX_BYTES + 1)
-        self.ms.prune_quarantine(str(q))
+        self.ms.prune_quarantine(str(q), "git-", self.ms.QUARANTINE_MAX_ENTRIES, self.ms.QUARANTINE_MAX_BYTES)
         self.assertFalse(big.exists())                                    # alone over the size
 
     # --- fairness and a streak of calls with notes that wait ----------------------
@@ -653,6 +661,9 @@ exit 9''')
         self.assertEqual(got, {names[0]: False, names[1]: False, names[2]: True, names[3]: True})
 
     def test_a_note_that_did_not_change_is_not_read_again(self):
+        saved = self.ms.RACY_NS
+        self.ms.RACY_NS = -10 ** 12                      # no racy window: the cache rule alone
+        self.addCleanup(setattr, self.ms, "RACY_NS", saved)
         for i in range(3):
             self.note("areas/c%d.md" % i)
         reads = []
@@ -684,6 +695,174 @@ exit 9''')
             self.ms.cycle(self.repo, push=False)
             calls.append((self.repo.result["pending"], self.repo.result["pending_calls"]))
         self.assertEqual(calls, [(3, 1), (2, 2), (1, 3), (0, 0)])         # reset when nothing waits
+
+    # --- round 4: fair reads, waiting-longest groups, hardening --------------------
+
+    def patch(self, name, value):
+        saved = getattr(self.ms, name)
+        setattr(self.ms, name, value)
+        self.addCleanup(setattr, self.ms, name, saved)
+
+    def test_a_flooding_owner_does_not_use_the_whole_read_budget(self):
+        """The review's case, smaller: an owner touches its notes before each
+        call so they must be read again; the read budget goes round-robin
+        over the groups, so another owner's note is read and saved on the
+        first call; from the 3rd call one alert names the group."""
+        self.patch("READ_BUDGET", 4000)
+        self.patch("RACY_NS", -10 ** 12)                 # calls follow each other at once here
+        for i in range(16):
+            self.note("areas/00/f%02d.md" % i, "---\nauthor: spam\n---\n" + "x" * 1000)
+        for _ in range(10):                               # all saved
+            self.ms.cycle(self.repo, push=False)
+            if self.repo.result["pending"] == 0:
+                break
+        self.assertEqual(self.repo.result["pending"], 0)
+        shutil.rmtree(self.state / "alerts")
+        (self.state / "alerts").mkdir()
+        self.note("areas/b/x.md", NOTE.replace("owner/epic-7", "bee"))
+        for call in range(3):
+            for i in range(16):
+                p = self.work / "areas" / "00" / ("f%02d.md" % i)
+                p.write_text(p.read_text())               # a new ctime: must be read again
+            self.ms.cycle(self.repo, push=False)
+            if call == 0:
+                self.assertIn("areas/b/x.md", self.head_files())
+        alert = [l for f in (self.state / "alerts").iterdir() if "budget_exhausted" in f.name
+                 for l in f.read_text().splitlines()]
+        self.assertEqual(len(alert), 1)                   # one, from the 3rd call
+        self.assertIn("areas/00", alert[0])
+
+    def test_new_groups_cannot_push_an_old_waiting_group_back(self):
+        """The review's second case, smaller: an owner makes many new groups
+        each call whose names sort before B's. B waits at most until call
+        2: groups that wait come before new ones, and only
+        NEW_GROUPS_PER_CALL new groups are served in a call."""
+        self.small_batch(5)
+        self.patch("NEW_GROUPS_PER_CALL", 2)
+        self.note("areas/zzzz-b/x.md", NOTE.replace("owner/epic-7", "bee"))
+        for call in (1, 2):
+            for i in range(6):
+                self.note("areas/a%d-%02d/n.md" % (call, i), NOTE.replace("owner/epic-7", "spam"))
+            self.ms.cycle(self.repo, push=False)
+        self.assertIn("areas/zzzz-b/x.md", self.head_files())
+
+    def test_the_group_state_keeps_only_groups_that_wait(self):
+        self.small_batch(1)
+        self.note("areas/g1/a.md")
+        self.note("areas/g2/a.md")
+        self.ms.cycle(self.repo, push=False)
+        state = json.loads((self.state / "groups.json").read_text())
+        self.assertEqual(len(state["waiting"]), 1)
+        self.ms.cycle(self.repo, push=False)
+        state = json.loads((self.state / "groups.json").read_text())
+        self.assertEqual(state["waiting"], {})
+        self.assertEqual(state["cursor"], {})
+
+    def test_the_read_budget_leaves_the_rest_waiting(self):
+        self.patch("READ_BUDGET", 2500)
+        for i in range(3):
+            self.note("areas/r%d/n.md" % i, "---\nauthor: a\n---\n" + "y" * 1000)
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(self.repo.result["pending"], 1)   # README (small) and 2 notes fit, 1 waits
+
+    def test_a_file_that_grows_after_fstat_and_before_the_read(self):
+        self.note("areas/grow.md")
+        self.note("areas/other.md")
+        self.ms._after_fstat = (lambda p: (self.work / p).write_bytes(b"x" * (self.ms.MAX_FILE_BYTES + 10))
+                                if p == "areas/grow.md" else None)
+        self.addCleanup(setattr, self.ms, "_after_fstat", None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertNotIn("areas/grow.md", self.head_files())
+        self.assertEqual(self.alerts(), ["refused_too_large"])
+
+    def test_a_folder_swapped_for_a_link_before_the_read_is_not_followed(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "x.md").write_text("---\nauthor: a\n---\nHOST SECRET\n")
+        self.note("areas/d/x.md")
+        self.note("areas/other.md")
+
+        def swap(p):
+            if p == "areas/d/x.md":
+                shutil.rmtree(self.work / "areas" / "d")
+                os.symlink(outside, self.work / "areas" / "d")
+        self.set_hook(swap)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertNotIn("areas/d/x.md", self.head_files())
+        self.assertNotIn(b"HOST SECRET", self.g("log", "-p", "--all"))
+        self.assertEqual(self.alerts(), ["refused_read_failed"])
+
+    def test_a_note_made_executable_before_the_read(self):
+        self.note("areas/x.md")
+        self.note("areas/other.md")
+        self.set_hook(lambda p: os.chmod(self.work / p, 0o755) if p == "areas/x.md" else None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertNotIn("areas/x.md", self.head_files())
+        self.assertEqual(self.alerts(), ["refused_not_a_plain_file"])
+
+    def test_a_cache_entry_from_the_same_time_step_is_not_trusted(self):
+        """A note written right after it was read can keep the same times on
+        a file system with coarse times: such an entry is read again."""
+        self.note("areas/x.md")
+        self.ms.cycle(self.repo, push=False)
+        reads = []
+        self.set_hook(reads.append)
+        self.ms.cycle(self.repo, push=False)              # within RACY_NS of the read
+        self.assertIn("areas/x.md", reads)
+
+    def test_a_broken_state_file_is_taken_as_empty_with_one_alert(self):
+        self.note("areas/x.md")
+        self.ms.cycle(self.repo, push=False)
+        for name, text in (("groups.json", '{"call": "x"}'), ("statcache.json", "not json"),
+                           ("pending-calls.json", "[1]"), ("refused.json", '{"a": 1}')):
+            (self.state / name).write_text(text)
+        self.note("areas/y.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertEqual(sorted(a for a in self.alerts() if a == "state_file_reset"), ["state_file_reset"] * 4)
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(len([a for a in self.alerts() if a == "state_file_reset"]), 4)   # no new ones
+
+    def test_alerts_of_one_call_are_capped(self):
+        (self.work / "areas").mkdir()
+        for i in range(self.ms.ALERT_DETAIL_LIMIT + 10):
+            (self.work / "areas" / ("r%03d.sh" % i)).write_text("x")
+        self.ms.cycle(self.repo, push=False)
+        kinds = self.alerts()
+        self.assertEqual(kinds.count("refused_path_not_allowed"), self.ms.ALERT_DETAIL_LIMIT)
+        self.assertEqual(kinds.count("alerts_suppressed"), 1)
+        self.assertEqual(self.repo.result["alerts"], self.ms.ALERT_DETAIL_LIMIT + 10)
+
+    def test_the_secret_quarantine_keeps_the_bytes_that_were_scanned_and_is_bounded(self):
+        self.patch("QUARANTINE_SECRET_MAX_ENTRIES", 2)
+        leak = self.note("areas/leak.md")
+        # the scanner stand-in changes the live file while it scans
+        self.set_scanners(gitleaks='''
+src=""; rep=""
+while [ $# -gt 0 ]; do
+  case "$1" in --source) src="$2"; shift ;; --report-path) rep="$2"; shift ;; esac
+  shift
+done
+echo LATER >> "%s"
+printf '[{"File": "%%sareas/leak.md"}]' "$src" > "$rep"
+exit 9''' % leak)
+        self.ms.cycle(self.repo, push=False)
+        (kept,) = [p for p in (self.state / "quarantine").iterdir() if p.name.startswith("secret-")]
+        self.assertEqual(kept.read_text(), NOTE)                   # not the later bytes
+        q = self.state / "quarantine"
+        for i in range(4):
+            (q / ("secret-2020010%d-old" % i)).write_text("x")
+        self.ms.prune_quarantine(str(q), "secret-", 2, 10 ** 9)
+        self.assertEqual(len([p for p in q.iterdir() if p.name.startswith("secret-")]), 2)
+
+    def test_a_state_dir_that_overlaps_the_folder_is_refused(self):
+        inside = self.work / "st"
+        r = subprocess.run(["python3", SYNC_PATH, "once", "--git-dir", str(self.gitdir), "--work-tree",
+                            str(self.work), "--state-dir", str(inside), "--no-push"], capture_output=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(b"state directory", r.stderr)
+        r = subprocess.run(["python3", SYNC_PATH, "quarantine-top-git", "--git-dir", str(self.gitdir),
+                            "--work-tree", str(self.work), "--state-dir", str(self.root)], capture_output=True)
+        self.assertEqual((r.returncode, r.stdout.decode().strip()), (5, "STATE_DIR_IN_FOLDER"))   # folder in state
 
     # --- a bounded batch ----------------------------------------------------------
 

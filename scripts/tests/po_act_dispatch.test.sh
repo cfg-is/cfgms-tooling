@@ -290,6 +290,14 @@ t9_out=$(run_epic_full_host "${SANDBOX}/memory-git") || true
 check_contains "T9g: refused before the capacity gate" "$t9_out" "DISPATCH_REFUSED:epic-4242:memory_dir_has_git"
 check_not_contains "T9g: not deferred" "$t9_out" "DISPATCH_DEFERRED"
 
+printf '\n== T9j: a state directory of notes-sync that overlaps the memory folder is refused ==\n'
+t9_rc=0
+t9_out=$(CFGMS_MEMORY_STATE_DIR="${SANDBOX}/memory/st" CFGMS_CANON_DIR="${SANDBOX}/canon" \
+  CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242) || t9_rc=$?
+check_eq "T9j: state dir inside the memory folder -> refused, exits 3" "${t9_rc}:${t9_out}" \
+  "3:DISPATCH_REFUSED:epic-4242:state_dir_in_folder (state directory ${SANDBOX}/memory/st, memory folder ${SANDBOX}/memory)"
+check_eq "T9j: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+
 printf '\n== T9i: a new owner needs owner + validator + the review reserve, a story one slot ==\n'
 # The stand-in answers like agent-dispatch.sh capacity: the line, or --json.
 mk_slots() {  # mk_slots <name> <raw_free_slots> <review_reserve> <free_slots line value>

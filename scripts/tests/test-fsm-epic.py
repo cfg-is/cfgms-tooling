@@ -665,6 +665,13 @@ class TestRefusals(EpicCase):
         self.assertEqual(self.f.records("docker-owner-start"), [])
         self.assertTrue(os.path.lexists(self.memory / ".git"))
 
+    def test_a_state_dir_that_overlaps_the_memory_folder_is_refused(self):
+        self.launch(env={"CFGMS_MEMORY_STATE_DIR": str(self.memory / "st")})
+        rc, out = self.finish()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("FSM_REFUSED:epic-900:state_dir_in_folder", out)
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+
     def test_a_git_entry_in_the_memory_folder_is_moved_away_and_the_run_goes_on(self):
         """With the notes set up, PREPARE moves the entry into the
         quarantine of notes-sync and the run starts its owner; when the move
