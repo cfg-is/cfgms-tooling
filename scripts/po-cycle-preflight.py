@@ -1256,11 +1256,20 @@ def owner_run_limit(environ=None):
 
 
 def capacity_free_slots(capacity):
-    """The free launch slots of the preflight's capacity snapshot
-    (`agent-dispatch.sh capacity --json`: `free_slots`, with the review
-    reserve already taken off), or None when the snapshot has no number."""
-    n = (capacity or {}).get("free_slots")
-    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+    """The launch slots that new owners and their validators can use, from
+    the preflight's capacity snapshot (`agent-dispatch.sh capacity --json`),
+    or None when the snapshot has no number. The gate keeps the review
+    reserve free once one agent runs, also on a host that is idle now, so
+    this is raw_free_slots - review_reserve when the snapshot has both (the
+    same rule as `po-act.sh dispatch --epic`, _capacity_owner_ok); else
+    free_slots."""
+    def num(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+    c = capacity or {}
+    raw, reserve = num(c.get("raw_free_slots")), num(c.get("review_reserve"))
+    if raw is not None and reserve is not None:
+        return max(0, raw - reserve)
+    return num(c.get("free_slots"))
 
 
 def dispatch_blocked(code_health):
@@ -1299,9 +1308,10 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
       or crashed, or an unexpired `epic-<N>` lease. A run that ended holds
       no place. `limit` None: no limit.
     - hold `resources`: the `start` entries before this one use all
-      `free_slots` (the free launch slots of the host). A new owner needs
-      OWNER_LAUNCH_SLOTS (2) of them: its own and one for its validator, so
-      at most `free_slots // 2` epics get `start`. A planning hint:
+      `free_slots` (capacity_free_slots: the launch slots that the gate
+      gives while an agent runs). A new owner needs OWNER_LAUNCH_SLOTS (2)
+      of them: its own and one for its validator, so at most
+      `free_slots // 2` epics get `start`. A planning hint:
       `po-act.sh dispatch --epic` asks the host gate again (for 2 slots).
       `free_slots` None (no capacity data): not held for this.
     - else `start` (reason `ready`), with the launch command.

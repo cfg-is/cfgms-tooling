@@ -10,25 +10,45 @@ owner container. That folder holds files only. Its git directory lives
 somewhere else on the host and is never mounted, so a container cannot write
 hooks, remotes or credential settings.
 
-Each cycle:
-  1. walk the folder (no symlink is followed). Every `.git` entry (a file, a
-     directory or a link, at the top too) is moved by a rename into the
-     host-only state directory, with an alert: no git command ever runs on
-     it, and the notes beside it are saved. An entry that `git add` cannot
-     read (an unreadable file, a FIFO, a socket, a device, a folder that
-     cannot be read or entered) and a `.git` entry that cannot be moved are
-     left out of `git add`, with an alert. Then stage what changed (git
-     config isolated from the host's). One owner cannot stop the save of the
-     notes of the others.
-  2. refuse anything that is not a plain note file (allow-list below)
-  3. scan the staged content for secrets: gitleaks, then truffleHog
-     (verified secrets); a hit moves the file out of the shared folder into a
-     host-only quarantine and writes an alert. The scan finds a secret that
-     was written by accident. It does not stop an agent that hides one on
-     purpose.
-  4. commit the staged content that was checked (never a second read of the
-     folder), one commit per author named in the note headers
-  5. push to main
+Each cycle (git never reads the folder; the host reads it itself):
+  1. walk the folder (walk_tree): iterative, no symlink followed, at most
+     MAX_DEPTH folders deep and MAX_ENTRIES entries. Every `.git` entry (a
+     file, a directory or a link, at the top too) is moved by a rename into
+     the host-only quarantine, with an alert (the quarantine keeps at most
+     QUARANTINE_MAX_ENTRIES of them and QUARANTINE_MAX_BYTES). Each note at
+     an allowed path (allow-list below) is opened by the host (O_NOFOLLOW,
+     O_NONBLOCK) and checked on the open file (a regular file, not
+     executable, at most MAX_FILE_BYTES; a larger one is refused without a
+     read), and at most MAX_FILE_BYTES + 1 bytes are read from it. A note
+     whose stat (size, times, inode) is as cached and whose blob is HEAD's is
+     not read again; at most READ_BUDGET bytes are read in one call.
+     Everything else is held for this call, with an alert, and counted in
+     `refused`: a path that is not a note, a link, an executable, a file too
+     large, a FIFO, a socket, a device, a file that cannot be read or that
+     changed into something else or was gone when it was read, a folder that
+     cannot be read or entered or is too deep, a `.git` that cannot be moved.
+  2. removals: a note of HEAD that the walk did not see, but never below a
+     folder that was not fully read, and none when the walk stopped at
+     MAX_ENTRIES.
+  3. a fair batch (fair_batch): at most BATCH_SIZE changed notes and
+     removals, round-robin over the groups (the first two parts of the
+     path), inside a group after a saved cursor. The rest wait (`pending`).
+  4. scan the bytes of the batch for secrets: gitleaks, then truffleHog
+     (verified secrets), in a private copy; a hit moves the file out of the
+     shared folder into a host-only quarantine and writes an alert. The scan
+     finds a secret that was written by accident. It does not stop an agent
+     that hides one on purpose.
+  5. write the blobs (`git hash-object -w --no-filters --stdin-paths` on
+     host-owned copies) and commit them in a private index from HEAD, one
+     commit per author named in the note headers, the removals first
+  6. push to main
+
+What one owner can still do to the others: change very many notes, so that
+its group takes its share of each batch and the others wait longer (the
+line says ATTENTION from the 3rd call in a row with notes that wait); make
+the walk reach MAX_ENTRIES (then the notes not reached wait and nothing is
+removed, ATTENTION); fill the folder up to READ_BUDGET (the rest waits).
+None of these runs anything of the agent on the host, and none is silent.
 
 Everything the folder contains is untrusted input written by agents.
 
@@ -40,12 +60,12 @@ Usage:
   memory-sync.py detach --work-tree W --git-dir G     one-time: move W/.git to G
 
 `once` exits 75 when another memory-sync holds the lock (nothing was done).
-With --result-file it writes {"committed", "alerts", "refused", "pending"}
-there as JSON when the cycle ran to its end. `refused` is the number of
-entries that are held back now: refused files that are still in the folder,
-and entries left out of `git add`. `pending` is the number of changed notes
-that wait for the next call: one call handles at most BATCH_SIZE of them, in
-path order. A caller counts from this file, never from the log text:
+With --result-file it writes {"committed", "alerts", "refused", "pending",
+"pending_calls"} there as JSON when the cycle ran to its end. `refused` is
+the number of entries held back now (step 1). `pending` is the number of
+changed notes and removals that wait for the next call (step 3, and notes
+over READ_BUDGET). `pending_calls` is how many calls in a row ended with
+`pending` above 0 (0 when nothing waits). A caller counts from this file, never from the log text:
 the log holds names that agents chose.
 
 `quarantine-top-git` is for the launch, resume and PREPARE gates of an epic
@@ -81,6 +101,22 @@ EXIT_LOCKED = 75
 #: rest wait for the next call (`pending`). Bounds the time of a call by the
 #: number of files (EPIC-DESIGN.md, shared notes row, measured there).
 BATCH_SIZE = 500
+#: Folders below the top that the walk goes into; deeper ones are refused
+#: (too_deep) and nothing below them is removed.
+MAX_DEPTH = 16
+#: Entries one walk looks at. Above it the walk stops (too_many_entries,
+#: refused, so the line is ATTENTION); the notes it did not reach wait and
+#: nothing is removed in that call.
+MAX_ENTRIES = 200_000
+#: Bytes of notes one call reads; the notes over it wait (pending).
+READ_BUDGET = 64 * 1024 * 1024
+#: From this many calls in a row with notes that wait, the notes-sync line
+#: is ATTENTION and says pending_calls=<n>.
+PENDING_CALLS_ATTENTION = 3
+#: The `.git` entries kept in the quarantine (the oldest go first).
+QUARANTINE_MAX_ENTRIES = 50
+QUARANTINE_MAX_BYTES = 256 * 1024 * 1024
+QUARANTINE_COUNT_LIMIT = 100_000
 ALLOWED = re.compile(r"^(README\.md|(areas|held)/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.md)$")
 AUTHOR_OK = re.compile(r"^[a-z0-9][a-z0-9/_.-]{0,62}$")
 FALLBACK_AUTHOR = "unknown"
@@ -149,7 +185,9 @@ class Repo:
         return r
 
     def staged(self):
-        """[(status, mode, blob, path)] for every staged change against HEAD."""
+        """[(status, mode, blob, path)] for every staged change against HEAD.
+        A cycle does not use it (git never reads the folder there); tests
+        use it to make entries for commit_checked."""
         out = self.git("diff", "--cached", "--raw", "--no-renames", "--no-abbrev", "-z", "HEAD").stdout
         parts = out.split(b"\0")
         res = []
@@ -161,10 +199,6 @@ class Repo:
             res.append((fields[4][0], fields[1], fields[3], path))
             i += 2
         return res
-
-    def unstage(self, paths):
-        if paths:
-            self.git("reset", "-q", "HEAD", "--", *paths)
 
     def alert(self, kind, path, detail):
         self.alert_count += 1
@@ -240,84 +274,307 @@ def quarantine_git_entry(dir_fd, rel, quarantine):
     return True, dst
 
 
-class _Unreadable(Exception):
-    """A folder whose entries cannot be listed or looked at."""
+def git_blob_id(data):
+    """The id that git gives a blob with these bytes (SHA-1 object format)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def scan_tree(repo):
-    """Walk the notes folder before `git add`, through folder descriptors;
-    no symlink is followed. Every `.git` entry is moved into the quarantine
-    (quarantine_git_entry, with an alert). Returns [(kind, path)] for the
-    entries that `git add` must leave out:
+def prune_quarantine(quarantine):
+    """Keep the `.git` entries of the quarantine (names `git-*`) to at most
+    QUARANTINE_MAX_ENTRIES and QUARANTINE_MAX_BYTES; the oldest go first (the
+    name starts with the time). They are untrusted garbage: an agent that
+    makes a new `.git` each call must not fill the disk. The size of an
+    entry is counted up to QUARANTINE_COUNT_LIMIT files; an entry with more
+    counts as too large. Nothing is followed (a link is removed as a link)."""
+    try:
+        names = sorted(n for n in os.listdir(quarantine) if n.startswith("git-"))
+    except OSError:
+        return
+    sizes = {}
+    for n in names:
+        p = os.path.join(quarantine, n)
+        total, count = 0, 0
+        try:
+            st = os.lstat(p)
+            total = st.st_size
+            if stat.S_ISDIR(st.st_mode):
+                for here, dirs, files in os.walk(p, followlinks=False):
+                    for f in dirs + files:
+                        count += 1
+                        if count > QUARANTINE_COUNT_LIMIT:
+                            break
+                        try:
+                            total += os.lstat(os.path.join(here, f)).st_size
+                        except OSError:
+                            pass
+                    if count > QUARANTINE_COUNT_LIMIT:
+                        total = QUARANTINE_MAX_BYTES + 1
+                        break
+        except OSError:
+            pass
+        sizes[n] = total
+    while names and (len(names) > QUARANTINE_MAX_ENTRIES or sum(sizes[n] for n in names) > QUARANTINE_MAX_BYTES):
+        n = names.pop(0)
+        p = os.path.join(quarantine, n)
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.unlink(p)
+        except OSError:
+            pass
 
-    - `git_entry_not_movable`: the folder of a `.git` entry that could not
-      be moved (path "" for the top: git skips a `.git` there, so nothing is
-      left out for it, but it is held back and counted).
-    - `unreadable_file`: `git add` stops the whole save at it.
-    - `special_file`: a FIFO, a socket or a device.
-    - `unreadable_dir`: a folder that cannot be read or entered. `git add`
-      stops at one it cannot enter, and leaves out one it cannot read
-      without a word (and can then see its committed notes as removed).
+
+#: A test sets this to a function(path) that runs after the walk looked at a
+#: file and before it opens it (the place where an agent can change the file).
+_before_read = None
+
+
+def walk_tree(repo, tracked, cache):
+    """Walk the notes folder and read the notes from it. The only reads of
+    the agent-written folder in a cycle; git never reads it.
+
+    Iterative (a stack of open folder descriptors, at most MAX_DEPTH + 1 of
+    them), no symlink followed, at most MAX_ENTRIES entries. Every `.git`
+    entry is moved into the quarantine (quarantine_git_entry, alert). For a
+    regular file at an allowed path, the host opens it itself (O_NOFOLLOW,
+    O_NONBLOCK), checks the open file with fstat (a regular file, not
+    executable, at most MAX_FILE_BYTES) and reads at most MAX_FILE_BYTES + 1
+    bytes from it. A file whose size, times and inode are as in `cache`
+    and whose cached blob is the one in HEAD is not read again. At most
+    READ_BUDGET bytes are read in one call; the files over it wait.
+
+    `tracked` is {path: blob id} of HEAD; `cache` is {path: [size, mtime_ns,
+    ctime_ns, ino, blob id]}. Returns a dict:
+      changed   {path: (blob id, bytes)}  notes whose content is not HEAD's
+      held      [(kind, path)]  entries held back in this call (refused)
+      present   set of every path seen (any type): never staged as removed
+      blocked   set of folders not fully read: nothing below is removed
+      truncated True when MAX_ENTRIES was reached: no removal at all
+      unread    number of notes not read (READ_BUDGET): they wait
+      cache     the new cache
     """
-    held = []
+    res = {"changed": {}, "held": [], "present": set(), "blocked": set(), "truncated": False,
+           "unread": 0, "cache": {}}
+    held, present, blocked = res["held"], res["present"], res["blocked"]
+    entries, budget = 0, READ_BUDGET
     not_moved = []
 
-    def walk(dir_fd, rel):
+    def refuse_path(path, mode):
+        """refuse_reason for an entry seen in the walk ("A", the git mode)."""
+        return refuse_reason("A", mode, path)
+
+    def read_note(dir_fd, name, path, st):
+        nonlocal budget
+        key = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
+        old = cache.get(path)
+        if old and old[:4] == key and old[4] == tracked.get(path):
+            res["cache"][path] = old
+            return
+        if st.st_size > budget:
+            res["unread"] += 1
+            return
+        if _before_read:
+            _before_read(path)
         try:
-            names = sorted(os.listdir(dir_fd))
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except FileNotFoundError:
+            held.append(("read_failed", path))          # gone after the walk saw it
+            return
+        except OSError as e:
+            held.append(("unreadable_file" if e.errno in (13, 1) else "read_failed", path))
+            return
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                held.append(("read_failed", path))      # not a file any more
+                return
+            if fst.st_mode & 0o111:
+                held.append(("not_a_plain_file", path))
+                return
+            if fst.st_size > MAX_FILE_BYTES:
+                held.append(("too_large", path))
+                return
+            chunks, left = [], MAX_FILE_BYTES + 1
+            while left > 0:
+                chunk = os.read(fd, min(1 << 16, left))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                left -= len(chunk)
+            data = b"".join(chunks)
         except OSError:
-            raise _Unreadable()
-        for name in names:
+            held.append(("unreadable_file", path))
+            return
+        finally:
+            os.close(fd)
+        if len(data) > MAX_FILE_BYTES:
+            held.append(("too_large", path))           # it grew while it was read
+            return
+        budget -= len(data)
+        blob = git_blob_id(data)
+        res["cache"][path] = [fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns, fst.st_ino, blob]
+        if blob != tracked.get(path):
+            res["changed"][path] = (blob, data)
+
+    top = os.open(repo.work_tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        names = sorted(os.listdir(top))
+    except OSError:
+        os.close(top)
+        raise RuntimeError("the notes folder itself cannot be read")
+    stack = [(top, "", 0, iter(names))]
+    try:
+        while stack:
+            dir_fd, rel, depth, it = stack[-1]
+            name = next(it, None)
+            if name is None:
+                stack.pop()
+                os.close(dir_fd)
+                continue
+            entries += 1
+            if entries > MAX_ENTRIES:
+                res["truncated"] = True
+                held.append(("too_many_entries", rel))
+                break
             path = name if not rel else rel + "/" + name
             if name == ".git":
                 ok, info = quarantine_git_entry(dir_fd, rel, repo.quarantine)
                 if ok:
                     repo.alert("git_entry_quarantined", path, "moved to " + info)
                 else:
-                    held.append(("git_entry_not_movable", rel))
+                    held.append(("git_entry_not_movable", path))
+                    present.add(path)
+                    blocked.add(rel)                     # its folder: nothing below is removed
                     not_moved.append((path, info))
                 continue
             try:
                 st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             except FileNotFoundError:
-                continue                       # removed while the walk runs
+                continue                                 # removed while the walk runs
             except OSError:
-                raise _Unreadable()            # the folder cannot be entered
+                held.append(("unreadable_dir", rel or "(top)"))   # the folder cannot be entered
+                blocked.add(rel)
+                stack.pop()
+                os.close(dir_fd)
+                continue
+            present.add(path)
             mode = st.st_mode
             if stat.S_ISDIR(mode):
+                if depth + 1 > MAX_DEPTH:
+                    held.append(("too_deep", path))
+                    blocked.add(path)
+                    continue
                 try:
                     sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
                 except FileNotFoundError:
+                    present.discard(path)
                     continue
                 except OSError:
                     held.append(("unreadable_dir", path))
+                    blocked.add(path)
                     continue
                 try:
-                    walk(sub, path)
-                except _Unreadable:
-                    held.append(("unreadable_dir", path))
-                finally:
+                    sub_names = sorted(os.listdir(sub))
+                except OSError:
                     os.close(sub)
-            elif stat.S_ISREG(mode):
-                try:
-                    os.close(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd))
-                except FileNotFoundError:
+                    held.append(("unreadable_dir", path))
+                    blocked.add(path)
                     continue
-                except OSError:
-                    held.append(("unreadable_file", path))
-            elif not stat.S_ISLNK(mode):       # a link is added as a link and refused later
+                stack.append((sub, path, depth + 1, iter(sub_names)))
+            elif stat.S_ISREG(mode):
+                reason = refuse_path(path, "100755" if mode & 0o111 else "100644")
+                if reason:
+                    held.append((reason, path))
+                elif st.st_size > MAX_FILE_BYTES:
+                    held.append(("too_large", path))     # refused without a read
+                else:
+                    read_note(dir_fd, name, path, st)
+            elif stat.S_ISLNK(mode):
+                held.append((refuse_path(path, "120000"), path))
+            else:
                 held.append(("special_file", path))
-
-    top = os.open(repo.work_tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        walk(top, "")
-    except _Unreadable:
-        raise RuntimeError("the notes folder itself cannot be read")
     finally:
-        os.close(top)
+        for dir_fd, _rel, _d, _it in stack:
+            os.close(dir_fd)
     for path, info in not_moved:
         log("a .git entry could not be moved: %s (%s)" % (path, info))
-    return held
+    return res
+
+
+def removals(tracked, walk):
+    """Paths of HEAD that the walk did not see, for a commit as removals.
+    Never a path below a folder that was not fully read (unreadable, too
+    deep, a `.git` that could not be moved), and none at all when the walk
+    stopped at MAX_ENTRIES."""
+    if walk["truncated"]:
+        return []
+    present, blocked = walk["present"], walk["blocked"]
+    out = []
+    for path in tracked:
+        if path in present:
+            continue
+        parts = path.split("/")
+        prefixes = ["/".join(parts[:i]) for i in range(0, len(parts))]
+        if any(p in blocked for p in prefixes):
+            continue
+        out.append(path)
+    return sorted(out)
+
+
+def group_of(path):
+    """The fairness group of a path: its first two parts (areas/<x>, held/<x>)."""
+    return "/".join(path.split("/")[:2])
+
+
+def fair_batch(paths, cursor, size):
+    """At most `size` of `paths`, taken round-robin over their groups (one
+    from each group in turn, the groups in order after the one served last),
+    and inside a group in path order after the group's cursor, wrapping.
+    One group gets at most its share while others wait. Returns (batch,
+    new cursor)."""
+    groups = {}
+    for p in sorted(paths):
+        groups.setdefault(group_of(p), []).append(p)
+    order = sorted(groups)
+    last = cursor.get("", "")
+    order = [g for g in order if g > last] + [g for g in order if g <= last]
+    queues = {}
+    for g in order:
+        items = groups[g]
+        after = cursor.get("g:" + g, "")
+        queues[g] = [p for p in items if p > after] + [p for p in items if p <= after]
+    batch, new = [], dict(cursor)
+    while len(batch) < size and any(queues.values()):
+        for g in order:
+            if len(batch) >= size:
+                break
+            if queues[g]:
+                p = queues[g].pop(0)
+                batch.append(p)
+                new["g:" + g] = p
+                new[""] = g
+    return batch, new
+
+
+def write_blobs(repo, blobs):
+    """Write {blob id: bytes} into the object store: copies in a private
+    folder of the state directory, then one `git hash-object -w
+    --no-filters --stdin-paths` (nothing of the notes folder is read). The
+    ids git gives must be the ones computed from the bytes that were read."""
+    if not blobs:
+        return
+    with tempfile.TemporaryDirectory(dir=repo.state_dir, prefix="blobs-") as tmp:
+        paths = []
+        for i, (sha, data) in enumerate(sorted(blobs.items())):
+            p = os.path.join(tmp, "%d" % i)
+            with open(p, "wb") as fh:
+                fh.write(data)
+            paths.append((sha, p))
+        out = repo.git("hash-object", "-w", "--no-filters", "--stdin-paths",
+                       stdin=("\n".join(p for _, p in paths) + "\n").encode()).stdout.decode().split()
+    if out != [sha for sha, _ in paths]:
+        raise RuntimeError("hash-object gave other ids than the bytes that were read")
 
 
 def usable_git_dir(git_dir):
@@ -392,36 +649,9 @@ def read_blobs(repo, shas):
     return res
 
 
-def blob_sizes(repo, shas):
-    """{blob id: size} for `shas`, read by one `git cat-file --batch-check`."""
-    want = sorted(set(shas))
-    if not want:
-        return {}
-    out = repo.git("cat-file", "--batch-check", stdin=("\n".join(want) + "\n").encode()).stdout
-    res = {}
-    for line in out.decode().splitlines():
-        parts = line.split()
-        if len(parts) == 3:
-            res[parts[0]] = int(parts[2])
-    return res
-
-
 def author_of(data):
     """`author:` from the header of a note's bytes."""
     for line in data[:4096].decode(errors="replace").splitlines()[:25]:
-        m = re.match(r"^author:\s*(\S+)\s*$", line)
-        if m:
-            a = m.group(1).strip("\"'").lower()
-            return a if AUTHOR_OK.match(a) else FALLBACK_AUTHOR
-    return FALLBACK_AUTHOR
-
-
-def note_author(repo, blob):
-    """`author:` from the note's header, read from the checked blob."""
-    r = repo.git("cat-file", "blob", blob, check=False)
-    if r.returncode != 0:
-        return FALLBACK_AUTHOR
-    for line in r.stdout[:4096].decode(errors="replace").splitlines()[:25]:
         m = re.match(r"^author:\s*(\S+)\s*$", line)
         if m:
             a = m.group(1).strip("\"'").lower()
@@ -532,95 +762,107 @@ def commit_checked(repo, author, entries):
     return True
 
 
+def _load_json(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def _save_json(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(value, fh)
+    os.replace(tmp, path)
+
+
+def head_blobs(repo):
+    """{path: blob id} of HEAD (paths as text; a name that is not UTF-8 is
+    kept with surrogate escapes)."""
+    out = repo.git("ls-tree", "-r", "-z", "--full-tree", "HEAD").stdout
+    res = {}
+    for rec in out.split(b"\0"):
+        if not rec:
+            continue
+        meta, _, path = rec.partition(b"\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == b"blob":
+            res[path.decode(errors="surrogateescape")] = parts[2].decode()
+    return res
+
+
 def cycle(repo, push=True):
     repo.alert_count = 0
-    held = scan_tree(repo)
-    excluded = sorted({p for _, p in held if p})
-    repo.git("add", "-A", "--", ":/", *[":(exclude,literal)" + p for p in excluded])
-    changes = repo.staged()
+    tracked = head_blobs(repo)
+    cache_file = os.path.join(repo.state_dir, "statcache.json")
+    walk = walk_tree(repo, tracked, _load_json(cache_file, {}))
+    prune_quarantine(repo.quarantine)
 
     # A refused file stays in the folder and is refused again every cycle.
-    # Alert once for each, not once a minute.
+    # Alert once for each, not once a minute; count it in `refused` each time.
     seen_file = os.path.join(repo.state_dir, "refused.json")
-    try:
-        with open(seen_file) as fh:
-            seen = set(json.load(fh))
-    except (OSError, ValueError):
-        seen = set()
+    seen = set(_load_json(seen_file, []))
     now_refused = set()
-
-    to_unstage = []
-
-    def refuse(kind, path, detail):
-        to_unstage.append(path)
-        key = kind + ":" + path
-        now_refused.add(key)
-        if key not in seen:
-            repo.alert(kind, path, detail)
-
     details = {
-        "git_entry_not_movable": "a .git entry here could not be moved: this folder is left out",
+        "git_path": "a path with a .git part: left out",
+        "path_not_allowed": "not a note path: left out",
+        "not_a_plain_file": "a link or an executable file: left out",
+        "too_large": "larger than %d bytes: left out without a read" % MAX_FILE_BYTES,
+        "git_entry_not_movable": "a .git entry here could not be moved: left out, nothing below is removed",
         "unreadable_file": "the file cannot be read: it is left out",
+        "read_failed": "the file was gone or not a file any more when it was read: left out this time",
         "special_file": "not a file or a folder (a FIFO, a socket or a device): it is left out",
-        "unreadable_dir": "the folder cannot be read or entered: it is left out",
+        "unreadable_dir": "the folder cannot be read or entered: it is left out, nothing below is removed",
+        "too_deep": "deeper than %d folders: left out, nothing below is removed" % MAX_DEPTH,
+        "too_many_entries": "the walk stopped at %d entries: the rest waits, nothing is removed" % MAX_ENTRIES,
     }
-    for kind, path in held:
+    for kind, path in walk["held"]:
         key = "refused_%s:%s" % (kind, path)
         now_refused.add(key)
         if key not in seen:
             repo.alert("refused_" + kind, path or "(top)", details[kind])
+    _save_json(seen_file, sorted(now_refused))
 
-    # The refusals are checked for every change (a rule on the path and one
-    # size query for all blobs), so a refused file never takes a place in
-    # the batch. Of the rest, at most BATCH_SIZE paths, in path order, are
-    # read, scanned and committed in this call; the others wait for the
-    # next call (`pending`). So the work of a call has a bound.
-    candidates = []
-    for status, mode, blob, path in changes:
-        reason = refuse_reason(status, mode, path)
-        if reason:
-            refuse("refused_" + reason, path, "left out of the commit")
-            continue
-        candidates.append((status, mode, blob, path))
-    sizes = blob_sizes(repo, [e[2] for e in candidates if e[0] != "D"])
-    ok = []
-    for status, mode, blob, path in candidates:
-        if status != "D" and sizes.get(blob, MAX_FILE_BYTES + 1) > MAX_FILE_BYTES:
-            refuse("refused_too_large", path, "%d bytes" % sizes.get(blob, -1))
-            continue
-        ok.append((status, mode, blob, path))
-    with open(seen_file, "w") as f:
-        json.dump(sorted(now_refused), f)
-    # `ok` is in path order (the bytes of the path): `git diff --cached`
-    # lists the index in that order. So the next call goes on where this one
-    # stopped.
-    pending = max(0, len(ok) - BATCH_SIZE)
-    ok = ok[:BATCH_SIZE]
+    # Fair batch: adds, changes and removals, round-robin over the groups.
+    changed = walk["changed"]
+    gone = removals(tracked, walk)
+    cursor_file = os.path.join(repo.state_dir, "cursor.json")
+    batch, cursor = fair_batch(list(changed) + gone, _load_json(cursor_file, {}), BATCH_SIZE)
+    pending = len(changed) + len(gone) - len(batch) + walk["unread"]
     if pending:
-        log("%d changed path(s) wait for the next call (a call takes at most %d)" % (pending, BATCH_SIZE))
+        log("%d changed note(s) wait for the next call (a call takes at most %d)" % (pending, BATCH_SIZE))
 
-    contents = read_blobs(repo, [e[2] for e in ok if e[0] != "D"])
-    hits = scan_secrets(repo, {e[3]: e[2] for e in ok if e[0] != "D"}, contents)
+    adds = {p: changed[p] for p in batch if p in changed}
+    hits = scan_secrets(repo, {p: b for p, (b, _d) in adds.items()},
+                        {b: d for b, d in adds.values()})
     for path, tool in hits.items():
-        to_unstage.append(path)
         repo.quarantine_file(path, "secret_" + tool)
-    ok = [e for e in ok if e[3] not in hits]
-    if to_unstage:
-        repo.git("reset", "-q", "HEAD", "--pathspec-from-file=-", "--pathspec-file-nul",
-                 stdin=b"".join(b":(literal)" + os.fsencode(p) + b"\0" for p in to_unstage))
+        walk["cache"].pop(path, None)
+    adds = {p: v for p, v in adds.items() if p not in hits}
+    write_blobs(repo, {b: d for b, d in adds.values()})
+    entries = [("M" if p in tracked else "A", "100644", b, p) for p, (b, _d) in adds.items()]
+    entries += [("D", "000000", tracked[p], p) for p in batch if p not in changed]
 
     committed = 0
-    if ok:
+    if entries:
         by_author = {}
-        for entry in ok:
-            author = FALLBACK_AUTHOR if entry[0] == "D" else author_of(contents[entry[2]])
+        for entry in entries:
+            author = FALLBACK_AUTHOR if entry[0] == "D" else author_of(adds[entry[3]][1])
             by_author.setdefault(author, []).append(entry)
         # The removals (author "unknown") go first: an add by one author can
         # need the place that a removal makes free.
-        for author, entries in sorted(by_author.items(), key=lambda kv: (kv[0] != FALLBACK_AUTHOR, kv[0])):
-            if commit_checked(repo, author, entries):
+        for author, group in sorted(by_author.items(), key=lambda kv: (kv[0] != FALLBACK_AUTHOR, kv[0])):
+            if commit_checked(repo, author, group):
                 committed += 1
-                log("committed %d file(s) from %s" % (len(entries), author))
+                log("committed %d file(s) from %s" % (len(group), author))
+    _save_json(cache_file, walk["cache"])
+    _save_json(cursor_file, cursor)
+
+    # How many calls in a row ended with notes that wait.
+    streak_file = os.path.join(repo.state_dir, "pending-calls.json")
+    pending_calls = (int(_load_json(streak_file, {}).get("calls", 0)) + 1) if pending else 0
+    _save_json(streak_file, {"calls": pending_calls})
 
     if push:
         ahead = repo.git("rev-list", "--count", "origin/main..HEAD", check=False)
@@ -634,7 +876,7 @@ def cycle(repo, push=True):
                 repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
                 log("pushed")
     repo.result = {"committed": committed, "alerts": repo.alert_count, "refused": len(now_refused),
-                   "pending": pending}
+                   "pending": pending, "pending_calls": pending_calls}
     return committed
 
 

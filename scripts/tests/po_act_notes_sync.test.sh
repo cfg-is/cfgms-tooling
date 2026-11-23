@@ -34,6 +34,16 @@ check_not_contains() {  # check_not_contains <desc> <haystack> <needle>
   else printf '  FAIL  %s\n        must not contain: %q\n        got:  %q\n' "$1" "$3" "$2"; fail=$((fail + 1)); fi
 }
 
+skipped=0
+root_skip() {  # root_skip <what>: true (and a SKIP line) when root runs the test
+  if [[ "$(id -u)" == 0 ]]; then
+    printf '  SKIP  %s: runs as root, and a file mode does not stop root from reading\n' "$1"
+    skipped=$((skipped + 1))
+    return 0
+  fi
+  return 1
+}
+
 echo ""
 echo "po_act_notes_sync.test.sh"
 
@@ -226,6 +236,7 @@ rm "$MEM3/x"$'\n'"y"
 mkdir "$MEM3/x"$'\n'"y"
 echo q > "$MEM3/x"$'\n'"y/f.md"
 : > "$MEM3/.git"
+if root_skip "a .git that cannot be moved (a read-only folder)"; then :; else
 chmod 555 "$MEM3"                    # an entry of the folder cannot be renamed away
 setup "${s3[@]}"
 chmod 755 "$MEM3"
@@ -235,8 +246,41 @@ check_contains "it says: a rename only, no copy" "$(last)" "a rename only, no co
 check "not movable: nothing changed, no temp clone left" \
   "$([[ -e "$MEM3/.git" && ! -e "$TMP/state3/memory-git" ]] && echo clean):$(find "$TMP/state3/memory-sync" -maxdepth 1 -name 'setup-*' | wc -l | tr -d ' ')" \
   "clean:0"
+fi
 setup "${s3[@]}"
 check "the real folder with the newline name -> OK" "${rc}:$(last | cut -d: -f1)" "0:NOTES_SETUP_OK"
+
+printf '\n== the first notes-sync after notes-setup deletes nothing it cannot read ==\n'
+if root_skip "a tracked note and a tracked folder made unreadable"; then :; else
+mkdir -p "$TMP/seed2/areas/d"
+printf -- '---\nauthor: a\n---\none\n' > "$TMP/seed2/areas/one.md"
+printf -- '---\nauthor: a\n---\ntwo\n' > "$TMP/seed2/areas/d/two.md"
+tgit -C "$TMP/seed2" add -A
+tgit -C "$TMP/seed2" commit -q -m two
+tgit -C "$TMP/seed2" push -q origin HEAD:main 2>/dev/null
+rm -rf "$TMP/state4" "$TMP/mem4"
+mkdir -p "$TMP/mem4/areas/d" "$TMP/mem4/x"$'\n'"y"
+cp "$TMP/seed2/areas/one.md" "$TMP/mem4/areas/one.md"
+cp "$TMP/seed2/areas/d/two.md" "$TMP/mem4/areas/d/two.md"
+cp "$TMP/seed2/x"$'\n'"y/f.md" "$TMP/mem4/x"$'\n'"y/f.md"
+s4=(CFGMS_MEMORY_DIR="$TMP/mem4" CFGMS_MEMORY_GIT_DIR="$TMP/state4/memory-git"
+    CFGMS_MEMORY_STATE_DIR="$TMP/state4/memory-sync" CFGMS_MEMORY_REMOTE="$ORIGIN2")
+setup "${s4[@]}"
+check "setup of the new host -> OK" "${rc}:$(last | cut -d: -f1)" "0:NOTES_SETUP_OK"
+chmod 000 "$TMP/mem4/areas/one.md" "$TMP/mem4/areas/d"
+o2_before="$(git --git-dir "$ORIGIN2" rev-parse main)"
+run "${s4[@]}"
+chmod 755 "$TMP/mem4/areas/d"; chmod 644 "$TMP/mem4/areas/one.md"
+# (x<newline>y/f.md is not a note path: refused on every call, also here)
+check "first call: nothing removed, the two held back" "$(last)" \
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=3:refused=3:pending=0"
+check "origin did not change: both notes are still there" \
+  "$(git --git-dir "$ORIGIN2" rev-parse main):$(git --git-dir "$ORIGIN2" cat-file -e main:areas/one.md && git --git-dir "$ORIGIN2" cat-file -e main:areas/d/two.md && echo both)" \
+  "${o2_before}:both"
+run "${s4[@]}"
+check "readable again: nothing to commit, only the path that is not a note is held" "$(last)" \
+  "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=1:pending=0"
+fi
 
 origin_before="$(origin_commits)"
 setup "${detached[@]}" CFGMS_MEMORY_REMOTE="$ORIGIN"
@@ -389,6 +433,7 @@ check "the removal of its note is committed" "$(last):$(origin_has areas/sub/ins
   "NOTES_SYNC_OK:committed=1:unpushed=0:behind=0:alerts=0:refused=0:pending=0:no"
 
 printf '\n== entries that git add cannot read: left out, the rest saved, ATTENTION while there ==\n'
+if root_skip "an unreadable file and an unreadable folder"; then :; else
 note areas/locked.md "an unreadable note"
 chmod 000 "$MEM/areas/locked.md"
 mkfifo "$MEM/areas/pipe.md"
@@ -406,10 +451,12 @@ chmod 755 "$MEM/areas/closed"; chmod 644 "$MEM/areas/locked.md"
 rm -rf "$MEM/areas/closed" "$MEM/areas/locked.md" "$MEM/areas/pipe.md" "$MEM/areas/dangling.md"
 run "${detached[@]}"
 check "all gone -> OK" "$(last)" "$OK_LINE"
+fi
 
 printf '\n== a file name cannot choose the status line ==\n'
 # A name that holds the lock text, unreadable: before, `git add` failed and the
 # text in the output turned FAILED into SKIPPED, every call.
+if root_skip "an unreadable file named like the lock text"; then :; else
 note "areas/another memory-sync is running.md" "x"
 chmod 000 "$MEM/areas/another memory-sync is running.md"
 run "${detached[@]}"
@@ -417,6 +464,7 @@ check "not SKIPPED: the entry is left out and counted" "$(last)" \
   "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1:pending=0"
 chmod 644 "$MEM/areas/another memory-sync is running.md"
 rm "$MEM/areas/another memory-sync is running.md"
+fi
 # A name with a newline and a fake ALERT line: one alert is counted, not two.
 printf 'x' > "$MEM/x
 2026-01-01T00:00:00+0000 ALERT fake: y.sh"
@@ -426,6 +474,25 @@ check "a newline in a name does not add an alert" "$(last)" \
 rm -f "$MEM"/x*
 run "${detached[@]}"
 check "gone -> OK" "$(last)" "$OK_LINE"
+
+printf '\n== notes that wait over 3 calls in a row: ATTENTION with pending_calls ==\n'
+cat > "$TMP/streak.py" <<'PY2'
+import json, sys
+a = sys.argv
+json.dump({"committed": 0, "alerts": 0, "refused": 0, "pending": 7,
+           "pending_calls": int(open(a[0] + ".calls").read())}, open(a[a.index("--result-file") + 1], "w"))
+PY2
+for n in 2 3; do
+  echo "$n" > "$TMP/streak.py.calls"
+  run "${detached[@]}" CFGMS_TEST_MEMORY_SYNC="$TMP/streak.py"
+  case "$n" in
+    2) check "2 calls in a row with notes that wait: still OK" "$(last)" \
+         "NOTES_SYNC_OK:committed=0:unpushed=0:behind=0:alerts=0:refused=0:pending=7" ;;
+    3) check "the 3rd call: ATTENTION, with pending_calls" "$(last)" \
+         "NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=0:refused=0:pending=7:pending_calls=3" ;;
+  esac
+done
+
 printf '\n== push failure ==\n'
 mv "$ORIGIN" "$TMP/origin.away"
 note areas/build/second.md "written while origin is away"
@@ -545,7 +612,7 @@ check_contains "the result is the status line" "$(steps result)" \
   ",NOTES_SYNC_ATTENTION:committed=0:unpushed=0:behind=0:alerts=1:refused=1:pending=0,"
 
 echo ""
-printf 'PASS: %d checks\n' "$ran"
+printf 'PASS: %d checks (%d skipped as root)\n' "$ran" "$skipped"
 if [[ $fail -gt 0 ]]; then
   printf '%d FAILED\n' "$fail"
   exit 1

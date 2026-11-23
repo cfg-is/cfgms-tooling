@@ -290,32 +290,54 @@ t9_out=$(run_epic_full_host "${SANDBOX}/memory-git") || true
 check_contains "T9g: refused before the capacity gate" "$t9_out" "DISPATCH_REFUSED:epic-4242:memory_dir_has_git"
 check_not_contains "T9g: not deferred" "$t9_out" "DISPATCH_DEFERRED"
 
-printf '\n== T9i: a new owner needs two free launch slots, a story still one ==\n'
-for t9_slots in 1 2; do
-  printf '#!/usr/bin/env bash\n[[ "$1" == capacity ]] && { echo "CAPACITY_OK:slots=%s"; exit 0; }\nexit 0\n' \
-    "$t9_slots" > "${SANDBOX}/dispatch-slots-${t9_slots}.sh"
-  chmod +x "${SANDBOX}/dispatch-slots-${t9_slots}.sh"
-done
-run_epic_slots() {  # run_epic_slots <n>: the capacity gate says n free slots
+printf '\n== T9i: a new owner needs owner + validator + the review reserve, a story one slot ==\n'
+# The stand-in answers like agent-dispatch.sh capacity: the line, or --json.
+mk_slots() {  # mk_slots <name> <raw_free_slots> <review_reserve> <free_slots line value>
+  cat > "${SANDBOX}/dispatch-$1.sh" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == capacity && "\${2:-}" == --json ]]; then
+  echo '{"can_launch": true, "free_slots": $4, "raw_free_slots": $2, "review_reserve": $3, "reserve_applied": false}'
+  exit 0
+fi
+[[ "\$1" == capacity ]] && { echo "CAPACITY_OK:slots=$4"; exit 0; }
+exit 0
+EOF
+  chmod +x "${SANDBOX}/dispatch-$1.sh"
+}
+mk_slots idle2 2 1 2           # an idle host with 2 raw slots: the review case
+mk_slots idle3 3 1 3
+mk_slots noreserve 2 0 2
+mk_slots story1 1 1 1
+run_epic_slots() {  # run_epic_slots <stand-in name>
   rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"
   : > "${SANDBOX}/supervisor.log"
   PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
   CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=on \
-  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-slots-$1.sh" CFGMS_PO_HOST_CAPS=linux \
+  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-$1.sh" CFGMS_PO_HOST_CAPS=linux \
   PO_CACHE_DIR="${SANDBOX}/po-cache" CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" \
   bash "$POACT" dispatch --epic 4242 2>&1
 }
-t9_rc=0; t9_out=$(run_epic_slots 1) || t9_rc=$?
-check_eq "T9i: one free slot -> the epic is deferred, exits 0" "${t9_rc}:${t9_out}" \
-  "0:DISPATCH_DEFERRED:epic-4242:resources (CAPACITY_OK:slots=1; 2 slots needed: one for the owner, one for its validator)"
-check_eq "T9i: one free slot: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
-t9_rc=0; t9_out=$(run_epic_slots 2) || t9_rc=$?
-check_contains "T9i: two free slots -> launched" "${t9_rc}:${t9_out}" "FSM_LAUNCHED:epic-4242:"
+# The real gate gives the fields the owner rule reads, and applies the
+# reserve once one agent runs (the reason for the rule).
+real_cap() {  # real_cap <running>: agent-dispatch.sh capacity --json with a pinned running count
+  CFGMS_TEST_CAPACITY_RUNNING="$1" bash "${REPO_ROOT_REAL}/.claude/tooling/scripts/agent-dispatch.sh" capacity --json 2>/dev/null || true
+}
+check_eq "T9i: the real gate: idle -> no reserve; one agent runs -> reserve applied, free = raw - reserve" \
+  "$(real_cap 0 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["reserve_applied"], d["free_slots"] == d["raw_free_slots"], "review_reserve" in d)'):$(real_cap 1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["reserve_applied"], d["free_slots"] == max(0, d["raw_free_slots"] - d["review_reserve"]))')" \
+  "False True True:True True"
+t9_rc=0; t9_out=$(run_epic_slots idle2) || t9_rc=$?
+check_eq "T9i: idle host, 2 raw slots, reserve 1 -> deferred (the validator could never start)" "${t9_rc}:${t9_out}" \
+  "0:DISPATCH_DEFERRED:epic-4242:resources (raw_free_slots=2 need=3 (owner 1 + validator 1 + review reserve 1))"
+check_eq "T9i: deferred: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+t9_rc=0; t9_out=$(run_epic_slots idle3) || t9_rc=$?
+check_contains "T9i: 3 raw slots, reserve 1 -> launched" "${t9_rc}:${t9_out}" "FSM_LAUNCHED:epic-4242:"
+t9_rc=0; t9_out=$(run_epic_slots noreserve) || t9_rc=$?
+check_contains "T9i: 2 raw slots, no reserve -> launched" "${t9_rc}:${t9_out}" "FSM_LAUNCHED:epic-4242:"
 t9_rc=0
 rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"; printf 'Ready\n' > "${SANDBOX}/board-status"
 t9_out=$(PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
   CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=on \
-  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-slots-1.sh" CFGMS_PO_HOST_CAPS=linux \
+  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-story1.sh" CFGMS_PO_HOST_CAPS=linux \
   PO_CACHE_DIR="${SANDBOX}/po-cache" bash "$POACT" dispatch 4242 2>&1) || t9_rc=$?
 check_contains "T9i: a story with one free slot is still dispatched" "$t9_out" "DISPATCHED:4242"
 check_not_contains "T9i: the story is not deferred" "$t9_out" "DISPATCH_DEFERRED"

@@ -146,6 +146,13 @@ class OwnerStart(unittest.TestCase):
         f = self.pf.capacity_free_slots
         self.assertEqual(f({"available": True, "free_slots": 2, "raw_free_slots": 3}), 2)
         self.assertEqual(f({"available": False, "free_slots": 0}), 0)
+        # with both numbers: raw - reserve (the reserve applies once an owner
+        # runs, also on an idle host): an idle host with 2 raw slots and a
+        # reserve of 1 has room for no owner
+        self.assertEqual(f({"free_slots": 2, "raw_free_slots": 2, "review_reserve": 1}), 1)
+        self.assertEqual(f({"free_slots": 3, "raw_free_slots": 3, "review_reserve": 1}), 2)
+        self.assertEqual(f({"free_slots": 2, "raw_free_slots": 2, "review_reserve": 0}), 2)
+        self.assertEqual(f({"free_slots": 0, "raw_free_slots": 0, "review_reserve": 1}), 0)
         for cap in (None, {}, {"available": None}, {"free_slots": "2"}, {"free_slots": -1},
                     {"free_slots": True}):
             self.assertIsNone(f(cap), cap)

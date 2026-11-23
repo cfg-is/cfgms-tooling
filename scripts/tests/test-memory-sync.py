@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +69,12 @@ class MemorySync(unittest.TestCase):
                 except (OSError, NotImplementedError):
                     pass
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def skip_if_root(self):
+        """root reads a file whatever its mode: a test that takes the read
+        right away proves nothing there. A visible skip, not a pass."""
+        if os.geteuid() == 0:
+            self.skipTest("runs as root: a file mode does not stop root from reading")
 
     def set_scanners(self, gitleaks="exit 0", trufflehog="exit 0"):
         for name, body in (("gitleaks", gitleaks), ("trufflehog", trufflehog)):
@@ -278,10 +285,10 @@ exit 9''')
         self.assertEqual(self.alerts(), ["git_entry_quarantined"])
         self.assertFalse(os.path.lexists(self.work / rel / ".git"))
         self.assertEqual(len(self.quarantined()), 1)
-        self.assertEqual(self.repo.result, {"committed": 2, "alerts": 1, "refused": 0, "pending": 0})
-        self.assertEqual(self.g("ls-files", "-s", "--", ":(literal)" + rel + "/inside.md")[:6], b"100644")
+        self.assertEqual(self.repo.result, {"committed": 2, "alerts": 1, "refused": 0, "pending": 0, "pending_calls": 0})
+        self.assertEqual(self.g("ls-tree", "HEAD", "--", rel + "/inside.md")[:6], b"100644")   # a note, no link
         self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 0, "pending": 0})
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 0, "pending": 0, "pending_calls": 0})
 
     def test_a_git_file_beside_notes_does_not_hold_them_back(self):
         """`touch areas/.git` and a note of another owner in areas/: the note
@@ -355,11 +362,15 @@ exit 9''')
             self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
         self.assertIn("areas/beside.md", self.head_files())
 
-    def test_a_git_entry_that_cannot_be_moved_holds_back_only_its_folder(self):
+    def test_a_git_entry_that_cannot_be_moved_is_held_and_nothing_below_is_removed(self):
         """A rename that fails (for example to another file system) copies
-        nothing: the entry stays, its own folder is left out, every call
-        counts it in `refused`, one alert."""
-        (self.work / "areas" / "sub").mkdir(parents=True)
+        nothing: the entry stays, every call counts it in `refused`, one
+        alert. git never reads the folder, so the notes beside it are saved;
+        a note of that folder that is gone is not removed while the entry
+        is there."""
+        self.note("areas/sub/kept.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        (self.work / "areas" / "sub" / "kept.md").unlink()
         (self.work / "areas" / "sub" / ".git").write_text("x")
         (self.work / "areas" / "sub" / "inside.md").write_text(NOTE)
         self.note("areas/beside.md")
@@ -374,10 +385,11 @@ exit 9''')
             self.assertEqual(self.repo.result["refused"], 1)
             self.assertEqual(self.alerts(), ["refused_git_entry_not_movable"])
             self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-            self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1, "pending": 0})
+            self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1, "pending": 0, "pending_calls": 0})
         files = self.head_files()
         self.assertIn("areas/beside.md", files)
-        self.assertNotIn("areas/sub/inside.md", files)
+        self.assertIn("areas/sub/inside.md", files)
+        self.assertIn("areas/sub/kept.md", files)                         # not removed
         self.assertTrue((self.work / "areas" / "sub" / ".git").exists())
         self.assertEqual(self.quarantined(), [])
 
@@ -399,9 +411,10 @@ exit 9''')
         self.assertEqual(self.alerts(), [alert or "refused_" + kind])
         self.assertEqual(self.repo.result["refused"], 1)
         self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1, "pending": 0})
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1, "pending": 0, "pending_calls": 0})
 
     def test_an_unreadable_file_is_left_out(self):
+        self.skip_if_root()
         p = self.note("areas/locked.md")
         p.chmod(0)
         self.held_cycle("unreadable_file")
@@ -439,8 +452,9 @@ exit 9''')
                 return os.stat_result((stat.S_IFCHR | 0o644,) + tuple(st)[1:])
             return st
         with mock.patch.object(self.ms.os, "stat", fake_stat):
-            held = self.ms.scan_tree(self.repo)
-        self.assertEqual(held, [("special_file", "areas/dev.md")])
+            walk = self.ms.walk_tree(self.repo, {}, {})
+        self.assertEqual(walk["held"], [("special_file", "areas/dev.md")])
+        self.assertIn("areas/dev.md", walk["present"])
 
     def test_a_dangling_link_is_refused_and_the_rest_saved(self):
         (self.work / "areas").mkdir()
@@ -448,6 +462,7 @@ exit 9''')
         self.held_cycle("not_a_plain_file", alert="refused_not_a_plain_file")
 
     def test_folders_that_cannot_be_read_or_entered_are_left_out(self):
+        self.skip_if_root()
         for name, mode in (("closed", 0), ("no-enter", 0o644), ("no-list", 0o311)):
             with self.subTest(name=name):
                 self.tearDown()
@@ -460,6 +475,209 @@ exit 9''')
                 files = self.head_files()
                 self.assertIn("areas/%s/kept.md" % name, files)                 # not taken as removed
                 self.assertNotIn("areas/%s/new.md" % name, files)
+
+    # --- git does not read the folder: the host reads each note itself -------------
+
+    def set_hook(self, fn):
+        self.ms._before_read = fn
+        self.addCleanup(setattr, self.ms, "_before_read", None)
+
+    def test_a_very_deep_folder_does_not_stop_the_save(self):
+        (self.work / "areas").mkdir()
+        fds = [os.open(str(self.work / "areas"), os.O_RDONLY | os.O_DIRECTORY)]
+        for _ in range(1000):                       # 1000 levels, made without recursion
+            os.mkdir("d", dir_fd=fds[-1])
+            fds.append(os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fds[-1]))
+
+        def remove_deep():
+            for parent in reversed(fds[:-1]):
+                os.rmdir("d", dir_fd=parent)
+            for fd in fds:
+                os.close(fd)
+        try:                                        # removed before tearDown's rmtree
+            self.note("areas/beside.md")
+            self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+            self.assertIn("areas/beside.md", self.head_files())
+            self.assertEqual(self.alerts(), ["refused_too_deep"])
+            self.assertEqual(self.repo.result["refused"], 1)
+        finally:
+            remove_deep()
+
+    def test_a_file_made_unreadable_between_the_walk_and_the_read(self):
+        """The review's chmod race, made certain by the hook."""
+        self.skip_if_root()
+        kept = self.note("areas/kept.md")
+        self.ms.cycle(self.repo, push=False)
+        kept.write_text(NOTE + "changed\n")
+        self.note("areas/other.md", NOTE.replace("owner/epic-7", "owner/epic-8"))
+        self.set_hook(lambda p: os.chmod(self.work / p, 0) if p == "areas/kept.md" else None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        files = self.head_files()
+        self.assertIn("areas/other.md", files)
+        self.assertIn("areas/kept.md", files)                            # held, not removed
+        self.assertEqual(self.g("show", "HEAD:areas/kept.md").decode(), NOTE)
+        self.assertIn("refused_unreadable_file", self.alerts())
+
+    def test_a_fifo_or_a_link_swapped_in_before_the_read_is_held(self):
+        for kind in ("fifo", "link"):
+            with self.subTest(kind=kind):
+                self.tearDown()
+                self.setUp()
+                self.note("areas/swap.md")
+                self.note("areas/other.md")
+
+                def swap(p, kind=kind):
+                    if p == "areas/swap.md":
+                        os.unlink(self.work / p)
+                        if kind == "fifo":
+                            os.mkfifo(self.work / p)
+                        else:
+                            os.symlink("/etc/hostname", self.work / p)
+                self.set_hook(swap)
+                self.assertEqual(self.ms.cycle(self.repo, push=False), 1)      # no hang, no stop
+                self.assertEqual(sorted(self.head_files()), ["README.md", "areas/other.md"])
+                self.assertEqual(self.alerts(), ["refused_read_failed"])
+
+    def test_a_file_that_grows_past_the_limit_before_the_read(self):
+        self.note("areas/grow.md")
+        self.note("areas/other.md")
+        self.set_hook(lambda p: (self.work / p).write_bytes(b"x" * (self.ms.MAX_FILE_BYTES + 10))
+                      if p == "areas/grow.md" else None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertNotIn("areas/grow.md", self.head_files())
+        self.assertEqual(self.alerts(), ["refused_too_large"])
+
+    def test_a_file_that_vanishes_before_the_read_is_not_removed_in_that_call(self):
+        p = self.note("areas/gone.md")
+        self.ms.cycle(self.repo, push=False)
+        p.write_text(NOTE + "changed\n")
+        self.set_hook(lambda q: os.unlink(self.work / q) if q == "areas/gone.md" else None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+        self.assertIn("areas/gone.md", self.head_files())
+        self.assertEqual(self.alerts(), ["refused_read_failed"])
+        self.set_hook(None)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)        # now it is a removal
+        self.assertNotIn("areas/gone.md", self.head_files())
+
+    def test_a_huge_sparse_file_is_refused_without_a_read(self):
+        self.note("areas/other.md")
+        with open(self.work / "areas" / "huge.md", "wb") as fh:
+            fh.truncate(20 * 1024 ** 3)                                   # 20 GB, sparse
+        t0 = time.time()
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertLess(time.time() - t0, 10)
+        self.assertEqual(sorted(self.head_files()), ["README.md", "areas/other.md"])
+        self.assertEqual(self.alerts(), ["refused_too_large"])
+
+    def test_a_walk_that_reaches_the_entry_limit_removes_nothing(self):
+        for i in range(3):
+            self.note("areas/n%d.md" % i)
+        self.ms.cycle(self.repo, push=False)
+        for i in range(3):
+            os.unlink(self.work / "areas" / ("n%d.md" % i))
+        for i in range(10):
+            self.note("areas/z%d.md" % i)
+        saved = self.ms.MAX_ENTRIES
+        self.ms.MAX_ENTRIES = 5
+        self.addCleanup(setattr, self.ms, "MAX_ENTRIES", saved)
+        self.ms.cycle(self.repo, push=False)
+        files = self.head_files()
+        self.assertTrue({"areas/n0.md", "areas/n1.md", "areas/n2.md"} <= files)   # nothing removed
+        self.assertIn("refused_too_many_entries", self.alerts())
+
+    def test_the_first_call_with_no_cache_removes_nothing_that_cannot_be_read(self):
+        """The first sync after notes-setup: no cache, a tracked note and a
+        tracked folder that cannot be read are held, not removed."""
+        self.skip_if_root()
+        self.note("areas/a.md")
+        self.note("areas/d/b.md")
+        self.ms.cycle(self.repo, push=False)
+        shutil.rmtree(self.state)                                         # a new host state
+        self.repo = self.ms.Repo(str(self.gitdir), str(self.work), str(self.state))
+        (self.work / "areas" / "a.md").chmod(0)
+        (self.work / "areas" / "d").chmod(0)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+        self.assertTrue({"areas/a.md", "areas/d/b.md"} <= self.head_files())
+        self.assertEqual(self.repo.result["refused"], 2)
+
+    def test_the_quarantine_keeps_a_bounded_number_and_size(self):
+        q = self.state / "quarantine"
+        q.mkdir(parents=True, exist_ok=True)
+        for i in range(self.ms.QUARANTINE_MAX_ENTRIES + 10):
+            (q / ("git-2026010%02d-x" % i)).mkdir()
+        (q / "20260101-secret-kept").write_text("x")                      # a secret file: not touched
+        self.ms.prune_quarantine(str(q))
+        names = sorted(p.name for p in q.iterdir() if p.name.startswith("git-"))
+        self.assertEqual(len(names), self.ms.QUARANTINE_MAX_ENTRIES)
+        self.assertEqual(names[0], "git-202601010-x")                     # the oldest 10 are gone
+        self.assertTrue((q / "20260101-secret-kept").exists())
+        big = q / "git-29990101-big"
+        big.mkdir()
+        with open(big / "f", "wb") as fh:
+            fh.truncate(self.ms.QUARANTINE_MAX_BYTES + 1)
+        self.ms.prune_quarantine(str(q))
+        self.assertFalse(big.exists())                                    # alone over the size
+
+    # --- fairness and a streak of calls with notes that wait ----------------------
+
+    def test_one_owner_with_many_changes_does_not_hold_back_the_others(self):
+        """The review's case: an owner rewrites many notes in areas/-/ each
+        call; the notes of the others are saved on the first call."""
+        self.small_batch(5)
+        for i in range(20):
+            self.note("areas/-/f%02d.md" % i, NOTE.replace("owner/epic-7", "spam"))
+        self.note("areas/zz-other.md", NOTE.replace("owner/epic-7", "other"))
+        self.note("held/q.md", NOTE.replace("owner/epic-7", "held"))
+        self.ms.cycle(self.repo, push=False)
+        files = self.head_files()
+        self.assertIn("areas/zz-other.md", files)
+        self.assertIn("held/q.md", files)
+        self.assertEqual(self.repo.result["pending"], 17)
+
+    def test_a_group_that_keeps_changing_goes_on_after_its_cursor(self):
+        """An owner rewrites the same 4 notes before each call: with a batch
+        of 2, the next call takes the next 2, not the first 2 again."""
+        self.small_batch(2)
+        names = ["areas/-/f%d.md" % i for i in range(4)]
+        for rnd in range(2):
+            for n in names:
+                self.note(n, NOTE + "round %d\n" % rnd)
+            self.ms.cycle(self.repo, push=False)
+        got = {n: self.g("show", "HEAD:" + n).decode().endswith("round 1\n") for n in names}
+        self.assertEqual(got, {names[0]: False, names[1]: False, names[2]: True, names[3]: True})
+
+    def test_a_note_that_did_not_change_is_not_read_again(self):
+        for i in range(3):
+            self.note("areas/c%d.md" % i)
+        reads = []
+        self.set_hook(reads.append)
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(sorted(reads), ["README.md", "areas/c0.md", "areas/c1.md", "areas/c2.md"])
+        reads.clear()
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(reads, [])                                       # the cache: no read
+        self.note("areas/c1.md", NOTE + "changed\n")
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(reads, ["areas/c1.md"])
+
+    def test_a_cycle_keeps_the_quarantine_bounded(self):
+        q = self.state / "quarantine"
+        for i in range(self.ms.QUARANTINE_MAX_ENTRIES + 5):
+            (q / ("git-2020010%02d-x" % i)).mkdir()
+        (self.work / ".git").mkdir()
+        self.ms.cycle(self.repo, push=False)
+        self.assertEqual(len([p for p in q.iterdir() if p.name.startswith("git-")]),
+                         self.ms.QUARANTINE_MAX_ENTRIES)
+
+    def test_three_calls_in_a_row_with_notes_that_wait(self):
+        self.small_batch(1)
+        for i in range(4):
+            self.note("areas/s/%d.md" % i)
+        calls = []
+        for _ in range(4):
+            self.ms.cycle(self.repo, push=False)
+            calls.append((self.repo.result["pending"], self.repo.result["pending_calls"]))
+        self.assertEqual(calls, [(3, 1), (2, 2), (1, 3), (0, 0)])         # reset when nothing waits
 
     # --- a bounded batch ----------------------------------------------------------
 
@@ -517,9 +735,9 @@ exit 9''')
         (self.work / "areas" / "run.sh").write_text("x")
         r = self.run_once("--result-file", str(result))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(result.read_text()), {"committed": 1, "alerts": 1, "refused": 1, "pending": 0})
+        self.assertEqual(json.loads(result.read_text()), {"committed": 1, "alerts": 1, "refused": 1, "pending": 0, "pending_calls": 0})
         r = self.run_once("--result-file", str(result))
-        self.assertEqual(json.loads(result.read_text()), {"committed": 0, "alerts": 0, "refused": 1, "pending": 0})
+        self.assertEqual(json.loads(result.read_text()), {"committed": 0, "alerts": 0, "refused": 1, "pending": 0, "pending_calls": 0})
 
     def test_a_name_with_a_newline_makes_one_log_line(self):
         (self.work / "areas").mkdir()
@@ -545,6 +763,7 @@ exit 9''')
         return r.returncode, r.stdout.decode().strip()
 
     def test_quarantine_top_git(self):
+        self.skip_if_root()
         self.assertEqual(self.quarantine_top(), (0, "NONE"))
         (self.work / ".git").write_text("gitdir: /x\n")
         rc, line = self.quarantine_top()

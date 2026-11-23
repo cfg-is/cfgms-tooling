@@ -45,7 +45,8 @@
 #                                   Folder CFGMS_MEMORY_DIR (default as for dispatch --epic), git dir
 #                                   CFGMS_MEMORY_GIT_DIR (default ~/.local/state/cfgms/memory-git).
 #                                   Last line: NOTES_SYNC_OK / NOTES_SYNC_ATTENTION
-#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>:pending=<n>[:fetch=failed]
+#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>:pending=<n>
+#                                   [:pending_calls=<n>][:fetch=failed]
 #                                   (exit 0), NOTES_SYNC_SKIPPED (exit 0), NOTES_SYNC_REFUSED:not_detached
 #                                   (exit 3; run notes-setup), NOTES_SYNC_FAILED:exit_<rc> or
 #                                   :timeout_<secs>s (exit 1; CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
@@ -610,22 +611,31 @@ _capacity_ok() {
   return 1
 }
 
-# _capacity_slots_ok <n>
-#   As _capacity_ok, but the host must have <n> free launch slots (the number
-#   in the CAPACITY_OK:slots=<n> line of the same gate). For a new epic owner:
-#   it needs a second slot for its validator. On too few, echoes the gate's
-#   line and the need, and returns 1. The gate for other launches is not
+# _capacity_owner_ok
+#   The gate for a NEW epic owner. The owner needs its own slot and, later, a
+#   slot for its validator, which asks the same `launch` gate while the owner
+#   runs. Once one agent runs, that gate keeps the review reserve free
+#   (agent-dispatch.sh _capacity_compute: reserve_applied when running >= 1),
+#   also on a host that is idle now. So the host must have
+#   raw_free_slots >= 2 + review_reserve (`capacity --json`). On too few,
+#   echoes the numbers and returns 1. The gate of other launches is not
 #   changed.
-_capacity_slots_ok() {
-  local need="$1" out slots
+_capacity_owner_ok() {
+  local out need
   [[ "${CFGMS_AGENT_CAPACITY_GATE:-on}" == "off" ]] && return 0
-  out=$("$DISPATCH" capacity 2>/dev/null) || { echo "$out"; return 1; }
-  slots="${out##*slots=}"
-  if [[ "$slots" =~ ^[0-9]+$ ]] && (( slots >= need )); then
-    return 0
+  out=$("$DISPATCH" capacity --json 2>/dev/null || true)
+  if ! need=$(printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read() or "{}")
+raw, res = d["raw_free_slots"], d["review_reserve"]
+assert all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (raw, res))
+need = 2 + res
+print(f"raw_free_slots={raw} need={need} (owner 1 + validator 1 + review reserve {res})")
+sys.exit(0 if raw >= need else 1)' 2>/dev/null); then
+    echo "${need:-capacity --json gave no raw_free_slots / review_reserve}"
+    return 1
   fi
-  echo "${out}; ${need} slots needed: one for the owner, one for its validator"
-  return 1
+  return 0
 }
 
 # _memory_git_gate <label> <refuse prefix> <note prefix> <memory dir>
@@ -1371,9 +1381,10 @@ case "$cmd" in
         # directory must be outside it) or an agent put one there. It is
         # never trusted: moved away when the notes are set up, else refused.
         _memory_git_gate "$epic_label" DISPATCH_REFUSED DISPATCH_NOTE "$epic_memory" || exit 3
-        # A new owner needs two launch slots: its own and one for its
-        # validator (the validator asks the same gate, fsm/epic.py).
-        if ! cap=$(_capacity_slots_ok 2); then
+        # A new owner needs its own slot, one for its validator (the
+        # validator asks the same gate, fsm/epic.py) and the review reserve
+        # that the gate keeps once the owner runs (_capacity_owner_ok).
+        if ! cap=$(_capacity_owner_ok); then
           echo "DISPATCH_DEFERRED:${epic_label}:resources (${cap})"
           exit 0
         fi
@@ -2018,16 +2029,20 @@ EOF
     #                                               alert), the sync runs, and the last
     #                                               line is ATTENTION.
     #   NOTES_SYNC_OK:committed=<n>:unpushed=0:behind=0:alerts=0:refused=0:pending=<n>   exit 0
-    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>:pending=<n>[:fetch=failed]
+    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>:pending=<n>[:pending_calls=<n>][:fetch=failed]
     #                                               exit 0  a number other than
     #                                               committed and pending is not 0,
-    #                                               the fetch failed, or the NOTE line
-    #                                               was printed
-    # pending: changed notes that wait for the next call. One call handles at
-    # most memory-sync.py's BATCH_SIZE (500) of them, so that a folder with
-    # very many new files is saved over several calls and no call runs into
-    # the time limit by file count. pending above 0 alone is normal progress
-    # (OK), not ATTENTION.
+    #                                               notes waited 3 calls in a row
+    #                                               (pending_calls), the fetch
+    #                                               failed, or the NOTE line was
+    #                                               printed
+    # pending: changed notes and removals that wait for the next call. One
+    # call handles at most memory-sync.py's BATCH_SIZE (500) of them, taken
+    # round-robin over the groups of the paths (areas/<x>, held/<x>), so one
+    # owner with very many changes gets its share and the others still go
+    # through. pending above 0 alone is normal progress (OK); from the 3rd
+    # call in a row that ends with pending above 0 the line is ATTENTION and
+    # ends with pending_calls=<n>.
     #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
     #   NOTES_SYNC_FAILED:no_result                 exit 1  it ended with 0 and wrote
     #                                               no usable result file
@@ -2040,8 +2055,11 @@ EOF
     # committed: commits made by this call. unpushed: origin/main..HEAD after
     # it. behind: HEAD..origin/main (commits on the remote that this host does
     # not have; nothing is merged). alerts: the alerts of this call. refused:
-    # the entries held back NOW (refused files still in the folder, entries
-    # that `git add` cannot read, `.git` entries that could not be moved).
+    # the entries held back NOW (memory-sync.py walk_tree: a path that is not
+    # a note, a link, a file too large or unreadable, a folder that cannot be
+    # read or is too deep, a `.git` that could not be moved, a walk that
+    # stopped at its entry limit). git never reads the folder: memory-sync.py
+    # reads each note itself and writes the blobs.
     # alerts and refused come from memory-sync.py's result file, never from
     # its log text (that holds file names that agents chose). A refused file
     # that stays in the folder gives an alert one time, and it is in refused
@@ -2104,13 +2122,13 @@ EOF
     if ! notes_ar="$(printf '%s' "$notes_counts_json" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-v = [d["alerts"], d["refused"], d["pending"]]
+v = [d["alerts"], d["refused"], d["pending"], d["pending_calls"]]
 assert all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in v)
 print(*v)' 2>/dev/null)"; then
       echo "NOTES_SYNC_FAILED:no_result"
       exit 1
     fi
-    read -r notes_alerts notes_refused notes_pending <<< "$notes_ar"
+    read -r notes_alerts notes_refused notes_pending notes_pending_calls <<< "$notes_ar"
     notes_head_after="$(notes_git_do rev-parse -q --verify HEAD || true)"
     if [[ "$notes_head_before" == "$notes_head_after" ]]; then
       notes_committed=0
@@ -2121,9 +2139,16 @@ print(*v)' 2>/dev/null)"; then
     notes_unpushed="$(notes_git_do rev-list --count origin/main..HEAD || notes_git_do rev-list --count HEAD || echo 1)"
     notes_behind="$(notes_git_do rev-list --count HEAD..origin/main || echo 0)"
     notes_counts="committed=${notes_committed}:unpushed=${notes_unpushed}:behind=${notes_behind}:alerts=${notes_alerts}:refused=${notes_refused}:pending=${notes_pending}"
+    # From the 3rd call in a row that ended with notes that wait (memory-sync.py
+    # PENDING_CALLS_ATTENTION): ATTENTION, and the line says how many calls.
+    notes_streak=0
+    if (( notes_pending_calls >= 3 )); then
+      notes_streak=1
+      notes_counts="${notes_counts}:pending_calls=${notes_pending_calls}"
+    fi
     [[ -n "$notes_git_entry" ]] && echo "NOTES_SYNC_NOTE:git_entry_in_folder (${notes_git_entry})"
     if [[ "$notes_unpushed" == 0 && "$notes_behind" == 0 && "$notes_alerts" == 0 && "$notes_refused" == 0 \
-          && "$notes_fetch" == ok && -z "$notes_git_entry" ]]; then
+          && "$notes_streak" == 0 && "$notes_fetch" == ok && -z "$notes_git_entry" ]]; then
       echo "NOTES_SYNC_OK:${notes_counts}"
     elif [[ "$notes_fetch" == ok ]]; then
       echo "NOTES_SYNC_ATTENTION:${notes_counts}"

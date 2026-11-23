@@ -218,6 +218,12 @@ class PreflightMain(unittest.TestCase):
         self.board = [item(7, "Ready", "epic 7"), item(8, "Ready", "epic 8")]
         out = self.run_main({"available": True, "can_launch": True, "free_slots": 3})
         self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "hold", "resources")])
+        # an idle host with 2 raw slots and a reserve of 1: no owner (the
+        # validator could never start); 3 raw slots: one
+        out = self.run_main({"available": True, "free_slots": 2, "raw_free_slots": 2, "review_reserve": 1})
+        self.assertEqual(self.starts(out), [(7, "hold", "resources"), (8, "hold", "resources")])
+        out = self.run_main({"available": True, "free_slots": 3, "raw_free_slots": 3, "review_reserve": 1})
+        self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "hold", "resources")])
         out = self.run_main()                                      # no capacity data
         self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "start", "ready")])
 
