@@ -1258,6 +1258,8 @@ TOOLING_SNAPSHOT_FILES = (
     "scripts/pipeline-helper.sh", "scripts/project-queue.sh", "scripts/po-cycle-preflight.py",
     "scripts/agent-dispatch.sh", "metrics/token_report.py", "metrics/pricing.json",
     "devcontainer/agent-context.sh",
+    # epic.py: quarantine-top-git for a `.git` entry in the memory folder
+    "scripts/memory-sync.py",
 )
 #: Directories copied whole (sourced libraries and the supervisor itself).
 TOOLING_SNAPSHOT_DIRS = ("scripts/lib", "scripts/fsm")

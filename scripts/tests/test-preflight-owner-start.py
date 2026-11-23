@@ -130,10 +130,13 @@ class OwnerStart(unittest.TestCase):
                          [(7, "hold", "owner_limit_invalid"), (8, "hold", "not_ready")])
 
     def test_free_launch_slots_bound_the_starts(self):
-        recs = self.recs([9, 7, 8], _board(ready=[7, 8, 9]), free_slots=1)
-        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
-                         [(7, "start", "ready"), (8, "hold", "resources"), (9, "hold", "resources")])
-        self.assertEqual(self.by([7], _board(ready=[7]), free_slots=0), {7: ("hold", "resources")})
+        """A new owner needs two slots: its own and one for its validator."""
+        for slots, starts in ((0, 0), (1, 0), (2, 1), (3, 1), (5, 2), (6, 3)):
+            with self.subTest(free_slots=slots):
+                recs = self.recs([9, 7, 8], _board(ready=[7, 8, 9]), free_slots=slots)
+                self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
+                                 [(n, "start", "ready") for n in (7, 8, 9)][:starts]
+                                 + [(n, "hold", "resources") for n in (7, 8, 9)][starts:])
 
     def test_no_capacity_data_holds_nothing_for_resources(self):
         recs = self.recs([7, 8, 9], _board(ready=[7, 8, 9]), free_slots=None)
@@ -371,10 +374,21 @@ class OwnerStartWiring(unittest.TestCase):
                 os.environ["CFGMS_OWNER_MAX_RUNS"] = value
                 out, recs, reasons, _ = self.apply(epics=(7, 8), ready=(7, 8))
                 self.assertEqual(recs, [(7, "hold", reason), (8, "hold", reason)])
+                # an invalid value also says so in degraded_reasons, one line
+                named = [r for r in reasons if "CFGMS_OWNER_MAX_RUNS" in r]
+                self.assertEqual(len(named), 0 if value == "0" else 1)
+
+    def test_a_long_invalid_limit_is_shown_short_and_printable(self):
+        os.environ["CFGMS_OWNER_MAX_RUNS"] = "x\x1b[31m" + "y" * 100
+        out, recs, reasons, _ = self.apply()
+        (line,) = [r for r in reasons if "CFGMS_OWNER_MAX_RUNS" in r]
+        self.assertNotIn("\x1b", line)
+        self.assertNotIn("y" * 41, line)
+        self.assertIn("...", line)
 
     def test_the_capacity_snapshot_bounds_the_starts(self):
         out = {"epics_undecomposed": [_epic(n) for n in (7, 8, 9)], "pipeline_state": _board(ready=(7, 8, 9)),
-               "capacity": {"available": True, "free_slots": 1, "raw_free_slots": 2}}
+               "capacity": {"available": True, "free_slots": 3, "raw_free_slots": 4}}
         self.pf.apply_owner_epics(out, {"ok": True}, [])
         self.assertEqual([(r["number"], r["action"], r["reason"]) for r in out["owner_start_recommendations"]],
                          [(7, "start", "ready"), (8, "hold", "resources"), (9, "hold", "resources")])

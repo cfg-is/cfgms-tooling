@@ -988,8 +988,11 @@ def owner_run_epics(runs, lease_rows=None):
       epic audit has not closed it yet.
     - an unexpired `epic-<N>` lease, which po-act.sh takes for the run and
       which every host can see. (`epic-decompose-<N>` is a different lease.)
-      The lease is released when the run ends, in every end state, so
-      another host sees an ended run's epic as free at once.
+      The run releases the lease when it ends, so another host then sees
+      the epic as free. Not released: a lease that the run lost
+      (lease_lost), and a lease whose status or release call ran out of time
+      at the end (the run notes lease_not_released=timeout). Those stay
+      until their TTL ends.
     """
     held = {}
     for n, r in owner_run_rows(runs).items():
@@ -1134,6 +1137,9 @@ def live_story_lease_item_ids(rows=False):
 #: owner_run_limit() for a CFGMS_OWNER_MAX_RUNS that is set and not a whole
 #: number of 0 or more: every start is held (a typo must not remove the brake).
 OWNER_LIMIT_INVALID = "invalid"
+#: Launch slots a new owner needs: its own container and one for its
+#: validator (the same gate; `po-act.sh dispatch --epic` asks for 2).
+OWNER_LAUNCH_SLOTS = 2
 #: A run with one of these statuses has an owner now (runindex.UNFINISHED).
 _OWNER_RUN_ACTIVE = ("live", "hung", "starting", "crashed")
 
@@ -1164,29 +1170,45 @@ def compute_owner_attention(out, runs, lease_rows, holders_unknown=False):
     epics.
 
     - the last epic-mode run of the epic on this host is `hung`, is
-      `abandoned`, or is `done` in a state other than REPORT (FAILED, also a
-      FAILED before the gates). A run that was REFUSED at a gate is not
-      listed: its item is still Ready and the start list offers it again.
+      `abandoned`, or is `done` in a state other than REPORT and REFUSED
+      (FAILED, also a FAILED before the gates).
+    - the last run ended REFUSED and was not a deferral (for example
+      base_branch_missing or item_mismatch): its item is still Ready, so the
+      start list offers it again each cycle, and the same gate refuses it.
+    - the last 3 runs of the epic (the run dirs that are still there, oldest
+      gone first) all ended as deferrals with the same reason. A deferral
+      alone is not listed: it is tried again. A REFUSED run that did not
+      record whether it was a deferral (a run dir from before the record)
+      is not listed: the preflight does not know.
     - the epic has no sub-issues, its project item is In Progress, no active
       run and no lease holds it, and it is not in epics_audit_due. Nothing
       works on it and nothing will. Left out when the holders are not known.
     """
     open_nums = {e.get("number") for e in out.get("epics_open") or []}
-    last = {}
+    history = {}
     for r in sorted(runs or [], key=lambda r: r.get("created") or 0):
         m = (_EPIC_KEY_RE.match(str(r.get("key") or ""))
              or _EPIC_KEY_RE.match(str(r.get("target") or "")))
         if r.get("mode") == "epic" and m:
-            last[int(m.group(1))] = r
+            history.setdefault(int(m.group(1)), []).append(r)
+    last = {n: rs[-1] for n, rs in history.items()}
     found = {}
     for n, r in last.items():
         status, state = r.get("status"), r.get("state")
+        reason = r.get("reason") or "no reason recorded"
+        last3 = history[n][-3:]
         if status == "hung":
             why = "the run is hung: its supervisor holds the run and gives no heartbeat"
         elif status == "abandoned":
-            why = f"the run was abandoned ({r.get('reason') or 'no reason recorded'})"
+            why = f"the run was abandoned ({reason})"
         elif status == "done" and state not in ("REPORT", "REFUSED"):
-            why = f"the run ended in {state} ({r.get('reason') or 'no reason recorded'})"
+            why = f"the run ended in {state} ({reason})"
+        elif status == "done" and state == "REFUSED" and r.get("refused_deferred") is False:
+            why = f"the run was refused ({reason}): the same gate refuses each new start"
+        elif (len(last3) == 3 and all(x.get("status") == "done" and x.get("state") == "REFUSED"
+                                      and x.get("refused_deferred") is True
+                                      and x.get("reason") == r.get("reason") for x in last3)):
+            why = f"the last 3 runs were deferred for the same reason ({reason})"
         else:
             continue
         if n in open_nums:
@@ -1277,9 +1299,11 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
       or crashed, or an unexpired `epic-<N>` lease. A run that ended holds
       no place. `limit` None: no limit.
     - hold `resources`: the `start` entries before this one use all
-      `free_slots` (the free launch slots of the host). A planning hint:
-      `po-act.sh dispatch --epic` asks the host gate again. `free_slots`
-      None (no capacity data): not held for this.
+      `free_slots` (the free launch slots of the host). A new owner needs
+      OWNER_LAUNCH_SLOTS (2) of them: its own and one for its validator, so
+      at most `free_slots // 2` epics get `start`. A planning hint:
+      `po-act.sh dispatch --epic` asks the host gate again (for 2 slots).
+      `free_slots` None (no capacity data): not held for this.
     - else `start` (reason `ready`), with the launch command.
     """
     by_num = {}
@@ -1307,7 +1331,7 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
             rec["reason"] = "owner_limit_invalid"
         elif limit is not None and in_use >= limit:
             rec["reason"] = "owner_limit"
-        elif free_slots is not None and starts >= free_slots:
+        elif free_slots is not None and starts >= free_slots // OWNER_LAUNCH_SLOTS:
             rec["reason"] = "resources"
         else:
             in_use += 1
@@ -1362,11 +1386,18 @@ def apply_owner_epics(out, code_health, degraded_reasons):
     # "undecomposed": keep it away from the Planning Team.
     apply_owner_run_epics(out, runs, lease_rows)
     # An epic whose project item is Ready gets an owner (EPIC-DESIGN.md §9).
+    limit = owner_run_limit()
+    if limit == OWNER_LIMIT_INVALID:
+        raw = str(os.environ.get("CFGMS_OWNER_MAX_RUNS", ""))
+        shown = "".join(c if c.isprintable() and c.isascii() else "?" for c in raw)
+        degraded_reasons.append(
+            "CFGMS_OWNER_MAX_RUNS is not a whole number of 0 or more (%r%s): every owner start is "
+            "held (owner_limit_invalid)" % (shown[:40], "..." if len(shown) > 40 else ""))
     out["owner_start_recommendations"] = compute_owner_start_recommendations(
         owner_start_candidates(out, runs, lease_rows), out.get("pipeline_state"), runs, lease_rows,
         develop_broken=dispatch_blocked(code_health),
         holders_unknown=holders_unknown,
-        limit=owner_run_limit(),
+        limit=limit,
         free_slots=capacity_free_slots(out.get("capacity")))
     out["owner_attention"] = compute_owner_attention(out, runs, lease_rows, holders_unknown)
     return lease_rows, runs, (None if holders_unknown else active_owner_epics(runs, lease_rows))

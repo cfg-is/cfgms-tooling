@@ -57,6 +57,9 @@ if bash -n "$POACT" 2>/dev/null; then ok "po-act.sh parses"; else bad "po-act.sh
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 fsm_launch_fakes "$SANDBOX"
+# The git and state directories of the notes: never the ones under the real
+# home. Not there at first: "notes-setup not done".
+export CFGMS_MEMORY_GIT_DIR="${SANDBOX}/notes-git" CFGMS_MEMORY_STATE_DIR="${SANDBOX}/notes-state"
 CHECKOUT_HASH="$FAKE_IMAGE_LABEL"
 
 # gh stand-in on PATH (the Dependencies gate calls it from Python, where an
@@ -227,7 +230,7 @@ check_eq "T9f: a set variable that names no folder -> exits 3, the default is no
 check_contains "T9f: the refusal names the set path" "$t9_out" "no_canon_or_memory_dir (canon ${SANDBOX}/no-such-canon,"
 rm -rf "${SANDBOX}/cfgms-canon" "${SANDBOX}/cfgms-memory"
 
-printf '\n== T9g: a memory folder with a .git entry is refused ==\n'
+printf '\n== T9g: a memory folder with a .git entry and no notes setup is refused ==\n'
 # Agents write the memory folder: its .git is never trusted.
 mkdir -p "${SANDBOX}/memory-git/.git" "${SANDBOX}/memory-gitfile" "${SANDBOX}/memory-gitlink"
 : > "${SANDBOX}/memory-gitfile/.git"
@@ -237,9 +240,38 @@ for t9_kind in git gitfile gitlink; do
   t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory-${t9_kind}" run_epic 4242) || t9_rc=$?
   check_eq "T9g (${t9_kind}): exits 3" "$t9_rc" "3"
   check_eq "T9g (${t9_kind}): the refusal names the entry and the way out" "$t9_out" \
-    "DISPATCH_REFUSED:epic-4242:memory_dir_has_git (${SANDBOX}/memory-${t9_kind}/.git; run: po-act.sh notes-setup)"
+    "DISPATCH_REFUSED:epic-4242:memory_dir_has_git (${SANDBOX}/memory-${t9_kind}/.git; no git directory of the notes at ${SANDBOX}/notes-git; run: po-act.sh notes-setup)"
   check_eq "T9g (${t9_kind}): the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+  check_eq "T9g (${t9_kind}): the entry is still there" \
+    "$([[ -e "${SANDBOX}/memory-${t9_kind}/.git" || -L "${SANDBOX}/memory-${t9_kind}/.git" ]] && echo there)" "there"
 done
+
+printf '\n== T9h: with the notes set up, the launch moves the .git entry away and goes on ==\n'
+git init -q --bare "${SANDBOX}/notes-git"
+for t9_kind in git gitfile gitlink; do
+  t9_rc=0
+  t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory-${t9_kind}" run_epic 4242) || t9_rc=$?
+  check_eq "T9h (${t9_kind}): exits 0" "$t9_rc" "0"
+  check_contains "T9h (${t9_kind}): a NOTE line says where the entry went" "$t9_out" \
+    "DISPATCH_NOTE:epic-4242:memory_git_quarantined (${SANDBOX}/memory-${t9_kind}/.git -> ${SANDBOX}/notes-state/quarantine/git-"
+  check_contains "T9h (${t9_kind}): launched" "$t9_out" "FSM_LAUNCHED:epic-4242:"
+  check_eq "T9h (${t9_kind}): the entry is gone from the folder" \
+    "$([[ -e "${SANDBOX}/memory-${t9_kind}/.git" || -L "${SANDBOX}/memory-${t9_kind}/.git" ]] || echo gone)" "gone"
+done
+check_eq "T9h: the link was moved as a link" \
+  "$(find "${SANDBOX}/notes-state/quarantine" -maxdepth 1 -name 'git-*' -type l | wc -l | tr -d ' ')" "1"
+: > "${SANDBOX}/memory-gitfile/.git"
+chmod 500 "${SANDBOX}/notes-state/quarantine"
+t9_rc=0
+t9_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory-gitfile" run_epic 4242) || t9_rc=$?
+chmod 700 "${SANDBOX}/notes-state/quarantine"
+check_eq "T9h: an entry that cannot be moved -> exits 3" "$t9_rc" "3"
+check_eq "T9h: refused, remove it by hand" "$t9_out" \
+  "DISPATCH_REFUSED:epic-4242:memory_dir_git_not_movable (${SANDBOX}/memory-gitfile/.git; remove it by hand)"
+check_eq "T9h: not movable: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+rm -f "${SANDBOX}/memory-gitfile/.git"
+rm -rf "${SANDBOX}/notes-git"
+mkdir -p "${SANDBOX}/memory-git/.git"
 # A host with no room: the capacity gate defers. The .git refusal comes first.
 printf '#!/usr/bin/env bash\n[[ "$1" == capacity ]] && { echo "ram 99%%"; exit 1; }\nexit 0\n' > "${SANDBOX}/dispatch-full.sh"
 chmod +x "${SANDBOX}/dispatch-full.sh"
@@ -257,6 +289,36 @@ check_contains "T9g: the stand-in host is full (a clean folder is deferred)" "$t
 t9_out=$(run_epic_full_host "${SANDBOX}/memory-git") || true
 check_contains "T9g: refused before the capacity gate" "$t9_out" "DISPATCH_REFUSED:epic-4242:memory_dir_has_git"
 check_not_contains "T9g: not deferred" "$t9_out" "DISPATCH_DEFERRED"
+
+printf '\n== T9i: a new owner needs two free launch slots, a story still one ==\n'
+for t9_slots in 1 2; do
+  printf '#!/usr/bin/env bash\n[[ "$1" == capacity ]] && { echo "CAPACITY_OK:slots=%s"; exit 0; }\nexit 0\n' \
+    "$t9_slots" > "${SANDBOX}/dispatch-slots-${t9_slots}.sh"
+  chmod +x "${SANDBOX}/dispatch-slots-${t9_slots}.sh"
+done
+run_epic_slots() {  # run_epic_slots <n>: the capacity gate says n free slots
+  rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"
+  : > "${SANDBOX}/supervisor.log"
+  PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=on \
+  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-slots-$1.sh" CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" \
+  bash "$POACT" dispatch --epic 4242 2>&1
+}
+t9_rc=0; t9_out=$(run_epic_slots 1) || t9_rc=$?
+check_eq "T9i: one free slot -> the epic is deferred, exits 0" "${t9_rc}:${t9_out}" \
+  "0:DISPATCH_DEFERRED:epic-4242:resources (CAPACITY_OK:slots=1; 2 slots needed: one for the owner, one for its validator)"
+check_eq "T9i: one free slot: the supervisor never started" "$(cat "${SANDBOX}/supervisor.log")" ""
+t9_rc=0; t9_out=$(run_epic_slots 2) || t9_rc=$?
+check_contains "T9i: two free slots -> launched" "${t9_rc}:${t9_out}" "FSM_LAUNCHED:epic-4242:"
+t9_rc=0
+rm -rf "${SANDBOX}/runs"; mkdir -p "${SANDBOX}/runs"; printf 'Ready\n' > "${SANDBOX}/board-status"
+t9_out=$(PATH="${SANDBOX}/bin:${PATH}" CFGMS_TEST_PIPELINE_HELPER="$MOCK_PIPELINE_HELPER" \
+  CFGMS_TEST_WORKTREE_BASE="${SANDBOX}/worktrees" CFGMS_AGENT_CAPACITY_GATE=on \
+  CFGMS_TEST_DISPATCH="${SANDBOX}/dispatch-slots-1.sh" CFGMS_PO_HOST_CAPS=linux \
+  PO_CACHE_DIR="${SANDBOX}/po-cache" bash "$POACT" dispatch 4242 2>&1) || t9_rc=$?
+check_contains "T9i: a story with one free slot is still dispatched" "$t9_out" "DISPATCHED:4242"
+check_not_contains "T9i: the story is not deferred" "$t9_out" "DISPATCH_DEFERRED"
 
 printf '\n== T10: a second dispatch of an epic that runs is skipped ==\n'
 t10_out=$(CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" run_epic 4242)
@@ -347,14 +409,30 @@ for t13_kind in dir file link; do
   esac
   t13_rc=0
   t13_out=$(t13_resume) || t13_rc=$?
-  check_eq "T13 (${t13_kind}): exits 3" "$t13_rc" "3"
+  check_eq "T13 (${t13_kind}): no notes setup -> exits 3" "$t13_rc" "3"
   check_eq "T13 (${t13_kind}): refused with the entry and the way out" "$t13_out" \
-    "FSM_RESUME_REFUSED:${t12_run}:memory_dir_has_git (${SANDBOX}/memory/.git; run: po-act.sh notes-setup)"
+    "FSM_RESUME_REFUSED:${t12_run}:memory_dir_has_git (${SANDBOX}/memory/.git; no git directory of the notes at ${SANDBOX}/notes-git; run: po-act.sh notes-setup)"
   check_eq "T13 (${t13_kind}): the supervisor was not started" "$(cat "${SANDBOX}/supervisor.log")" ""
   rm -rf "${SANDBOX}/memory/.git"
 done
 t13_out=$(t13_resume) || true
 check_contains "T13: with the entry gone the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
+git init -q --bare "${SANDBOX}/notes-git"
+: > "${SANDBOX}/memory/.git"
+t13_out=$(t13_resume) || true
+check_contains "T13: notes set up: the entry is moved, a NOTE line" "$t13_out" \
+  "FSM_RESUME_NOTE:${t12_run}:memory_git_quarantined (${SANDBOX}/memory/.git -> ${SANDBOX}/notes-state/quarantine/git-"
+check_contains "T13: notes set up: the supervisor is started" "$(cat "${SANDBOX}/supervisor.log")" "resume ${t12_run}"
+check_eq "T13: notes set up: the entry is gone" "$([[ -e "${SANDBOX}/memory/.git" ]] || echo gone)" "gone"
+: > "${SANDBOX}/memory/.git"
+chmod 500 "${SANDBOX}/notes-state/quarantine"
+t13_rc=0
+t13_out=$(t13_resume) || t13_rc=$?
+chmod 700 "${SANDBOX}/notes-state/quarantine"
+check_eq "T13: not movable -> exits 3, remove it by hand" "${t13_rc}:${t13_out}" \
+  "3:FSM_RESUME_REFUSED:${t12_run}:memory_dir_git_not_movable (${SANDBOX}/memory/.git; remove it by hand)"
+rm -f "${SANDBOX}/memory/.git"
+rm -rf "${SANDBOX}/notes-git"
 
 echo ""
 echo "-----------------------------------------"

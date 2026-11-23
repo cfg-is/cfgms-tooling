@@ -217,7 +217,7 @@ class TestRefusalsAndExits(Base):
         troot = self.f.run_dir(rid) / "tooling" / ".claude" / "tooling"
         for rel in ("scripts/fsm/supervisor.py", "scripts/pipeline-helper.sh", "scripts/project-queue.sh",
                     "scripts/po-cycle-preflight.py", "metrics/token_report.py",
-                    "devcontainer/agent-context.sh", "scripts/lib"):
+                    "devcontainer/agent-context.sh", "scripts/lib", "scripts/memory-sync.py"):
             self.assertTrue((troot / rel).exists(), rel)
         params = json.loads((self.f.run_dir(rid) / "run.json").read_text())
         self.assertEqual(params["tooling_root"], str(troot))

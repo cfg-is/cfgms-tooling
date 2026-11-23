@@ -75,7 +75,8 @@ class LockSweep(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def sweep(self, prs, perms=None, issue_labels=None):
-        self.world.write_text(json.dumps({"prs": prs, "perms": perms or {"dev": "push"},
+        # perms: what the real API gives in `.permission`: admin, write, read or none
+        self.world.write_text(json.dumps({"prs": prs, "perms": perms or {"dev": "write"},
                                           "issue_labels": issue_labels or {}}))
         self.log.write_text("")
         env = dict(os.environ, PATH="%s%s%s" % (self.root / "bin", os.pathsep, os.environ["PATH"]),
@@ -109,7 +110,9 @@ class LockSweep(unittest.TestCase):
         self.assertIn("LOCK_SKIPPED_PR:#55", out)
 
     def test_a_slice_branch_name_from_an_author_who_cannot_push_is_not_taken(self):
-        for perms in ({"dev": "read"}, {"dev": "triage"}, {}):
+        # read (also the answer for triage), none, no answer; and the values
+        # that the field never has (role names) are not taken either
+        for perms in ({"dev": "read"}, {"dev": "none"}, {}, {"dev": "push"}, {"dev": "maintain"}):
             with self.subTest(perms=perms):
                 out, locked, labelled = self.sweep([pr(55, "feature/epic-7-slice-1")],
                                                    perms=perms or {"other": "admin"})
@@ -129,10 +132,11 @@ class LockSweep(unittest.TestCase):
              pr(57, "xfeature/epic-7-slice-1")])
         self.assertEqual((locked, labelled), ([], {}))
 
-    def test_maintain_and_admin_authors_are_internal(self):
+    def test_write_and_admin_authors_are_internal(self):
+        """A maintainer's `.permission` is `write` in the real API."""
         out, locked, labelled = self.sweep(
             [pr(55, "feature/epic-7-slice-1", login="a"), pr(56, "feature/epic-7-slice-2", login="m")],
-            perms={"a": "admin", "m": "maintain"})
+            perms={"a": "admin", "m": "write"})
         self.assertEqual(locked, ["PR_node55", "PR_node56"])
 
     def test_a_slice_gets_the_capability_tags_of_its_epic(self):

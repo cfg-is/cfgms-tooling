@@ -623,7 +623,10 @@ def lock(node_id):
 locked_count = 0
 
 SLICE_BRANCH_RE = re.compile(r'feature/epic-([1-9][0-9]*)-slice-[1-9][0-9]*')
-TRUSTED_PERMS = ('push', 'maintain', 'admin')
+# The legacy `permission` field of "Get repository permissions for a user" is
+# admin, write, read or none (maintain is given as write, triage as read).
+# admin and write can push.
+TRUSTED_PERMS = ('admin', 'write')
 _perms = {}
 
 

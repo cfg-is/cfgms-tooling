@@ -19,7 +19,10 @@ case "$1" in
   lease-status)
     if held; then echo "HELD:$2:${CFGMS_HOST_ID}:exp=9999999999:expired=false"
     else echo "FREE:$2"; fi ;;
-  lease-acquire) echo "ACQUIRED:$2:${CFGMS_HOST_ID}:exp=9999999999" ;;
+  lease-acquire)
+    # FSM_FAKE_ACQUIRE=held: another host holds the lease
+    if [[ "${FSM_FAKE_ACQUIRE:-ok}" == "held" ]]; then echo "HELD:$2:other-host"; exit 1; fi
+    echo "ACQUIRED:$2:${CFGMS_HOST_ID}:exp=9999999999" ;;
   lease-release) echo "RELEASED:$2" ;;
   lease-renew)
     if [[ "${FSM_FAKE_RENEW:-ok}" == "ok" ]]; then echo "RENEWED:$2:${CFGMS_HOST_ID}:exp=9999999999"

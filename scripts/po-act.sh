@@ -45,7 +45,7 @@
 #                                   Folder CFGMS_MEMORY_DIR (default as for dispatch --epic), git dir
 #                                   CFGMS_MEMORY_GIT_DIR (default ~/.local/state/cfgms/memory-git).
 #                                   Last line: NOTES_SYNC_OK / NOTES_SYNC_ATTENTION
-#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>[:fetch=failed]
+#                                   :committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>[:fetch=failed]
 #                                   (exit 0), NOTES_SYNC_SKIPPED (exit 0), NOTES_SYNC_REFUSED:not_detached
 #                                   (exit 3; run notes-setup), NOTES_SYNC_FAILED:exit_<rc> or
 #                                   :timeout_<secs>s (exit 1; CFGMS_NOTES_SYNC_TIMEOUT_SECS, default 300)
@@ -610,6 +610,54 @@ _capacity_ok() {
   return 1
 }
 
+# _capacity_slots_ok <n>
+#   As _capacity_ok, but the host must have <n> free launch slots (the number
+#   in the CAPACITY_OK:slots=<n> line of the same gate). For a new epic owner:
+#   it needs a second slot for its validator. On too few, echoes the gate's
+#   line and the need, and returns 1. The gate for other launches is not
+#   changed.
+_capacity_slots_ok() {
+  local need="$1" out slots
+  [[ "${CFGMS_AGENT_CAPACITY_GATE:-on}" == "off" ]] && return 0
+  out=$("$DISPATCH" capacity 2>/dev/null) || { echo "$out"; return 1; }
+  slots="${out##*slots=}"
+  if [[ "$slots" =~ ^[0-9]+$ ]] && (( slots >= need )); then
+    return 0
+  fi
+  echo "${out}; ${need} slots needed: one for the owner, one for its validator"
+  return 1
+}
+
+# _memory_git_gate <label> <refuse prefix> <note prefix> <memory dir>
+#   A `.git` entry at the top of an epic's memory folder (agents write that
+#   folder, so the entry is never trusted). When the trusted git directory of
+#   the notes is there (notes-setup done), the entry is moved into the
+#   quarantine of notes-sync (`memory-sync.py quarantine-top-git`, a rename,
+#   never followed) and the launch goes on, with a line
+#   <note prefix>:<label>:memory_git_quarantined (<from> -> <to>). Returns 3,
+#   with a <refuse prefix> line, when there is no trusted git directory
+#   (memory_dir_has_git; the cure is notes-setup) or the entry cannot be
+#   moved (memory_dir_git_not_movable). fsm/epic.py runs the same helper in
+#   PREPARE and when it starts an owner container again.
+_memory_git_gate() {
+  local label="$1" refuse="$2" note="$3" mem="$4" out rc=0
+  [[ -e "${mem}/.git" || -L "${mem}/.git" ]] || return 0
+  _notes_paths
+  out=$(python3 "$(cd "$(dirname "$0")" && pwd)/memory-sync.py" quarantine-top-git \
+        --git-dir "$notes_git" --work-tree "$mem" --state-dir "$notes_state" 2>/dev/null) || rc=$?
+  case "$rc" in
+    0)
+      echo "${note}:${label}:memory_git_quarantined (${mem}/.git -> ${out#MOVED:})"
+      return 0 ;;
+    3)
+      echo "${refuse}:${label}:memory_dir_has_git (${mem}/.git; no git directory of the notes at ${notes_git}; run: po-act.sh notes-setup)"
+      return 3 ;;
+    *)
+      echo "${refuse}:${label}:memory_dir_git_not_movable (${mem}/.git; remove it by hand)"
+      return 3 ;;
+  esac
+}
+
 # _mq_failed_runs_for_pr <pr>
 #   Reads `gh run list --event merge_group --json
 #   databaseId,headBranch,conclusion,workflowName` output on stdin and prints one
@@ -1115,14 +1163,13 @@ except Exception: print('')" 2>/dev/null || true)
   fi
   # An epic run mounts its memory folder again when it must start a new
   # owner container. The folder is the one in the run's run.json. The same
-  # rule as at the launch: no `.git` entry in it.
+  # rule as at the launch (_memory_git_gate).
   if [[ "$mode" == "epic" ]]; then
     local resume_memory
     resume_memory=$(python3 -c "import json,sys
 print(json.load(open(sys.argv[1])).get('memory_dir') or '')" "${FSM_RUNS_BASE}/${run_id}/run.json" 2>/dev/null || true)
-    if [[ -n "$resume_memory" && ( -e "${resume_memory}/.git" || -L "${resume_memory}/.git" ) ]]; then
-      echo "FSM_RESUME_REFUSED:${run_id}:memory_dir_has_git (${resume_memory}/.git; run: po-act.sh notes-setup)"
-      return 3
+    if [[ -n "$resume_memory" ]]; then
+      _memory_git_gate "$run_id" FSM_RESUME_REFUSED FSM_RESUME_NOTE "$resume_memory" || return 3
     fi
   fi
   if ! cap=$(_capacity_ok); then
@@ -1320,14 +1367,13 @@ case "$cmd" in
           echo "DISPATCH_REFUSED:${epic_label}:no_canon_or_memory_dir (canon ${epic_canon}, memory ${epic_memory}: one is not a directory; set CFGMS_CANON_DIR and CFGMS_MEMORY_DIR to the host clones)"
           exit 3
         fi
-        # A `.git` in the memory folder means the folder is not set up (the
-        # git directory must be outside it) or that an agent put one there.
-        # Agents write that folder, so its `.git` is never trusted.
-        if [[ -e "${epic_memory}/.git" || -L "${epic_memory}/.git" ]]; then
-          echo "DISPATCH_REFUSED:${epic_label}:memory_dir_has_git (${epic_memory}/.git; run: po-act.sh notes-setup)"
-          exit 3
-        fi
-        if ! cap=$(_capacity_ok); then
+        # A `.git` in the memory folder: the folder is not set up (the git
+        # directory must be outside it) or an agent put one there. It is
+        # never trusted: moved away when the notes are set up, else refused.
+        _memory_git_gate "$epic_label" DISPATCH_REFUSED DISPATCH_NOTE "$epic_memory" || exit 3
+        # A new owner needs two launch slots: its own and one for its
+        # validator (the validator asks the same gate, fsm/epic.py).
+        if ! cap=$(_capacity_slots_ok 2); then
           echo "DISPATCH_DEFERRED:${epic_label}:resources (${cap})"
           exit 0
         fi
@@ -1954,7 +2000,8 @@ EOF
     # supported: the second sees `behind` and does not merge.
     #   NOTES_SYNC_SKIPPED:no_memory_dir (<path>)   exit 0  no folder on this host
     #   NOTES_SYNC_SKIPPED:already_running          exit 0  another memory-sync.py holds
-    #                                               the lock: its run does the work
+    #                                               the lock (its exit code 75): its
+    #                                               run does the work
     #   NOTES_SYNC_REFUSED:not_detached (<what>)    exit 3  there is no usable git
     #                                               directory outside the folder. The
     #                                               text names `po-act.sh notes-setup`.
@@ -1966,14 +2013,19 @@ EOF
     #                                               place and the folder has a `.git`
     #                                               entry too. An owner can write the
     #                                               folder, so this must not stop the
-    #                                               save for all: the sync runs (git
-    #                                               never adds a `.git` entry) and the
-    #                                               last line is ATTENTION.
-    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:behind=0:alerts=0   exit 0
-    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>[:fetch=failed]
-    #                                               exit 0  a number is not 0, the fetch
+    #                                               save for all: memory-sync.py moves
+    #                                               the entry into its quarantine (an
+    #                                               alert), the sync runs, and the last
+    #                                               line is ATTENTION.
+    #   NOTES_SYNC_OK:committed=<n>:unpushed=0:behind=0:alerts=0:refused=0   exit 0
+    #   NOTES_SYNC_ATTENTION:committed=<n>:unpushed=<n>:behind=<n>:alerts=<n>:refused=<n>[:fetch=failed]
+    #                                               exit 0  a number other than
+    #                                               committed is not 0, the fetch
     #                                               failed, or the NOTE line was printed
     #   NOTES_SYNC_FAILED:exit_<rc>                 exit 1  memory-sync.py failed
+    #   NOTES_SYNC_FAILED:no_result                 exit 1  it ended with 0 and wrote
+    #                                               no usable result file
+    #   NOTES_SYNC_FAILED:state_dir (<path>)        exit 1  no result file can be made
     #   NOTES_SYNC_FAILED:timeout_<secs>s           exit 1  memory-sync.py ran longer
     #                                               than CFGMS_NOTES_SYNC_TIMEOUT_SECS
     #                                               (default 300) and was stopped
@@ -1981,10 +2033,15 @@ EOF
     # are about the remote as it is now, not about what this host pushed last.
     # committed: commits made by this call. unpushed: origin/main..HEAD after
     # it. behind: HEAD..origin/main (commits on the remote that this host does
-    # not have; nothing is merged). alerts: the ALERT lines of this call. A
-    # refused file that stays in the folder gives an alert one time, not each
-    # call. fetch=failed: the remote could not be read, so unpushed and behind
-    # are from the last time it could.
+    # not have; nothing is merged). alerts: the alerts of this call. refused:
+    # the entries held back NOW (refused files still in the folder, entries
+    # that `git add` cannot read, `.git` entries that could not be moved).
+    # alerts and refused come from memory-sync.py's result file, never from
+    # its log text (that holds file names that agents chose). A refused file
+    # that stays in the folder gives an alert one time, and it is in refused
+    # on every call, so every call says ATTENTION while it is there.
+    # fetch=failed: the remote could not be read, so unpushed and behind are
+    # from the last time it could.
     _notes_paths
     notes_py="${CFGMS_TEST_MEMORY_SYNC:-$(cd "$(dirname "$0")" && pwd)/memory-sync.py}"
     if [[ ! -d "$notes_dir" ]]; then
@@ -2009,25 +2066,45 @@ EOF
     notes_fetch=ok
     _notes_host_git fetch -q --no-tags origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null 2>&1 || notes_fetch=failed
     notes_head_before="$(notes_git_do rev-parse -q --verify HEAD || true)"
-    notes_args=(once --git-dir "$notes_git" --work-tree "$notes_dir")
-    [[ -n "${CFGMS_MEMORY_STATE_DIR:-}" ]] && notes_args+=(--state-dir "$CFGMS_MEMORY_STATE_DIR")
+    # The numbers come from a result file that memory-sync.py writes, and the
+    # lock case from its exit code (75): never from the log text, which holds
+    # file names that agents chose.
+    mkdir -p -m 700 "$notes_state" 2>/dev/null || true
+    notes_result="$(mktemp "${notes_state}/result-XXXXXX" 2>/dev/null)" || {
+      echo "NOTES_SYNC_FAILED:state_dir (${notes_state})"; exit 1; }
+    notes_args=(once --git-dir "$notes_git" --work-tree "$notes_dir" --state-dir "$notes_state"
+                --result-file "$notes_result")
     notes_rc=0
     # `timeout` stops memory-sync.py and what it started (a push that hangs).
     # 124: stopped at the limit. 137: it did not stop and was killed.
     notes_out="$(timeout -k 5 "$notes_timeout" python3 "$notes_py" "${notes_args[@]}" 2>&1)" || notes_rc=$?
     [[ -n "$notes_out" ]] && printf '%s\n' "$notes_out"
+    notes_counts_json="$(cat -- "$notes_result" 2>/dev/null || true)"
+    rm -f -- "$notes_result"
     if [[ "$notes_rc" == 124 || "$notes_rc" == 137 ]]; then
       echo "NOTES_SYNC_FAILED:timeout_${notes_timeout}s"
       exit 1
     fi
+    if [[ "$notes_rc" == 75 ]]; then
+      echo "NOTES_SYNC_SKIPPED:already_running"
+      exit 0
+    fi
     if [[ "$notes_rc" != 0 ]]; then
-      if [[ "$notes_out" == *"another memory-sync is running"* ]]; then
-        echo "NOTES_SYNC_SKIPPED:already_running"
-        exit 0
-      fi
       echo "NOTES_SYNC_FAILED:exit_${notes_rc}"
       exit 1
     fi
+    # "<alerts> <refused>" from the result file; no file or a bad one: FAILED.
+    if ! notes_ar="$(printf '%s' "$notes_counts_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+a, r = d["alerts"], d["refused"]
+assert all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (a, r))
+print(a, r)' 2>/dev/null)"; then
+      echo "NOTES_SYNC_FAILED:no_result"
+      exit 1
+    fi
+    notes_alerts="${notes_ar% *}"
+    notes_refused="${notes_ar#* }"
     notes_head_after="$(notes_git_do rev-parse -q --verify HEAD || true)"
     if [[ "$notes_head_before" == "$notes_head_after" ]]; then
       notes_committed=0
@@ -2037,11 +2114,9 @@ EOF
     # No origin/main to compare with: every commit counts as not pushed.
     notes_unpushed="$(notes_git_do rev-list --count origin/main..HEAD || notes_git_do rev-list --count HEAD || echo 1)"
     notes_behind="$(notes_git_do rev-list --count HEAD..origin/main || echo 0)"
-    # memory-sync.py logs one "<time> ALERT <kind>: ..." line for each alert.
-    notes_alerts="$(printf '%s\n' "$notes_out" | grep -cE '^[0-9T:+-]+ ALERT ' || true)"
-    notes_counts="committed=${notes_committed}:unpushed=${notes_unpushed}:behind=${notes_behind}:alerts=${notes_alerts}"
+    notes_counts="committed=${notes_committed}:unpushed=${notes_unpushed}:behind=${notes_behind}:alerts=${notes_alerts}:refused=${notes_refused}"
     [[ -n "$notes_git_entry" ]] && echo "NOTES_SYNC_NOTE:git_entry_in_folder (${notes_git_entry})"
-    if [[ "$notes_unpushed" == 0 && "$notes_behind" == 0 && "$notes_alerts" == 0 \
+    if [[ "$notes_unpushed" == 0 && "$notes_behind" == 0 && "$notes_alerts" == 0 && "$notes_refused" == 0 \
           && "$notes_fetch" == ok && -z "$notes_git_entry" ]]; then
       echo "NOTES_SYNC_OK:${notes_counts}"
     elif [[ "$notes_fetch" == ok ]]; then
@@ -2076,9 +2151,14 @@ EOF
     #                                                 remove them from the remote. Nothing
     #                                                 changed: no git directory, the
     #                                                 folder's .git is where it was
+    #   NOTES_SETUP_REFUSED:git_entry_not_movable (<from> -> <to>: <error>; ...)
+    #                                                 exit 3  the folder's .git cannot be
+    #                                                 moved by one rename (for example the
+    #                                                 state directory is on another file
+    #                                                 system). It is never copied. Nothing
+    #                                                 changed: no git directory
     #   NOTES_SETUP_FAILED:<step> (...)               exit 1  step: state_dir, clone,
-    #                                                 no_origin_main, move_untrusted_git,
-    #                                                 move_git_dir. A failure before
+    #                                                 no_origin_main, move_git_dir. A failure before
     #                                                 move_git_dir leaves no git directory.
     _notes_paths
     notes_remote="${CFGMS_MEMORY_REMOTE:-https://github.com/cfg-is/cfgms-memory.git}"
@@ -2137,9 +2217,12 @@ EOF
       notes_missing=0; notes_first=""
       while IFS= read -r -d '' notes_path; do
         notes_parent="$notes_dir"; notes_found=1
-        IFS=/ read -r -a notes_parts <<< "$notes_path"
-        for notes_part in "${notes_parts[@]:0:${#notes_parts[@]}-1}"; do
-          notes_parent="${notes_parent}/${notes_part}"
+        # Each folder on the way, split at "/" by parameter expansion: a
+        # name can hold a newline, which `read` would stop at.
+        notes_rest="$notes_path"
+        while [[ "$notes_rest" == */* ]]; do
+          notes_parent="${notes_parent}/${notes_rest%%/*}"
+          notes_rest="${notes_rest#*/}"
           if [[ -L "$notes_parent" || ! -d "$notes_parent" ]]; then notes_found=0; break; fi
         done
         if [[ "$notes_found" == 1 && ! -e "${notes_dir}/${notes_path}" && ! -L "${notes_dir}/${notes_path}" ]]; then
@@ -2152,15 +2235,26 @@ EOF
       done < "$notes_listing"
       if [[ "$notes_missing" -gt 0 ]]; then
         rm -rf "$notes_tmp"
-        echo "NOTES_SETUP_REFUSED:folder_lacks_remote_files (${notes_missing} files; first: ${notes_first})"
+        # %q: a name with a newline stays on the one status line
+        printf -v notes_first_q '%q' "$notes_first"
+        echo "NOTES_SETUP_REFUSED:folder_lacks_remote_files (${notes_missing} files; first: ${notes_first_q})"
         exit 3
       fi
     fi
     if [[ -e "${notes_dir}/.git" || -L "${notes_dir}/.git" ]]; then
       notes_aside="${notes_state}/untrusted-git-$(date -u +%Y%m%dT%H%M%SZ)"
       [[ -e "$notes_aside" || -L "$notes_aside" ]] && notes_aside="${notes_aside}-$$"
-      mv -T -- "${notes_dir}/.git" "$notes_aside" 2>/dev/null \
-        || notes_setup_fail move_untrusted_git "${notes_dir}/.git"
+      # One rename (os.rename): never a copy, never into the link's target.
+      # A rename to another file system fails; then nothing is changed.
+      if ! notes_err="$(python3 -c 'import os, sys
+try:
+    os.rename(sys.argv[1], sys.argv[2])
+except OSError as e:
+    print(e.strerror or e); sys.exit(1)' "${notes_dir}/.git" "$notes_aside" 2>&1)"; then
+        rm -rf "$notes_tmp"
+        echo "NOTES_SETUP_REFUSED:git_entry_not_movable (${notes_dir}/.git -> ${notes_aside}: ${notes_err}; a rename only, no copy: move or remove it by hand)"
+        exit 3
+      fi
       echo "NOTES_SETUP_NOTE:moved_untrusted_git (${notes_dir}/.git -> ${notes_aside}); it is not used. Look at it or delete it."
     fi
     mv -T -- "$notes_new" "$notes_git" 2>/dev/null || notes_setup_fail move_git_dir "$notes_git"

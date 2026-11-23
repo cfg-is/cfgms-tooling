@@ -176,12 +176,13 @@ class PreflightMain(unittest.TestCase):
             for f in ("run.json", "state.jsonl"):
                 os.utime(r.p(f), (old, old))
 
-    def run_main(self):
+    def run_main(self, capacity=None):
         self.world_file.write_text(json.dumps(self.world))
         self.board_file.write_text(json.dumps(self.board))
         pf = _load_preflight()
         pf.code_health_check = lambda: dict(self.code_health)      # no build of develop in a test
-        pf.host_capacity = lambda: {"available": None}             # not this machine's memory
+        # not this machine's memory
+        pf.host_capacity = lambda: dict(capacity or {"available": None})
         pf.running_containers = lambda: []                         # not this machine's containers
         self.pf = pf
         return pf.main()
@@ -208,6 +209,17 @@ class PreflightMain(unittest.TestCase):
         self.assertIs(json.loads(printed.getvalue())["dispatch_blocked"], True)
         self.code_health = {"ok": False, "skipped": True, "skipped_reason": "no checkout"}
         self.assertIs(self.run_main()["dispatch_blocked"], False)
+
+    def test_the_capacity_snapshot_reaches_the_owner_starts(self):
+        """main() passes out["capacity"].free_slots to the owner starts: a
+        new owner needs 2 slots."""
+        self.world["epics"] = [{"number": 7, "title": "epic 7"}, {"number": 8, "title": "epic 8"}]
+        self.world["issues"]["8"] = {"title": "epic 8", "labels": ["epic"]}
+        self.board = [item(7, "Ready", "epic 7"), item(8, "Ready", "epic 8")]
+        out = self.run_main({"available": True, "can_launch": True, "free_slots": 3})
+        self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "hold", "resources")])
+        out = self.run_main()                                      # no capacity data
+        self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "start", "ready")])
 
     def test_a_ready_epic_is_held_from_the_story_dispatch_and_offered_to_an_owner(self):
         out = self.run_main()
@@ -291,11 +303,43 @@ class PreflightMain(unittest.TestCase):
         self.assertEqual([(a["number"], a["run_state"]) for a in out["owner_attention"]], [(7, "FAILED")])
         self.assertEqual(self.starts(out), [(7, "start", "ready")])   # no gate passed: nothing holds it
 
-    def test_a_run_refused_at_a_gate_is_not_in_the_attention_list(self):
+    def test_a_refused_run_that_did_not_record_a_deferral_is_not_in_the_attention_list(self):
+        """A run dir from before the record: not known, not listed."""
         self.make_run(7, [("PREPARE", "gate_refused", "REFUSED")], done=True)
         out = self.run_main()
         self.assertEqual(out["owner_attention"], [])
         self.assertEqual(self.starts(out), [(7, "start", "ready")])
+
+    def test_a_refusal_that_is_not_a_deferral_is_in_the_attention_list(self):
+        r = statemod.RunDir("epic-7-a", base=self.base)
+        r.create({"mode": supervisor.EPIC_MODE, "epic": 7, "target": "epic-7", "key": "epic-7",
+                  "item_id": "PVTI_item7"})
+        r.append("note", refused_deferred=False)
+        r.append("transition", frm="PREPARE", event="gate_refused", to="REFUSED", kind="",
+                 reason="base_branch_missing")
+        r.append("terminal_done", state="REFUSED")
+        out = self.run_main()
+        self.assertEqual([(a["number"], a["run_state"]) for a in out["owner_attention"]], [(7, "REFUSED")])
+        self.assertIn("refused (base_branch_missing)", out["owner_attention"][0]["why"])
+        self.assertEqual(self.starts(out), [(7, "start", "ready")])     # still offered: a person decides
+
+    def test_attention_for_refused_and_deferred_rows(self):
+        pf = _load_preflight()
+        out = {"epics_open": [{"number": n} for n in range(1, 7)], "epics_undecomposed": [],
+               "epics_owner_run": [], "epics_audit_due": [], "pipeline_state": {"in_progress": []}}
+
+        def row(n, created, deferred, reason="capacity:full"):
+            return {"mode": "epic", "key": f"epic-{n}", "run_id": f"epic-{n}-{created}", "status": "done",
+                    "state": "REFUSED", "reason": reason, "created": created, "refused_deferred": deferred}
+        rows = [row(1, 1, False, "item_mismatch"),                         # refused: listed
+                row(2, 1, True),                                           # one deferral: not
+                row(3, 1, True), row(3, 2, True), row(3, 3, True),         # 3 the same: listed
+                row(4, 1, True), row(4, 2, True, "lease_held"), row(4, 3, True),   # not the same
+                row(5, 1, False, "item_mismatch"), row(5, 2, True),        # the last is a deferral
+                row(6, 1, None)]                                           # not recorded: not known
+        got = pf.compute_owner_attention(out, rows, [])
+        self.assertEqual([(a["number"], a["run_id"]) for a in got], [(1, "epic-1-1"), (3, "epic-3-3")])
+        self.assertIn("the last 3 runs were deferred for the same reason (capacity:full)", got[1]["why"])
 
     def test_a_closed_epic_is_not_in_the_attention_list(self):
         self.make_run(8, OWNER + [("OWNER", "failed", "FAILED")], done=True)   # epic 8 is not open

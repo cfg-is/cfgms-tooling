@@ -10,6 +10,7 @@ need no gitleaks or truffleHog and no network. Git is real.
 Run: python3 scripts/tests/test-memory-sync.py
 """
 import importlib.util
+import json
 import os
 import shutil
 import stat
@@ -60,6 +61,12 @@ class MemorySync(unittest.TestCase):
 
     def tearDown(self):
         os.environ["PATH"] = self.old_path
+        for here, dirs, files in os.walk(self.root):       # tests take permissions away
+            for d in dirs:
+                try:
+                    os.chmod(os.path.join(here, d), 0o700, follow_symlinks=False)
+                except (OSError, NotImplementedError):
+                    pass
         shutil.rmtree(self.root, ignore_errors=True)
 
     def set_scanners(self, gitleaks="exit 0", trufflehog="exit 0"):
@@ -248,69 +255,131 @@ exit 9''')
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(b"inside the mounted folder", r.stderr)
 
-    # --- a `.git` entry below the folder ------------------------------------------
-    # An agent can run `git init` in a sub-folder. `git add` stops with an error
-    # at a nested repository that has no commit, so one such folder stopped the
-    # save for every owner.
+    # --- a `.git` entry in the folder ---------------------------------------------
+    # An agent can put a `.git` entry (a directory, a file or a link) in any
+    # folder. Before, its whole folder was left out: one owner stopped the save
+    # of the notes of the others. Now the entry is moved into the quarantine
+    # (one rename; never followed, never read by git) and everything is saved.
 
-    def nested_cycle(self, rel):
-        """One cycle with a `.git` entry in `rel` and a note beside it."""
+    def quarantined(self):
+        return sorted(p.name for p in (self.state / "quarantine").iterdir() if p.name.startswith("git-"))
+
+    def git_entry_cycle(self, rel):
+        """One cycle with a `.git` entry in `rel`, a note in `rel` and a note
+        of another owner beside it: both notes are committed in that call."""
+        (self.work / rel).mkdir(parents=True, exist_ok=True)
         (self.work / rel / "inside.md").write_text(NOTE)
-        self.note("areas/beside.md")
-        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.note("areas/beside.md", NOTE.replace("owner/epic-7", "owner/epic-8"))
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 2)
         files = self.head_files()
         self.assertIn("areas/beside.md", files)
-        self.assertEqual([f for f in files if f.startswith(rel)], [])
-        self.assertEqual(self.alerts(), ["refused_nested_git"])
-        self.assertEqual(self.g("ls-files", "-s", "--", ":(literal)" + rel), b"")     # no link to a repository
-        # the folder stays: one alert for the path, not one each cycle
+        self.assertIn(rel + "/inside.md", files)
+        self.assertEqual([f for f in files if ".git" in f.split("/")], [])
+        self.assertEqual(self.alerts(), ["git_entry_quarantined"])
+        self.assertFalse(os.path.lexists(self.work / rel / ".git"))
+        self.assertEqual(len(self.quarantined()), 1)
+        self.assertEqual(self.repo.result, {"committed": 2, "alerts": 1, "refused": 0})
+        self.assertEqual(self.g("ls-files", "-s", "--", ":(literal)" + rel + "/inside.md")[:6], b"100644")
         self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
-        self.assertEqual(self.alerts(), ["refused_nested_git"])
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 0})
 
-    def test_nested_repository_with_no_commit_does_not_stop_the_save(self):
+    def test_a_git_file_beside_notes_does_not_hold_them_back(self):
+        """`touch areas/.git` and a note of another owner in areas/: the note
+        is saved in the same call."""
+        (self.work / "areas").mkdir()
+        (self.work / "areas" / ".git").write_text("gitdir: /nowhere\n")
+        self.note("areas/other-owner.md", NOTE.replace("owner/epic-7", "owner/epic-9"))
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertIn("areas/other-owner.md", self.head_files())
+        self.assertEqual(self.alerts(), ["git_entry_quarantined"])
+
+    def test_nested_repository_with_no_commit_is_quarantined(self):
         (self.work / "areas" / "sub").mkdir(parents=True)
         _git("init", "-q", cwd=self.work / "areas" / "sub")
-        self.nested_cycle("areas/sub")
+        self.git_entry_cycle("areas/sub")
 
-    def test_nested_repository_with_a_commit_is_left_out(self):
+    def test_nested_repository_with_a_commit_is_quarantined(self):
         (self.work / "areas" / "sub").mkdir(parents=True)
         _git("init", "-q", cwd=self.work / "areas" / "sub")
         _git("commit", "-q", "--allow-empty", "-m", "x", cwd=self.work / "areas" / "sub")
-        self.nested_cycle("areas/sub")
+        self.git_entry_cycle("areas/sub")
 
-    def test_nested_git_file_is_left_out(self):
+    def test_nested_git_file_is_quarantined(self):
         (self.work / "areas" / "sub").mkdir(parents=True)
         (self.work / "areas" / "sub" / ".git").write_text("gitdir: /nowhere\n")
-        self.nested_cycle("areas/sub")
+        self.git_entry_cycle("areas/sub")
 
-    def test_nested_git_link_is_left_out_and_not_followed(self):
-        outside = self.root / "outside"
-        (outside / "deep").mkdir(parents=True)
-        (outside / "deep" / ".git").mkdir()
+    def test_nested_git_link_is_moved_as_a_link_and_not_followed(self):
+        target = self.root / "target"
+        target.mkdir()
+        (target / "keep").write_text("host file\n")
         (self.work / "areas" / "sub").mkdir(parents=True)
-        os.symlink(self.root / "nowhere", self.work / "areas" / "sub" / ".git")
-        os.symlink(outside, self.work / "areas" / "link")
-        # the link to a folder is not walked: outside/deep/.git is not found
-        self.assertEqual(self.ms.nested_git_dirs(str(self.work)), ["areas/sub"])
-        os.unlink(self.work / "areas" / "link")     # (a link is refused by its own rule)
-        self.nested_cycle("areas/sub")
+        os.symlink(target, self.work / "areas" / "sub" / ".git")
+        self.git_entry_cycle("areas/sub")
+        moved = self.state / "quarantine" / self.quarantined()[0]
+        self.assertTrue(moved.is_symlink())
+        self.assertEqual((target / "keep").read_text(), "host file\n")    # the target is not touched
 
-    def test_git_entry_at_the_top_is_not_a_nested_one(self):
-        (self.work / ".git" / "areas").mkdir(parents=True)
-        (self.work / ".git" / "areas" / ".git").mkdir()
+    def test_a_link_to_a_folder_is_not_walked(self):
+        outside = self.root / "outside"
+        (outside / "deep" / ".git").mkdir(parents=True)
+        (self.work / "areas").mkdir()
+        os.symlink(outside, self.work / "areas" / "link")
         self.note("areas/beside.md")
-        self.assertEqual(self.ms.nested_git_dirs(str(self.work)), [])
+        self.ms.cycle(self.repo, push=False)
+        self.assertTrue((outside / "deep" / ".git").is_dir())             # not moved
+        self.assertEqual(self.quarantined(), [])
+
+    def test_git_entry_at_the_top_is_quarantined(self):
+        (self.work / ".git" / "hooks").mkdir(parents=True)
+        self.note("areas/beside.md")
         self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
-        self.assertEqual(self.alerts(), [])
+        self.assertFalse(os.path.lexists(self.work / ".git"))
+        self.assertEqual(self.alerts(), ["git_entry_quarantined"])
         self.assertEqual([f for f in self.head_files() if ".git" in f], [])
 
-    def test_nested_folder_with_a_pattern_name_leaves_out_only_itself(self):
-        """A folder named `*`: as a pattern it would leave out every note in
-        `areas/`. The name is taken as it is written."""
-        rel = "areas/*"
-        (self.work / rel).mkdir(parents=True)
-        _git("init", "-q", cwd=self.work / rel)
-        self.nested_cycle(rel)
+    def test_a_folder_with_a_pattern_name_that_is_left_out_leaves_out_only_itself(self):
+        """A folder named `*` whose `.git` cannot be moved: as a pattern it
+        would leave out every note in `areas/`. The name is taken as it is
+        written."""
+        (self.work / "areas" / "*").mkdir(parents=True)
+        (self.work / "areas" / "*" / ".git").write_text("x")
+        self.note("areas/beside.md")
+        real = os.rename
+
+        def rename(src, dst, *a, **kw):
+            if src == ".git":
+                raise OSError(18, "Invalid cross-device link")
+            return real(src, dst, *a, **kw)
+        with mock.patch.object(self.ms.os, "rename", rename):
+            self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertIn("areas/beside.md", self.head_files())
+
+    def test_a_git_entry_that_cannot_be_moved_holds_back_only_its_folder(self):
+        """A rename that fails (for example to another file system) copies
+        nothing: the entry stays, its own folder is left out, every call
+        counts it in `refused`, one alert."""
+        (self.work / "areas" / "sub").mkdir(parents=True)
+        (self.work / "areas" / "sub" / ".git").write_text("x")
+        (self.work / "areas" / "sub" / "inside.md").write_text(NOTE)
+        self.note("areas/beside.md")
+        real = os.rename
+
+        def rename(src, dst, *a, **kw):
+            if src == ".git":
+                raise OSError(18, "Invalid cross-device link")
+            return real(src, dst, *a, **kw)
+        with mock.patch.object(self.ms.os, "rename", rename):
+            self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+            self.assertEqual(self.repo.result["refused"], 1)
+            self.assertEqual(self.alerts(), ["refused_git_entry_not_movable"])
+            self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+            self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1})
+        files = self.head_files()
+        self.assertIn("areas/beside.md", files)
+        self.assertNotIn("areas/sub/inside.md", files)
+        self.assertTrue((self.work / "areas" / "sub" / ".git").exists())
+        self.assertEqual(self.quarantined(), [])
 
     def test_a_note_that_was_committed_stays_when_its_folder_gets_a_git_entry(self):
         self.note("areas/sub/kept.md")
@@ -318,6 +387,139 @@ exit 9''')
         _git("init", "-q", cwd=self.work / "areas" / "sub")
         self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
         self.assertIn("areas/sub/kept.md", self.head_files())
+
+    # --- entries that `git add` cannot read ---------------------------------------
+    # None of them may stop the save of the rest. Each is left out, alerted one
+    # time, and counted in `refused` on every call while it is there.
+
+    def held_cycle(self, kind, *, alert=None):
+        self.note("areas/beside.md")
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 1)
+        self.assertIn("areas/beside.md", self.head_files())
+        self.assertEqual(self.alerts(), [alert or "refused_" + kind])
+        self.assertEqual(self.repo.result["refused"], 1)
+        self.assertEqual(self.ms.cycle(self.repo, push=False), 0)
+        self.assertEqual(self.repo.result, {"committed": 0, "alerts": 0, "refused": 1})
+
+    def test_an_unreadable_file_is_left_out(self):
+        p = self.note("areas/locked.md")
+        p.chmod(0)
+        self.held_cycle("unreadable_file")
+        self.assertNotIn("areas/locked.md", self.head_files())
+
+    def test_a_fifo_is_left_out(self):
+        (self.work / "areas").mkdir()
+        os.mkfifo(self.work / "areas" / "pipe.md")
+        self.held_cycle("special_file")
+
+    def test_a_socket_is_left_out(self):
+        import socket
+        (self.work / "areas").mkdir()
+        old = os.getcwd()
+        os.chdir(self.work / "areas")                  # a short path: socket paths are short
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.bind("sock.md")
+        finally:
+            os.chdir(old)
+        try:
+            self.held_cycle("special_file")
+        finally:
+            s.close()
+
+    def test_a_device_is_left_out(self):
+        """A device node needs root to make: the walk is given one by its
+        lstat answer."""
+        self.note("areas/dev.md")
+        real = os.stat
+
+        def fake_stat(name, *a, **kw):
+            st = real(name, *a, **kw)
+            if name == "dev.md":
+                return os.stat_result((stat.S_IFCHR | 0o644,) + tuple(st)[1:])
+            return st
+        with mock.patch.object(self.ms.os, "stat", fake_stat):
+            held = self.ms.scan_tree(self.repo)
+        self.assertEqual(held, [("special_file", "areas/dev.md")])
+
+    def test_a_dangling_link_is_refused_and_the_rest_saved(self):
+        (self.work / "areas").mkdir()
+        os.symlink(self.root / "nowhere", self.work / "areas" / "dangling.md")
+        self.held_cycle("not_a_plain_file", alert="refused_not_a_plain_file")
+
+    def test_folders_that_cannot_be_read_or_entered_are_left_out(self):
+        for name, mode in (("closed", 0), ("no-enter", 0o644), ("no-list", 0o311)):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.note("areas/%s/kept.md" % name)
+                self.assertEqual(self.ms.cycle(self.repo, push=False), 1)       # committed before
+                self.note("areas/%s/new.md" % name)
+                (self.work / "areas" / name).chmod(mode)
+                self.held_cycle("unreadable_dir")
+                files = self.head_files()
+                self.assertIn("areas/%s/kept.md" % name, files)                 # not taken as removed
+                self.assertNotIn("areas/%s/new.md" % name, files)
+
+    # --- what a caller reads ------------------------------------------------------
+
+    def run_once(self, *extra):
+        return subprocess.run(["python3", SYNC_PATH, "once", "--git-dir", str(self.gitdir),
+                               "--work-tree", str(self.work), "--state-dir", str(self.state),
+                               "--no-push", *extra], capture_output=True)
+
+    def test_the_result_file_counts_this_call(self):
+        result = self.root / "result.json"
+        self.note("areas/a.md")
+        (self.work / "areas" / "run.sh").write_text("x")
+        r = self.run_once("--result-file", str(result))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(result.read_text()), {"committed": 1, "alerts": 1, "refused": 1})
+        r = self.run_once("--result-file", str(result))
+        self.assertEqual(json.loads(result.read_text()), {"committed": 0, "alerts": 0, "refused": 1})
+
+    def test_a_name_with_a_newline_makes_one_log_line(self):
+        (self.work / "areas").mkdir()
+        (self.work / "areas" / "x\n2026 ALERT fake: y.sh").write_text("x")
+        r = self.run_once()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.decode().splitlines()
+        self.assertEqual(len([l for l in lines if " ALERT " in l]), 1)
+        self.assertIn("\\x0a", r.stdout.decode())
+
+    def test_a_held_lock_exits_75(self):
+        import fcntl
+        self.state.mkdir(exist_ok=True)
+        with open(self.state / "lock", "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            r = self.run_once()
+        self.assertEqual(r.returncode, 75)
+
+    def quarantine_top(self, git_dir=None):
+        r = subprocess.run(["python3", SYNC_PATH, "quarantine-top-git", "--git-dir",
+                            str(git_dir or self.gitdir), "--work-tree", str(self.work),
+                            "--state-dir", str(self.state)], capture_output=True)
+        return r.returncode, r.stdout.decode().strip()
+
+    def test_quarantine_top_git(self):
+        self.assertEqual(self.quarantine_top(), (0, "NONE"))
+        (self.work / ".git").write_text("gitdir: /x\n")
+        rc, line = self.quarantine_top()
+        self.assertEqual(rc, 0)
+        self.assertTrue(line.startswith("MOVED:" + str(self.state / "quarantine" / "git-")), line)
+        self.assertFalse(os.path.lexists(self.work / ".git"))
+        os.symlink(self.root / "nowhere", self.work / ".git")
+        self.assertEqual(self.quarantine_top(self.root / "no-git-dir"), (3, "NO_GIT_DIR"))
+        self.assertTrue(os.path.lexists(self.work / ".git"))
+        self.assertEqual(self.quarantine_top(self.work / ".git"), (3, "NO_GIT_DIR"))   # in the folder
+        (self.state / "quarantine").chmod(0o500)
+        try:
+            rc, line = self.quarantine_top()
+        finally:
+            (self.state / "quarantine").chmod(0o700)
+        self.assertEqual(rc, 4)
+        self.assertTrue(line.startswith("NOT_MOVABLE:"), line)
+        self.assertTrue(os.path.lexists(self.work / ".git"))
 
     def test_a_stopped_cycle_leaves_nothing_for_the_next_start(self):
         """A cycle that was killed leaves its scan folder (copies of notes)

@@ -140,9 +140,12 @@ def describe(run_id, base=None, now=None):
         params, params_unreadable = {}, True
     recs = run.records()
     state, reason, frm = "PREPARE", "", ""
+    refused_deferred = None
     for rec in recs:
         if rec.get("type") == "transition":
             state, reason, frm = rec.get("to", state), rec.get("reason") or "", rec.get("frm", "")
+        elif rec.get("type") == "note" and isinstance(rec.get("refused_deferred"), bool):
+            refused_deferred = rec["refused_deferred"]
     ended = [r for r in recs if r.get("type") == "terminal_done"]
     done = bool(ended)
     abandoned = [r for r in recs if r.get("type") == "abandoned"]
@@ -178,6 +181,10 @@ def describe(run_id, base=None, now=None):
         "branch": params.get("branch") or "", "lease_key": params.get("lease_key") or "",
         "container": container_for(mode, target, params.get("epic")), "state": state, "from": frm,
         "reason": reason, "status": status, "locked": locked,
+        # a REFUSED run: True when it was a deferral (tried again later),
+        # False when not; None when the run is not REFUSED or did not record
+        # it (an epic run records it, fsm/epic.py)
+        "refused_deferred": refused_deferred if state == "REFUSED" else None,
         "heartbeat_age": None if hb is None else round(hb, 1),
         "agent_launched": bool(launched), "sessions": len(launched),
         "gates_passed": gates_passed, "created": created, "last_activity": last,

@@ -11,9 +11,15 @@ somewhere else on the host and is never mounted, so a container cannot write
 hooks, remotes or credential settings.
 
 Each cycle:
-  1. stage what changed in the folder (git config isolated from the host's).
-     A folder below the top that holds a `.git` entry is left out, with an
-     alert: git cannot add it, and it must not stop the save of the rest.
+  1. walk the folder (no symlink is followed). Every `.git` entry (a file, a
+     directory or a link, at the top too) is moved by a rename into the
+     host-only state directory, with an alert: no git command ever runs on
+     it, and the notes beside it are saved. An entry that `git add` cannot
+     read (an unreadable file, a FIFO, a socket, a device, a folder that
+     cannot be read or entered) and a `.git` entry that cannot be moved are
+     left out of `git add`, with an alert. Then stage what changed (git
+     config isolated from the host's). One owner cannot stop the save of the
+     notes of the others.
   2. refuse anything that is not a plain note file (allow-list below)
   3. scan the staged content for secrets: gitleaks, then truffleHog
      (verified secrets); a hit moves the file out of the shared folder into a
@@ -28,8 +34,24 @@ Everything the folder contains is untrusted input written by agents.
 
 Usage:
   memory-sync.py once   --git-dir G --work-tree W [--state-dir S] [--no-push]
+                        [--result-file F]
   memory-sync.py run    --git-dir G --work-tree W [--state-dir S] [--interval 60]
+  memory-sync.py quarantine-top-git --git-dir G --work-tree W [--state-dir S]
   memory-sync.py detach --work-tree W --git-dir G     one-time: move W/.git to G
+
+`once` exits 75 when another memory-sync holds the lock (nothing was done).
+With --result-file it writes {"committed", "alerts", "refused"} there as JSON
+when the cycle ran to its end. `refused` is the number of entries that are
+held back now: refused files that are still in the folder, and entries left
+out of `git add`. A caller counts from this file, never from the log text:
+the log holds names that agents chose.
+
+`quarantine-top-git` is for the launch, resume and PREPARE gates of an epic
+run. When G is a usable git directory, it moves W/.git (a file, a directory
+or a link) into the state directory with the same rename as a cycle. It
+prints one line: MOVED:<to> or NONE (exit 0), NO_GIT_DIR (exit 3: G is
+missing or not usable; run `po-act.sh notes-setup`), NOT_MOVABLE:<error>
+(exit 4: remove it by hand).
 
 `detach` trusts W/.git: its config, hooks and remotes become the host's.
 Use it only for a folder that no container ever mounted. For a folder that
@@ -50,6 +72,9 @@ import tempfile
 import time
 
 MAX_FILE_BYTES = 1024 * 1024
+EXIT_NO_GIT_DIR = 3
+EXIT_NOT_MOVABLE = 4
+EXIT_LOCKED = 75
 ALLOWED = re.compile(r"^(README\.md|(areas|held)/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.md)$")
 AUTHOR_OK = re.compile(r"^[a-z0-9][a-z0-9/_.-]{0,62}$")
 FALLBACK_AUTHOR = "unknown"
@@ -63,8 +88,14 @@ def printable(text):
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def log(msg):
-    print(time.strftime("%Y-%m-%dT%H:%M:%S%z"), printable(msg), flush=True)
+    """One log line. A control character (a newline in a file name) is
+    written as \\xNN: a name cannot make a second line."""
+    text = _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), printable(msg))
+    print(time.strftime("%Y-%m-%dT%H:%M:%S%z"), text, flush=True)
 
 
 class Repo:
@@ -74,6 +105,8 @@ class Repo:
         self.state_dir = os.path.abspath(state_dir)
         self.quarantine = os.path.join(self.state_dir, "quarantine")
         self.alerts = os.path.join(self.state_dir, "alerts")
+        self.alert_count = 0           # alerts written by the current cycle
+        self.result = None             # set at the end of a cycle
         for d in (self.state_dir, self.quarantine, self.alerts):
             os.makedirs(d, mode=0o700, exist_ok=True)
 
@@ -128,7 +161,8 @@ class Repo:
             self.git("reset", "-q", "HEAD", "--", *paths)
 
     def alert(self, kind, path, detail):
-        name = "%s-%s.json" % (time.strftime("%Y%m%dT%H%M%S"), kind)
+        self.alert_count += 1
+        name ="%s-%s.json" % (time.strftime("%Y%m%dT%H%M%S"), kind)
         with open(os.path.join(self.alerts, name), "a") as f:
             f.write(json.dumps({"kind": kind, "path": printable(path), "detail": detail}) + "\n")
         log("ALERT %s: %s (%s)" % (kind, path, detail))
@@ -182,22 +216,144 @@ class Repo:
         self.alert(reason, path, "moved to quarantine")
 
 
-def nested_git_dirs(work_tree):
-    """Folders below the notes folder that hold a `.git` entry (a directory,
-    a file or a link), as paths from the folder, sorted. `git add` stops with
-    an error at such a folder when it has no commit, and adds it as a link to
-    another repository when it has one. The walk follows no symlink and does
-    not go into such a folder, or into a `.git` at the top (git skips that)."""
-    found = []
-    for here, dirs, files in os.walk(work_tree, followlinks=False):
-        if here == work_tree:
-            if ".git" in dirs:
-                dirs.remove(".git")
-            continue
-        if ".git" in dirs or ".git" in files:
-            found.append(os.path.relpath(here, work_tree))
-            dirs[:] = []
-    return sorted(found)
+def quarantine_git_entry(dir_fd, rel, quarantine):
+    """Move the `.git` entry of the open folder `dir_fd` (`rel` is the path of
+    that folder from the notes folder; "" is the top) into `quarantine` by
+    one rename. The rename moves the entry itself: a link is moved as a
+    link, never followed, and nothing is copied (a rename to another file
+    system fails). No git command runs on it. Returns (True, destination)
+    or (False, error text)."""
+    where = printable(rel.replace("/", "__") or "top")[-80:]
+    digest = hashlib.sha256(os.fsencode(rel)).hexdigest()[:12]
+    dst = os.path.join(quarantine, "git-%s-%s-%d-%s" % (
+        time.strftime("%Y%m%dT%H%M%S"), digest, os.getpid(), where))
+    try:
+        os.rename(".git", dst, src_dir_fd=dir_fd)
+    except OSError as e:
+        return False, "%s: %s" % (type(e).__name__, e.strerror or e)
+    return True, dst
+
+
+class _Unreadable(Exception):
+    """A folder whose entries cannot be listed or looked at."""
+
+
+def scan_tree(repo):
+    """Walk the notes folder before `git add`, through folder descriptors;
+    no symlink is followed. Every `.git` entry is moved into the quarantine
+    (quarantine_git_entry, with an alert). Returns [(kind, path)] for the
+    entries that `git add` must leave out:
+
+    - `git_entry_not_movable`: the folder of a `.git` entry that could not
+      be moved (path "" for the top: git skips a `.git` there, so nothing is
+      left out for it, but it is held back and counted).
+    - `unreadable_file`: `git add` stops the whole save at it.
+    - `special_file`: a FIFO, a socket or a device.
+    - `unreadable_dir`: a folder that cannot be read or entered. `git add`
+      stops at one it cannot enter, and leaves out one it cannot read
+      without a word (and can then see its committed notes as removed).
+    """
+    held = []
+    not_moved = []
+
+    def walk(dir_fd, rel):
+        try:
+            names = sorted(os.listdir(dir_fd))
+        except OSError:
+            raise _Unreadable()
+        for name in names:
+            path = name if not rel else rel + "/" + name
+            if name == ".git":
+                ok, info = quarantine_git_entry(dir_fd, rel, repo.quarantine)
+                if ok:
+                    repo.alert("git_entry_quarantined", path, "moved to " + info)
+                else:
+                    held.append(("git_entry_not_movable", rel))
+                    not_moved.append((path, info))
+                continue
+            try:
+                st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue                       # removed while the walk runs
+            except OSError:
+                raise _Unreadable()            # the folder cannot be entered
+            mode = st.st_mode
+            if stat.S_ISDIR(mode):
+                try:
+                    sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    held.append(("unreadable_dir", path))
+                    continue
+                try:
+                    walk(sub, path)
+                except _Unreadable:
+                    held.append(("unreadable_dir", path))
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(mode):
+                try:
+                    os.close(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd))
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    held.append(("unreadable_file", path))
+            elif not stat.S_ISLNK(mode):       # a link is added as a link and refused later
+                held.append(("special_file", path))
+
+    top = os.open(repo.work_tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        walk(top, "")
+    except _Unreadable:
+        raise RuntimeError("the notes folder itself cannot be read")
+    finally:
+        os.close(top)
+    for path, info in not_moved:
+        log("a .git entry could not be moved: %s (%s)" % (path, info))
+    return held
+
+
+def usable_git_dir(git_dir):
+    """True when `git_dir` is a git directory that git can use. Run on the
+    host's own git directory only, never on anything in the notes folder."""
+    if not os.path.isdir(git_dir):
+        return False
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
+    r = subprocess.run(["git", "--git-dir", git_dir, "rev-parse", "--git-dir"],
+                       env=env, capture_output=True)
+    return r.returncode == 0
+
+
+def cmd_quarantine_top_git(a):
+    """The `.git` entry at the top of the notes folder, for the gates of an
+    epic run (see the module text)."""
+    gd, wt = os.path.realpath(a.git_dir), os.path.realpath(a.work_tree)
+    if gd == wt or gd.startswith(wt + os.sep) or not usable_git_dir(a.git_dir):
+        print("NO_GIT_DIR")           # a git directory in the folder is not trusted
+        return EXIT_NO_GIT_DIR
+    quarantine = os.path.join(os.path.abspath(a.state_dir), "quarantine")
+    os.makedirs(quarantine, mode=0o700, exist_ok=True)
+    try:
+        top = os.open(a.work_tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        print(printable("NOT_MOVABLE:the notes folder cannot be opened (%s)" % e.strerror))
+        return EXIT_NOT_MOVABLE
+    try:
+        try:
+            os.stat(".git", dir_fd=top, follow_symlinks=False)
+        except FileNotFoundError:
+            print("NONE")
+            return 0
+        except OSError as e:
+            print(printable("NOT_MOVABLE:%s" % e.strerror))
+            return EXIT_NOT_MOVABLE
+        ok, info = quarantine_git_entry(top, "", quarantine)
+    finally:
+        os.close(top)
+    print(printable(("MOVED:" if ok else "NOT_MOVABLE:") + info))
+    return 0 if ok else EXIT_NOT_MOVABLE
 
 
 def refuse_reason(status, mode, path):
@@ -324,8 +480,10 @@ def commit_checked(repo, author, entries):
 
 
 def cycle(repo, push=True):
-    nested = nested_git_dirs(repo.work_tree)
-    repo.git("add", "-A", "--", ":/", *[":(exclude,literal)" + d for d in nested])
+    repo.alert_count = 0
+    held = scan_tree(repo)
+    excluded = sorted({p for _, p in held if p})
+    repo.git("add", "-A", "--", ":/", *[":(exclude,literal)" + p for p in excluded])
     changes = repo.staged()
 
     # A refused file stays in the folder and is refused again every cycle.
@@ -345,11 +503,17 @@ def cycle(repo, push=True):
         if key not in seen:
             repo.alert(kind, path, detail)
 
-    for path in nested:
-        key = "refused_nested_git:" + path
+    details = {
+        "git_entry_not_movable": "a .git entry here could not be moved: this folder is left out",
+        "unreadable_file": "the file cannot be read: it is left out",
+        "special_file": "not a file or a folder (a FIFO, a socket or a device): it is left out",
+        "unreadable_dir": "the folder cannot be read or entered: it is left out",
+    }
+    for kind, path in held:
+        key = "refused_%s:%s" % (kind, path)
         now_refused.add(key)
         if key not in seen:
-            repo.alert("refused_nested_git", path, "a .git entry is in this folder: the folder is left out")
+            repo.alert("refused_" + kind, path or "(top)", details[kind])
 
     ok = []
     for status, mode, blob, path in changes:
@@ -396,6 +560,7 @@ def cycle(repo, push=True):
             else:
                 repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
                 log("pushed")
+    repo.result = {"committed": committed, "alerts": repo.alert_count, "refused": len(now_refused)}
     return committed
 
 
@@ -414,7 +579,7 @@ def cmd_detach(a):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["once", "run", "detach"],
+    p.add_argument("command", choices=["once", "run", "detach", "quarantine-top-git"],
                    help="detach trusts W/.git: only for a folder that no container ever "
                         "mounted; else use `po-act.sh notes-setup`")
     p.add_argument("--git-dir", required=True)
@@ -422,14 +587,17 @@ def main():
     p.add_argument("--state-dir", default=os.path.expanduser("~/.local/state/cfgms/memory-sync"))
     p.add_argument("--interval", type=int, default=60)
     p.add_argument("--no-push", action="store_true")
+    p.add_argument("--result-file")
     a = p.parse_args()
 
     if a.command == "detach":
         return cmd_detach(a)
+    if a.command == "quarantine-top-git":
+        sys.exit(cmd_quarantine_top_git(a))
 
     # The git directory must live outside the mounted folder. (A `.git` entry
-    # that an agent plants inside the folder is not a reason to stop: git
-    # ignores it at the top, and a nested one is refused as a gitlink.)
+    # that an agent plants inside the folder is not a reason to stop: the
+    # cycle moves it into the quarantine, see scan_tree.)
     gd, wt = os.path.realpath(a.git_dir), os.path.realpath(a.work_tree)
     if gd == wt or gd.startswith(wt + os.sep):
         sys.exit("refusing to run: the git directory %s is inside the mounted folder %s "
@@ -439,7 +607,8 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("another memory-sync is running")
+        print("another memory-sync is running", file=sys.stderr)
+        sys.exit(EXIT_LOCKED)
     # A cycle that was stopped (a time limit, a host restart) leaves its scan
     # folder, with copies of notes, and its private index. The lock is held:
     # no other cycle uses them.
@@ -454,6 +623,9 @@ def main():
 
     if a.command == "once":
         cycle(repo, push=not a.no_push)
+        if a.result_file:
+            with open(a.result_file, "w") as fh:
+                json.dump(repo.result, fh)
         return
     while True:
         try:
