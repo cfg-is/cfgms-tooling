@@ -34,7 +34,12 @@ ARG STEWARD_VERSION
 # procps and iproute2 give the steward's DNA collectors the tools a real host has.
 # No ca-certificates: the steward must trust only the controller CA the harness
 # mounts, never a system trust store.
-RUN apt-get update \
+# STEWARD_VERSION becomes a path and a JSON value below, so it must be a SemVer 2.0
+# value (the product's version grammar); the verify stage checks the same rule.
+RUN test "$(printf '%s' "$STEWARD_VERSION" | wc -l)" -eq 0 \
+ && printf '%s\n' "$STEWARD_VERSION" | grep -Eqx \
+      'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?' \
+ && apt-get update \
  && apt-get install -y --no-install-recommends procps=2:4.0.4-9 iproute2=6.15.0-1 \
  && rm -rf /var/lib/apt/lists/*
 

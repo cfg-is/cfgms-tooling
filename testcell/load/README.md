@@ -26,12 +26,17 @@ path for them, and whether there should be is an open founder decision.
 the artifact directory plus `image/entrypoint.sh` and `image/verify_steward_sig.py`:
 
 ```
-podman build --build-arg STEWARD_VERSION=<ver>   --build-arg PUBLISHER_PUBKEY=<base64 Ed25519 key baked into that steward build>   -t cfgms-vsteward:<ver> -f testcell/load/image/Containerfile <context-dir>
+podman build --build-arg STEWARD_VERSION=<ver> \
+  --build-arg PUBLISHER_PUBKEY=<base64 Ed25519 key baked into that steward build> \
+  -t cfgms-vsteward:<ver> -f testcell/load/image/Containerfile <context-dir>
 ```
 
 A first build stage verifies the steward's publisher signature over the canonical
 steward-binary message (`<sha256>|<version>|linux|amd64`) and the build fails if it
-does not verify; only the verified binary is copied into the image. The base image is
+does not verify; only the verified binary is copied into the image. The signature file
+may be raw 64 bytes (the product signer's form) or base64url text. A key that cannot
+anchor trust (the all-zero placeholder of builds without a publisher key, or any other
+small-order point) is refused, as the steward itself refuses it. The base image is
 pinned by digest and the packages by version. The image carries no system CA bundle.
 
 The entrypoint refuses to start without the controller CA mount, a registration token,
