@@ -482,6 +482,10 @@ cat > "$CONFLICT_STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 # The permission probe runs `gh api ... --jq '.permission // ""'`, so it expects
 # the already-extracted value, not a JSON object.
+# The base commit of a tooling-pointer PR comes from the REST API (gh 2.45 has
+# no baseRefOid field); answered before the per-argument loop, whose pulls/<n>
+# case answers changed_files.
+[[ "$1 $2" == api\ repos/cfg-is/cfgms/pulls/[0-9]* && "$*" == *"--jq .base.sha"* ]] && { echo "${GH_BASE_SHA:-}"; exit 0; }
 for a in "$@"; do
   case "$a" in
     *collaborators*permission*) echo admin; exit 0 ;;
@@ -850,8 +854,8 @@ printf '[submodule ".claude/tooling"]\n\tpath = .claude/tooling\n\turl = https:/
 # run_nostory <label> <draft> <tree lines|""> <rows...>: rows "<file>\t<old>\t<status>"
 run_nostory() {
   local label="$1" draft="$2" tree="$3"; shift 3
-  printf '{"state":"OPEN","headRefName":"feature/tooling-pointer-c6a0f1a","headRefOid":"%s","baseRefOid":"%s","body":"%s","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","isDraft":%s}' \
-    "$NOSTORY_HEAD" "$NS_BASE" "${NS_BODY:-Bump the tooling pointer to c6a0f1a.}" "$draft" > "$PR_ROOT/meta.json"
+  printf '{"state":"OPEN","headRefName":"feature/tooling-pointer-c6a0f1a","headRefOid":"%s","body":"%s","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","isDraft":%s}' \
+    "$NOSTORY_HEAD" "${NS_BODY:-Bump the tooling pointer to c6a0f1a.}" "$draft" > "$PR_ROOT/meta.json"
   printf '%b\n' "$@" > "$PR_ROOT/files.txt"
   printf 'truncated=%s\n%b\n' "${NS_TRUNC:-false}" "$tree" > "$PR_ROOT/tree.txt"
   rm -f "$PR_ROOT/prompt.md" "$PR_ROOT/docker-args.txt"

@@ -70,7 +70,7 @@ case "$*" in
     printf '[submodule ".claude/tooling"]\n\tpath = .claude/tooling\n\turl = https://github.com/cfg-is/cfgms-tooling.git\n' | base64 -w0 ;;
   "api repos/cfg-is/cfgms-tooling/compare/main..."*) printf '%s\n' "${GH_CMP_MAIN:-behind}" ;;
   "api repos/cfg-is/cfgms-tooling/compare/"*) printf '%s\n' "${GH_CMP_FWD:-ahead}" ;;
-  "pr view"*"--jq .baseRefOid"*) printf 'base1\n' ;;
+  "api repos/cfg-is/cfgms/pulls/7 --jq .base.sha") printf 'base1\n' ;;
   "pr view"*)
     printf '{"number":7,"headRefName":"%s","baseRefName":"develop","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"cfg-is"},"body":"the claim"}\n' "$GH_BRANCH" ;;
   "pr edit"*)  cat > /dev/null ;;
