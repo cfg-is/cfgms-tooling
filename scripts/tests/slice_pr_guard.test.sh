@@ -64,13 +64,13 @@ case "$*" in
     done ;;
   "api repos/cfg-is/cfgms/git/trees/"*) printf '{"truncated":false,"tree":[{"path":".claude/tooling","mode":"160000"}]}\n' ;;
   # the tooling pointer check: old/new gitlink commits, .gitmodules, compares
-  "api repos/cfg-is/cfgms/contents/.claude/tooling?ref=base1"*) printf '%s\n' 2222222222222222222222222222222222222222 ;;
+  "api repos/cfg-is/cfgms/contents/.claude/tooling?ref=1111111111111111111111111111111111111111"*) printf '%s\n' 2222222222222222222222222222222222222222 ;;
   "api repos/cfg-is/cfgms/contents/.claude/tooling?ref="*) printf '%s\n' 3333333333333333333333333333333333333333 ;;
-  "api repos/cfg-is/cfgms/contents/.gitmodules?ref=base1"*)
+  "api repos/cfg-is/cfgms/contents/.gitmodules?ref=1111111111111111111111111111111111111111"*)
     printf '[submodule ".claude/tooling"]\n\tpath = .claude/tooling\n\turl = https://github.com/cfg-is/cfgms-tooling.git\n' | base64 -w0 ;;
   "api repos/cfg-is/cfgms-tooling/compare/main..."*) printf '%s\n' "${GH_CMP_MAIN:-behind}" ;;
   "api repos/cfg-is/cfgms-tooling/compare/"*) printf '%s\n' "${GH_CMP_FWD:-ahead}" ;;
-  "api repos/cfg-is/cfgms/pulls/7 --jq .base.sha") printf 'base1\n' ;;
+  "api repos/cfg-is/cfgms/pulls/7 --jq .base.sha") printf '%s\n' "${GH_BASE_SHA-1111111111111111111111111111111111111111}" ;;
   "pr view"*)
     printf '{"number":7,"headRefName":"%s","baseRefName":"develop","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"cfg-is"},"body":"the claim"}\n' "$GH_BRANCH" ;;
   "pr edit"*)  cat > /dev/null ;;
@@ -240,6 +240,13 @@ GH_CMP_FWD=behind
 run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
 check "pointer moved backward: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_not_forward"
 GH_CMP_FWD=""
+# A base commit that cannot be read (empty, or an error body) is unknown, never
+# the default branch's pointer.
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" GH_BASE_SHA="" "$POACT" enqueue 7 --head "$HEAD_A"
+check "base commit unreadable: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_unknown"
+check "base commit unreadable: nothing is merged" "$calls" "pr merge" not
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" GH_BASE_SHA='{"message":"Not Found"}' "$POACT" enqueue 7 --head "$HEAD_A"
+check "base read returns an error body: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_unknown"
 run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
 check "pointer released, on main and forward: enqueued" "$out" "ENQUEUED:7"
 GH_LABELS=""
