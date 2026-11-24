@@ -57,8 +57,20 @@ case "$*" in
   # the class reads of a no-story PR: GH_NS_FILES is "<file>|<old>|<status>"
   # rows separated by spaces; the tree has the .claude/tooling gitlink
   "api repos/cfg-is/cfgms/pulls/7 --jq .changed_files") printf '%s\n' "$(wc -w <<< "$GH_NS_FILES")" ;;
-  "api repos/cfg-is/cfgms/pulls/7/files"*) for r in $GH_NS_FILES; do printf '%s\n' "${r//|/$'\t'}"; done ;;
-  "api repos/cfg-is/cfgms/git/trees/"*) printf 'truncated=false\n160000 .claude/tooling\n' ;;
+  "api repos/cfg-is/cfgms/pulls/7/files"*)
+    for r in $GH_NS_FILES; do
+      IFS='|' read -r f o st <<< "$r"
+      printf '{"filename":"%s","previous_filename":%s,"status":"%s"}\n' "$f" "$([[ -n "$o" ]] && printf '"%s"' "$o" || echo null)" "$st"
+    done ;;
+  "api repos/cfg-is/cfgms/git/trees/"*) printf '{"truncated":false,"tree":[{"path":".claude/tooling","mode":"160000"}]}\n' ;;
+  # the tooling pointer check: old/new gitlink commits, .gitmodules, compares
+  "api repos/cfg-is/cfgms/contents/.claude/tooling?ref=base1"*) printf '%s\n' 2222222222222222222222222222222222222222 ;;
+  "api repos/cfg-is/cfgms/contents/.claude/tooling?ref="*) printf '%s\n' 3333333333333333333333333333333333333333 ;;
+  "api repos/cfg-is/cfgms/contents/.gitmodules?ref=base1"*)
+    printf '[submodule ".claude/tooling"]\n\tpath = .claude/tooling\n\turl = https://github.com/cfg-is/cfgms-tooling.git\n' | base64 -w0 ;;
+  "api repos/cfg-is/cfgms-tooling/compare/main..."*) printf '%s\n' "${GH_CMP_MAIN:-behind}" ;;
+  "api repos/cfg-is/cfgms-tooling/compare/"*) printf '%s\n' "${GH_CMP_FWD:-ahead}" ;;
+  "pr view"*"--jq .baseRefOid"*) printf 'base1\n' ;;
   "pr view"*)
     printf '{"number":7,"headRefName":"%s","baseRefName":"develop","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"cfg-is"},"body":"the claim"}\n' "$GH_BRANCH" ;;
   "pr edit"*)  cat > /dev/null ;;
@@ -86,7 +98,7 @@ run() {  # run <branch> <command...>   (stdout+stderr in $out, exit code in $rc,
   local branch="$1"; shift
   : > "$SANDBOX/gh.log"
   rc=0
-  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_NS_FILES="$GH_NS_FILES" GH_LABELS="$GH_LABELS" GH_STATE="$GH_STATE" GH_AFTER_DEQUEUE="$GH_AFTER_DEQUEUE" GH_LOG="$SANDBOX/gh.log" \
+  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_NS_FILES="$GH_NS_FILES" GH_LABELS="$GH_LABELS" GH_CMP_MAIN="${GH_CMP_MAIN:-}" GH_CMP_FWD="${GH_CMP_FWD:-}" CFGMS_TEST_TOKEN_LOGIN="${TOKEN_LOGIN-hostbot}" GH_STATE="$GH_STATE" GH_AFTER_DEQUEUE="$GH_AFTER_DEQUEUE" GH_LOG="$SANDBOX/gh.log" \
         PATH="$SANDBOX/bin:$PATH" HOME="$SANDBOX/home" \
         CFGMS_TEST_DISPATCH="$SANDBOX/bin/dispatch-stub" \
         CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
@@ -174,6 +186,7 @@ REL=(env CFGMS_TEST_ACTOR_LOGIN=maint CFGMS_TEST_ACTOR_PERM=admin CFGMS_TEST_HEA
 GH_NS_FILES=".claude/settings.json||modified docs/a.md||modified"
 run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
 check "approval class (settings), no release: refused" "$out" "ENQUEUE_REFUSED:7:no_story_needs_human_release (.claude/settings.json)"
+check "the refusal names both ways" "$out" "a maintainer with another account applies human-reviewed:ok and approves this head; or the repository owner merges it in GitHub after reading it"
 check "approval class, no release: nothing is merged" "$calls" "pr merge" not
 GH_LABELS="human-reviewed:ok"
 run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_B}" "$POACT" enqueue 7 --head "$HEAD_A"
@@ -183,6 +196,17 @@ check "approval class, the label actor is read-only: refused" "$out" "no_story_n
 run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
 check "approval class, released for this head: enqueued" "$out" "ENQUEUED:7"
 check "approval class, released: bound to the head" "$calls" "pr merge 7 --repo cfg-is/cfgms --squash --match-head-commit ${HEAD_A}"
+# the token's own account (every agent holds it) cannot release class approval
+TOKEN_LOGIN=maint run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, released by the token's own account: refused" "$out" "no_story_needs_human_release"
+TOKEN_LOGIN=MAINT run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, the token account in another case: refused" "$out" "no_story_needs_human_release"
+TOKEN_LOGIN="" run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, token account unknown: refused (fail closed)" "$out" "no_story_needs_human_release"
+GH_NS_FILES="docs/development/x.md||modified"
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "docs/development is class approval at enqueue" "$out" "no_story_needs_human_release (docs/development/x.md)"
+GH_NS_FILES=".claude/settings.json||modified docs/a.md||modified"
 GH_LABELS=""
 run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
 check "approval class, an approval but no label: refused" "$out" "no_story_needs_human_release"
@@ -201,7 +225,19 @@ check "product code: nothing is merged" "$calls" "pr merge" not
 GH_NS_FILES=""
 run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
 check "files that cannot be read: refused" "$out" "ENQUEUE_REFUSED:7:no_story_files_unknown"
+# the tooling pointer is checked at enqueue too
 GH_NS_FILES=".claude/tooling||modified"
+GH_CMP_MAIN=ahead
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "pointer not on tooling main: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_not_on_main"
+check "pointer not on main: nothing is merged" "$calls" "pr merge" not
+GH_CMP_MAIN=""
+GH_CMP_FWD=behind
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "pointer moved backward: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_not_forward"
+GH_CMP_FWD=""
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "pointer on main and forward: enqueued" "$out" "ENQUEUED:7"
 GH_CLOSES=12
 run "$NOSTORY" "$POACT" enqueue 7
 check "a PR that GitHub closes an issue with is not no-story: no head needed" "$out" "no_story_pr_needs_reviewed_head" not

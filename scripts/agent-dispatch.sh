@@ -1174,41 +1174,21 @@ _no_story_class_of() {
 #     3000), or when the list is empty;
 #   - modes: one `git/trees/<head>?recursive=1` read; a truncated tree is
 #     "unknown".
+#   Names travel as JSON (jq tojson) and are compared in no_story_class.py
+#   check, never as tsv text: a name with a tab or a backslash stays exact.
 _no_story_files_check() {
-  local pr_num="$1" head="$2" count rows names=() modes f old status line touches=no
+  local pr_num="$1" head="$2" count rows tree
   count=$(gh api "repos/cfg-is/cfgms/pulls/${pr_num}" --jq '.changed_files' 2>/dev/null) || count=""
   rows=$(gh api "repos/cfg-is/cfgms/pulls/${pr_num}/files" --paginate \
-           --jq '.[] | [.filename, (.previous_filename // ""), .status] | @tsv' 2>/dev/null) || rows=""
-  if [[ ! "$count" =~ ^[0-9]+$ || -z "$rows" ]] || (( count >= 3000 )) \
-     || [[ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" != "$count" ]]; then
+           --jq '.[] | {filename, previous_filename, status} | tojson' 2>/dev/null) || rows=""
+  tree=$(gh api "repos/cfg-is/cfgms/git/trees/${head}?recursive=1" \
+           --jq '{truncated, tree: [.tree[] | select(.mode == "160000" or .mode == "120000") | {path, mode}]} | tojson' 2>/dev/null) || tree=""
+  if [[ ! "$count" =~ ^[0-9]+$ || -z "$rows" || -z "$tree" ]]; then
     echo "unknown"; return 0
   fi
-  local present=()
-  # Split each row by hand: `read` with a tab IFS merges two tabs, so an
-  # empty old name would shift the status into its place.
-  while IFS= read -r line; do
-    f="${line%%$'\t'*}"; line="${line#*$'\t'}"
-    old="${line%%$'\t'*}"; status="${line#*$'\t'}"
-    names+=("$f")
-    [[ -n "$old" ]] && names+=("$old")
-    [[ "$status" != "removed" ]] && present+=("$f")
-    [[ "$f" == ".claude/tooling" || "$old" == ".claude/tooling" ]] && touches=yes
-  done <<< "$rows"
-  modes=$(gh api "repos/cfg-is/cfgms/git/trees/${head}?recursive=1" \
-            --jq '"truncated=\(.truncated)", (.tree[] | select(.mode == "160000" or .mode == "120000") | "\(.mode) \(.path)")' 2>/dev/null) || modes=""
-  if [[ "$modes" != truncated=false* ]]; then
-    echo "unknown"; return 0
-  fi
-  for f in "${present[@]}"; do
-    if grep -qxF "120000 ${f}" <<< "$modes"; then echo "bad_mode ${f}"; return 0; fi
-    if [[ "$f" == ".claude/tooling" ]]; then
-      grep -qxF "160000 ${f}" <<< "$modes" || { echo "bad_mode ${f}"; return 0; }
-    elif grep -qxF "160000 ${f}" <<< "$modes"; then
-      echo "bad_mode ${f}"; return 0
-    fi
-  done
-  _no_story_class_of "${names[@]}"
-  echo "tooling=${touches}"
+  printf '%s\n%s\n' "$tree" "$rows" \
+    | python3 "$(dirname "${BASH_SOURCE[0]}")/no_story_class.py" check "$count" 2>/dev/null \
+    || echo "unknown"
 }
 
 # _tooling_pointer_check <base_sha> <head_sha>
@@ -1258,13 +1238,29 @@ _closing_issue_numbers() {
     --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[].number' 2>/dev/null
 }
 
-# _human_release_ok <pr_num> <labels newline-separated> <head_sha>
-#   Exit 0 when a person released the PR for exactly <head_sha>: the
+# _token_login
+#   The login of the GitHub account this process acts as (the host token
+#   every agent container holds); empty when it cannot be read.
+_token_login() {
+  if [[ -n "${CFGMS_TEST_TOKEN_LOGIN+x}" ]]; then
+    echo "${CFGMS_TEST_TOKEN_LOGIN}"
+  else
+    gh api user --jq '.login // ""' 2>/dev/null || echo ""
+  fi
+}
+
+# _human_release_ok <pr_num> <labels newline-separated> <head_sha> [not_token_account]
+#   Exit 0 when the PR was released for exactly <head_sha>: the
 #   human-reviewed:ok label is present, the account that applied it last is
 #   a push+ collaborator, and that account approved <head_sha> (the release
 #   mechanism of external PRs, _check_author_permission). Fail closed.
+#   With "not_token_account" (a no-story PR of class approval only): the
+#   account must also not be the one this process acts as, since every
+#   agent holds that token and could label and approve with it; an unknown
+#   token account fails closed. The external-PR release does not pass it:
+#   the founder releases external PRs with that same account today.
 _human_release_ok() {
-  local pr_num="$1" labels="$2" head="$3" actor_login actor_perm
+  local pr_num="$1" labels="$2" head="$3" not_self="${4:-}" actor_login actor_perm token_login
   echo "$labels" | grep -qx "human-reviewed:ok" 2>/dev/null || return 1
   if [[ -n "${CFGMS_TEST_ACTOR_LOGIN+x}" ]]; then
     actor_login="${CFGMS_TEST_ACTOR_LOGIN}"
@@ -1276,6 +1272,10 @@ _human_release_ok() {
       2>/dev/null || echo "")
   fi
   [[ -n "$actor_login" ]] || return 1
+  if [[ "$not_self" == "not_token_account" ]]; then
+    token_login=$(_token_login)
+    [[ -n "$token_login" && "${token_login,,}" != "${actor_login,,}" ]] || return 1
+  fi
   _release_covers_head "$pr_num" "$actor_login" "$head" || return 1
   if [[ -n "${CFGMS_TEST_ACTOR_PERM+x}" ]]; then
     actor_perm="${CFGMS_TEST_ACTOR_PERM}"
@@ -2300,10 +2300,12 @@ Commands:
                                             a slice gets the slice prompt; a non-draft PR with no
                                             story and no closing reference (internal, or released)
                                             gets the no-story prompt by class (no_story_class.py):
-                                            auto (the tooling pointer, docs/ outside ADRs and
-                                            product intent): PASS -> enqueue --head <sha>;
-                                            approval (other .claude/ paths, ADRs, product intent):
-                                            PASS waits for a person's release of the head; else
+                                            auto (the tooling pointer, docs/ outside ADRs,
+                                            product intent and docs/development/): PASS ->
+                                            enqueue --head <sha>; approval (other .claude/ paths,
+                                            those three docs folders): PASS waits for a person
+                                            (a release by another account, or the owner merges
+                                            it in GitHub); else
                                             REVIEW_REFUSED no_story_draft / no_story_product_code /
                                             no_story_bad_mode / no_story_files_unknown /
                                             tooling_pointer_not_on_main / tooling_pointer_not_forward;
@@ -4114,12 +4116,14 @@ PROMPT_EOF
       # assignee, no fix agent. Class auto: a PASS enqueues at the reviewed
       # head. Class approval: a PASS does not enqueue; a person releases it.
       if [[ -n "$nostory_approval" ]]; then
-        nostory_class_text="Its class is APPROVAL: it changes \`${nostory_approval}\` (under \`.claude/\`, an ADR or product intent), which can change what agents run or what the founder decided. Your review is advice to a person; you never enqueue it."
-        nostory_pass_text="- **PASS (zero findings)**: post the PASS comment and stop. Do NOT enqueue: a
-  maintainer must release it (apply the \`human-reviewed:ok\` label and approve
-  head \`${pr_head_review}\`); then the pipeline enqueues that commit."
+        nostory_class_text="Its class is APPROVAL: it changes \`${nostory_approval}\` (under \`.claude/\`, an ADR, product intent or \`docs/development/\`), which can change what agents run or what the founder decided. Your review is advice to a person; you never enqueue it."
+        nostory_pass_text="- **PASS (zero findings)**: post the PASS comment and stop. Do NOT enqueue, and
+  do not label or approve the PR: a person lets it merge. Either a maintainer
+  with another GitHub account applies \`human-reviewed:ok\` and approves head
+  \`${pr_head_review}\` (the pipeline then enqueues that commit), or the
+  repository owner merges it in GitHub after reading it."
       else
-        nostory_class_text="Its class is AUTO: only the \`.claude/tooling\` pointer and/or \`docs/\` outside ADRs and product intent. A PASS enqueues it."
+        nostory_class_text="Its class is AUTO: only the \`.claude/tooling\` pointer and/or \`docs/\` outside ADRs, product intent and \`docs/development/\`. A PASS enqueues it."
         nostory_pass_text="- **PASS (zero findings)**: after the PASS comment is posted, enqueue with
   \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} --head ${pr_head_review}\`
   and NO story argument. \`ENQUEUED\` or \`ALREADY_QUEUED\` in its output: done.

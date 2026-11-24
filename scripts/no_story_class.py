@@ -9,16 +9,18 @@ that a person wrote it. One rule, used by `agent-dispatch.sh review-pr`,
 `po-cycle-preflight.py` (by import):
 
   auto          only the `.claude/tooling` gitlink and/or files under `docs/`
-                that are not under `docs/architecture/decisions/` (ADRs) and
-                not under `docs/product/` (product intent). The agent review
+                that are not in an approval folder below. The agent review
                 decides; a PASS enqueues.
   approval      only paths under `.claude/` (hooks, settings, agents,
                 commands, skills, pipeline config: what agents run and what
-                they are told) and/or `docs/` (with ADRs and product intent),
-                and not only auto paths. The agent reviews, but a merge needs
-                a person's release bound to the head (label
-                `human-reviewed:ok` by a push+ collaborator who approved the
-                head commit).
+                they are told) and/or `docs/`, and not only auto paths. The
+                approval folders under `docs/` are `architecture/decisions/`
+                (ADRs), `product/` (product intent) and `development/` (the
+                procedures that agent definitions and CLAUDE.md tell agents to
+                follow). They are compared without case and with trailing dots
+                and spaces cut from each segment, so a look-alike
+                (`docs/Architecture/decisions/`, `docs/product./`) is approval
+                too. The agent reviews; a person lets it merge.
   product_code  anything else (product code, scripts, `.github/`,
                 `Makefile`, `go.mod`, files at the top): no no-story path; it
                 needs an issue. Also a path that is not a plain relative path.
@@ -27,15 +29,32 @@ The class of a pull request is the strictest class of its paths; the path
 named is the first path of that class (sorted). For a rename both the old
 and the new name count.
 
-Command line: paths on stdin, one per line; prints "<class> <path>", or
-"unknown" when there is no path.
+Command line:
+  no_story_class.py           paths on stdin, one per line; prints
+                              "<class> <path>", or "unknown" for no path.
+  no_story_class.py check <changed_files>
+                              stdin: line 1 the head tree as JSON
+                              ({"truncated", "tree": [{"path", "mode"}]} with
+                              the gitlink and symlink entries), then one JSON
+                              object per changed file ({"filename",
+                              "previous_filename", "status"}), as GitHub
+                              gives them (raw names, never tsv-escaped).
+                              Prints "<class> <path>", "bad_mode <path>" or
+                              "unknown", then "tooling=yes|no".
 """
+import json
 import sys
 
 AUTO, APPROVAL, PRODUCT = "auto", "approval", "product_code"
 TOOLING_GITLINK = ".claude/tooling"
-FOUNDER_DOCS = ("docs/architecture/decisions/", "docs/product/")
+_APPROVAL_DOCS = (("architecture", "decisions"), ("product",), ("development",))
 _RANK = {AUTO: 0, APPROVAL: 1, PRODUCT: 2}
+GITLINK, SYMLINK = "160000", "120000"
+MAX_LISTED = 3000  # GitHub lists at most 3000 files of a pull request
+
+
+def _norm(seg):
+    return seg.rstrip(". ").lower()
 
 
 def path_class(path):
@@ -45,7 +64,11 @@ def path_class(path):
     if path == TOOLING_GITLINK:
         return AUTO
     if parts[0] == "docs" and len(parts) > 1:
-        return APPROVAL if path.startswith(FOUNDER_DOCS) else AUTO
+        segs = [_norm(p) for p in parts[1:-1]]
+        for folder in _APPROVAL_DOCS:
+            if tuple(segs[:len(folder)]) == folder:
+                return APPROVAL
+        return AUTO
     if parts[0] == ".claude" and len(parts) > 1:
         return APPROVAL
     return PRODUCT
@@ -62,7 +85,42 @@ def classify(paths):
     return best, next(p for p in paths if classes[p] == best)
 
 
+def check(changed_files, lines):
+    """The lines `check` prints, from the tree and the file rows (see the
+    module text). Fails closed: "unknown" for anything it cannot read."""
+    try:
+        count = int(changed_files)
+        tree = json.loads(lines[0])
+        rows = [json.loads(line) for line in lines[1:] if line.strip()]
+    except (ValueError, IndexError, TypeError):
+        return ["unknown"]
+    if (not rows or count != len(rows) or count >= MAX_LISTED
+            or tree.get("truncated") is not False or not isinstance(tree.get("tree"), list)):
+        return ["unknown"]
+    modes = {e.get("path"): e.get("mode") for e in tree["tree"] if isinstance(e, dict)}
+    names, touches = [], False
+    for r in rows:
+        f, old = r.get("filename"), r.get("previous_filename")
+        if not isinstance(f, str) or not f:
+            return ["unknown"]
+        names.append(f)
+        if isinstance(old, str) and old:
+            names.append(old)
+        if TOOLING_GITLINK in (f, old):
+            touches = True
+        if r.get("status") == "removed":
+            continue
+        mode = modes.get(f)
+        if mode == SYMLINK or (f == TOOLING_GITLINK) != (mode == GITLINK):
+            return ["bad_mode %s" % f, "tooling=%s" % ("yes" if touches else "no")]
+    cls, first = classify(names)
+    return ["%s %s" % (cls, first), "tooling=%s" % ("yes" if touches else "no")]
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "check":
+        print("\n".join(check(sys.argv[2], sys.stdin.read().split("\n"))))
+        return
     paths = [line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]
     cls, first = classify(paths)
     print("unknown" if cls is None else "%s %s" % (cls, first))

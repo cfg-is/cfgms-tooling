@@ -32,10 +32,12 @@
 #                                   another. Required for a slice and for a PR
 #                                   with no story (no_story_pr_needs_reviewed_head).
 #                                   A no-story PR of class approval (.claude/ other
-#                                   than the pointer, ADRs, product intent) also
-#                                   needs a person's release of that head
+#                                   than the pointer, ADRs, product intent,
+#                                   docs/development/) also needs a release of that
+#                                   head by an account other than this token's
 #                                   (no_story_needs_human_release); product code:
-#                                   no_story_product_code.
+#                                   no_story_product_code; a moved tooling pointer
+#                                   is checked as in review-pr (tooling_pointer_*).
 #                                   Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
 #                                   missing so GitHub auto-closes the issue on merge.
@@ -1801,14 +1803,16 @@ except Exception: print('')" 2>/dev/null || echo "")
     # an agent FAIL: enqueue reads no verdict.
     if $enqueue_no_story; then
       # The first line only (no `| head`: under pipefail its early close kills the script).
-      enqueue_class=$(_no_story_files_check "$pr" "$head_sha")
-      enqueue_class="${enqueue_class%%$'\n'*}"
+      enqueue_check=$(_no_story_files_check "$pr" "$head_sha")
+      enqueue_class="${enqueue_check%%$'\n'*}"
       case "$enqueue_class" in
         "auto "*) ;;
         "approval "*)
+          # The release must come from an account other than this token's:
+          # every agent holds this token and could label and approve with it.
           enqueue_labels=$(gh pr view "$pr" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
-          if ! _human_release_ok "$pr" "$enqueue_labels" "$head_sha"; then
-            echo "ENQUEUE_REFUSED:${pr}:no_story_needs_human_release (${enqueue_class#approval })"
+          if ! _human_release_ok "$pr" "$enqueue_labels" "$head_sha" not_token_account; then
+            echo "ENQUEUE_REFUSED:${pr}:no_story_needs_human_release (${enqueue_class#approval }): a maintainer with another account applies human-reviewed:ok and approves this head; or the repository owner merges it in GitHub after reading it"
             exit 3
           fi
           ;;
@@ -1816,6 +1820,16 @@ except Exception: print('')" 2>/dev/null || echo "")
         "bad_mode "*) echo "ENQUEUE_REFUSED:${pr}:no_story_bad_mode (${enqueue_class#bad_mode })"; exit 3 ;;
         *) echo "ENQUEUE_REFUSED:${pr}:no_story_files_unknown"; exit 3 ;;
       esac
+      # A moved tooling pointer: the same check as review-pr, at this head.
+      if [[ "$enqueue_check" == *$'\n'"tooling=yes" ]]; then
+        enqueue_base=$(gh pr view "$pr" --repo "$REPO" --json baseRefOid --jq .baseRefOid 2>/dev/null || echo "")
+        case "$(_tooling_pointer_check "$enqueue_base" "$head_sha")" in
+          ok) ;;
+          not_on_main) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_not_on_main"; exit 3 ;;
+          not_forward) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_not_forward"; exit 3 ;;
+          *) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_unknown"; exit 3 ;;
+        esac
+      fi
     fi
     # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
     # Even if review-pr passed earlier, labels or collaborator status may have

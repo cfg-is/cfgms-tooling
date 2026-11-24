@@ -43,16 +43,23 @@ in it cannot change what agents run or what the founder decided. One function,
 `scripts/no_story_class.py`, gives its class; `agent-dispatch.sh review-pr`,
 `po-act.sh enqueue` and the preflight all use it.
 
-- **auto**: only the `.claude/tooling` gitlink and/or `docs/` outside
-  `docs/architecture/decisions/` and `docs/product/`. The agent review
-  decides: a PASS enqueues.
+- **auto**: only the `.claude/tooling` gitlink and/or `docs/` outside the
+  three approval folders below. The agent review is the only check: a PASS
+  enqueues. What this guarantees: such a PR cannot change a hook, a setting,
+  an agent definition, a command, an ADR, product intent or a development
+  procedure. It does not guarantee that no agent reads the file: other docs
+  (for example `docs/architecture/`) can still be reference material.
 - **approval**: anything else under `.claude/` (hooks, `settings.json`, agent
   definitions, commands, skills, pipeline config), ADRs
-  (`docs/architecture/decisions/`) and product intent (`docs/product/`).
-  Hooks and settings decide what agents may run; agent definitions and
-  commands decide what they do; ADRs and product intent are the founder's
-  decisions. The agent still reviews it, but its PASS is advice: nothing
-  enqueues it until a person releases its head.
+  (`docs/architecture/decisions/`), product intent (`docs/product/`) and
+  development procedures (`docs/development/`). Hooks and settings decide what
+  agents may run; agent definitions and commands decide what they do; agent
+  definitions and CLAUDE.md tell agents to follow the files in
+  `docs/development/`; ADRs and product intent are the founder's decisions.
+  The three folders are compared without case and with trailing dots and
+  spaces cut from each path segment, so a look-alike such as
+  `docs/Architecture/decisions/` is approval too. The agent still reviews it,
+  but its PASS is advice: a person lets it merge.
 - **product code**: anything else (code, `scripts/`, workflows, `Makefile`,
   `go.mod`, top-level files). Refused
   (`REVIEW_REFUSED:<PR>:no_story_product_code`); it needs an issue.
@@ -60,30 +67,46 @@ in it cannot change what agents run or what the founder decided. One function,
 Before a container starts, review-pr refuses a no-story PR that is a draft,
 that is external and not released, whose file list cannot be read in full
 (`no_story_files_unknown`: GitHub lists at most 3000 files, and the list must
-match the PR's `changed_files`), that adds a symlink or a gitlink other than
-`.claude/tooling` (`no_story_bad_mode`). For a rename both the old and the new
-name count, so moving a file out of a stricter class keeps that class. A new
-tooling pointer is checked in code:
-the old and new commits come from GitHub's contents API at the base and the
-head, the tooling repository from `.gitmodules` on the base; the new commit
-must be on `main` (`tooling_pointer_not_on_main`) and come after the old one
-(`tooling_pointer_not_forward`). The reviewer then gets the no-story prompt:
-the PR title and body are the specification, the repository rules apply, and
-the required checks must be green. Its verdict names the commit it judged
-(`Reviewed head: <sha>`); an enqueue names that commit too
-(`po-act.sh enqueue <PR> --head <sha>`, else
+match the PR's `changed_files`), or that adds a symlink or a gitlink other
+than `.claude/tooling` (`no_story_bad_mode`). For a rename both the old and
+the new name count, so moving a file out of a stricter class keeps that
+class. A moved tooling pointer is checked in code, by review-pr and again by
+`po-act.sh enqueue`: the old and new commits come from GitHub's contents API
+at the base and the head, the tooling repository from `.gitmodules` on the
+base; the new commit must be on `main` (`tooling_pointer_not_on_main`) and
+come after the old one (`tooling_pointer_not_forward`). The reviewer then gets
+the no-story prompt: the PR title and body are the specification, the
+repository rules apply, and the required checks must be green. Its verdict
+names the commit it judged (`Reviewed head: <sha>`); an enqueue names that
+commit too (`po-act.sh enqueue <PR> --head <sha>`, else
 `no_story_pr_needs_reviewed_head`). Enqueue checks the class again at that
-head and refuses an approval-class PR that nobody released
+head and refuses an approval-class PR without a valid release
 (`ENQUEUE_REFUSED:<PR>:no_story_needs_human_release (<path>)`).
 
-A person releases a head, or overrides an agent FAIL, the way an external PR
-is released: a push+ collaborator applies the `human-reviewed:ok` label and
-approves that exact head commit, then runs
-`./.claude/tooling/scripts/po-act.sh enqueue <PR> --head <sha>` (or lets the
-next cycle do it: the preflight recommends that enqueue once the head is
-released and its checks are green, also with a FAIL present). A new push voids
-the release. The pipeline never takes a released PR out of the merge queue.
-Without a release a FAIL needs a person or a new commit; there is no fix
+How an approval-class PR merges, in one of two ways:
+
+1. A maintainer with **another** GitHub account (push+) applies the
+   `human-reviewed:ok` label and approves that exact head commit. Then
+   `./.claude/tooling/scripts/po-act.sh enqueue <PR> --head <sha>` enqueues
+   it, or the next cycle does: the preflight recommends that enqueue once the
+   head is released and its checks are green, also with an agent FAIL present.
+   A release by the account of the pipeline's token does not count, because
+   every agent holds that token and could label and approve with it; when that
+   account cannot be read, no release counts. A new push voids the release.
+2. The repository owner reads it and merges it in GitHub (or types
+   `gh pr merge` themselves). The pipeline never takes an approval-class PR
+   out of the merge queue or disarms it, whatever the verdict.
+
+Today the founder and every agent use the same GitHub account, and GitHub
+does not let an author approve their own PR, so way 2 is the working path
+for now. This gate is a pipeline rule, not a GitHub rule: `develop` requires
+no approval, so it holds only for callers that go through `po-act.sh` and the
+preflight. It becomes a GitHub rule only once agents have their own GitHub
+identity and `develop` requires an approval. (An external PR's release still
+accepts the token's account: the founder releases external PRs with it.)
+
+The pipeline never takes a released PR out of the merge queue either.
+Without a release, a FAIL needs a person or a new commit; there is no fix
 cycle. Tested with stand-ins only; not run yet with a real reviewer.
 
 ## Tests

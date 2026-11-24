@@ -3047,6 +3047,26 @@ def _slice_review_rec(pr, in_queue, owner_active=True):
                        f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
 
 
+_token_login_cache: list = []
+
+
+def _token_login():
+    """The login of the GitHub account the pipeline acts as (the host token
+    that every agent container holds), read once; "" when unknown.
+    CFGMS_TEST_TOKEN_LOGIN stands in for it in tests."""
+    if not _token_login_cache:
+        login = os.environ.get("CFGMS_TEST_TOKEN_LOGIN")
+        if login is None:
+            try:
+                r = subprocess.run(["gh", "api", "user", "--jq", ".login // \"\""],
+                                   capture_output=True, text=True, timeout=30)
+                login = r.stdout.strip() if r.returncode == 0 else ""
+            except (OSError, subprocess.SubprocessError):
+                login = ""
+        _token_login_cache.append(login)
+    return _token_login_cache[0]
+
+
 def _no_story_review_rec(pr, in_queue):
     """The recommendation for a pull request with no story (no story or item
     branch, no closing reference, not a slice; internal, or external and
@@ -3057,10 +3077,12 @@ def _no_story_review_rec(pr, in_queue):
     enqueue names that commit (`po-act.sh enqueue <PR> --head <sha>`). The
     class (no_story_class.py, from the PR's paths) decides who may let it
     merge: auto, the agent review; approval (`.claude/` other than the
-    tooling pointer, ADRs, product intent), a person's release of the head
-    (`is_released`: label human-reviewed:ok by a push+ collaborator who
-    approved the head). A release stands against an agent FAIL, and a released
-    PR in the queue is never taken out. Product code: skip, it needs an
+    tooling pointer, ADRs, product intent, docs/development/), a person: a
+    release of the head (`is_released`: label human-reviewed:ok by a push+
+    collaborator who approved the head) by an account other than the
+    pipeline token's, or the owner merging it in GitHub. A release stands
+    against an agent FAIL; a released PR, and an approval-class PR, in the
+    queue or armed is never taken out. Product code: skip, it needs an
     issue. There is no fix cycle: a FAIL needs a person or a new commit.
     """
     overall = pr["ci_summary"]["overall"]
@@ -3069,9 +3091,17 @@ def _no_story_review_rec(pr, in_queue):
     verdict = pr.get("latest_review_verdict")
     cls, cls_path = pr.get("no_story_class") or (None, None)
     released = bool(pr.get("is_released"))
+    if released and cls != no_story_class.AUTO:
+        # Class approval (or unknown): a release by the token's own account does
+        # not count; every agent holds that token. Unknown token: fail closed.
+        # (The external-PR release, is_released, still accepts that account.)
+        token = _token_login()
+        actor = pr.get("release_actor") or ""
+        released = bool(token and actor and actor.lower() != token.lower())
     person = "it needs a person or a new commit by its author"
-    release_hint = (f"a maintainer must apply the human-reviewed:ok label and approve head {head}, "
-                    "then the pipeline enqueues that commit")
+    release_hint = ("a maintainer with another account applies human-reviewed:ok and approves head "
+                    f"{head} (then the pipeline enqueues that commit); or the repository owner merges it "
+                    "in GitHub after reading it")
 
     def rec(action, reason, **more):
         return {"pr": pr["pr"], "story": None, "no_story": True, "no_story_class": cls, "action": action,
@@ -3088,6 +3118,9 @@ def _no_story_review_rec(pr, in_queue):
     reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
     if in_queue or pr.get("auto_merge_enabled"):
         where = "in the merge queue" if in_queue else "auto-merge armed"
+        if cls == no_story_class.APPROVAL:
+            # Only a person merges it while one account exists: whatever the verdict.
+            return rec("skip", f"{where}; class approval: a person enqueued it; left alone")
         if released:
             return rec("skip", f"{where}, released by a person for this head; the pipeline leaves it alone")
         if reviewed and verdict == "pass":
@@ -3360,6 +3393,7 @@ def _build_pr_summaries(prs):
             for l in labels
         }
         pr_is_released = False
+        pr_release_actor = ""
         if "human-reviewed:ok" in pr_label_names:
             actor_login = _release_marker_actor_login(pr.get("timeline_items", []))
             if (actor_login and not is_external(actor_login)
@@ -3368,6 +3402,7 @@ def _build_pr_summaries(prs):
                         pr.get("head_oid", ""),
                         pr.get("approvals", []))):
                 pr_is_released = True
+                pr_release_actor = actor_login
 
         # story_number only assigned to internal-author PRs.
         # An external author naming their branch feature/story-N-agent gains no
@@ -3417,6 +3452,9 @@ def _build_pr_summaries(prs):
             "author_login": author_login,
             "is_external": pr_is_external,
             "is_released": pr_is_released,
+            # The account that released it (label and approval of the head).
+            # A no-story PR of class approval needs one other than the token's.
+            "release_actor": pr_release_actor,
             "story_number": story_number,
             "is_slice": epic_number is not None,
             # Internal (or an external PR that a person released), no story,

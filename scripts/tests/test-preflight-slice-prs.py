@@ -383,10 +383,14 @@ class NoStoryPullRequests(unittest.TestCase):
     def setUp(self):
         self.pf = _load()
         self.pf._perm_cache.clear()
-        os.environ["CFGMS_TEST_COLLAB_PERM_MAP"] = json.dumps({"pipeline": "admin", "stranger": "read"})
+        os.environ["CFGMS_TEST_COLLAB_PERM_MAP"] = json.dumps(
+            {"pipeline": "admin", "stranger": "read", "hostbot": "admin", "HostBot": "admin"})
+        # the account of the pipeline's token; "pipeline" releases are another account
+        os.environ["CFGMS_TEST_TOKEN_LOGIN"] = "hostbot"
 
     def tearDown(self):
         os.environ.pop("CFGMS_TEST_COLLAB_PERM_MAP", None)
+        os.environ.pop("CFGMS_TEST_TOKEN_LOGIN", None)
         self.pf._perm_cache.clear()
 
     def rec(self, pr, queued=()):
@@ -462,7 +466,7 @@ class NoStoryPullRequests(unittest.TestCase):
         _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/hooks/x.sh"]})
         self.assertEqual(r["action"], "skip")
         self.assertIn("it changes .claude/hooks/x.sh", r["reason"])
-        self.assertIn(f"apply the human-reviewed:ok label and approve head {HEAD}", r["reason"])
+        self.assertIn(f"applies human-reviewed:ok and approves head {HEAD}", r["reason"])
         # no review yet: it is still reviewed (the review is advice to the person)
         _, r = self.rec(raw_pr(head=NOSTORY) | {"files": [".claude/settings.json"]})
         self.assertEqual(r["action"], "spawn_acceptance_reviewer")
@@ -493,6 +497,38 @@ class NoStoryPullRequests(unittest.TestCase):
         self.assertEqual((r["action"], r["head"]), ("enqueue_merge", HEAD))
         _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("FAIL")]))
         self.assertIn("override it", r["reason"])
+
+    def test_the_token_account_cannot_release_class_approval(self):
+        for actor in ("hostbot", "HostBot"):
+            pr = self.released(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/agents/x.md"]},
+                               actor=actor)
+            s, r = self.rec(pr)
+            self.assertTrue(s["is_released"])  # the external-PR rule still counts it
+            self.assertEqual(r["action"], "skip", actor)
+            self.assertIn("with another account", r["reason"])
+            self.assertIn("repository owner merges it in GitHub", r["reason"])
+        # an auto PR released by that account: unchanged, it counts
+        pr = self.released(raw_pr(head=NOSTORY, comments=[review("FAIL")]), actor="hostbot")
+        _, r = self.rec(pr)
+        self.assertEqual(r["action"], "enqueue_merge")
+
+    def test_an_unknown_token_account_fails_closed(self):
+        os.environ["CFGMS_TEST_TOKEN_LOGIN"] = ""
+        pr = self.released(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/agents/x.md"]})
+        _, r = self.rec(pr)
+        self.assertEqual(r["action"], "skip")
+
+    def test_approval_class_queued_by_a_person_is_left_alone(self):
+        for verdict, vhead in (("FAIL", HEAD), ("PASS", OLD_HEAD), ("FAIL", OLD_HEAD), (None, None)):
+            comments = [review(verdict, head=vhead)] if verdict else []
+            pr = raw_pr(head=NOSTORY, comments=comments) | {"files": [".claude/settings.json"]}
+            _, r = self.rec(pr, queued=[6382])
+            self.assertEqual(r["action"], "skip", verdict)
+            self.assertIn("class approval: a person enqueued it; left alone", r["reason"])
+            pr = raw_pr(head=NOSTORY, comments=comments, auto_merge={"enabledAt": T1}) | {"files": ["docs/product/v.md"]}
+            _, r = self.rec(pr)
+            self.assertEqual(r["action"], "skip", verdict)
+            self.assertIn("left alone", r["reason"])
 
     def test_released_and_queued_is_never_taken_out(self):
         for verdict_head in (OLD_HEAD, HEAD):

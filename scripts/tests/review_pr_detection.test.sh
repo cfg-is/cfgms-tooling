@@ -487,14 +487,24 @@ for a in "$@"; do
     *collaborators*permission*) echo admin; exit 0 ;;
     # The reads of a no-story PR (each answer as gh prints it after --jq):
     # GH_FILES_LIST: a file of "<filename>\t<previous filename>\t<status>"
-    # rows; GH_FILES_COUNT: the PR's changed_files; GH_TREE: a file of the
-    # trees answer ("truncated=false", then "<mode> <path>" lines);
+    # rows, answered as one JSON object per file; GH_FILES_COUNT: the PR's
+    # changed_files; GH_TREE: a file of "truncated=<bool>", then "<mode>
+    # <path>" lines, answered as the JSON object the check reads;
     # GH_TOOLING_OLD/NEW: the gitlink sha at the base / head; GH_GITMODULES: a
     # file whose base64 is the base's .gitmodules; GH_CMP_MAIN/GH_CMP_FWD: the
     # compare statuses; GH_CLOSING: the closing issue numbers.
-    */pulls/*/files) [[ -n "${GH_FILES_LIST:-}" ]] || exit 1; cat "$GH_FILES_LIST"; exit 0 ;;
+    */pulls/*/files) [[ -n "${GH_FILES_LIST:-}" ]] || exit 1
+      python3 -c 'import json, sys
+for l in open(sys.argv[1]).read().split("\n"):
+    if l:
+        f, o, st = l.split("\t")
+        print(json.dumps({"filename": f, "previous_filename": o or None, "status": st}))' "$GH_FILES_LIST"; exit 0 ;;
     repos/cfg-is/cfgms/pulls/[0-9]*) [[ -n "${GH_FILES_COUNT:-}" ]] || exit 1; echo "$GH_FILES_COUNT"; exit 0 ;;
-    */git/trees/*) [[ -n "${GH_TREE:-}" ]] || exit 1; cat "$GH_TREE"; exit 0 ;;
+    */git/trees/*) [[ -n "${GH_TREE:-}" ]] || exit 1
+      python3 -c 'import json, sys
+ls = [l for l in open(sys.argv[1]).read().split("\n") if l]
+tree = [dict(zip(("mode", "path"), l.split(" ", 1))) for l in ls[1:]]
+print(json.dumps({"truncated": ls[0] != "truncated=false", "tree": tree}))' "$GH_TREE"; exit 0 ;;
     */contents/.claude/tooling?ref=*) [[ "$a" == *"ref=${GH_BASE_SHA:-none}" ]] && { echo "${GH_TOOLING_OLD:-}"; exit 0; }
                                       echo "${GH_TOOLING_NEW:-}"; exit 0 ;;
     */contents/.gitmodules?ref=*) [[ -n "${GH_GITMODULES:-}" ]] || exit 1; base64 -w0 < "$GH_GITMODULES"; exit 0 ;;
@@ -896,6 +906,12 @@ NS_TRUNC=true run_nostory truncated false "" "docs/a.md\t\tmodified"
 refused truncated "no_story_files_unknown"
 run_nostory symlink false "120000 docs/a.md" "docs/a.md\t\tadded"
 refused symlink "no_story_bad_mode (docs/a.md)"
+# a name with a backslash: compared as raw JSON, never tsv-escaped
+run_nostory symlinkbs false '120000 docs/a\\b.md' 'docs/a\\b.md\t\tadded'
+refused symlinkbs 'no_story_bad_mode (docs/a\b.md)'
+run_nostory devdocs false "" "docs/development/product-planning.md\t\tmodified"
+assert_adv "docs/development is class approval" "grep -qF 'Its class is APPROVAL: it changes \`docs/development/product-planning.md\`' '$PR_ROOT/prompt.md'"
+assert_adv "approval prompt names both ways to merge" "grep -qF 'with another GitHub account' '$PR_ROOT/prompt.md' && grep -qF 'repository owner merges it in GitHub' '$PR_ROOT/prompt.md'"
 run_nostory gitlink false "160000 docs/sub" "docs/sub\t\tadded"
 refused gitlink "no_story_bad_mode (docs/sub)"
 run_nostory notgitlink false "" ".claude/tooling\t\tmodified"
