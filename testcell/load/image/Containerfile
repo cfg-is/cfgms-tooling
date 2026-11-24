@@ -1,0 +1,35 @@
+# Virtual steward: the unmodified, test-cell-signed release steward and launcher in a
+# minimal container (cfg-is/cfgms#5981, criterion 1). Nothing is built here; the
+# build context holds the release artifacts the deploy pipeline (#5980) produced:
+#
+#   cfgms-steward            the signed steward binary
+#   cfgms-steward.sig        its signature
+#   cfgms-steward-launcher   the launcher
+#
+# Build:   podman build --build-arg STEWARD_VERSION=<ver> -t cfgms-vsteward:<ver> \
+#            -f testcell/load/image/Containerfile <artifact-dir>
+# Run:     see testcell/load/README.md (the harness supplies the token secret, the
+#          controller CA, a pinned MAC and a persistent state volume per steward).
+FROM docker.io/library/debian:trixie-slim
+
+ARG STEWARD_VERSION
+RUN test -n "$STEWARD_VERSION" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates procps iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+# The launcher path is fixed: the steward's push-upgrade handler execs
+# "cfgms-launcher swap" at exactly this path.
+COPY cfgms-steward-launcher /usr/local/bin/cfgms-launcher
+
+# The release version is kept as a seed outside the install root. The entrypoint
+# copies it into /opt/cfgms (a per-steward volume) only when that volume is empty,
+# so versions the controller pushes later survive a container restart.
+COPY cfgms-steward cfgms-steward.sig /usr/share/cfgms-seed/versions/${STEWARD_VERSION}/
+RUN chmod 0755 /usr/local/bin/cfgms-launcher /usr/share/cfgms-seed/versions/${STEWARD_VERSION}/cfgms-steward \
+ && printf '{"current":"%s"}\n' "$STEWARD_VERSION" > /usr/share/cfgms-seed/state.json
+
+COPY --chmod=0755 entrypoint.sh /usr/local/sbin/vsteward-entrypoint
+
+# Runs as root inside the container: a non-root steward always reports degraded.
+ENTRYPOINT ["/usr/local/sbin/vsteward-entrypoint"]
