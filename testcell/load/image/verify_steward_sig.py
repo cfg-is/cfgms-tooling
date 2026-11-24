@@ -27,6 +27,7 @@ import re
 import sys
 
 SEP = "|"
+B64URL = re.compile(r"[A-Za-z0-9_-]+")
 KEY_SIZE = 32
 SIG_SIZE = 64
 
@@ -78,6 +79,8 @@ def parse_signature(data):
         return data
     try:
         text = data.decode("ascii").strip()
+        if not B64URL.fullmatch(text):
+            raise ValueError("not base64url")
         sig = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
     except (UnicodeDecodeError, binascii.Error, ValueError) as e:
         raise BadInput("signature is neither 64 raw bytes nor base64url text") from e
@@ -87,8 +90,13 @@ def parse_signature(data):
 
 
 def message(content_hash, version, platform, arch):
-    if not SEMVER.fullmatch(version):
+    m = SEMVER.fullmatch(version)
+    if not m:
         raise BadInput("version is not a SemVer 2.0 value")
+    # SemVer 2.0: numeric pre-release identifiers carry no leading zeros.
+    for ident in (m.group(4) or "").split("."):
+        if ident.isdigit() and len(ident) > 1 and ident.startswith("0"):
+            raise BadInput("version has a numeric pre-release identifier with a leading zero")
     for name, value in (("content hash", content_hash), ("version", version),
                         ("platform", platform), ("arch", arch)):
         if not value or SEP in value:

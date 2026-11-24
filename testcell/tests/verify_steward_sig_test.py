@@ -4,13 +4,15 @@
 Run: python3 testcell/tests/verify_steward_sig_test.py
 
 Key-set and input-parsing tests use only the standard library. Signature tests use
-pyca/cryptography when it is installed (it is in the image's verify stage) and are
-skipped otherwise.
+pyca/cryptography (it is in the image's verify stage and in the tooling-tests
+workflow). Outside CI they are skipped when it is missing; with CI set, a missing
+pyca/cryptography fails the run.
 """
 
 from __future__ import annotations
 
 import base64
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -24,6 +26,8 @@ try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     HAVE_CRYPTO = True
 except ImportError:  # pragma: no cover - depends on the environment
+    if os.environ.get("CI"):
+        raise SystemExit("verify_steward_sig_test: pyca/cryptography is required in CI")
     HAVE_CRYPTO = False
 
 ORDER8_A = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
@@ -77,15 +81,19 @@ class InputTest(unittest.TestCase):
         text = base64.urlsafe_b64encode(raw).rstrip(b"=") + b"\n"
         self.assertEqual(v.parse_signature(text), raw)
 
-    def test_signature_of_the_wrong_length_is_refused(self):
-        for bad in (bytes(63), b"AAAA", b"\xff\xfe not text"):
+    def test_signature_of_the_wrong_length_or_alphabet_is_refused(self):
+        good = base64.urlsafe_b64encode(bytes(range(64))).rstrip(b"=")
+        plus = good[:20] + b"+" + good[21:]
+        space = good[:40] + b" " + good[40:]
+        for bad in (bytes(63), b"AAAA", b"\xff\xfe not text", plus, space):
             with self.subTest(bad=bad), self.assertRaises(v.BadInput):
                 v.parse_signature(bad)
 
     def test_version_must_be_semver(self):
         self.assertTrue(v.message("h", "v0.10.8-lab.3767.gf9494beb", "linux", "amd64"))
         self.assertEqual(v.message("h", "1.2.3", "linux", "amd64"), b"h|v1.2.3|linux|amd64")
-        for bad in ("1.2", "v1.2.3/../x", "1.2.3 extra", "01.2.3", "v1.2.3|x", "1.2.3\n"):
+        self.assertTrue(v.message("h", "1.2.3-rc.0", "linux", "amd64"))
+        for bad in ("1.2.3-01", "1.2.3-rc.01", "1.2", "v1.2.3/../x", "1.2.3 extra", "01.2.3", "v1.2.3|x", "1.2.3\n"):
             with self.subTest(bad=bad), self.assertRaises(v.BadInput):
                 v.message("h", bad, "linux", "amd64")
 
@@ -114,10 +122,13 @@ class SignatureTest(unittest.TestCase):
         self.assertFalse(v.verify(self.binary, sig, "1.2.3", "linux", "arm64", self.pub))
 
     def test_a_forged_signature_against_a_small_order_key_is_refused_before_verify(self):
-        forged = bytes(64)  # R = identity, S = 0
-        for name, key in UNSAFE.items():
-            with self.subTest(name=name), self.assertRaises(v.BadInput):
-                v.verify(self.binary, forged, "1.2.3", "linux", "amd64", b64(key))
+        # Forgeries R || S with S = 0 and R a small-order point verify against
+        # small-order keys in some Ed25519 implementations; every pairing of key and
+        # R is refused before verification.
+        for key_name, key in UNSAFE.items():
+            for r_name, r in UNSAFE.items():
+                with self.subTest(key=key_name, r=r_name), self.assertRaises(v.BadInput):
+                    v.verify(self.binary, r + bytes(32), "1.2.3", "linux", "amd64", b64(key))
 
 
 if __name__ == "__main__":
