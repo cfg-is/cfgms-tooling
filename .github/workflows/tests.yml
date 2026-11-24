@@ -52,8 +52,13 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
-      - name: Install dnsmasq
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq
+      - name: Install dnsmasq and python3-cryptography
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq python3-cryptography
+
+      # Run verbosely on its own so the log shows the signature tests ran rather than
+      # skipped; the suite runner below hides output on a pass.
+      - name: Steward signature check tests (verbose)
+        run: python3 .claude/tooling/testcell/tests/verify_steward_sig_test.py -v
 
       - name: Run tooling test suite
         run: ./.claude/tooling/scripts/tests/run-tooling-tests.sh
