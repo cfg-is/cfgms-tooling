@@ -1,32 +1,55 @@
-# Virtual steward: the unmodified, test-cell-signed release steward and launcher in a
-# minimal container (cfg-is/cfgms#5981, criterion 1). Nothing is built here; the
-# build context holds the release artifacts the deploy pipeline (#5980) produced:
+# Virtual steward: the unmodified release steward and launcher in a minimal
+# container (cfg-is/cfgms#5981, criterion 1). Nothing is built here; the build
+# context holds the release artifacts the deploy pipeline (#5980) produced, plus
+# the two scripts from this directory:
 #
-#   cfgms-steward            the signed steward binary
-#   cfgms-steward.sig        its signature
+#   cfgms-steward            the steward binary
+#   cfgms-steward.sig        its publisher signature
 #   cfgms-steward-launcher   the launcher
+#   entrypoint.sh, verify_steward_sig.py
 #
-# Build:   podman build --build-arg STEWARD_VERSION=<ver> -t cfgms-vsteward:<ver> \
-#            -f testcell/load/image/Containerfile <artifact-dir>
-# Run:     see testcell/load/README.md (the harness supplies the token secret, the
-#          controller CA, a pinned MAC and a persistent state volume per steward).
-FROM docker.io/library/debian:trixie-slim
+# Build:   podman build --build-arg STEWARD_VERSION=<ver> \
+#            --build-arg PUBLISHER_PUBKEY=<base64 Ed25519 key baked into the steward> \
+#            -t cfgms-vsteward:<ver> -f testcell/load/image/Containerfile <context-dir>
+# The build fails unless the signature verifies for <ver>, linux, amd64.
+# Run:     see testcell/load/README.md.
 
+# Debian trixie-slim, pinned by digest.
+ARG BASE=docker.io/library/debian@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
+
+FROM ${BASE} AS verify
 ARG STEWARD_VERSION
-RUN test -n "$STEWARD_VERSION" \
+ARG PUBLISHER_PUBKEY
+RUN test -n "$STEWARD_VERSION" && test -n "$PUBLISHER_PUBKEY" \
  && apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates procps iproute2 \
+ && apt-get install -y --no-install-recommends python3-cryptography=43.0.0-3+deb13u1 \
+ && rm -rf /var/lib/apt/lists/*
+COPY cfgms-steward cfgms-steward.sig verify_steward_sig.py /verify/
+RUN python3 /verify/verify_steward_sig.py /verify/cfgms-steward /verify/cfgms-steward.sig \
+      "$STEWARD_VERSION" linux amd64 "$PUBLISHER_PUBKEY" \
+ && touch /verify/ok
+
+FROM ${BASE}
+ARG STEWARD_VERSION
+# procps and iproute2 give the steward's DNA collectors the tools a real host has.
+# No ca-certificates: the steward must trust only the controller CA the harness
+# mounts, never a system trust store.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends procps=2:4.0.4-9 iproute2=6.15.0-1 \
  && rm -rf /var/lib/apt/lists/*
 
 # The launcher path is fixed: the steward's push-upgrade handler execs
 # "cfgms-launcher swap" at exactly this path.
 COPY cfgms-steward-launcher /usr/local/bin/cfgms-launcher
 
-# The release version is kept as a seed outside the install root. The entrypoint
-# copies it into /opt/cfgms (a per-steward volume) only when that volume is empty,
-# so versions the controller pushes later survive a container restart.
-COPY cfgms-steward cfgms-steward.sig /usr/share/cfgms-seed/versions/${STEWARD_VERSION}/
+# Only a binary whose signature verified in the first stage is copied in. The
+# release version is kept as a seed outside the install root; the entrypoint copies
+# it into /opt/cfgms (a per-steward volume) only when that volume is empty, so
+# versions the controller pushes later survive a container restart.
+COPY --from=verify /verify/ok /usr/share/cfgms-seed/.verified
+COPY --from=verify /verify/cfgms-steward /verify/cfgms-steward.sig /usr/share/cfgms-seed/versions/${STEWARD_VERSION}/
 RUN chmod 0755 /usr/local/bin/cfgms-launcher /usr/share/cfgms-seed/versions/${STEWARD_VERSION}/cfgms-steward \
+ && rm /usr/share/cfgms-seed/.verified \
  && printf '{"current":"%s"}\n' "$STEWARD_VERSION" > /usr/share/cfgms-seed/state.json
 
 COPY --chmod=0755 entrypoint.sh /usr/local/sbin/vsteward-entrypoint

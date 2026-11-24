@@ -1,7 +1,7 @@
 # testcell/load: virtual stewards and synthetic load
 
 The cfgms-tooling half of cfg-is/cfgms#5981: continuous synthetic load against a
-test cell, using the real signed steward in small containers. Nothing here names a
+test cell, using the real release steward in small containers. Nothing here names a
 real host, address or key.
 
 ## Status
@@ -22,24 +22,29 @@ path for them, and whether there should be is an open founder decision.
 ## Virtual steward image
 
 `image/Containerfile` wraps the artifacts the deploy pipeline already produced:
-`cfgms-steward`, `cfgms-steward.sig` and `cfgms-steward-launcher`. Build with the
-artifact directory plus `image/entrypoint.sh` as the build context:
+`cfgms-steward`, `cfgms-steward.sig` and `cfgms-steward-launcher`. The build context is
+the artifact directory plus `image/entrypoint.sh` and `image/verify_steward_sig.py`:
 
 ```
-podman build --build-arg STEWARD_VERSION=<ver> -t cfgms-vsteward:<ver> \
-  -f testcell/load/image/Containerfile <context-dir>
+podman build --build-arg STEWARD_VERSION=<ver>   --build-arg PUBLISHER_PUBKEY=<base64 Ed25519 key baked into that steward build>   -t cfgms-vsteward:<ver> -f testcell/load/image/Containerfile <context-dir>
 ```
 
-The entrypoint seeds the launcher's install root once, installs the controller
-CA, copies the registration token into a root-only file, and execs the launcher,
-which stays the container's PID 1 and supervises the steward.
+A first build stage verifies the steward's publisher signature over the canonical
+steward-binary message (`<sha256>|<version>|linux|amd64`) and the build fails if it
+does not verify; only the verified binary is copied into the image. The base image is
+pinned by digest and the packages by version. The image carries no system CA bundle.
+
+The entrypoint refuses to start without the controller CA mount, a registration token,
+or an `https://` controller URL without whitespace. It seeds the launcher's install
+root once, installs the controller CA, copies the token into a root-only file, and
+execs the launcher, which stays the container's PID 1 and supervises the steward.
 
 ### What each container needs
 
 | Input | How | Why |
 |---|---|---|
 | Registration token | secret mounted at `/run/secrets/regtoken` | the steward reads it from a root-only regular file; the entrypoint copies it. Never in argv or logs |
-| Controller CA | read-only mount at `/run/vsteward/controller-ca.crt` | install-pinned trust |
+| Controller CA | read-only mount at `/run/vsteward/controller-ca.crt` (required) | install-pinned trust; the image has no system CA bundle to fall back to |
 | `VSTEWARD_CONTROLLER_URL` | env | release builds bake no controller URL |
 | `/var/lib/cfgms` | named volume per steward | identity and certificates; an empty dir enrolls a new device |
 | `/opt/cfgms` | named volume per steward | versions the controller pushes survive a restart |
@@ -63,17 +68,21 @@ which stays the container's PID 1 and supervises the steward.
 
 `footprint.py` runs on the container host (cgroup v2, rootful podman). It reads each
 `vsteward-*` container's own cgroup at the start and end of a window and prints JSON:
-CPU percent of one core, anonymous memory, charged page cache, `memory.peak`, task count,
-totals, and a density estimate for a memory budget.
+CPU percent of one core, `memory.current` (all memory the kernel charges, including
+slab, stacks, page tables and socket buffers), anonymous memory, page cache,
+`memory.peak`, task count, totals, and a density estimate for a memory budget. A
+container that exits or restarts during the window is listed under `skipped` with the
+reason instead of failing the run.
 
 ```
 sudo python3 testcell/load/footprint.py --window 600 --budget-mib 4096
 ```
 
 Each virtual steward runs the steward binary from its own `/opt/cfgms` volume, because
-the launcher needs a writable install root for pushed versions. The binary's page cache
-is therefore charged to every container, and the density estimate divides the budget by
-the mean of anonymous plus page-cache memory per container.
+the launcher needs a writable install root for pushed versions, so the binary's page
+cache is charged to every container. The density estimate divides the budget by the
+mean `memory.peak` (or `memory.current` where peak is unavailable), which includes
+kernel memory.
 
 ### First measurement
 
@@ -89,7 +98,7 @@ over 600 seconds after all five had connected.
 | Page cache per steward | 39.5 MiB (the steward binary, per container) |
 | `memory.peak` per steward | 57.5 to 59.1 MiB |
 | Tasks per container | 20 to 23 |
-| Density by memory | 80 stewards per 4 GiB (mean 50.6 MiB each) |
+| Density by memory | 70 stewards per 4 GiB (mean `memory.peak` 58.1 MiB) |
 
 These are idle figures. Steady-state CPU of a virtual steward is lower than a real
 host's: software and security DNA are collected once per process today (cfgms #6498),
