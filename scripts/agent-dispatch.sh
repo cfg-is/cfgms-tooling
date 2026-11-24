@@ -1201,6 +1201,12 @@ _no_story_files_check() {
 #   old one (compare <old>...<new> is ahead).
 _tooling_pointer_check() {
   local base="$1" head="$2" old new mods repo st
+  # Both commits must be full shas. An empty ref makes the contents API answer
+  # for the default branch, and a failed read can print an error body; either
+  # would measure against the wrong commit, so anything else is "unknown".
+  if [[ ! "$base" =~ ^[0-9a-f]{40}$ || ! "$head" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "unknown"; return 0
+  fi
   old=$(gh api "repos/cfg-is/cfgms/contents/.claude/tooling?ref=${base}" --jq 'select(.type == "submodule") | .sha' 2>/dev/null) || old=""
   new=$(gh api "repos/cfg-is/cfgms/contents/.claude/tooling?ref=${head}" --jq 'select(.type == "submodule") | .sha' 2>/dev/null) || new=""
   mods=$(gh api "repos/cfg-is/cfgms/contents/.gitmodules?ref=${base}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null) || mods=""
@@ -3751,7 +3757,7 @@ PYEOF
 
     # Validate PR + auto-detect story number.
     pr_meta=$(gh pr view "$pr_num" --repo cfg-is/cfgms \
-      --json state,headRefName,headRefOid,baseRefOid,body,labels,headRepositoryOwner,author,mergeStateStatus,isDraft 2>/dev/null) || {
+      --json state,headRefName,headRefOid,body,labels,headRepositoryOwner,author,mergeStateStatus,isDraft 2>/dev/null) || {
       _emit_review_refused "$pr_num" "pr_not_found"
     }
     gate_credentials_for_launch
@@ -3778,7 +3784,6 @@ PYEOF
     pr_author_login=$(echo "$pr_meta" | jq -r '.author.login // empty')
     pr_head_review=$(echo "$pr_meta" | jq -r '.headRefOid // empty')
     pr_is_draft=$(echo "$pr_meta" | jq -r '.isDraft // false')
-    pr_base_review=$(echo "$pr_meta" | jq -r '.baseRefOid // empty')
 
     if [[ "$state" != "OPEN" ]]; then
       _emit_review_refused "$pr_num" "pr_state_${state}"
@@ -3892,6 +3897,11 @@ PYEOF
           *) _emit_review_refused "$pr_num" "no_story_files_unknown" ;;
         esac
         if [[ "$nostory_check" == *$'\n'"tooling=yes" ]]; then
+          # The base commit comes from the REST API: `gh pr view --json baseRefOid`
+          # does not exist in older gh releases (2.45), and an unknown field makes
+          # the whole `gh pr view` call fail. _tooling_pointer_check answers
+          # "unknown" for anything that is not a full sha (empty, an error body).
+          pr_base_review=$(gh api "repos/cfg-is/cfgms/pulls/${pr_num}" --jq '.base.sha' 2>/dev/null || echo "")
           case "$(_tooling_pointer_check "$pr_base_review" "$pr_head_review")" in
             ok) ;;
             not_on_main) _emit_review_refused "$pr_num" "tooling_pointer_not_on_main" ;;

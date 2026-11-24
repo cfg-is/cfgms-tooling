@@ -1831,7 +1831,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       esac
       # A moved tooling pointer: the same check as review-pr, at this head.
       if [[ "$enqueue_check" == *$'\n'"tooling=yes" ]]; then
-        enqueue_base=$(gh pr view "$pr" --repo "$REPO" --json baseRefOid --jq .baseRefOid 2>/dev/null || echo "")
+        enqueue_base=$(gh api "repos/${REPO}/pulls/${pr}" --jq '.base.sha' 2>/dev/null || echo "")
         case "$(_tooling_pointer_check "$enqueue_base" "$head_sha")" in
           ok) ;;
           not_on_main) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_not_on_main"; exit 3 ;;
