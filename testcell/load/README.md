@@ -73,8 +73,8 @@ execs the launcher, which stays the container's PID 1 and supervises the steward
 
 `cell.py` keeps the virtual stewards of one cell matching a composition file that
 lives on the harness host (the format is in the module docstring; it names the
-controller, the CA path, the token secret, the tags, the real stewards that share
-the cell and the controller CLI used for tagging).
+controller, the CA path, the token secret, the load tenant, the tags, the real
+stewards that share the cell and the controller CLI used for tagging).
 
 ```
 python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json plan
@@ -87,15 +87,25 @@ python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json down
 - Steward `i` is always the container `<prefix><i:03d>` with the same MAC and the same
   two named volumes, so `up` after an image change recreates the container and the
   steward reconnects with its existing identity; no re-enrollment, no approval.
+- Only containers labelled `cfgms.testcell=vsteward` (which `up` sets) are started,
+  stopped, recreated or counted. A container with a member's name but without the
+  label is reported as a conflict and never touched; `up` then exits 1.
 - `up` creates the network with the composition's MTU if it is missing, starts stopped
-  stewards and runs containers with `--restart always`. Stewards beyond `count` are
-  reported as surplus and never removed; `down` stops and keeps everything.
+  stewards, recreates stewards whose image ID differs from the composition image's, and
+  runs containers with `--restart always`. Stewards beyond `count` are reported as
+  surplus and never removed; `down` stops and keeps everything. If an action fails, `up`
+  reports the actions already done and the error.
 - `status` reads each steward's enrolled identity (steward ID, tenant) and, while it
-  waits for approval, its pending registration ID, which the operator approves.
-- `tag` adds the composition's tags to every enrolled virtual steward through the
-  controller CLI. Together with the dedicated tenant and its own registration token,
-  the tags make virtual stewards identifiable as synthetic with existing product
-  mechanisms.
+  waits for approval, its pending registration ID from the steward's pending-state file
+  (only that field is read out; the file also holds the CSR key).
+- **Approval stays manual.** `cell.py` approves nothing: an operator approves each
+  pending ID (`cfg registration approve <pending-id>`), or the load tenant trusts the
+  harness host's source range.
+- `tag` adds the composition's tags to an enrolled virtual steward only when both the
+  steward's own identity and the controller (`cfg steward status --json`) place it in
+  the composition's `load_tenant`; anything else is skipped and reported. Together with
+  the dedicated tenant and its own registration token, the tags make virtual stewards
+  identifiable as synthetic with existing product mechanisms.
 
 ## Footprint sampler
 
