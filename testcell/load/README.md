@@ -10,8 +10,8 @@ real host, address or key.
 |---|---|---|
 | 1 | Virtual steward image (`image/`): release steward + launcher, no build of its own | done |
 | 4 | Footprint sampler (`footprint.py`) and a first measurement | done (first figure below) |
-| 3 | Cell composition: N virtual stewards with pinned MACs and persistent state | next |
-| 7 | Dedicated tenant, its own registration token, steward tags | tenant and token exist in the lab; tagging next |
+| 3 | Cell composition (`cell.py`): N virtual stewards with pinned MACs and persistent state, plus the cell's real stewards | done |
+| 7 | Dedicated tenant, its own registration token, steward tags (`cell.py tag`) | done |
 | 2 | Workload drivers (config push, library scripts, API reads, web session) | next |
 | 5 | Unattended runner, restart-safe across deploys, results keyed by revision | next |
 | 6 | `load` queries, baseline compare, alerts | next |
@@ -68,6 +68,34 @@ execs the launcher, which stays the container's PID 1 and supervises the steward
   for the load tenant only.
 - **Token lifetime.** A token created without an explicit lifetime expires after 15
   minutes. Create the load tenant's token with an explicit lifetime.
+
+## Cell composition
+
+`cell.py` keeps the virtual stewards of one cell matching a composition file that
+lives on the harness host (the format is in the module docstring; it names the
+controller, the CA path, the token secret, the tags, the real stewards that share
+the cell and the controller CLI used for tagging).
+
+```
+python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json plan
+python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json up
+python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json status
+python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json tag
+python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json down
+```
+
+- Steward `i` is always the container `<prefix><i:03d>` with the same MAC and the same
+  two named volumes, so `up` after an image change recreates the container and the
+  steward reconnects with its existing identity; no re-enrollment, no approval.
+- `up` creates the network with the composition's MTU if it is missing, starts stopped
+  stewards and runs containers with `--restart always`. Stewards beyond `count` are
+  reported as surplus and never removed; `down` stops and keeps everything.
+- `status` reads each steward's enrolled identity (steward ID, tenant) and, while it
+  waits for approval, its pending registration ID, which the operator approves.
+- `tag` adds the composition's tags to every enrolled virtual steward through the
+  controller CLI. Together with the dedicated tenant and its own registration token,
+  the tags make virtual stewards identifiable as synthetic with existing product
+  mechanisms.
 
 ## Footprint sampler
 
