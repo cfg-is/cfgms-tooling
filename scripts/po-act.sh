@@ -1740,6 +1740,31 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "ENQUEUE_REFUSED:${pr}:branch_unknown"
       exit 3
     fi
+    # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
+    # the merge to it with --match-head-commit. The trust check is passed this
+    # SHA so it cannot re-read a different head (an author swapping heads
+    # between capture and check); a push after the check cannot be merged.
+    # Fail closed if the head cannot be read.
+    head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "ENQUEUE_REFUSED:${pr}:head_unknown"
+      exit 3
+    fi
+    # The merge below is bound to head_sha (--match-head-commit). With --head
+    # it must also be the commit that was reviewed.
+    if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
+      exit 3
+    fi
+    # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
+    # Even if review-pr passed earlier, labels or collaborator status may have
+    # changed between review and merge. Fail-closed: refuse if not internal.
+    # It comes before anything else is read about the PR: an untrusted PR is
+    # told external_author, and its body, files and class are not read.
+    if ! "$DISPATCH" check-pr-author "$pr" "$head_sha"; then
+      echo "ENQUEUE_REFUSED:${pr}:external_author"
+      exit 3
+    fi
     # A pull request with no story (agent-dispatch.sh review-pr, no-story
     # prompt): no story argument, no story or item branch, no closing
     # reference that GitHub reads (any keyword form). Its review names the
@@ -1780,22 +1805,6 @@ except Exception: print('')" 2>/dev/null || echo "")
         exit 3
       fi
     fi
-    # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
-    # the merge to it with --match-head-commit. The trust check is passed this
-    # SHA so it cannot re-read a different head (an author swapping heads
-    # between capture and check); a push after the check cannot be merged.
-    # Fail closed if the head cannot be read.
-    head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
-    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-      echo "ENQUEUE_REFUSED:${pr}:head_unknown"
-      exit 3
-    fi
-    # The merge below is bound to head_sha (--match-head-commit). With --head
-    # it must also be the commit that was reviewed.
-    if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
-      echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
-      exit 3
-    fi
     # A no-story PR: its class at this head. auto: the agent review decides.
     # approval (.claude/ with the tooling pointer, ADRs, product intent): a
     # person must have released this head (human-reviewed:ok by a push+
@@ -1830,13 +1839,6 @@ except Exception: print('')" 2>/dev/null || echo "")
           *) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_unknown"; exit 3 ;;
         esac
       fi
-    fi
-    # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
-    # Even if review-pr passed earlier, labels or collaborator status may have
-    # changed between review and merge. Fail-closed: refuse if not internal.
-    if ! "$DISPATCH" check-pr-author "$pr" "$head_sha"; then
-      echo "ENQUEUE_REFUSED:${pr}:external_author"
-      exit 3
     fi
     # Only develop-based PRs go through the pipeline's merge path (Issue #4693).
     # develop is the only branch with a merge queue; on any other base,

@@ -228,10 +228,10 @@ touch -d "@$((NOW - GRACE - 60))" "${WT}/review-pr-515"
 decides "modified TRACKED file of that name keeps"        review-pr-515 "" "keep dirty"
 writers=$(grep -c 'cat > "${clone_dir}/${REVIEW_PROMPT_FILE}"' "$DISPATCH" || true)
 literals=$(grep -c 'clone_dir}/\.acceptance-review-prompt\.md' "$DISPATCH" || true)
-if [[ "$writers" -eq 3 && "$literals" -eq 0 ]]; then
-  ok "all three prompt writers (story, item, slice) use REVIEW_PROMPT_FILE (no drift-prone literal)"
+if [[ "$writers" -eq 4 && "$literals" -eq 0 ]]; then
+  ok "all four prompt writers (story, item, no-story, slice) use REVIEW_PROMPT_FILE (no drift-prone literal)"
 else
-  bad "all three prompt writers (story, item, slice) use REVIEW_PROMPT_FILE (no drift-prone literal)" "writers=${writers} literals=${literals}"
+  bad "all four prompt writers (story, item, no-story, slice) use REVIEW_PROMPT_FILE (no drift-prone literal)" "writers=${writers} literals=${literals}"
 fi
 
 printf '\n== orphan clones: a failed container listing reaps nothing ==\n'
