@@ -2300,10 +2300,10 @@ Commands:
                                             a slice gets the slice prompt; a non-draft PR with no
                                             story and no closing reference (internal, or released)
                                             gets the no-story prompt by class (no_story_class.py):
-                                            auto (the tooling pointer, docs/ outside ADRs,
-                                            product intent and docs/development/): PASS ->
-                                            enqueue --head <sha>; approval (other .claude/ paths,
-                                            those three docs folders): PASS waits for a person
+                                            auto (docs/ outside ADRs, product intent and
+                                            docs/development/): PASS -> enqueue --head <sha>;
+                                            approval (.claude/ with the tooling pointer, those
+                                            three docs folders): PASS waits for a person
                                             (a release by another account, or the owner merges
                                             it in GitHub); else
                                             REVIEW_REFUSED no_story_draft / no_story_product_code /
@@ -4116,14 +4116,14 @@ PROMPT_EOF
       # assignee, no fix agent. Class auto: a PASS enqueues at the reviewed
       # head. Class approval: a PASS does not enqueue; a person releases it.
       if [[ -n "$nostory_approval" ]]; then
-        nostory_class_text="Its class is APPROVAL: it changes \`${nostory_approval}\` (under \`.claude/\`, an ADR, product intent or \`docs/development/\`), which can change what agents run or what the founder decided. Your review is advice to a person; you never enqueue it."
+        nostory_class_text="Its class is APPROVAL: it changes \`${nostory_approval}\` (under \`.claude/\`, the \`.claude/tooling\` pointer, an ADR, product intent or \`docs/development/\`), which can change what agents run or what the founder decided. Your review is advice to a person; you never enqueue it."
         nostory_pass_text="- **PASS (zero findings)**: post the PASS comment and stop. Do NOT enqueue, and
   do not label or approve the PR: a person lets it merge. Either a maintainer
   with another GitHub account applies \`human-reviewed:ok\` and approves head
   \`${pr_head_review}\` (the pipeline then enqueues that commit), or the
   repository owner merges it in GitHub after reading it."
       else
-        nostory_class_text="Its class is AUTO: only the \`.claude/tooling\` pointer and/or \`docs/\` outside ADRs, product intent and \`docs/development/\`. A PASS enqueues it."
+        nostory_class_text="Its class is AUTO: only \`docs/\` outside ADRs, product intent and \`docs/development/\`. A PASS enqueues it."
         nostory_pass_text="- **PASS (zero findings)**: after the PASS comment is posted, enqueue with
   \`${TRUSTED_ROOT}/.claude/tooling/scripts/po-act.sh enqueue ${pr_num} --head ${pr_head_review}\`
   and NO story argument. \`ENQUEUED\` or \`ALREADY_QUEUED\` in its output: done.

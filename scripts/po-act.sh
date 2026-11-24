@@ -31,8 +31,8 @@
 #                                   (head_moved_since_review) when the head is
 #                                   another. Required for a slice and for a PR
 #                                   with no story (no_story_pr_needs_reviewed_head).
-#                                   A no-story PR of class approval (.claude/ other
-#                                   than the pointer, ADRs, product intent,
+#                                   A no-story PR of class approval (.claude/ with
+#                                   the tooling pointer, ADRs, product intent,
 #                                   docs/development/) also needs a release of that
 #                                   head by an account other than this token's
 #                                   (no_story_needs_human_release); product code:
@@ -1797,7 +1797,7 @@ except Exception: print('')" 2>/dev/null || echo "")
       exit 3
     fi
     # A no-story PR: its class at this head. auto: the agent review decides.
-    # approval (.claude/ other than the pointer, ADRs, product intent): a
+    # approval (.claude/ with the tooling pointer, ADRs, product intent): a
     # person must have released this head (human-reviewed:ok by a push+
     # collaborator who approved it). A person's release also stands against
     # an agent FAIL: enqueue reads no verdict.
@@ -1890,11 +1890,14 @@ except Exception: print('')" 2>/dev/null || echo "")
     }
     squash_enqueue
     state=$(enqueue_state)
-    # A slice must not wait with auto-merge armed: its owner can push a new
-    # round, and the armed merge would then take a commit that nobody
-    # reviewed. Queued, or not at all. The state is read up to three times:
-    # GitHub may need a moment to show the queue entry.
-    if $enqueue_is_slice; then
+    # A slice or a no-story PR must not wait with auto-merge armed: a later
+    # push (an owner's new round, or anyone with the token) would then ride
+    # the arming into develop with no review of that commit. Queued, or not
+    # at all. The state is read up to three times: GitHub may need a moment
+    # to show the queue entry.
+    if $enqueue_is_slice || $enqueue_no_story; then
+      not_queued="slice_pr_not_queued"
+      $enqueue_no_story && not_queued="no_story_pr_not_queued"
       for _ in 1 2; do
         [ "$state" = "queued" ] && break
         sleep 3
@@ -1902,9 +1905,9 @@ except Exception: print('')" 2>/dev/null || echo "")
       done
       if [ "$state" != "queued" ]; then
         if gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1; then
-          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed; a queue entry, if there is one, stays)"
+          echo "ENQUEUE_REFUSED:${pr}:${not_queued} (state ${state}; auto-merge disarmed; a queue entry, if there is one, stays)"
         else
-          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
+          echo "ENQUEUE_REFUSED:${pr}:${not_queued} (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
         fi
         exit 3
       fi

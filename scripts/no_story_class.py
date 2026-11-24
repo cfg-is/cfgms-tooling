@@ -8,12 +8,15 @@ that a person wrote it. One rule, used by `agent-dispatch.sh review-pr`,
 `po-act.sh enqueue` (both through this file's command line) and
 `po-cycle-preflight.py` (by import):
 
-  auto          only the `.claude/tooling` gitlink and/or files under `docs/`
-                that are not in an approval folder below. The agent review
-                decides; a PASS enqueues.
+  auto          only files under `docs/` that are not in an approval folder
+                below. The agent review decides; a PASS enqueues.
   approval      only paths under `.claude/` (hooks, settings, agents,
                 commands, skills, pipeline config: what agents run and what
-                they are told) and/or `docs/`, and not only auto paths. The
+                they are told; and the `.claude/tooling` gitlink, the tools
+                themselves, including these gates: `main` of the tooling
+                repository has no review rule at GitHub and every agent holds
+                a token that can push there) and/or `docs/`, and not only
+                auto paths. The
                 approval folders under `docs/` are `architecture/decisions/`
                 (ADRs), `product/` (product intent) and `development/` (the
                 procedures that agent definitions and CLAUDE.md tell agents to
@@ -62,7 +65,7 @@ def path_class(path):
     if not path or path.startswith("/") or any(p in ("", ".", "..") for p in parts):
         return PRODUCT
     if path == TOOLING_GITLINK:
-        return AUTO
+        return APPROVAL
     if parts[0] == "docs" and len(parts) > 1:
         segs = [_norm(p) for p in parts[1:-1]]
         for folder in _APPROVAL_DOCS:

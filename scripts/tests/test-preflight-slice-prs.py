@@ -394,7 +394,7 @@ class NoStoryPullRequests(unittest.TestCase):
         self.pf._perm_cache.clear()
 
     def rec(self, pr, queued=()):
-        pr.setdefault("files", [".claude/tooling"])
+        pr.setdefault("files", ["docs/a.md"])
         summaries = self.pf._build_pr_summaries([pr])
         recs = self.pf.compute_review_recommendations(summaries, set(queued), set(), set())
         return summaries[0], recs[0]
@@ -429,7 +429,7 @@ class NoStoryPullRequests(unittest.TestCase):
     def test_a_fail_with_no_new_commit_needs_a_person(self):
         _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("FAIL")]))
         self.assertEqual(r["action"], "skip")
-        self.assertIn("needs a person or a new commit by its author", r["reason"])
+        self.assertIn("it needs a new commit by its author", r["reason"])
 
     def test_queued_with_a_verdict_not_for_the_head_is_taken_out(self):
         _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS", head=OLD_HEAD)]), queued=[6382])
@@ -444,7 +444,8 @@ class NoStoryPullRequests(unittest.TestCase):
         return pr
 
     def test_the_class_comes_from_the_files(self):
-        for files, cls in (([".claude/tooling", "docs/a.md"], "auto"),
+        for files, cls in ((["docs/b.md", "docs/a.md"], "auto"),
+                           ([".claude/tooling", "docs/a.md"], "approval"),
                            (["docs/a.md", ".claude/settings.json"], "approval"),
                            (["docs/product/vision.md"], "approval"),
                            (["docs/architecture/decisions/031-x.md"], "approval"),
@@ -496,7 +497,14 @@ class NoStoryPullRequests(unittest.TestCase):
         _, r = self.rec(pr)
         self.assertEqual((r["action"], r["head"]), ("enqueue_merge", HEAD))
         _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("FAIL")]))
-        self.assertIn("override it", r["reason"])
+        self.assertIn("a new commit by its author (it gets a new review), or a release of this head by a "
+                      "maintainer with another account", r["reason"])
+        self.assertNotIn("merges it in GitHub", r["reason"])
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("FAIL")]) | {"files": [".claude/settings.json"]})
+        self.assertNotIn("merges it in GitHub", r["reason"])
+        # the two-way text stays for approval with a PASS of the head
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/settings.json"]})
+        self.assertIn("repository owner merges it in GitHub", r["reason"])
 
     def test_the_token_account_cannot_release_class_approval(self):
         for actor in ("hostbot", "HostBot"):
@@ -529,13 +537,14 @@ class NoStoryPullRequests(unittest.TestCase):
         return out
 
     def test_queued_with_no_verdict_is_left_alone_any_class(self):
-        for files in ([".claude/tooling"], [".claude/settings.json"], ["pkg/x.go"]):
+        for files in (["docs/a.md"], [".claude/tooling"], [".claude/settings.json"], ["pkg/x.go"]):
             for r in self.queued_both(files, []):
                 self.assertEqual(r["action"], "skip", files)
                 self.assertIn("queued with no review verdict: a person enqueued it; left alone", r["reason"])
 
     def test_queued_without_a_pass_of_the_head_is_taken_out_any_class(self):
-        for files in ([".claude/tooling"], [".claude/settings.json"], ["docs/product/v.md"], ["pkg/x.go"]):
+        for files in (["docs/a.md"], [".claude/tooling"], [".claude/settings.json"], ["docs/product/v.md"],
+                      ["pkg/x.go"]):
             for verdict, vhead in (("FAIL", HEAD), ("PASS", OLD_HEAD), ("FAIL", OLD_HEAD)):
                 for r in self.queued_both(files, [review(verdict, head=vhead)]):
                     self.assertEqual(r["action"], "dequeue_unreviewed", (files, verdict, vhead))
@@ -546,7 +555,7 @@ class NoStoryPullRequests(unittest.TestCase):
 
     def test_reviewer_scenario_armed_pass_of_old_head_then_a_claude_file(self):
         # AUTO PR passed at the old head and armed; a push adds a hook
-        r = self.queued_both([".claude/tooling", ".claude/hooks/x.sh"], [review("PASS", head=OLD_HEAD)])[1]
+        r = self.queued_both(["docs/a.md", ".claude/hooks/x.sh"], [review("PASS", head=OLD_HEAD)])[1]
         self.assertEqual(r["action"], "dequeue_unreviewed")
 
     def test_reviewer_scenario_queued_fail_of_the_head_with_a_claude_file(self):
@@ -557,19 +566,22 @@ class NoStoryPullRequests(unittest.TestCase):
         for verdict, vhead in (("PASS", HEAD), ("PASS", OLD_HEAD), ("FAIL", HEAD)):
             r = self.queued_both(["go.mod"], [review(verdict, head=vhead)])[1]
             self.assertEqual(r["action"], "dequeue_unreviewed", (verdict, vhead))
+        r = self.queued_both(["go.mod"], [review("PASS")])[0]
+        self.assertIn("it changes go.mod, which needs an issue; a PR with no story cannot merge it", r["reason"])
+        self.assertIn("po-act.sh dequeue 6382", r["reason"])
 
     def test_a_pass_of_the_head_auto_rides_approval_is_left_alone(self):
-        for r in self.queued_both([".claude/tooling"], [review("PASS")]):
+        for r in self.queued_both(["docs/a.md"], [review("PASS")]):
             self.assertEqual(r["action"], "skip")
             self.assertIn("reviewed PASS on this commit", r["reason"])
             self.assertNotIn("class approval", r["reason"])
-        for files in ([".claude/settings.json"], ["docs/development/x.md"]):
+        for files in ([".claude/settings.json"], ["docs/development/x.md"], [".claude/tooling"]):
             for r in self.queued_both(files, [review("PASS")]):
                 self.assertEqual(r["action"], "skip", files)
                 self.assertIn("class approval: a person enqueued it; left alone", r["reason"])
 
     def test_released_by_another_account_rides_any_verdict(self):
-        for files in ([".claude/settings.json"], [".claude/tooling"]):
+        for files in ([".claude/settings.json"], ["docs/a.md"]):
             for r in self.queued_both(files, [review("FAIL", head=OLD_HEAD)], release="pipeline"):
                 self.assertEqual(r["action"], "skip", files)
                 self.assertIn("released by a person", r["reason"])

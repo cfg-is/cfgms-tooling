@@ -1605,6 +1605,46 @@ def host_capacity():
         return {"available": None}
 
 
+def tooling_pointer_status(repo_root=None):
+    """Whether the host runs the tools that develop names.
+
+    After a pointer PR merges, the cfgms checkout still runs the old tools
+    until a person runs `git submodule update --init`. Compares the
+    `.claude/tooling` gitlink recorded in `origin/develop` of the cfgms
+    checkout with the commit its submodule is at. Local reads only: no fetch
+    (code_health_check may have fetched already). Fails soft: anything it
+    cannot read gives None for both fields and no degraded reason.
+
+    Returns {"tooling_pointer_behind": bool | None,
+             "tooling_pointer": {"checkout": sha, "develop": sha} | None}.
+    """
+    unknown = {"tooling_pointer_behind": None, "tooling_pointer": None}
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[3]
+
+    def git(*args):
+        r = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", check=False, timeout=10)
+        out = r.stdout.strip()
+        return out if r.returncode == 0 and _SHA_RE.match(out) else None
+
+    sub = root / ".claude" / "tooling"
+    try:
+        develop = git("-C", str(root), "rev-parse", "--verify", "--quiet", "origin/develop:.claude/tooling")
+        # An uninitialised submodule is a plain folder: git there would read
+        # the parent repository's HEAD. Its own top level, or unknown.
+        top = subprocess.run(["git", "-C", str(sub), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", check=False, timeout=10)
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != sub.resolve():
+            return unknown
+        checkout = git("-C", str(sub), "rev-parse", "--verify", "--quiet", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return unknown
+    if not develop or not checkout:
+        return unknown
+    return {"tooling_pointer_behind": develop != checkout,
+            "tooling_pointer": {"checkout": checkout, "develop": develop}}
+
+
 def code_health_check():
     """Run a fast check of develop's code health so the PO can decide whether
     to dispatch this cycle.
@@ -3076,8 +3116,8 @@ def _no_story_review_rec(pr, in_queue):
     A review counts for the commit it names ("Reviewed head: <sha>"), and an
     enqueue names that commit (`po-act.sh enqueue <PR> --head <sha>`). The
     class (no_story_class.py, from the PR's paths) decides who may let it
-    merge: auto, the agent review; approval (`.claude/` other than the
-    tooling pointer, ADRs, product intent, docs/development/), a person: a
+    merge: auto, the agent review; approval (`.claude/` with the tooling
+    pointer, ADRs, product intent, docs/development/), a person: a
     release of the head (`is_released`: label human-reviewed:ok by a push+
     collaborator who approved the head) by an account other than the
     pipeline token's, or the owner merging it in GitHub. A release stands
@@ -3131,7 +3171,9 @@ def _no_story_review_rec(pr, in_queue):
         if cls == no_story_class.AUTO:
             return rec("skip", f"reviewed PASS on this commit, {where} (mergeStateStatus={ms or 'UNKNOWN'})")
         if cls == no_story_class.PRODUCT:
-            return dequeue
+            return rec("dequeue_unreviewed",
+                       f"{where}, but it changes {cls_path}, which needs an issue; a PR with no story cannot "
+                       f"merge it — run `./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}`")
         # Class approval (or unknown) with a PASS of this head: the reviewer
         # never enqueues it and po-act refuses it without a release, so a
         # person put it there (while one account exists, the owner's merge in
@@ -3162,8 +3204,11 @@ def _no_story_review_rec(pr, in_queue):
             return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
         return rec("skip", f"checks failed — {person}")
     if verdict == "fail":
-        return rec("skip", f"acceptance review FAILED on this commit — {person}; a person can also "
-                           f"override it: {release_hint}")
+        # Not "the owner merges it in GitHub": a queued PR with a FAIL of its
+        # head is taken out (the queue rows above).
+        return rec("skip", "acceptance review FAILED on this commit — it needs a new commit by its author "
+                           "(it gets a new review), or a release of this head by a maintainer with another "
+                           f"account (human-reviewed:ok and an approval of head {head})")
     if cls != no_story_class.AUTO and not released:
         if cls is None:
             # No file list, or more than 100 files: fail closed.
@@ -3624,6 +3669,9 @@ def main():
     out["capacity"] = host_capacity()
     out["merge_queue"] = merge_queue
     out["code_health"] = code_health
+    # The host's tools against the pointer on develop (after code_health_check,
+    # which may have fetched origin/develop).
+    out.update(tooling_pointer_status())
     # also in the cache, for `po-act.sh state '.dispatch_blocked'`
     out["dispatch_blocked"] = dispatch_blocked(code_health)
     out["done_on_merge_count"] = done_on_merge_count
@@ -4124,6 +4172,10 @@ def build_summary(out, cache_path):
             ],
         },
         "dispatch_blocked": dispatch_blocked(code_health),
+        # True: a pointer PR merged and the host still runs the old tools until
+        # a person runs `git submodule update --init` in the cfgms checkout.
+        "tooling_pointer_behind": out.get("tooling_pointer_behind"),
+        "tooling_pointer": out.get("tooling_pointer"),
         "done_on_merge_count": out.get("done_on_merge_count", 0),
         "counts": {
             "ready": len(out.get("ready_stories", [])),

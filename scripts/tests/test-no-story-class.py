@@ -2,9 +2,10 @@
 """
 Tests: scripts/no_story_class.py, the class of a pull request with no story.
 
-auto: only the .claude/tooling gitlink and/or docs/ outside ADRs and product
-intent. approval: .claude/ (hooks, settings, agents, commands, skills,
-pipeline config), ADRs, product intent. product_code: anything else.
+auto: only docs/ outside ADRs, product intent and docs/development/.
+approval: .claude/ (hooks, settings, agents, commands, skills, pipeline
+config, the .claude/tooling gitlink), ADRs, product intent,
+docs/development/. product_code: anything else.
 
 Run: python3 scripts/tests/test-no-story-class.py
 """
@@ -24,13 +25,15 @@ spec.loader.exec_module(nsc)
 
 class Classes(unittest.TestCase):
     def test_auto_paths(self):
-        for p in (".claude/tooling", "docs/a.md", "docs/deployment/x/y.md", "docs/architecture/overview.md"):
+        for p in ("docs/a.md", "docs/deployment/x/y.md", "docs/architecture/overview.md"):
             self.assertEqual(nsc.path_class(p), nsc.AUTO, p)
 
     def test_approval_paths(self):
         for p in (".claude/settings.json", ".claude/hooks/block-autonomous-issue-create.sh",
                   ".claude/agents/acceptance-reviewer.md", ".claude/commands/orc.md",
                   ".claude/skills/x/SKILL.md", ".claude/pipeline.yaml", ".claude/tooling/x",
+                  # the tooling pointer: the tools hold the gates themselves
+                  ".claude/tooling",
                   "docs/architecture/decisions/030-x.md", "docs/product/vision.md",
                   "docs/development/product-planning.md", "docs/development/x/y.md",
                   # look-alikes: no case, trailing dots and spaces cut per segment
@@ -47,14 +50,15 @@ class Classes(unittest.TestCase):
             self.assertEqual(nsc.path_class(p), nsc.PRODUCT, repr(p))
 
     def test_the_strictest_class_and_its_first_path(self):
-        self.assertEqual(nsc.classify([".claude/tooling", "docs/a.md"]), (nsc.AUTO, ".claude/tooling"))
+        self.assertEqual(nsc.classify(["docs/b.md", "docs/a.md"]), (nsc.AUTO, "docs/a.md"))
+        self.assertEqual(nsc.classify([".claude/tooling", "docs/a.md"]), (nsc.APPROVAL, ".claude/tooling"))
         self.assertEqual(nsc.classify(["docs/a.md", ".claude/settings.json", ".claude/agents/z.md"]),
                          (nsc.APPROVAL, ".claude/agents/z.md"))
         self.assertEqual(nsc.classify([".claude/settings.json", "pkg/x.go"]), (nsc.PRODUCT, "pkg/x.go"))
         self.assertEqual(nsc.classify([]), (None, None))
 
     def test_command_line(self):
-        r = subprocess.run([sys.executable, PATH], input=".claude/tooling\ndocs/product/v.md\n",
+        r = subprocess.run([sys.executable, PATH], input="docs/a.md\ndocs/product/v.md\n",
                            capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "approval docs/product/v.md")
         r = subprocess.run([sys.executable, PATH], input="", capture_output=True, text=True)
@@ -75,7 +79,8 @@ class Check(unittest.TestCase):
 
     def test_classes_and_the_tooling_flag(self):
         self.assertEqual(self.run_check(2, [self.row(".claude/tooling"), self.row("docs/a.md")]),
-                         ["auto .claude/tooling", "tooling=yes"])
+                         ["approval .claude/tooling", "tooling=yes"])
+        self.assertEqual(self.run_check(1, [self.row("docs/a.md")]), ["auto docs/a.md", "tooling=no"])
         self.assertEqual(self.run_check(1, [self.row("docs/new.md", ".claude/agents/x.md", "renamed")]),
                          ["approval .claude/agents/x.md", "tooling=no"])
 

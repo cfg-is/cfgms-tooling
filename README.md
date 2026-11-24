@@ -33,6 +33,10 @@ git submodule update --init
 1. Open a PR here. CI runs the suite against cfgms `develop`.
 2. After it merges, open a cfgms PR that moves the submodule pointer:
    `git -C .claude/tooling pull origin main && git add .claude/tooling`.
+   An agent reviews it, and a person lets it merge (class approval, below).
+3. After that merges, the host still runs the old tools until a person runs
+   `git submodule update --init` in the cfgms checkout. The preflight reports
+   this as `tooling_pointer_behind`.
 
 The step 2 PR has no story: no story argument, no story or item branch, and
 no issue that GitHub would close (`closingIssuesReferences`, any keyword form;
@@ -43,19 +47,23 @@ in it cannot change what agents run or what the founder decided. One function,
 `scripts/no_story_class.py`, gives its class; `agent-dispatch.sh review-pr`,
 `po-act.sh enqueue` and the preflight all use it.
 
-- **auto**: only the `.claude/tooling` gitlink and/or `docs/` outside the
-  three approval folders below. The agent review is the only check: a PASS
-  enqueues. What this guarantees: such a PR cannot change a hook, a setting,
-  an agent definition, a command, an ADR, product intent or a development
-  procedure. It does not guarantee that no agent reads the file: other docs
+- **auto**: only `docs/` outside the three approval folders below. The agent
+  review is the only check: a PASS enqueues. What this guarantees: such a PR
+  cannot change a hook, a setting, an agent definition, a command, the tools,
+  an ADR, product intent or a development procedure. It does not guarantee that no agent reads the file: other docs
   (for example `docs/architecture/`) can still be reference material.
-- **approval**: anything else under `.claude/` (hooks, `settings.json`, agent
-  definitions, commands, skills, pipeline config), ADRs
+- **approval**: anything under `.claude/` (hooks, `settings.json`, agent
+  definitions, commands, skills, pipeline config, and the `.claude/tooling`
+  pointer), ADRs
   (`docs/architecture/decisions/`), product intent (`docs/product/`) and
   development procedures (`docs/development/`). Hooks and settings decide what
   agents may run; agent definitions and commands decide what they do; agent
   definitions and CLAUDE.md tell agents to follow the files in
   `docs/development/`; ADRs and product intent are the founder's decisions.
+  The pointer is approval because the tools hold the gates themselves (the
+  release check, the quarantine, this class rule), `main` of the tooling
+  repository has no review rule at GitHub, and every agent holds a token
+  that can push there: an agent PASS alone must not move it.
   The three folders are compared without case and with trailing dots and
   spaces cut from each path segment, so a look-alike such as
   `docs/Architecture/decisions/` is approval too. The agent still reviews it,

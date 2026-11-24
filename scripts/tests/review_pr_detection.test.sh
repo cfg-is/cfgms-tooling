@@ -874,14 +874,16 @@ refused() {  # refused <label> <token>
 }
 
 # auto: the pointer and docs/
-run_nostory auto false "$GL" ".claude/tooling\t\tmodified" "docs/a.md\t\tadded"
+run_nostory auto false "" "docs/b.md\t\tmodified" "docs/a.md\t\tadded"
 assert_adv "auto: dispatched" 'grep -q "^REVIEW_DISPATCHED:4242:0:" "$PR_ROOT/launch-auto.out"'
 assert_adv "auto: the no-story marker" 'grep -qF "Your assignment: pr:4242 no-story" "$PR_ROOT/prompt.md"'
 assert_adv "auto: class AUTO, PASS enqueues the reviewed head with no story" 'grep -qF "Its class is AUTO" "$PR_ROOT/prompt.md" && grep -qF "po-act.sh enqueue 4242 --head ${NOSTORY_HEAD}\`" "$PR_ROOT/prompt.md" && ! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
 assert_adv "auto: the Reviewed head line, no board field, no assignee, trusted paths" 'grep -qx "    Reviewed head: ${NOSTORY_HEAD}" "$PR_ROOT/prompt.md" && ! grep -qF "update-field" "$PR_ROOT/prompt.md" && ! grep -qF "add-assignee" "$PR_ROOT/prompt.md" && ! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
 assert_adv "auto: story=0 label" 'grep -qx "story=0" "$PR_ROOT/docker-args.txt"'
 
-# approval: hooks, settings, agents, ADRs, product intent
+# approval: the tooling pointer (the tools hold the gates), hooks, settings, agents, ADRs, product intent
+run_nostory pointer false "$GL" ".claude/tooling\t\tmodified"
+assert_adv "pointer: class APPROVAL, the PASS does not enqueue" "grep -q '^REVIEW_DISPATCHED:4242:0:' '$PR_ROOT/launch-pointer.out' && grep -qF 'Its class is APPROVAL: it changes \`.claude/tooling\`' '$PR_ROOT/prompt.md' && ! grep -qF 'po-act.sh enqueue 4242' '$PR_ROOT/prompt.md'"
 for ap in .claude/settings.json .claude/hooks/block.sh .claude/agents/x.md docs/architecture/decisions/031-x.md docs/product/vision.md; do
   run_nostory "approval-${ap//\//_}" false "" "${ap}\t\tmodified"
   assert_adv "approval ($ap): reviewed, but the PASS does not enqueue" "grep -q '^REVIEW_DISPATCHED:4242:0:' '$PR_ROOT/launch-approval-${ap//\//_}.out' && grep -qF 'Its class is APPROVAL: it changes \`${ap}\`' '$PR_ROOT/prompt.md' && grep -qF 'Do NOT enqueue' '$PR_ROOT/prompt.md' && grep -qF 'human-reviewed:ok' '$PR_ROOT/prompt.md' && ! grep -qF 'po-act.sh enqueue 4242' '$PR_ROOT/prompt.md'"

@@ -89,7 +89,7 @@ chmod +x "$SANDBOX/bin/gh" "$SANDBOX/bin/dispatch-stub" "$SANDBOX/bin/sleep"
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 GH_CLOSES=0
-GH_NS_FILES=".claude/tooling||modified"
+GH_NS_FILES="docs/a.md||modified"
 GH_LABELS=""
 GH_STATE=queued
 GH_AFTER_DEQUEUE=none
@@ -225,19 +225,25 @@ check "product code: nothing is merged" "$calls" "pr merge" not
 GH_NS_FILES=""
 run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
 check "files that cannot be read: refused" "$out" "ENQUEUE_REFUSED:7:no_story_files_unknown"
-# the tooling pointer is checked at enqueue too
+# the tooling pointer is class approval: an agent PASS alone does not move it
 GH_NS_FILES=".claude/tooling||modified"
-GH_CMP_MAIN=ahead
 run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "pointer, no release: refused (class approval)" "$out" "ENQUEUE_REFUSED:7:no_story_needs_human_release (.claude/tooling)"
+# ... and with a release of the head, the pointer is checked at enqueue too
+GH_LABELS="human-reviewed:ok"
+GH_CMP_MAIN=ahead
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
 check "pointer not on tooling main: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_not_on_main"
 check "pointer not on main: nothing is merged" "$calls" "pr merge" not
 GH_CMP_MAIN=""
 GH_CMP_FWD=behind
-run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
 check "pointer moved backward: refused at enqueue" "$out" "ENQUEUE_REFUSED:7:tooling_pointer_not_forward"
 GH_CMP_FWD=""
-run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
-check "pointer on main and forward: enqueued" "$out" "ENQUEUED:7"
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "pointer released, on main and forward: enqueued" "$out" "ENQUEUED:7"
+GH_LABELS=""
+GH_NS_FILES="docs/a.md||modified"
 GH_CLOSES=12
 run "$NOSTORY" "$POACT" enqueue 7
 check "a PR that GitHub closes an issue with is not no-story: no head needed" "$out" "no_story_pr_needs_reviewed_head" not
@@ -283,6 +289,14 @@ for st in SQUASH none; do
   check "slice not queued after the merge call (state $st) is refused" "$out" "ENQUEUE_REFUSED:7:slice_pr_not_queued"
   check "slice not queued (state $st): auto-merge is disarmed" "$calls" "pr merge 7 --repo cfg-is/cfgms --disable-auto"
   check "slice not queued (state $st): not reported as enqueued" "$out" "ENQUEUED:7" not
+done
+# The same for a no-story PR: a later push would ride the arming.
+for st in SQUASH none; do
+  GH_STATE="$st"
+  run feature/tooling-pointer-c6a0f1a "$POACT" enqueue 7 --head "$HEAD_A"
+  check "no-story not queued after the merge call (state $st) is refused" "$out" "ENQUEUE_REFUSED:7:no_story_pr_not_queued"
+  check "no-story not queued (state $st): auto-merge is disarmed" "$calls" "pr merge 7 --repo cfg-is/cfgms --disable-auto"
+  check "no-story not queued (state $st): not reported as enqueued" "$out" "ENQUEUED:7" not
 done
 GH_STATE=queued
 
