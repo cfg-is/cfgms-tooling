@@ -31,6 +31,11 @@
 #                                   (head_moved_since_review) when the head is
 #                                   another. Required for a slice and for a PR
 #                                   with no story (no_story_pr_needs_reviewed_head).
+#                                   A no-story PR of class approval (.claude/ other
+#                                   than the pointer, ADRs, product intent) also
+#                                   needs a person's release of that head
+#                                   (no_story_needs_human_release); product code:
+#                                   no_story_product_code.
 #                                   Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
 #                                   missing so GitHub auto-closes the issue on merge.
@@ -1734,15 +1739,24 @@ except Exception: print('')" 2>/dev/null || echo "")
       exit 3
     fi
     # A pull request with no story (agent-dispatch.sh review-pr, no-story
-    # prompt): its review names the commit it judged, so the merge must name
-    # it too. Without --head (and without a story, which would make it a
-    # story PR) it is refused. A failed body read counts as "no story".
-    if [ -z "$story" ] && [ -z "$reviewed_head" ]; then
+    # prompt): no story argument, no story or item branch, no closing
+    # reference that GitHub reads (any keyword form). Its review names the
+    # commit it judged, so the merge must name it too: without --head it is
+    # refused. Its class (no_story_class.py) is checked below, at the head.
+    # A failed body or closing-reference read counts as "no story".
+    enqueue_no_story=false
+    if [ -z "$story" ]; then
       enqueue_body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body 2>/dev/null || echo "")
       if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "$enqueue_body")" == "REFUSED:no_story_link" ]]; then
-        echo "ENQUEUE_REFUSED:${pr}:no_story_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
-        exit 3
+        enqueue_closing=$(_closing_issue_numbers "$pr" || true)
+        if ! grep -qE '^[1-9][0-9]*$' <<< "$enqueue_closing"; then
+          enqueue_no_story=true
+        fi
       fi
+    fi
+    if $enqueue_no_story && [ -z "$reviewed_head" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:no_story_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
+      exit 3
     fi
     if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "")" == SLICE:* ]]; then
       enqueue_is_slice=true
@@ -1779,6 +1793,29 @@ except Exception: print('')" 2>/dev/null || echo "")
     if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
       echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
       exit 3
+    fi
+    # A no-story PR: its class at this head. auto: the agent review decides.
+    # approval (.claude/ other than the pointer, ADRs, product intent): a
+    # person must have released this head (human-reviewed:ok by a push+
+    # collaborator who approved it). A person's release also stands against
+    # an agent FAIL: enqueue reads no verdict.
+    if $enqueue_no_story; then
+      # The first line only (no `| head`: under pipefail its early close kills the script).
+      enqueue_class=$(_no_story_files_check "$pr" "$head_sha")
+      enqueue_class="${enqueue_class%%$'\n'*}"
+      case "$enqueue_class" in
+        "auto "*) ;;
+        "approval "*)
+          enqueue_labels=$(gh pr view "$pr" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+          if ! _human_release_ok "$pr" "$enqueue_labels" "$head_sha"; then
+            echo "ENQUEUE_REFUSED:${pr}:no_story_needs_human_release (${enqueue_class#approval })"
+            exit 3
+          fi
+          ;;
+        "product_code "*) echo "ENQUEUE_REFUSED:${pr}:no_story_product_code (${enqueue_class#product_code })"; exit 3 ;;
+        "bad_mode "*) echo "ENQUEUE_REFUSED:${pr}:no_story_bad_mode (${enqueue_class#bad_mode })"; exit 3 ;;
+        *) echo "ENQUEUE_REFUSED:${pr}:no_story_files_unknown"; exit 3 ;;
+      esac
     fi
     # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
     # Even if review-pr passed earlier, labels or collaborator status may have

@@ -390,6 +390,7 @@ class NoStoryPullRequests(unittest.TestCase):
         self.pf._perm_cache.clear()
 
     def rec(self, pr, queued=()):
+        pr.setdefault("files", [".claude/tooling"])
         summaries = self.pf._build_pr_summaries([pr])
         recs = self.pf.compute_review_recommendations(summaries, set(queued), set(), set())
         return summaries[0], recs[0]
@@ -429,6 +430,99 @@ class NoStoryPullRequests(unittest.TestCase):
     def test_queued_with_a_verdict_not_for_the_head_is_taken_out(self):
         _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS", head=OLD_HEAD)]), queued=[6382])
         self.assertEqual(r["action"], "dequeue_unreviewed")
+
+    @staticmethod
+    def released(pr, actor="pipeline", oid=HEAD):
+        """A person's release: the label, its actor, the actor's approval of oid."""
+        pr["labels"] = [{"name": "human-reviewed:ok"}]
+        pr["timeline_items"] = [{"label": {"name": "human-reviewed:ok"}, "actor": {"login": actor}}]
+        pr["approvals"] = [{"login": actor, "oid": oid}]
+        return pr
+
+    def test_the_class_comes_from_the_files(self):
+        for files, cls in (([".claude/tooling", "docs/a.md"], "auto"),
+                           (["docs/a.md", ".claude/settings.json"], "approval"),
+                           (["docs/product/vision.md"], "approval"),
+                           (["docs/architecture/decisions/031-x.md"], "approval"),
+                           (["docs/a.md", "pkg/x.go"], "product_code")):
+            s, r = self.rec(raw_pr(head=NOSTORY) | {"files": files})
+            self.assertEqual((s["no_story_class"][0], r["no_story_class"]), (cls, cls), files)
+        s, _ = self.rec(raw_pr(head=NOSTORY) | {"files": ["docs/a.md"], "files_truncated": True})
+        self.assertEqual(s["no_story_class"], (None, None))
+
+    def test_product_code_needs_an_issue(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": ["docs/a.md", "go.mod"]})
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("it changes go.mod", r["reason"])
+        self.assertIn("needs an issue", r["reason"])
+        _, r = self.rec(raw_pr(head=NOSTORY) | {"files": ["Makefile"]})
+        self.assertEqual(r["action"], "skip")
+
+    def test_approval_class_pass_waits_for_a_person(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/hooks/x.sh"]})
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("it changes .claude/hooks/x.sh", r["reason"])
+        self.assertIn(f"apply the human-reviewed:ok label and approve head {HEAD}", r["reason"])
+        # no review yet: it is still reviewed (the review is advice to the person)
+        _, r = self.rec(raw_pr(head=NOSTORY) | {"files": [".claude/settings.json"]})
+        self.assertEqual(r["action"], "spawn_acceptance_reviewer")
+
+    def test_an_unknown_class_waits_for_a_person(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS")])
+                        | {"files": ["docs/a.md"], "files_truncated": True})
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("class is not known", r["reason"])
+
+    def test_approval_class_released_and_pass_is_enqueued(self):
+        pr = self.released(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/agents/x.md"]})
+        s, r = self.rec(pr)
+        self.assertTrue(s["is_released"])
+        self.assertEqual((r["action"], r["head"]), ("enqueue_merge", HEAD))
+        self.assertIn(f"po-act.sh enqueue 6382 --head {HEAD}`", r["reason"])
+
+    def test_a_release_of_another_commit_does_not_count(self):
+        pr = self.released(raw_pr(head=NOSTORY, comments=[review("PASS")]) | {"files": [".claude/agents/x.md"]},
+                           oid=OLD_HEAD)
+        _, r = self.rec(pr)
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("human-reviewed:ok", r["reason"])
+
+    def test_a_release_overrides_an_agent_fail(self):
+        pr = self.released(raw_pr(head=NOSTORY, comments=[review("FAIL")]) | {"files": [".claude/agents/x.md"]})
+        _, r = self.rec(pr)
+        self.assertEqual((r["action"], r["head"]), ("enqueue_merge", HEAD))
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("FAIL")]))
+        self.assertIn("override it", r["reason"])
+
+    def test_released_and_queued_is_never_taken_out(self):
+        for verdict_head in (OLD_HEAD, HEAD):
+            pr = self.released(raw_pr(head=NOSTORY, comments=[review("FAIL", head=verdict_head)]))
+            _, r = self.rec(pr, queued=[6382])
+            self.assertEqual(r["action"], "skip")
+            self.assertIn("released by a person", r["reason"])
+            pr = self.released(raw_pr(head=NOSTORY, comments=[review("FAIL", head=verdict_head)],
+                                      auto_merge={"enabledAt": T1}))
+            _, r = self.rec(pr)
+            self.assertNotEqual(r["action"], "dequeue_unreviewed")
+
+    def test_a_released_external_pr_with_no_story_gets_the_head(self):
+        pr = self.released(raw_pr(head=NOSTORY, author="stranger", comments=[review("PASS")]),
+                           actor="pipeline")
+        s, r = self.rec(pr)
+        self.assertTrue(s["is_no_story"])
+        self.assertEqual((r["action"], r["head"]), ("enqueue_merge", HEAD))
+        self.assertIn(f"--head {HEAD}`", r["reason"])
+        pr = self.released(raw_pr(head=NOSTORY, author="stranger") | {"files": ["pkg/x.go"]})
+        _, r = self.rec(pr)
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("needs an issue", r["reason"])
+
+    def test_a_closing_reference_is_never_no_story(self):
+        s, _ = self.rec(raw_pr(head=NOSTORY) | {"closing_issue_numbers": [12]})
+        self.assertFalse(s["is_no_story"])
+        # a released external PR gets no story from it, but is not no-story either
+        s, _ = self.rec(self.released(raw_pr(head=NOSTORY, author="stranger") | {"closing_issue_numbers": [12]}))
+        self.assertFalse(s["is_no_story"])
 
 
 if __name__ == "__main__":

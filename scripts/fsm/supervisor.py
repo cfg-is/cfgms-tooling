@@ -1260,6 +1260,8 @@ TOOLING_SNAPSHOT_FILES = (
     "devcontainer/agent-context.sh",
     # epic.py: quarantine-top-git for a `.git` entry in the memory folder
     "scripts/memory-sync.py",
+    # po-cycle-preflight.py imports it (the class of a PR with no story)
+    "scripts/no_story_class.py",
 )
 #: Directories copied whole (sourced libraries and the supervisor itself).
 TOOLING_SNAPSHOT_DIRS = ("scripts/lib", "scripts/fsm")

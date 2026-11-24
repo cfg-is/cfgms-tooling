@@ -38,6 +38,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The class of a pull request with no story: one rule, shared with
+# agent-dispatch.sh review-pr and po-act.sh enqueue (no_story_class.py).
+_NSC_SPEC = importlib.util.spec_from_file_location(
+    "no_story_class", os.path.join(os.path.dirname(os.path.abspath(__file__)), "no_story_class.py"))
+no_story_class = importlib.util.module_from_spec(_NSC_SPEC)
+_NSC_SPEC.loader.exec_module(no_story_class)
+
 REPO = "cfg-is/cfgms"
 
 SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
@@ -3041,30 +3048,48 @@ def _slice_review_rec(pr, in_queue, owner_active=True):
 
 
 def _no_story_review_rec(pr, in_queue):
-    """The recommendation for an internal, non-draft pull request with no
-    story (no story or item branch, no closing reference, not a slice): a
-    tooling pointer bump, a prompt or a document change. `agent-dispatch.sh
-    review-pr` reviews it with the no-story prompt (the PR body is the spec).
+    """The recommendation for a pull request with no story (no story or item
+    branch, no closing reference, not a slice; internal, or external and
+    released): a tooling pointer bump, a prompt or a document change.
+    `agent-dispatch.sh review-pr` reviews it with the no-story prompt.
 
-    As for a slice, a review counts for the commit it names ("Reviewed head:
-    <sha>"), and an enqueue names that commit (`po-act.sh enqueue <PR> --head
-    <sha>`): a commit pushed after the review is never merged on that review.
-    There is no story and no fix cycle: a FAIL, or checks that fail, need a
-    person or a new commit by the author.
+    A review counts for the commit it names ("Reviewed head: <sha>"), and an
+    enqueue names that commit (`po-act.sh enqueue <PR> --head <sha>`). The
+    class (no_story_class.py, from the PR's paths) decides who may let it
+    merge: auto, the agent review; approval (`.claude/` other than the
+    tooling pointer, ADRs, product intent), a person's release of the head
+    (`is_released`: label human-reviewed:ok by a push+ collaborator who
+    approved the head). A release stands against an agent FAIL, and a released
+    PR in the queue is never taken out. Product code: skip, it needs an
+    issue. There is no fix cycle: a FAIL needs a person or a new commit.
     """
     overall = pr["ci_summary"]["overall"]
     ms = (pr.get("merge_state_status") or "").upper()
     head = pr.get("head_oid") or ""
     verdict = pr.get("latest_review_verdict")
+    cls, cls_path = pr.get("no_story_class") or (None, None)
+    released = bool(pr.get("is_released"))
     person = "it needs a person or a new commit by its author"
+    release_hint = (f"a maintainer must apply the human-reviewed:ok label and approve head {head}, "
+                    "then the pipeline enqueues that commit")
 
     def rec(action, reason, **more):
-        return {"pr": pr["pr"], "story": None, "no_story": True, "action": action,
+        return {"pr": pr["pr"], "story": None, "no_story": True, "no_story_class": cls, "action": action,
                 "reason": f"pull request with no story: {reason}", **more}
 
+    def enqueue(why):
+        return rec("enqueue_merge",
+                   f"{why} + checks green + mergeable — run "
+                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`", head=head)
+
+    if cls == no_story_class.PRODUCT:
+        return rec("skip", f"it changes {cls_path}, which a PR with no story may not change; it needs an "
+                           "issue (Fixes #N) and goes the story way")
     reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
     if in_queue or pr.get("auto_merge_enabled"):
         where = "in the merge queue" if in_queue else "auto-merge armed"
+        if released:
+            return rec("skip", f"{where}, released by a person for this head; the pipeline leaves it alone")
         if reviewed and verdict == "pass":
             return rec("skip", f"reviewed PASS on this commit, {where} (mergeStateStatus={ms or 'UNKNOWN'})")
         if verdict in ("pass", "fail"):
@@ -3077,6 +3102,10 @@ def _no_story_review_rec(pr, in_queue):
     if ms == "DIRTY":
         return rec("rebase", "mergeStateStatus=DIRTY (conflicts with develop) — run "
                              "`./.claude/tooling/scripts/rebase-pr.sh <PR>`; the new head is reviewed again")
+    mergeable = pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", "")
+    if released and overall == "green" and mergeable:
+        # A person released this head: that stands, also against an agent FAIL.
+        return enqueue("released by a person for this head")
     if not reviewed:
         if not pr["has_acceptance_review_comment"]:
             why = "no acceptance review yet"
@@ -3091,7 +3120,15 @@ def _no_story_review_rec(pr, in_queue):
             return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
         return rec("skip", f"checks failed — {person}")
     if verdict == "fail":
-        return rec("skip", f"acceptance review FAILED on this commit — {person}")
+        return rec("skip", f"acceptance review FAILED on this commit — {person}; a person can also "
+                           f"override it: {release_hint}")
+    if cls != no_story_class.AUTO and not released:
+        if cls is None:
+            # No file list, or more than 100 files: fail closed.
+            return rec("skip", "reviewed PASS, but its class is not known here (no file list, or more than "
+                               f"100 files) — {release_hint}")
+        return rec("skip", f"reviewed PASS, but it changes {cls_path} (class approval: what agents run or "
+                           f"what the founder decided) — {release_hint}")
     kicks = pr.get("evictions_since_review", 0)
     if kicks >= 2:
         return rec("skip", f"reviewed PASS but removed from the merge queue {kicks}x since that review — {person}")
@@ -3103,11 +3140,8 @@ def _no_story_review_rec(pr, in_queue):
     if overall == "pending":
         r = _ci_pending_rec(pr, "reviewed PASS; checks pending: ")
         return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
-    if pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", ""):
-        return rec("enqueue_merge",
-                   "reviewed PASS on this commit + checks green + mergeable — run "
-                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`",
-                   head=head)
+    if mergeable:
+        return enqueue("reviewed PASS on this commit")
     return rec("skip", f"reviewed PASS but not mergeable (mergeable={pr.get('mergeable')}, "
                        f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
 
@@ -3385,10 +3419,18 @@ def _build_pr_summaries(prs):
             "is_released": pr_is_released,
             "story_number": story_number,
             "is_slice": epic_number is not None,
-            # Internal, no story, no item branch, not a slice: reviewed with the
-            # no-story prompt, verdict and enqueue bound to the head commit.
-            "is_no_story": (not pr_is_external and story_number is None and epic_number is None
-                            and not BRANCH_STORY_RE.match(head)),
+            # Internal (or an external PR that a person released), no story,
+            # no closing reference, no item branch, not a slice: reviewed with
+            # the no-story prompt, verdict and enqueue bound to the head commit.
+            "is_no_story": ((not pr_is_external or pr_is_released) and story_number is None
+                            and epic_number is None and not BRANCH_STORY_RE.match(head)
+                            and not [n for n in pr.get("closing_issue_numbers", []) if isinstance(n, int)]),
+            # Its class from the paths of the PR (no_story_class.py), or None when
+            # the list is missing or has more than 100 paths. A hint only: the
+            # GraphQL list has no old name of a rename; review-pr and enqueue
+            # decide from the REST list.
+            "no_story_class": (no_story_class.classify(pr.get("files") or [])
+                               if pr.get("files") and not pr.get("files_truncated") else (None, None)),
             "epic_number": epic_number,
             "slice_number": slice_number,
             "comment_count": len(comments),

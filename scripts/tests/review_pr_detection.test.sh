@@ -485,8 +485,22 @@ cat > "$CONFLICT_STUB_DIR/gh" <<'STUB'
 for a in "$@"; do
   case "$a" in
     *collaborators*permission*) echo admin; exit 0 ;;
-    # the changed files of a no-story PR: GH_FILES_LIST names a file of paths
+    # The reads of a no-story PR (each answer as gh prints it after --jq):
+    # GH_FILES_LIST: a file of "<filename>\t<previous filename>\t<status>"
+    # rows; GH_FILES_COUNT: the PR's changed_files; GH_TREE: a file of the
+    # trees answer ("truncated=false", then "<mode> <path>" lines);
+    # GH_TOOLING_OLD/NEW: the gitlink sha at the base / head; GH_GITMODULES: a
+    # file whose base64 is the base's .gitmodules; GH_CMP_MAIN/GH_CMP_FWD: the
+    # compare statuses; GH_CLOSING: the closing issue numbers.
     */pulls/*/files) [[ -n "${GH_FILES_LIST:-}" ]] || exit 1; cat "$GH_FILES_LIST"; exit 0 ;;
+    repos/cfg-is/cfgms/pulls/[0-9]*) [[ -n "${GH_FILES_COUNT:-}" ]] || exit 1; echo "$GH_FILES_COUNT"; exit 0 ;;
+    */git/trees/*) [[ -n "${GH_TREE:-}" ]] || exit 1; cat "$GH_TREE"; exit 0 ;;
+    */contents/.claude/tooling?ref=*) [[ "$a" == *"ref=${GH_BASE_SHA:-none}" ]] && { echo "${GH_TOOLING_OLD:-}"; exit 0; }
+                                      echo "${GH_TOOLING_NEW:-}"; exit 0 ;;
+    */contents/.gitmodules?ref=*) [[ -n "${GH_GITMODULES:-}" ]] || exit 1; base64 -w0 < "$GH_GITMODULES"; exit 0 ;;
+    repos/*/compare/main...*) echo "${GH_CMP_MAIN:-}"; exit 0 ;;
+    repos/*/compare/*) echo "${GH_CMP_FWD:-}"; exit 0 ;;
+    *closingIssuesReferences*) [[ -n "${GH_CLOSING_FAIL:-}" ]] && exit 1; printf '%s' "${GH_CLOSING:-}" | tr ' ' '\n'; exit 0 ;;
   esac
 done
 # `gh pr view` is the only other call reached before the guard.
@@ -821,15 +835,22 @@ echo "--- review-pr: an internal pull request with no story ---"
 
 git -C "$PR_ROOT/origin" branch feature/tooling-pointer-c6a0f1a
 NOSTORY_HEAD=$(git -C "$PR_ROOT/origin" rev-parse feature/tooling-pointer-c6a0f1a)
-run_nostory_launch() {  # run_nostory_launch <label> <draft> <files...>: files "" = the read fails
-  local label="$1" draft="$2"; shift 2
-  printf '{"state":"OPEN","headRefName":"feature/tooling-pointer-c6a0f1a","headRefOid":"%s","body":"Bump the tooling pointer to c6a0f1a.","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","isDraft":%s}' \
-    "$NOSTORY_HEAD" "$draft" > "$PR_ROOT/meta.json"
-  local files_env=""
-  if [[ $# -gt 0 && "$1" == EMPTY ]]; then : > "$PR_ROOT/files.txt"; files_env="$PR_ROOT/files.txt"
-  elif [[ $# -gt 0 && -n "$1" ]]; then printf '%s\n' "$@" > "$PR_ROOT/files.txt"; files_env="$PR_ROOT/files.txt"; fi
+NS_BASE=1111111111111111111111111111111111111111
+printf '[submodule ".claude/tooling"]\n\tpath = .claude/tooling\n\turl = https://github.com/cfg-is/cfgms-tooling.git\n' > "$PR_ROOT/gitmodules"
+# run_nostory <label> <draft> <tree lines|""> <rows...>: rows "<file>\t<old>\t<status>"
+run_nostory() {
+  local label="$1" draft="$2" tree="$3"; shift 3
+  printf '{"state":"OPEN","headRefName":"feature/tooling-pointer-c6a0f1a","headRefOid":"%s","baseRefOid":"%s","body":"%s","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","isDraft":%s}' \
+    "$NOSTORY_HEAD" "$NS_BASE" "${NS_BODY:-Bump the tooling pointer to c6a0f1a.}" "$draft" > "$PR_ROOT/meta.json"
+  printf '%b\n' "$@" > "$PR_ROOT/files.txt"
+  printf 'truncated=%s\n%b\n' "${NS_TRUNC:-false}" "$tree" > "$PR_ROOT/tree.txt"
   rm -f "$PR_ROOT/prompt.md" "$PR_ROOT/docker-args.txt"
-  PR_ROOT="$PR_ROOT" GH_FIXTURE="$PR_ROOT/meta.json" GH_FILES_LIST="$files_env" \
+  PR_ROOT="$PR_ROOT" GH_FIXTURE="$PR_ROOT/meta.json" GH_FILES_LIST="$PR_ROOT/files.txt" \
+    GH_FILES_COUNT="${NS_COUNT:-$#}" GH_TREE="$PR_ROOT/tree.txt" GH_BASE_SHA="$NS_BASE" \
+    GH_TOOLING_OLD="${NS_OLD-2222222222222222222222222222222222222222}" \
+    GH_TOOLING_NEW="${NS_NEW-3333333333333333333333333333333333333333}" \
+    GH_GITMODULES="${NS_GITMODULES-$PR_ROOT/gitmodules}" GH_CMP_MAIN="${NS_CMP_MAIN:-behind}" \
+    GH_CMP_FWD="${NS_CMP_FWD:-ahead}" GH_CLOSING="${NS_CLOSING:-}" GH_CLOSING_FAIL="${NS_CLOSING_FAIL:-}" \
     PATH="$PR_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$PR_ROOT/home" \
     CFGMS_TEST_COLLAB_PERM="${PERM:-admin}" CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
     CFGMS_TEST_REPO_ROOT="$PR_ROOT/repo" CFGMS_ADVERSARIAL_REVIEW_GATE=off \
@@ -837,33 +858,73 @@ run_nostory_launch() {  # run_nostory_launch <label> <draft> <files...>: files "
     CFGMS_AGENT_CAPACITY_GATE=off \
     "$DISPATCH" review-pr 4242 >"$PR_ROOT/launch-$label.out" 2>&1 || true
 }
-run_nostory_launch nostory false .claude/tooling docs/a.md
-assert_adv "no-story PR is dispatched" 'grep -q "^REVIEW_DISPATCHED:4242:0:" "$PR_ROOT/launch-nostory.out"'
-assert_adv "no-story prompt marker" 'grep -qF "Your assignment: pr:4242 no-story" "$PR_ROOT/prompt.md"'
-assert_adv "no-story prompt: the body is the spec, the gitlink check is given" 'grep -qF "The PR title and body are the specification" "$PR_ROOT/prompt.md" && grep -qF "gh api repos/cfg-is/cfgms-tooling/compare/main...<new-commit> --jq .status" "$PR_ROOT/prompt.md"'
-assert_adv "no-story prompt enqueues the reviewed head, no story argument" 'grep -qF "po-act.sh enqueue 4242 --head ${NOSTORY_HEAD}\`" "$PR_ROOT/prompt.md" && ! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
-assert_adv "no-story prompt gives the Reviewed head line" 'grep -qx "    Reviewed head: ${NOSTORY_HEAD}" "$PR_ROOT/prompt.md"'
-assert_adv "no-story prompt writes no board field and assigns nobody" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "update-field" "$PR_ROOT/prompt.md" && ! grep -qF "add-assignee" "$PR_ROOT/prompt.md"'
-assert_adv "no-story prompt uses the trusted path only" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
-assert_adv "no-story container is labelled story=0" 'grep -qx "story=0" "$PR_ROOT/docker-args.txt"'
-run_nostory_launch nostory-code false .claude/tooling pkg/x.go
-assert_adv "no-story PR with product code is refused before a container" 'grep -q "REVIEW_REFUSED:4242:no_story_product_code (pkg/x.go)" "$PR_ROOT/launch-nostory-code.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
-run_nostory_launch nostory-make false Makefile
-assert_adv "no-story PR that changes the Makefile is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_product_code (Makefile)" "$PR_ROOT/launch-nostory-make.out"'
-run_nostory_launch nostory-draft true .claude/tooling
-assert_adv "no-story draft is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_draft" "$PR_ROOT/launch-nostory-draft.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
-run_nostory_launch nostory-nofiles false ""
-assert_adv "no-story PR whose files cannot be read is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_files_unknown" "$PR_ROOT/launch-nostory-nofiles.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
-run_nostory_launch nostory-empty false EMPTY
-assert_adv "no-story PR whose file list is empty is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_files_unknown" "$PR_ROOT/launch-nostory-empty.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
-PERM=read run_nostory_launch nostory-ext false .claude/tooling
-assert_adv "no-story PR of an external author is refused as before" 'grep -q "REVIEW_REFUSED:4242:external_author_jrdnr" "$PR_ROOT/launch-nostory-ext.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
-for p_ok in .claude/tooling .claude/agents/x.md docs/a/b.md; do
-  assert_adv "no-story path allowed: $p_ok" "\"\$DISPATCH\" _test-no-story-path-ok '$p_ok'"
+GL='160000 .claude/tooling'
+refused() {  # refused <label> <token>
+  assert_adv "$1: $2, no container" "grep -qF 'REVIEW_REFUSED:4242:$2' '$PR_ROOT/launch-$1.out' && [[ ! -e '$PR_ROOT/docker-args.txt' ]]"
+}
+
+# auto: the pointer and docs/
+run_nostory auto false "$GL" ".claude/tooling\t\tmodified" "docs/a.md\t\tadded"
+assert_adv "auto: dispatched" 'grep -q "^REVIEW_DISPATCHED:4242:0:" "$PR_ROOT/launch-auto.out"'
+assert_adv "auto: the no-story marker" 'grep -qF "Your assignment: pr:4242 no-story" "$PR_ROOT/prompt.md"'
+assert_adv "auto: class AUTO, PASS enqueues the reviewed head with no story" 'grep -qF "Its class is AUTO" "$PR_ROOT/prompt.md" && grep -qF "po-act.sh enqueue 4242 --head ${NOSTORY_HEAD}\`" "$PR_ROOT/prompt.md" && ! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
+assert_adv "auto: the Reviewed head line, no board field, no assignee, trusted paths" 'grep -qx "    Reviewed head: ${NOSTORY_HEAD}" "$PR_ROOT/prompt.md" && ! grep -qF "update-field" "$PR_ROOT/prompt.md" && ! grep -qF "add-assignee" "$PR_ROOT/prompt.md" && ! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
+assert_adv "auto: story=0 label" 'grep -qx "story=0" "$PR_ROOT/docker-args.txt"'
+
+# approval: hooks, settings, agents, ADRs, product intent
+for ap in .claude/settings.json .claude/hooks/block.sh .claude/agents/x.md docs/architecture/decisions/031-x.md docs/product/vision.md; do
+  run_nostory "approval-${ap//\//_}" false "" "${ap}\t\tmodified"
+  assert_adv "approval ($ap): reviewed, but the PASS does not enqueue" "grep -q '^REVIEW_DISPATCHED:4242:0:' '$PR_ROOT/launch-approval-${ap//\//_}.out' && grep -qF 'Its class is APPROVAL: it changes \`${ap}\`' '$PR_ROOT/prompt.md' && grep -qF 'Do NOT enqueue' '$PR_ROOT/prompt.md' && grep -qF 'human-reviewed:ok' '$PR_ROOT/prompt.md' && ! grep -qF 'po-act.sh enqueue 4242' '$PR_ROOT/prompt.md'"
 done
-for p_no in pkg/x.go Makefile go.mod .github/workflows/a.yml scripts/x.sh CLAUDE.md README.md cmd/a/main.go; do
-  assert_adv "no-story path refused: $p_no" "! \"\$DISPATCH\" _test-no-story-path-ok '$p_no'"
+
+# refused classes and modes
+run_nostory code false "$GL" ".claude/tooling\t\tmodified" "pkg/x.go\t\tmodified"
+refused code "no_story_product_code (pkg/x.go)"
+run_nostory make false "" "Makefile\t\tmodified"
+refused make "no_story_product_code (Makefile)"
+run_nostory rename false "" "docs/new.md\tpkg/old.go\trenamed"
+refused rename "no_story_product_code (pkg/old.go)"
+NS_COUNT=3 run_nostory count false "" "docs/a.md\t\tmodified" "docs/b.md\t\tmodified"
+refused count "no_story_files_unknown"
+NS_COUNT=3000 run_nostory count3000 false "" "docs/a.md\t\tmodified"
+refused count3000 "no_story_files_unknown"
+# 3000 files, all listed: GitHub stops at 3000, so the list may be cut short
+mapfile -t NS_ROWS < <(for i in $(seq 1 3000); do printf 'docs/f%s.md\t\tadded\n' "$i"; done)
+run_nostory full3000 false "" "${NS_ROWS[@]}"
+refused full3000 "no_story_files_unknown"
+NS_TRUNC=true run_nostory truncated false "" "docs/a.md\t\tmodified"
+refused truncated "no_story_files_unknown"
+run_nostory symlink false "120000 docs/a.md" "docs/a.md\t\tadded"
+refused symlink "no_story_bad_mode (docs/a.md)"
+run_nostory gitlink false "160000 docs/sub" "docs/sub\t\tadded"
+refused gitlink "no_story_bad_mode (docs/sub)"
+run_nostory notgitlink false "" ".claude/tooling\t\tmodified"
+refused notgitlink "no_story_bad_mode (.claude/tooling)"
+run_nostory draft true "" "docs/a.md\t\tmodified"
+refused draft "no_story_draft"
+PERM=read run_nostory external false "" "docs/a.md\t\tmodified"
+refused external "external_author_jrdnr"
+
+# the tooling pointer, checked before a container starts
+NS_CMP_MAIN=ahead run_nostory notmain false "$GL" ".claude/tooling\t\tmodified"
+refused notmain "tooling_pointer_not_on_main"
+NS_CMP_FWD=behind run_nostory backward false "$GL" ".claude/tooling\t\tmodified"
+refused backward "tooling_pointer_not_forward"
+NS_GITMODULES="" run_nostory nomodules false "$GL" ".claude/tooling\t\tmodified"
+refused nomodules "tooling_pointer_unknown"
+NS_OLD="" run_nostory noold false "$GL" ".claude/tooling\t\tmodified"
+refused noold "tooling_pointer_unknown"
+
+# a PR that GitHub would treat as closing an issue is a story PR, whatever the form
+for body in "fixes #12" "FIXES #12" "fix #12" "resolved #12"; do
+  NS_BODY="$body" NS_CLOSING=12 run_nostory "closes-${body// /_}" false "" "docs/a.md\t\tmodified"
+  assert_adv "body '$body' (GitHub closes #12): the story prompt, not no-story" "grep -qF 'story:12 --project-item' '$PR_ROOT/prompt.md' && ! grep -qF 'no-story' '$PR_ROOT/prompt.md'"
 done
+NS_CLOSING_FAIL=1 run_nostory closingfail false "" "docs/a.md\t\tmodified"
+refused closingfail "closing_refs_unknown"
+
+assert_adv "class hook: approval for settings" '[[ "$("$DISPATCH" _test-no-story-class .claude/tooling .claude/settings.json)" == "approval .claude/settings.json" ]]'
+assert_adv "class hook: product code wins" '[[ "$("$DISPATCH" _test-no-story-class docs/a.md go.mod)" == "product_code go.mod" ]]'
 
 echo
 echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"

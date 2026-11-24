@@ -53,6 +53,12 @@ case "$*" in
   "pr view"*"--jq .headRefOid"*)  printf '%s\n' "$GH_HEAD" ;;
   "pr view"*"--jq .baseRefName"*) printf '%s\n' "develop" ;;
   "pr view"*"--jq .body"*)        printf '%s\n' "the claim" ;;
+  "pr view"*"--json labels"*)     printf '%s\n' "${GH_LABELS:-}" ;;
+  # the class reads of a no-story PR: GH_NS_FILES is "<file>|<old>|<status>"
+  # rows separated by spaces; the tree has the .claude/tooling gitlink
+  "api repos/cfg-is/cfgms/pulls/7 --jq .changed_files") printf '%s\n' "$(wc -w <<< "$GH_NS_FILES")" ;;
+  "api repos/cfg-is/cfgms/pulls/7/files"*) for r in $GH_NS_FILES; do printf '%s\n' "${r//|/$'\t'}"; done ;;
+  "api repos/cfg-is/cfgms/git/trees/"*) printf 'truncated=false\n160000 .claude/tooling\n' ;;
   "pr view"*)
     printf '{"number":7,"headRefName":"%s","baseRefName":"develop","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"cfg-is"},"body":"the claim"}\n' "$GH_BRANCH" ;;
   "pr edit"*)  cat > /dev/null ;;
@@ -71,6 +77,8 @@ chmod +x "$SANDBOX/bin/gh" "$SANDBOX/bin/dispatch-stub" "$SANDBOX/bin/sleep"
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 GH_CLOSES=0
+GH_NS_FILES=".claude/tooling||modified"
+GH_LABELS=""
 GH_STATE=queued
 GH_AFTER_DEQUEUE=none
 
@@ -78,7 +86,7 @@ run() {  # run <branch> <command...>   (stdout+stderr in $out, exit code in $rc,
   local branch="$1"; shift
   : > "$SANDBOX/gh.log"
   rc=0
-  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_STATE="$GH_STATE" GH_AFTER_DEQUEUE="$GH_AFTER_DEQUEUE" GH_LOG="$SANDBOX/gh.log" \
+  out=$(GH_BRANCH="$branch" GH_HEAD="$HEAD_A" GH_CLOSES="$GH_CLOSES" GH_NS_FILES="$GH_NS_FILES" GH_LABELS="$GH_LABELS" GH_STATE="$GH_STATE" GH_AFTER_DEQUEUE="$GH_AFTER_DEQUEUE" GH_LOG="$SANDBOX/gh.log" \
         PATH="$SANDBOX/bin:$PATH" HOME="$SANDBOX/home" \
         CFGMS_TEST_DISPATCH="$SANDBOX/bin/dispatch-stub" \
         CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
@@ -157,6 +165,47 @@ run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
 check "no-story at the reviewed head: enqueued" "$out" "ENQUEUED:7"
 check "no-story: the merge is bound to the reviewed head" "$calls" "pr merge 7 --repo cfg-is/cfgms --squash --match-head-commit ${HEAD_A}"
 check "no-story: the body is not edited" "$calls" "pr edit" not
+
+# The class at the head (no_story_class.py). The release hooks of
+# agent-dispatch.sh stand in for the label actor, its permission and its
+# approvals: a person released a head when the label is on, the actor is
+# push+, and the actor approved exactly that head.
+REL=(env CFGMS_TEST_ACTOR_LOGIN=maint CFGMS_TEST_ACTOR_PERM=admin CFGMS_TEST_HEAD_OID="$HEAD_A")
+GH_NS_FILES=".claude/settings.json||modified docs/a.md||modified"
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class (settings), no release: refused" "$out" "ENQUEUE_REFUSED:7:no_story_needs_human_release (.claude/settings.json)"
+check "approval class, no release: nothing is merged" "$calls" "pr merge" not
+GH_LABELS="human-reviewed:ok"
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_B}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, the person approved another commit: refused" "$out" "no_story_needs_human_release"
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" CFGMS_TEST_ACTOR_PERM=read "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, the label actor is read-only: refused" "$out" "no_story_needs_human_release"
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, released for this head: enqueued" "$out" "ENQUEUED:7"
+check "approval class, released: bound to the head" "$calls" "pr merge 7 --repo cfg-is/cfgms --squash --match-head-commit ${HEAD_A}"
+GH_LABELS=""
+run "$NOSTORY" "${REL[@]}" CFGMS_TEST_APPROVALS="maint ${HEAD_A}" "$POACT" enqueue 7 --head "$HEAD_A"
+check "approval class, an approval but no label: refused" "$out" "no_story_needs_human_release"
+for ap in docs/product/vision.md docs/architecture/decisions/031-x.md .claude/hooks/x.sh; do
+  GH_NS_FILES="${ap}||modified"
+  run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+  check "approval class ($ap), no release: refused" "$out" "ENQUEUE_REFUSED:7:no_story_needs_human_release (${ap})"
+done
+GH_NS_FILES="docs/a.md|.claude/agents/x.md|renamed"
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "a rename out of .claude/agents counts the old name: refused" "$out" "no_story_needs_human_release (.claude/agents/x.md)"
+GH_NS_FILES=".claude/tooling||modified go.mod||modified"
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "product code at the head: refused" "$out" "ENQUEUE_REFUSED:7:no_story_product_code (go.mod)"
+check "product code: nothing is merged" "$calls" "pr merge" not
+GH_NS_FILES=""
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "files that cannot be read: refused" "$out" "ENQUEUE_REFUSED:7:no_story_files_unknown"
+GH_NS_FILES=".claude/tooling||modified"
+GH_CLOSES=12
+run "$NOSTORY" "$POACT" enqueue 7
+check "a PR that GitHub closes an issue with is not no-story: no head needed" "$out" "no_story_pr_needs_reviewed_head" not
+GH_CLOSES=0
 
 printf '\n== enqueue: a slice ==\n'
 run "$SLICE" "$POACT" enqueue 7 6380 --head "$HEAD_A"
