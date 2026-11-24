@@ -2660,6 +2660,9 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 pr, in_queue,
                 owner_active=active_epics is None or pr.get("epic_number") in active_epics))
             continue
+        if pr.get("is_no_story"):
+            recs.append(_no_story_review_rec(pr, in_queue))
+            continue
         if pr.get("story_number") in blocked_story_nums:
             recs.append({
                 "pr": pr["pr"],
@@ -3037,6 +3040,78 @@ def _slice_review_rec(pr, in_queue, owner_active=True):
                        f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
 
 
+def _no_story_review_rec(pr, in_queue):
+    """The recommendation for an internal, non-draft pull request with no
+    story (no story or item branch, no closing reference, not a slice): a
+    tooling pointer bump, a prompt or a document change. `agent-dispatch.sh
+    review-pr` reviews it with the no-story prompt (the PR body is the spec).
+
+    As for a slice, a review counts for the commit it names ("Reviewed head:
+    <sha>"), and an enqueue names that commit (`po-act.sh enqueue <PR> --head
+    <sha>`): a commit pushed after the review is never merged on that review.
+    There is no story and no fix cycle: a FAIL, or checks that fail, need a
+    person or a new commit by the author.
+    """
+    overall = pr["ci_summary"]["overall"]
+    ms = (pr.get("merge_state_status") or "").upper()
+    head = pr.get("head_oid") or ""
+    verdict = pr.get("latest_review_verdict")
+    person = "it needs a person or a new commit by its author"
+
+    def rec(action, reason, **more):
+        return {"pr": pr["pr"], "story": None, "no_story": True, "action": action,
+                "reason": f"pull request with no story: {reason}", **more}
+
+    reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
+    if in_queue or pr.get("auto_merge_enabled"):
+        where = "in the merge queue" if in_queue else "auto-merge armed"
+        if reviewed and verdict == "pass":
+            return rec("skip", f"reviewed PASS on this commit, {where} (mergeStateStatus={ms or 'UNKNOWN'})")
+        if verdict in ("pass", "fail"):
+            return rec("dequeue_unreviewed",
+                       f"{where}, but the newest review verdict is not a PASS of its head commit — run "
+                       f"`./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}`; the next cycle reviews "
+                       "the commit")
+        return rec("skip", f"{where} with no review verdict: enqueued by a person; the pipeline neither "
+                           "reviews nor dequeues it")
+    if ms == "DIRTY":
+        return rec("rebase", "mergeStateStatus=DIRTY (conflicts with develop) — run "
+                             "`./.claude/tooling/scripts/rebase-pr.sh <PR>`; the new head is reviewed again")
+    if not reviewed:
+        if not pr["has_acceptance_review_comment"]:
+            why = "no acceptance review yet"
+        elif verdict not in ("pass", "fail"):
+            why = "its review comment has no verdict"
+        else:
+            why = "its review is for another commit (or names none)"
+        if overall == "green":
+            return rec("spawn_acceptance_reviewer", f"checks green; {why}")
+        if overall == "pending":
+            r = _ci_pending_rec(pr, f"{why}; checks pending: ")
+            return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
+        return rec("skip", f"checks failed — {person}")
+    if verdict == "fail":
+        return rec("skip", f"acceptance review FAILED on this commit — {person}")
+    kicks = pr.get("evictions_since_review", 0)
+    if kicks >= 2:
+        return rec("skip", f"reviewed PASS but removed from the merge queue {kicks}x since that review — {person}")
+    if overall == "red":
+        if pr.get("failed_run_attempt", 1) <= 1:
+            return rec("rerun_failed_checks", "reviewed PASS but its checks failed (attempt 1) — one "
+                                              "`po-act.sh rerun <PR>` to clear a transient failure")
+        return rec("skip", f"reviewed PASS but its checks still fail after a rerun — {person}")
+    if overall == "pending":
+        r = _ci_pending_rec(pr, "reviewed PASS; checks pending: ")
+        return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
+    if pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", ""):
+        return rec("enqueue_merge",
+                   "reviewed PASS on this commit + checks green + mergeable — run "
+                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`",
+                   head=head)
+    return rec("skip", f"reviewed PASS but not mergeable (mergeable={pr.get('mergeable')}, "
+                       f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
+
+
 def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=None, queued_pr_numbers=None):
     """Decide what to do for each Fix-status story (Step 4 of pipeline cycle).
 
@@ -3310,6 +3385,10 @@ def _build_pr_summaries(prs):
             "is_released": pr_is_released,
             "story_number": story_number,
             "is_slice": epic_number is not None,
+            # Internal, no story, no item branch, not a slice: reviewed with the
+            # no-story prompt, verdict and enqueue bound to the head commit.
+            "is_no_story": (not pr_is_external and story_number is None and epic_number is None
+                            and not BRANCH_STORY_RE.match(head)),
             "epic_number": epic_number,
             "slice_number": slice_number,
             "comment_count": len(comments),

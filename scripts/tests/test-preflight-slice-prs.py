@@ -372,5 +372,64 @@ class SlicePullRequests(unittest.TestCase):
         self.assertIn("po-act.sh enqueue 6382 12`", r["reason"])
 
 
+NOSTORY = "feature/tooling-pointer-c6a0f1a"
+
+
+class NoStoryPullRequests(unittest.TestCase):
+    """An internal pull request with no story (a tooling pointer bump, a
+    prompt or a document change) is reviewed with the no-story prompt; its
+    verdict and its enqueue are bound to the head commit, as for a slice."""
+
+    def setUp(self):
+        self.pf = _load()
+        self.pf._perm_cache.clear()
+        os.environ["CFGMS_TEST_COLLAB_PERM_MAP"] = json.dumps({"pipeline": "admin", "stranger": "read"})
+
+    def tearDown(self):
+        os.environ.pop("CFGMS_TEST_COLLAB_PERM_MAP", None)
+        self.pf._perm_cache.clear()
+
+    def rec(self, pr, queued=()):
+        summaries = self.pf._build_pr_summaries([pr])
+        recs = self.pf.compute_review_recommendations(summaries, set(queued), set(), set())
+        return summaries[0], recs[0]
+
+    def test_a_pr_with_no_story_is_a_no_story_pr(self):
+        s, r = self.rec(raw_pr(head=NOSTORY))
+        self.assertTrue(s["is_no_story"])
+        self.assertEqual((r["action"], r.get("no_story")), ("spawn_acceptance_reviewer", True))
+        for head, body in (("feature/story-12-agent", ""), ("feature/item-abc123-agent", ""),
+                           (SLICE, ""), (NOSTORY, "Fixes #12")):
+            s, _ = self.rec(raw_pr(head=head, body=body))
+            self.assertFalse(s["is_no_story"], head)
+
+    def test_external_and_draft_are_as_before(self):
+        s, r = self.rec(raw_pr(head=NOSTORY, author="stranger"))
+        self.assertFalse(s["is_no_story"])
+        self.assertIn("quarantined", r["reason"])
+        _, r = self.rec(raw_pr(head=NOSTORY, draft=True))
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("draft", r["reason"])
+
+    def test_a_pass_of_the_head_is_enqueued_at_that_head(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS")]))
+        self.assertEqual((r["action"], r["head"]), ("enqueue_merge", HEAD))
+        self.assertIn(f"po-act.sh enqueue 6382 --head {HEAD}`", r["reason"])
+
+    def test_a_pass_of_another_commit_is_reviewed_again(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS", head=OLD_HEAD)], commit_date=T0))
+        self.assertEqual(r["action"], "spawn_acceptance_reviewer")
+        self.assertIn("another commit", r["reason"])
+
+    def test_a_fail_with_no_new_commit_needs_a_person(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("FAIL")]))
+        self.assertEqual(r["action"], "skip")
+        self.assertIn("needs a person or a new commit by its author", r["reason"])
+
+    def test_queued_with_a_verdict_not_for_the_head_is_taken_out(self):
+        _, r = self.rec(raw_pr(head=NOSTORY, comments=[review("PASS", head=OLD_HEAD)]), queued=[6382])
+        self.assertEqual(r["action"], "dequeue_unreviewed")
+
+
 if __name__ == "__main__":
     unittest.main()

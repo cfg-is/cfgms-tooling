@@ -485,6 +485,8 @@ cat > "$CONFLICT_STUB_DIR/gh" <<'STUB'
 for a in "$@"; do
   case "$a" in
     *collaborators*permission*) echo admin; exit 0 ;;
+    # the changed files of a no-story PR: GH_FILES_LIST names a file of paths
+    */pulls/*/files) [[ -n "${GH_FILES_LIST:-}" ]] || exit 1; cat "$GH_FILES_LIST"; exit 0 ;;
   esac
 done
 # `gh pr view` is the only other call reached before the guard.
@@ -813,6 +815,55 @@ assert_adv "slice container is labelled story=0" 'grep -qx "story=0" "$PR_ROOT/d
 NO_EPIC_ITEM=1 run_prompt_launch feature/epic-77-slice-2 slice-noitem
 assert_adv "slice of an epic with no project item is refused" 'grep -q "REVIEW_REFUSED:4242:no_project_item_for_epic_77" "$PR_ROOT/launch-slice-noitem.out"'
 assert_adv "slice of an epic with no project item starts no container" '[[ -s "$PR_ROOT/launch-slice-noitem.out" && ! -e "$PR_ROOT/docker-args.txt" ]]'
+
+echo
+echo "--- review-pr: an internal pull request with no story ---"
+
+git -C "$PR_ROOT/origin" branch feature/tooling-pointer-c6a0f1a
+NOSTORY_HEAD=$(git -C "$PR_ROOT/origin" rev-parse feature/tooling-pointer-c6a0f1a)
+run_nostory_launch() {  # run_nostory_launch <label> <draft> <files...>: files "" = the read fails
+  local label="$1" draft="$2"; shift 2
+  printf '{"state":"OPEN","headRefName":"feature/tooling-pointer-c6a0f1a","headRefOid":"%s","body":"Bump the tooling pointer to c6a0f1a.","labels":[],"headRepositoryOwner":{"login":"cfg-is"},"author":{"login":"jrdnr"},"mergeStateStatus":"CLEAN","isDraft":%s}' \
+    "$NOSTORY_HEAD" "$draft" > "$PR_ROOT/meta.json"
+  local files_env=""
+  if [[ $# -gt 0 && "$1" == EMPTY ]]; then : > "$PR_ROOT/files.txt"; files_env="$PR_ROOT/files.txt"
+  elif [[ $# -gt 0 && -n "$1" ]]; then printf '%s\n' "$@" > "$PR_ROOT/files.txt"; files_env="$PR_ROOT/files.txt"; fi
+  rm -f "$PR_ROOT/prompt.md" "$PR_ROOT/docker-args.txt"
+  PR_ROOT="$PR_ROOT" GH_FIXTURE="$PR_ROOT/meta.json" GH_FILES_LIST="$files_env" \
+    PATH="$PR_ROOT/bin:$CONFLICT_STUB_DIR:$PATH" HOME="$PR_ROOT/home" \
+    CFGMS_TEST_COLLAB_PERM="${PERM:-admin}" CFGMS_TEST_CREDS_STATUS="CREDS_OK:test" \
+    CFGMS_TEST_REPO_ROOT="$PR_ROOT/repo" CFGMS_ADVERSARIAL_REVIEW_GATE=off \
+    CFGMS_TEST_PIPELINE_HELPER="$SCRIPT_DIR/mock-pipeline-helper.sh" \
+    CFGMS_AGENT_CAPACITY_GATE=off \
+    "$DISPATCH" review-pr 4242 >"$PR_ROOT/launch-$label.out" 2>&1 || true
+}
+run_nostory_launch nostory false .claude/tooling docs/a.md
+assert_adv "no-story PR is dispatched" 'grep -q "^REVIEW_DISPATCHED:4242:0:" "$PR_ROOT/launch-nostory.out"'
+assert_adv "no-story prompt marker" 'grep -qF "Your assignment: pr:4242 no-story" "$PR_ROOT/prompt.md"'
+assert_adv "no-story prompt: the body is the spec, the gitlink check is given" 'grep -qF "The PR title and body are the specification" "$PR_ROOT/prompt.md" && grep -qF "gh api repos/cfg-is/cfgms-tooling/compare/main...<new-commit> --jq .status" "$PR_ROOT/prompt.md"'
+assert_adv "no-story prompt enqueues the reviewed head, no story argument" 'grep -qF "po-act.sh enqueue 4242 --head ${NOSTORY_HEAD}\`" "$PR_ROOT/prompt.md" && ! grep -qE "po-act\.sh enqueue 4242 [0-9]" "$PR_ROOT/prompt.md"'
+assert_adv "no-story prompt gives the Reviewed head line" 'grep -qx "    Reviewed head: ${NOSTORY_HEAD}" "$PR_ROOT/prompt.md"'
+assert_adv "no-story prompt writes no board field and assigns nobody" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "update-field" "$PR_ROOT/prompt.md" && ! grep -qF "add-assignee" "$PR_ROOT/prompt.md"'
+assert_adv "no-story prompt uses the trusted path only" '[[ -s "$PR_ROOT/prompt.md" ]] && ! grep -qF "./.claude/tooling/scripts/" "$PR_ROOT/prompt.md"'
+assert_adv "no-story container is labelled story=0" 'grep -qx "story=0" "$PR_ROOT/docker-args.txt"'
+run_nostory_launch nostory-code false .claude/tooling pkg/x.go
+assert_adv "no-story PR with product code is refused before a container" 'grep -q "REVIEW_REFUSED:4242:no_story_product_code (pkg/x.go)" "$PR_ROOT/launch-nostory-code.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
+run_nostory_launch nostory-make false Makefile
+assert_adv "no-story PR that changes the Makefile is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_product_code (Makefile)" "$PR_ROOT/launch-nostory-make.out"'
+run_nostory_launch nostory-draft true .claude/tooling
+assert_adv "no-story draft is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_draft" "$PR_ROOT/launch-nostory-draft.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
+run_nostory_launch nostory-nofiles false ""
+assert_adv "no-story PR whose files cannot be read is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_files_unknown" "$PR_ROOT/launch-nostory-nofiles.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
+run_nostory_launch nostory-empty false EMPTY
+assert_adv "no-story PR whose file list is empty is refused" 'grep -q "REVIEW_REFUSED:4242:no_story_files_unknown" "$PR_ROOT/launch-nostory-empty.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
+PERM=read run_nostory_launch nostory-ext false .claude/tooling
+assert_adv "no-story PR of an external author is refused as before" 'grep -q "REVIEW_REFUSED:4242:external_author_jrdnr" "$PR_ROOT/launch-nostory-ext.out" && [[ ! -e "$PR_ROOT/docker-args.txt" ]]'
+for p_ok in .claude/tooling .claude/agents/x.md docs/a/b.md; do
+  assert_adv "no-story path allowed: $p_ok" "\"\$DISPATCH\" _test-no-story-path-ok '$p_ok'"
+done
+for p_no in pkg/x.go Makefile go.mod .github/workflows/a.yml scripts/x.sh CLAUDE.md README.md cmd/a/main.go; do
+  assert_adv "no-story path refused: $p_no" "! \"\$DISPATCH\" _test-no-story-path-ok '$p_no'"
+done
 
 echo
 echo "--- every external-PR release check is bound to the head acted on (Issue #5401) ---"

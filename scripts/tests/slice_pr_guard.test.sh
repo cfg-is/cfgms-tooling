@@ -144,6 +144,20 @@ check "a branch that cannot be read refuses the enqueue" "$out" "ENQUEUE_REFUSED
 check "... and writes no closing reference" "$calls" "pr edit" not
 check "... and merges nothing" "$calls" "pr merge" not
 
+printf '\n== enqueue: a pull request with no story ==\n'
+NOSTORY="feature/tooling-pointer-c6a0f1a"
+run "$NOSTORY" "$POACT" enqueue 7
+check "no-story without --head is refused" "$out" "ENQUEUE_REFUSED:7:no_story_pr_needs_reviewed_head"
+check "no-story without --head exits 3" "$rc" "3"
+check "no-story without --head: nothing is merged" "$calls" "pr merge" not
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_B"
+check "no-story whose head moved after the review is refused" "$out" "ENQUEUE_REFUSED:7:head_moved_since_review"
+check "no-story whose head moved: nothing is merged" "$calls" "pr merge" not
+run "$NOSTORY" "$POACT" enqueue 7 --head "$HEAD_A"
+check "no-story at the reviewed head: enqueued" "$out" "ENQUEUED:7"
+check "no-story: the merge is bound to the reviewed head" "$calls" "pr merge 7 --repo cfg-is/cfgms --squash --match-head-commit ${HEAD_A}"
+check "no-story: the body is not edited" "$calls" "pr edit" not
+
 printf '\n== enqueue: a slice ==\n'
 run "$SLICE" "$POACT" enqueue 7 6380 --head "$HEAD_A"
 check "slice: enqueued" "$out" "ENQUEUED:7"

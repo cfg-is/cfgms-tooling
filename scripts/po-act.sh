@@ -26,7 +26,12 @@
 # FAILED before launching, 2 usage, 3 refused (*_REFUSED line), 4 run locked by
 # a live supervisor, 10 credentials deferral, 75 interrupted (resumable).
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
-#   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
+#   enqueue <PR_NUM> [<STORY>] [--head <SHA>]
+#                                   --head: the reviewed commit; refused
+#                                   (head_moved_since_review) when the head is
+#                                   another. Required for a slice and for a PR
+#                                   with no story (no_story_pr_needs_reviewed_head).
+#                                   Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
 #                                   missing so GitHub auto-closes the issue on merge.
 #                                   ENQUEUED only when the PR is in the queue or
@@ -1688,7 +1693,8 @@ except Exception: print('')" 2>/dev/null || echo "")
   enqueue)
     # enqueue <PR> [<story>] [--head <sha>]
     #   --head <sha>: the commit that was reviewed. The merge is refused when
-    #   the pull request head is another commit. Required for a slice.
+    #   the pull request head is another commit. Required for a slice and for
+    #   a pull request with no story (no_story_pr_needs_reviewed_head).
     pr="${1:?PR number required}"
     shift
     story=""
@@ -1726,6 +1732,17 @@ except Exception: print('')" 2>/dev/null || echo "")
     if [ -z "$enqueue_branch" ]; then
       echo "ENQUEUE_REFUSED:${pr}:branch_unknown"
       exit 3
+    fi
+    # A pull request with no story (agent-dispatch.sh review-pr, no-story
+    # prompt): its review names the commit it judged, so the merge must name
+    # it too. Without --head (and without a story, which would make it a
+    # story PR) it is refused. A failed body read counts as "no story".
+    if [ -z "$story" ] && [ -z "$reviewed_head" ]; then
+      enqueue_body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body 2>/dev/null || echo "")
+      if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "$enqueue_body")" == "REFUSED:no_story_link" ]]; then
+        echo "ENQUEUE_REFUSED:${pr}:no_story_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
+        exit 3
+      fi
     fi
     if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "")" == SLICE:* ]]; then
       enqueue_is_slice=true
