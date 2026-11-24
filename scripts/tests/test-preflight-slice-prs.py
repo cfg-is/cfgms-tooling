@@ -518,17 +518,64 @@ class NoStoryPullRequests(unittest.TestCase):
         _, r = self.rec(pr)
         self.assertEqual(r["action"], "skip")
 
-    def test_approval_class_queued_by_a_person_is_left_alone(self):
-        for verdict, vhead in (("FAIL", HEAD), ("PASS", OLD_HEAD), ("FAIL", OLD_HEAD), (None, None)):
-            comments = [review(verdict, head=vhead)] if verdict else []
-            pr = raw_pr(head=NOSTORY, comments=comments) | {"files": [".claude/settings.json"]}
-            _, r = self.rec(pr, queued=[6382])
-            self.assertEqual(r["action"], "skip", verdict)
-            self.assertIn("class approval: a person enqueued it; left alone", r["reason"])
-            pr = raw_pr(head=NOSTORY, comments=comments, auto_merge={"enabledAt": T1}) | {"files": ["docs/product/v.md"]}
-            _, r = self.rec(pr)
-            self.assertEqual(r["action"], "skip", verdict)
-            self.assertIn("left alone", r["reason"])
+    def queued_both(self, files, comments, release=None):
+        """The rec when queued and when armed (the two must agree)."""
+        out = []
+        for queued, auto in (([6382], None), ((), {"enabledAt": T1})):
+            pr = raw_pr(head=NOSTORY, comments=comments, auto_merge=auto) | {"files": files}
+            if release:
+                pr = self.released(pr, actor=release)
+            out.append(self.rec(pr, queued=queued)[1])
+        return out
+
+    def test_queued_with_no_verdict_is_left_alone_any_class(self):
+        for files in ([".claude/tooling"], [".claude/settings.json"], ["pkg/x.go"]):
+            for r in self.queued_both(files, []):
+                self.assertEqual(r["action"], "skip", files)
+                self.assertIn("queued with no review verdict: a person enqueued it; left alone", r["reason"])
+
+    def test_queued_without_a_pass_of_the_head_is_taken_out_any_class(self):
+        for files in ([".claude/tooling"], [".claude/settings.json"], ["docs/product/v.md"], ["pkg/x.go"]):
+            for verdict, vhead in (("FAIL", HEAD), ("PASS", OLD_HEAD), ("FAIL", OLD_HEAD)):
+                for r in self.queued_both(files, [review(verdict, head=vhead)]):
+                    self.assertEqual(r["action"], "dequeue_unreviewed", (files, verdict, vhead))
+                    self.assertIn("po-act.sh dequeue 6382", r["reason"])
+        # unknown class (more than 100 files)
+        pr = raw_pr(head=NOSTORY, comments=[review("FAIL")]) | {"files": ["docs/a.md"], "files_truncated": True}
+        self.assertEqual(self.rec(pr, queued=[6382])[1]["action"], "dequeue_unreviewed")
+
+    def test_reviewer_scenario_armed_pass_of_old_head_then_a_claude_file(self):
+        # AUTO PR passed at the old head and armed; a push adds a hook
+        r = self.queued_both([".claude/tooling", ".claude/hooks/x.sh"], [review("PASS", head=OLD_HEAD)])[1]
+        self.assertEqual(r["action"], "dequeue_unreviewed")
+
+    def test_reviewer_scenario_queued_fail_of_the_head_with_a_claude_file(self):
+        r = self.queued_both(["docs/a.md", ".claude/agents/x.md"], [review("FAIL")])[0]
+        self.assertEqual(r["action"], "dequeue_unreviewed")
+
+    def test_product_code_armed_is_taken_out(self):
+        for verdict, vhead in (("PASS", HEAD), ("PASS", OLD_HEAD), ("FAIL", HEAD)):
+            r = self.queued_both(["go.mod"], [review(verdict, head=vhead)])[1]
+            self.assertEqual(r["action"], "dequeue_unreviewed", (verdict, vhead))
+
+    def test_a_pass_of_the_head_auto_rides_approval_is_left_alone(self):
+        for r in self.queued_both([".claude/tooling"], [review("PASS")]):
+            self.assertEqual(r["action"], "skip")
+            self.assertIn("reviewed PASS on this commit", r["reason"])
+            self.assertNotIn("class approval", r["reason"])
+        for files in ([".claude/settings.json"], ["docs/development/x.md"]):
+            for r in self.queued_both(files, [review("PASS")]):
+                self.assertEqual(r["action"], "skip", files)
+                self.assertIn("class approval: a person enqueued it; left alone", r["reason"])
+
+    def test_released_by_another_account_rides_any_verdict(self):
+        for files in ([".claude/settings.json"], [".claude/tooling"]):
+            for r in self.queued_both(files, [review("FAIL", head=OLD_HEAD)], release="pipeline"):
+                self.assertEqual(r["action"], "skip", files)
+                self.assertIn("released by a person", r["reason"])
+        # released by the token account: not a release for class approval
+        for r in self.queued_both([".claude/settings.json"], [review("FAIL")], release="hostbot"):
+            self.assertEqual(r["action"], "dequeue_unreviewed")
 
     def test_released_and_queued_is_never_taken_out(self):
         for verdict_head in (OLD_HEAD, HEAD):

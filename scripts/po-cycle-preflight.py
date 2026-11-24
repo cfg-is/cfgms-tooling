@@ -3112,26 +3112,35 @@ def _no_story_review_rec(pr, in_queue):
                    f"{why} + checks green + mergeable — run "
                    f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`", head=head)
 
+    reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
+    if in_queue or pr.get("auto_merge_enabled"):
+        # In the queue or armed, any class. Only a review of THIS head, or a
+        # release of it, lets it ride: a push after the pipeline armed it (a new
+        # head, perhaps a new class) is taken out.
+        where = "in the merge queue" if in_queue else "auto-merge armed"
+        dequeue = rec("dequeue_unreviewed",
+                      f"{where}, but the newest review verdict is not a PASS of its head commit — run "
+                      f"`./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}`; the next cycle reviews "
+                      "the commit")
+        if released:
+            return rec("skip", f"{where}, released by a person for this head; the pipeline leaves it alone")
+        if verdict not in ("pass", "fail"):
+            return rec("skip", f"{where}; queued with no review verdict: a person enqueued it; left alone")
+        if not (reviewed and verdict == "pass"):
+            return dequeue
+        if cls == no_story_class.AUTO:
+            return rec("skip", f"reviewed PASS on this commit, {where} (mergeStateStatus={ms or 'UNKNOWN'})")
+        if cls == no_story_class.PRODUCT:
+            return dequeue
+        # Class approval (or unknown) with a PASS of this head: the reviewer
+        # never enqueues it and po-act refuses it without a release, so a
+        # person put it there (while one account exists, the owner's merge in
+        # GitHub goes through the queue): left alone.
+        return rec("skip", f"{where}; reviewed PASS on this commit, class approval: a person enqueued it; "
+                           "left alone")
     if cls == no_story_class.PRODUCT:
         return rec("skip", f"it changes {cls_path}, which a PR with no story may not change; it needs an "
                            "issue (Fixes #N) and goes the story way")
-    reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
-    if in_queue or pr.get("auto_merge_enabled"):
-        where = "in the merge queue" if in_queue else "auto-merge armed"
-        if cls == no_story_class.APPROVAL:
-            # Only a person merges it while one account exists: whatever the verdict.
-            return rec("skip", f"{where}; class approval: a person enqueued it; left alone")
-        if released:
-            return rec("skip", f"{where}, released by a person for this head; the pipeline leaves it alone")
-        if reviewed and verdict == "pass":
-            return rec("skip", f"reviewed PASS on this commit, {where} (mergeStateStatus={ms or 'UNKNOWN'})")
-        if verdict in ("pass", "fail"):
-            return rec("dequeue_unreviewed",
-                       f"{where}, but the newest review verdict is not a PASS of its head commit — run "
-                       f"`./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}`; the next cycle reviews "
-                       "the commit")
-        return rec("skip", f"{where} with no review verdict: enqueued by a person; the pipeline neither "
-                           "reviews nor dequeues it")
     if ms == "DIRTY":
         return rec("rebase", "mergeStateStatus=DIRTY (conflicts with develop) — run "
                              "`./.claude/tooling/scripts/rebase-pr.sh <PR>`; the new head is reviewed again")

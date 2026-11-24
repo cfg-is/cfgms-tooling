@@ -94,8 +94,8 @@ How an approval-class PR merges, in one of two ways:
    every agent holds that token and could label and approve with it; when that
    account cannot be read, no release counts. A new push voids the release.
 2. The repository owner reads it and merges it in GitHub (or types
-   `gh pr merge` themselves). The pipeline never takes an approval-class PR
-   out of the merge queue or disarms it, whatever the verdict.
+   `gh pr merge` themselves). This works for a PR whose agent review PASSed
+   that head, or that has no review yet.
 
 Today the founder and every agent use the same GitHub account, and GitHub
 does not let an author approve their own PR, so way 2 is the working path
@@ -105,9 +105,22 @@ preflight. It becomes a GitHub rule only once agents have their own GitHub
 identity and `develop` requires an approval. (An external PR's release still
 accepts the token's account: the founder releases external PRs with it.)
 
-The pipeline never takes a released PR out of the merge queue either.
-Without a release, a FAIL needs a person or a new commit; there is no fix
-cycle. Tested with stand-ins only; not run yet with a real reviewer.
+A no-story PR in the merge queue or armed for auto-merge, of any class:
+
+- released for its current head (by an account that counts): left alone;
+- no review verdict at all (a person enqueued it before any review): left
+  alone;
+- a PASS of its current head: left alone, except a product-code PR, which is
+  taken out;
+- anything else (a FAIL, or a PASS of another commit): taken out
+  (`po-act.sh dequeue <PR>`), whatever its class. So a push after the
+  pipeline armed a PR, which may also change its class, never rides on the
+  old review.
+
+So while one account exists, the owner cannot override an agent FAIL by
+merging in GitHub: the queue entry is taken out while the FAIL stands. The
+owner pushes a fix (the new head is reviewed again) or a second account
+releases the head. There is no fix cycle. Tested with stand-ins only; not run yet with a real reviewer.
 
 ## Tests
 
