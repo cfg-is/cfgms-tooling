@@ -26,7 +26,19 @@
 # FAILED before launching, 2 usage, 3 refused (*_REFUSED line), 4 run locked by
 # a live supervisor, 10 credentials deferral, 75 interrupted (resumable).
 #   close-merged <ISSUE> <PR>       Close issue that didn't auto-close after PR merge
-#   enqueue <PR_NUM> [<STORY>]      Add PR to merge queue. If STORY is given,
+#   enqueue <PR_NUM> [<STORY>] [--head <SHA>]
+#                                   --head: the reviewed commit; refused
+#                                   (head_moved_since_review) when the head is
+#                                   another. Required for a slice and for a PR
+#                                   with no story (no_story_pr_needs_reviewed_head).
+#                                   A no-story PR of class approval (.claude/ with
+#                                   the tooling pointer, ADRs, product intent,
+#                                   docs/development/) also needs a release of that
+#                                   head by an account other than this token's
+#                                   (no_story_needs_human_release); product code:
+#                                   no_story_product_code; a moved tooling pointer
+#                                   is checked as in review-pr (tooling_pointer_*).
+#                                   Add PR to merge queue. If STORY is given,
 #                                   prepends "Fixes #STORY" to the PR body when
 #                                   missing so GitHub auto-closes the issue on merge.
 #                                   ENQUEUED only when the PR is in the queue or
@@ -1688,7 +1700,8 @@ except Exception: print('')" 2>/dev/null || echo "")
   enqueue)
     # enqueue <PR> [<story>] [--head <sha>]
     #   --head <sha>: the commit that was reviewed. The merge is refused when
-    #   the pull request head is another commit. Required for a slice.
+    #   the pull request head is another commit. Required for a slice and for
+    #   a pull request with no story (no_story_pr_needs_reviewed_head).
     pr="${1:?PR number required}"
     shift
     story=""
@@ -1727,6 +1740,51 @@ except Exception: print('')" 2>/dev/null || echo "")
       echo "ENQUEUE_REFUSED:${pr}:branch_unknown"
       exit 3
     fi
+    # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
+    # the merge to it with --match-head-commit. The trust check is passed this
+    # SHA so it cannot re-read a different head (an author swapping heads
+    # between capture and check); a push after the check cannot be merged.
+    # Fail closed if the head cannot be read.
+    head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "ENQUEUE_REFUSED:${pr}:head_unknown"
+      exit 3
+    fi
+    # The merge below is bound to head_sha (--match-head-commit). With --head
+    # it must also be the commit that was reviewed.
+    if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
+      exit 3
+    fi
+    # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
+    # Even if review-pr passed earlier, labels or collaborator status may have
+    # changed between review and merge. Fail-closed: refuse if not internal.
+    # It comes before anything else is read about the PR: an untrusted PR is
+    # told external_author, and its body, files and class are not read.
+    if ! "$DISPATCH" check-pr-author "$pr" "$head_sha"; then
+      echo "ENQUEUE_REFUSED:${pr}:external_author"
+      exit 3
+    fi
+    # A pull request with no story (agent-dispatch.sh review-pr, no-story
+    # prompt): no story argument, no story or item branch, no closing
+    # reference that GitHub reads (any keyword form). Its review names the
+    # commit it judged, so the merge must name it too: without --head it is
+    # refused. Its class (no_story_class.py) is checked below, at the head.
+    # A failed body or closing-reference read counts as "no story".
+    enqueue_no_story=false
+    if [ -z "$story" ]; then
+      enqueue_body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body 2>/dev/null || echo "")
+      if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "$enqueue_body")" == "REFUSED:no_story_link" ]]; then
+        enqueue_closing=$(_closing_issue_numbers "$pr" || true)
+        if ! grep -qE '^[1-9][0-9]*$' <<< "$enqueue_closing"; then
+          enqueue_no_story=true
+        fi
+      fi
+    fi
+    if $enqueue_no_story && [ -z "$reviewed_head" ]; then
+      echo "ENQUEUE_REFUSED:${pr}:no_story_pr_needs_reviewed_head (enqueue <PR> --head <sha>)"
+      exit 3
+    fi
     if [[ "$(resolve_pr_story_or_item "$enqueue_branch" "")" == SLICE:* ]]; then
       enqueue_is_slice=true
       if [ -n "$story" ]; then
@@ -1747,28 +1805,40 @@ except Exception: print('')" 2>/dev/null || echo "")
         exit 3
       fi
     fi
-    # Capture the head SHA ONCE, judge trust against that exact SHA, and bind
-    # the merge to it with --match-head-commit. The trust check is passed this
-    # SHA so it cannot re-read a different head (an author swapping heads
-    # between capture and check); a push after the check cannot be merged.
-    # Fail closed if the head cannot be read.
-    head_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")
-    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-      echo "ENQUEUE_REFUSED:${pr}:head_unknown"
-      exit 3
-    fi
-    # The merge below is bound to head_sha (--match-head-commit). With --head
-    # it must also be the commit that was reviewed.
-    if [ -n "$reviewed_head" ] && [ "$reviewed_head" != "$head_sha" ]; then
-      echo "ENQUEUE_REFUSED:${pr}:head_moved_since_review"
-      exit 3
-    fi
-    # TOCTOU re-check: verify author trust at enqueue time (Issue #1786).
-    # Even if review-pr passed earlier, labels or collaborator status may have
-    # changed between review and merge. Fail-closed: refuse if not internal.
-    if ! "$DISPATCH" check-pr-author "$pr" "$head_sha"; then
-      echo "ENQUEUE_REFUSED:${pr}:external_author"
-      exit 3
+    # A no-story PR: its class at this head. auto: the agent review decides.
+    # approval (.claude/ with the tooling pointer, ADRs, product intent): a
+    # person must have released this head (human-reviewed:ok by a push+
+    # collaborator who approved it). A person's release also stands against
+    # an agent FAIL: enqueue reads no verdict.
+    if $enqueue_no_story; then
+      # The first line only (no `| head`: under pipefail its early close kills the script).
+      enqueue_check=$(_no_story_files_check "$pr" "$head_sha")
+      enqueue_class="${enqueue_check%%$'\n'*}"
+      case "$enqueue_class" in
+        "auto "*) ;;
+        "approval "*)
+          # The release must come from an account other than this token's:
+          # every agent holds this token and could label and approve with it.
+          enqueue_labels=$(gh pr view "$pr" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+          if ! _human_release_ok "$pr" "$enqueue_labels" "$head_sha" not_token_account; then
+            echo "ENQUEUE_REFUSED:${pr}:no_story_needs_human_release (${enqueue_class#approval }): a maintainer with another account applies human-reviewed:ok and approves this head; or the repository owner merges it in GitHub after reading it"
+            exit 3
+          fi
+          ;;
+        "product_code "*) echo "ENQUEUE_REFUSED:${pr}:no_story_product_code (${enqueue_class#product_code })"; exit 3 ;;
+        "bad_mode "*) echo "ENQUEUE_REFUSED:${pr}:no_story_bad_mode (${enqueue_class#bad_mode })"; exit 3 ;;
+        *) echo "ENQUEUE_REFUSED:${pr}:no_story_files_unknown"; exit 3 ;;
+      esac
+      # A moved tooling pointer: the same check as review-pr, at this head.
+      if [[ "$enqueue_check" == *$'\n'"tooling=yes" ]]; then
+        enqueue_base=$(gh pr view "$pr" --repo "$REPO" --json baseRefOid --jq .baseRefOid 2>/dev/null || echo "")
+        case "$(_tooling_pointer_check "$enqueue_base" "$head_sha")" in
+          ok) ;;
+          not_on_main) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_not_on_main"; exit 3 ;;
+          not_forward) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_not_forward"; exit 3 ;;
+          *) echo "ENQUEUE_REFUSED:${pr}:tooling_pointer_unknown"; exit 3 ;;
+        esac
+      fi
     fi
     # Only develop-based PRs go through the pipeline's merge path (Issue #4693).
     # develop is the only branch with a merge queue; on any other base,
@@ -1822,11 +1892,14 @@ except Exception: print('')" 2>/dev/null || echo "")
     }
     squash_enqueue
     state=$(enqueue_state)
-    # A slice must not wait with auto-merge armed: its owner can push a new
-    # round, and the armed merge would then take a commit that nobody
-    # reviewed. Queued, or not at all. The state is read up to three times:
-    # GitHub may need a moment to show the queue entry.
-    if $enqueue_is_slice; then
+    # A slice or a no-story PR must not wait with auto-merge armed: a later
+    # push (an owner's new round, or anyone with the token) would then ride
+    # the arming into develop with no review of that commit. Queued, or not
+    # at all. The state is read up to three times: GitHub may need a moment
+    # to show the queue entry.
+    if $enqueue_is_slice || $enqueue_no_story; then
+      not_queued="slice_pr_not_queued"
+      $enqueue_no_story && not_queued="no_story_pr_not_queued"
       for _ in 1 2; do
         [ "$state" = "queued" ] && break
         sleep 3
@@ -1834,9 +1907,9 @@ except Exception: print('')" 2>/dev/null || echo "")
       done
       if [ "$state" != "queued" ]; then
         if gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1; then
-          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; auto-merge disarmed; a queue entry, if there is one, stays)"
+          echo "ENQUEUE_REFUSED:${pr}:${not_queued} (state ${state}; auto-merge disarmed; a queue entry, if there is one, stays)"
         else
-          echo "ENQUEUE_REFUSED:${pr}:slice_pr_not_queued (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
+          echo "ENQUEUE_REFUSED:${pr}:${not_queued} (state ${state}; disarm of auto-merge FAILED: run po-act.sh dequeue ${pr})"
         fi
         exit 3
       fi

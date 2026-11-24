@@ -38,6 +38,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The class of a pull request with no story: one rule, shared with
+# agent-dispatch.sh review-pr and po-act.sh enqueue (no_story_class.py).
+_NSC_SPEC = importlib.util.spec_from_file_location(
+    "no_story_class", os.path.join(os.path.dirname(os.path.abspath(__file__)), "no_story_class.py"))
+no_story_class = importlib.util.module_from_spec(_NSC_SPEC)
+_NSC_SPEC.loader.exec_module(no_story_class)
+
 REPO = "cfg-is/cfgms"
 
 SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
@@ -1598,6 +1605,46 @@ def host_capacity():
         return {"available": None}
 
 
+def tooling_pointer_status(repo_root=None):
+    """Whether the host runs the tools that develop names.
+
+    After a pointer PR merges, the cfgms checkout still runs the old tools
+    until a person runs `git submodule update --init`. Compares the
+    `.claude/tooling` gitlink recorded in `origin/develop` of the cfgms
+    checkout with the commit its submodule is at. Local reads only: no fetch
+    (code_health_check may have fetched already). Fails soft: anything it
+    cannot read gives None for both fields and no degraded reason.
+
+    Returns {"tooling_pointer_behind": bool | None,
+             "tooling_pointer": {"checkout": sha, "develop": sha} | None}.
+    """
+    unknown = {"tooling_pointer_behind": None, "tooling_pointer": None}
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[3]
+
+    def git(*args):
+        r = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", check=False, timeout=10)
+        out = r.stdout.strip()
+        return out if r.returncode == 0 and _SHA_RE.match(out) else None
+
+    sub = root / ".claude" / "tooling"
+    try:
+        develop = git("-C", str(root), "rev-parse", "--verify", "--quiet", "origin/develop:.claude/tooling")
+        # An uninitialised submodule is a plain folder: git there would read
+        # the parent repository's HEAD. Its own top level, or unknown.
+        top = subprocess.run(["git", "-C", str(sub), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", check=False, timeout=10)
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != sub.resolve():
+            return unknown
+        checkout = git("-C", str(sub), "rev-parse", "--verify", "--quiet", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return unknown
+    if not develop or not checkout:
+        return unknown
+    return {"tooling_pointer_behind": develop != checkout,
+            "tooling_pointer": {"checkout": checkout, "develop": develop}}
+
+
 def code_health_check():
     """Run a fast check of develop's code health so the PO can decide whether
     to dispatch this cycle.
@@ -2660,6 +2707,9 @@ def compute_review_recommendations(pr_summaries, queued_pr_numbers, active_fix_p
                 pr, in_queue,
                 owner_active=active_epics is None or pr.get("epic_number") in active_epics))
             continue
+        if pr.get("is_no_story"):
+            recs.append(_no_story_review_rec(pr, in_queue))
+            continue
         if pr.get("story_number") in blocked_story_nums:
             recs.append({
                 "pr": pr["pr"],
@@ -3037,6 +3087,152 @@ def _slice_review_rec(pr, in_queue, owner_active=True):
                        f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
 
 
+_token_login_cache: list = []
+
+
+def _token_login():
+    """The login of the GitHub account the pipeline acts as (the host token
+    that every agent container holds), read once; "" when unknown.
+    CFGMS_TEST_TOKEN_LOGIN stands in for it in tests."""
+    if not _token_login_cache:
+        login = os.environ.get("CFGMS_TEST_TOKEN_LOGIN")
+        if login is None:
+            try:
+                r = subprocess.run(["gh", "api", "user", "--jq", ".login // \"\""],
+                                   capture_output=True, text=True, timeout=30)
+                login = r.stdout.strip() if r.returncode == 0 else ""
+            except (OSError, subprocess.SubprocessError):
+                login = ""
+        _token_login_cache.append(login)
+    return _token_login_cache[0]
+
+
+def _no_story_review_rec(pr, in_queue):
+    """The recommendation for a pull request with no story (no story or item
+    branch, no closing reference, not a slice; internal, or external and
+    released): a tooling pointer bump, a prompt or a document change.
+    `agent-dispatch.sh review-pr` reviews it with the no-story prompt.
+
+    A review counts for the commit it names ("Reviewed head: <sha>"), and an
+    enqueue names that commit (`po-act.sh enqueue <PR> --head <sha>`). The
+    class (no_story_class.py, from the PR's paths) decides who may let it
+    merge: auto, the agent review; approval (`.claude/` with the tooling
+    pointer, ADRs, product intent, docs/development/), a person: a
+    release of the head (`is_released`: label human-reviewed:ok by a push+
+    collaborator who approved the head) by an account other than the
+    pipeline token's, or the owner merging it in GitHub. A release stands
+    against an agent FAIL; a released PR, and an approval-class PR, in the
+    queue or armed is never taken out. Product code: skip, it needs an
+    issue. There is no fix cycle: a FAIL needs a person or a new commit.
+    """
+    overall = pr["ci_summary"]["overall"]
+    ms = (pr.get("merge_state_status") or "").upper()
+    head = pr.get("head_oid") or ""
+    verdict = pr.get("latest_review_verdict")
+    cls, cls_path = pr.get("no_story_class") or (None, None)
+    released = bool(pr.get("is_released"))
+    if released and cls != no_story_class.AUTO:
+        # Class approval (or unknown): a release by the token's own account does
+        # not count; every agent holds that token. Unknown token: fail closed.
+        # (The external-PR release, is_released, still accepts that account.)
+        token = _token_login()
+        actor = pr.get("release_actor") or ""
+        released = bool(token and actor and actor.lower() != token.lower())
+    person = "it needs a person or a new commit by its author"
+    release_hint = ("a maintainer with another account applies human-reviewed:ok and approves head "
+                    f"{head} (then the pipeline enqueues that commit); or the repository owner merges it "
+                    "in GitHub after reading it")
+
+    def rec(action, reason, **more):
+        return {"pr": pr["pr"], "story": None, "no_story": True, "no_story_class": cls, "action": action,
+                "reason": f"pull request with no story: {reason}", **more}
+
+    def enqueue(why):
+        return rec("enqueue_merge",
+                   f"{why} + checks green + mergeable — run "
+                   f"`./.claude/tooling/scripts/po-act.sh enqueue {pr['pr']} --head {head}`", head=head)
+
+    reviewed = bool(head) and verdict in ("pass", "fail") and pr.get("latest_review_head") == head
+    if in_queue or pr.get("auto_merge_enabled"):
+        # In the queue or armed, any class. Only a review of THIS head, or a
+        # release of it, lets it ride: a push after the pipeline armed it (a new
+        # head, perhaps a new class) is taken out.
+        where = "in the merge queue" if in_queue else "auto-merge armed"
+        dequeue = rec("dequeue_unreviewed",
+                      f"{where}, but the newest review verdict is not a PASS of its head commit — run "
+                      f"`./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}`; the next cycle reviews "
+                      "the commit")
+        if released:
+            return rec("skip", f"{where}, released by a person for this head; the pipeline leaves it alone")
+        if verdict not in ("pass", "fail"):
+            return rec("skip", f"{where}; queued with no review verdict: a person enqueued it; left alone")
+        if not (reviewed and verdict == "pass"):
+            return dequeue
+        if cls == no_story_class.AUTO:
+            return rec("skip", f"reviewed PASS on this commit, {where} (mergeStateStatus={ms or 'UNKNOWN'})")
+        if cls == no_story_class.PRODUCT:
+            return rec("dequeue_unreviewed",
+                       f"{where}, but it changes {cls_path}, which needs an issue; a PR with no story cannot "
+                       f"merge it — run `./.claude/tooling/scripts/po-act.sh dequeue {pr['pr']}`")
+        # Class approval (or unknown) with a PASS of this head: the reviewer
+        # never enqueues it and po-act refuses it without a release, so a
+        # person put it there (while one account exists, the owner's merge in
+        # GitHub goes through the queue): left alone.
+        return rec("skip", f"{where}; reviewed PASS on this commit, class approval: a person enqueued it; "
+                           "left alone")
+    if cls == no_story_class.PRODUCT:
+        return rec("skip", f"it changes {cls_path}, which a PR with no story may not change; it needs an "
+                           "issue (Fixes #N) and goes the story way")
+    if ms == "DIRTY":
+        return rec("rebase", "mergeStateStatus=DIRTY (conflicts with develop) — run "
+                             "`./.claude/tooling/scripts/rebase-pr.sh <PR>`; the new head is reviewed again")
+    mergeable = pr.get("mergeable") == "MERGEABLE" and ms not in ("BLOCKED", "UNKNOWN", "")
+    if released and overall == "green" and mergeable:
+        # A person released this head: that stands, also against an agent FAIL.
+        return enqueue("released by a person for this head")
+    if not reviewed:
+        if not pr["has_acceptance_review_comment"]:
+            why = "no acceptance review yet"
+        elif verdict not in ("pass", "fail"):
+            why = "its review comment has no verdict"
+        else:
+            why = "its review is for another commit (or names none)"
+        if overall == "green":
+            return rec("spawn_acceptance_reviewer", f"checks green; {why}")
+        if overall == "pending":
+            r = _ci_pending_rec(pr, f"{why}; checks pending: ")
+            return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
+        return rec("skip", f"checks failed — {person}")
+    if verdict == "fail":
+        # Not "the owner merges it in GitHub": a queued PR with a FAIL of its
+        # head is taken out (the queue rows above).
+        return rec("skip", "acceptance review FAILED on this commit — it needs a new commit by its author "
+                           "(it gets a new review), or a release of this head by a maintainer with another "
+                           f"account (human-reviewed:ok and an approval of head {head})")
+    if cls != no_story_class.AUTO and not released:
+        if cls is None:
+            # No file list, or more than 100 files: fail closed.
+            return rec("skip", "reviewed PASS, but its class is not known here (no file list, or more than "
+                               f"100 files) — {release_hint}")
+        return rec("skip", f"reviewed PASS, but it changes {cls_path} (class approval: what agents run or "
+                           f"what the founder decided) — {release_hint}")
+    kicks = pr.get("evictions_since_review", 0)
+    if kicks >= 2:
+        return rec("skip", f"reviewed PASS but removed from the merge queue {kicks}x since that review — {person}")
+    if overall == "red":
+        if pr.get("failed_run_attempt", 1) <= 1:
+            return rec("rerun_failed_checks", "reviewed PASS but its checks failed (attempt 1) — one "
+                                              "`po-act.sh rerun <PR>` to clear a transient failure")
+        return rec("skip", f"reviewed PASS but its checks still fail after a rerun — {person}")
+    if overall == "pending":
+        r = _ci_pending_rec(pr, "reviewed PASS; checks pending: ")
+        return rec(r["action"], r["reason"], **{k: r[k] for k in ("remedy", "rerun_run_ids") if k in r})
+    if mergeable:
+        return enqueue("reviewed PASS on this commit")
+    return rec("skip", f"reviewed PASS but not mergeable (mergeable={pr.get('mergeable')}, "
+                       f"mergeStateStatus={ms or 'UNKNOWN'}); if it stays, {person}")
+
+
 def compute_fix_recommendations(fix_stories, pr_summaries, active_fix_pr_nums=None, queued_pr_numbers=None):
     """Decide what to do for each Fix-status story (Step 4 of pipeline cycle).
 
@@ -3251,6 +3447,7 @@ def _build_pr_summaries(prs):
             for l in labels
         }
         pr_is_released = False
+        pr_release_actor = ""
         if "human-reviewed:ok" in pr_label_names:
             actor_login = _release_marker_actor_login(pr.get("timeline_items", []))
             if (actor_login and not is_external(actor_login)
@@ -3259,6 +3456,7 @@ def _build_pr_summaries(prs):
                         pr.get("head_oid", ""),
                         pr.get("approvals", []))):
                 pr_is_released = True
+                pr_release_actor = actor_login
 
         # story_number only assigned to internal-author PRs.
         # An external author naming their branch feature/story-N-agent gains no
@@ -3308,8 +3506,23 @@ def _build_pr_summaries(prs):
             "author_login": author_login,
             "is_external": pr_is_external,
             "is_released": pr_is_released,
+            # The account that released it (label and approval of the head).
+            # A no-story PR of class approval needs one other than the token's.
+            "release_actor": pr_release_actor,
             "story_number": story_number,
             "is_slice": epic_number is not None,
+            # Internal (or an external PR that a person released), no story,
+            # no closing reference, no item branch, not a slice: reviewed with
+            # the no-story prompt, verdict and enqueue bound to the head commit.
+            "is_no_story": ((not pr_is_external or pr_is_released) and story_number is None
+                            and epic_number is None and not BRANCH_STORY_RE.match(head)
+                            and not [n for n in pr.get("closing_issue_numbers", []) if isinstance(n, int)]),
+            # Its class from the paths of the PR (no_story_class.py), or None when
+            # the list is missing or has more than 100 paths. A hint only: the
+            # GraphQL list has no old name of a rename; review-pr and enqueue
+            # decide from the REST list.
+            "no_story_class": (no_story_class.classify(pr.get("files") or [])
+                               if pr.get("files") and not pr.get("files_truncated") else (None, None)),
             "epic_number": epic_number,
             "slice_number": slice_number,
             "comment_count": len(comments),
@@ -3456,6 +3669,9 @@ def main():
     out["capacity"] = host_capacity()
     out["merge_queue"] = merge_queue
     out["code_health"] = code_health
+    # The host's tools against the pointer on develop (after code_health_check,
+    # which may have fetched origin/develop).
+    out.update(tooling_pointer_status())
     # also in the cache, for `po-act.sh state '.dispatch_blocked'`
     out["dispatch_blocked"] = dispatch_blocked(code_health)
     out["done_on_merge_count"] = done_on_merge_count
@@ -3956,6 +4172,10 @@ def build_summary(out, cache_path):
             ],
         },
         "dispatch_blocked": dispatch_blocked(code_health),
+        # True: a pointer PR merged and the host still runs the old tools until
+        # a person runs `git submodule update --init` in the cfgms checkout.
+        "tooling_pointer_behind": out.get("tooling_pointer_behind"),
+        "tooling_pointer": out.get("tooling_pointer"),
         "done_on_merge_count": out.get("done_on_merge_count", 0),
         "counts": {
             "ready": len(out.get("ready_stories", [])),
