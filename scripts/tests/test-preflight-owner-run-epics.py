@@ -197,7 +197,7 @@ class OwnerRunEpics(unittest.TestCase):
         # test-preflight-owner-start.py.
         self.assertIn("lease_rows, all_fsm_runs, active_epics = apply_owner_epics(\n"
                       "        out, code_health, degraded_reasons, ready_parsed=ready_parsed, prs=prs, "
-                      "parents=issue_parents)", body)
+                      "parents=issue_parents,\n        caps=caps)", body)
         # ... before the story dispatch, which holds the owner's plain issues
         self.assertLess(body.index("= apply_owner_epics("), body.index("= compute_dispatch_recommendations("))
         self.assertIn("apply_owner_run_epics(out, runs, lease_rows)", src)

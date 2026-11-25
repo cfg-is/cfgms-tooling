@@ -1195,7 +1195,7 @@ def owner_start_candidates(out, runs, lease_rows):
     return sorted(pool, key=lambda e: e.get("number") or 0)
 
 
-def plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows):
+def plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows, caps=None):
     """The Ready issues that are not epics and that an owner builds (a
     feature or a bug fix filed as a plain issue, EPIC-DESIGN.md §9). Returns
     (candidates, owner_path): `candidates` for compute_owner_start_
@@ -1210,7 +1210,15 @@ def plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows):
     unfinished FSM run or live story lease works on it, and (d) no owner
     holds it now. `parents` is issue_parents_from_batch: a number missing
     from it has an unknown parent state, which fails closed (held from both
-    paths). The `epic` label is not needed; the owner run adds it at its
+    paths). Two more rules leave the story path exactly as before: (e) its
+    required environment (`requires_env`, from `## Environment` and the
+    `needs-<env>` labels, as the story routing reads it) must be linux and
+    one of `caps` (this host's; None: linux only), since an owner container
+    is a linux container; else it is no candidate and keeps its story routing
+    (another host's self-dispatch takes it). (f) It must carry the
+    `internal` label: the pipeline's own issues do, an outside party cannot
+    set one. Without it: a `hold` / `not_internal` entry, and no owner path
+    (a `community` issue never gets an owner). The `epic` label is not needed; the owner run adds it at its
     gates (fsm/epic.py), after which the issue is an epic everywhere."""
     linked = set()
     for pr in prs or []:
@@ -1231,14 +1239,21 @@ def plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows):
             continue
         if n in linked or n in view["story_nums"] or (st.get("item_id") or None) in leased_items:
             continue                   # in the story flow (c)
+        env = st.get("requires_env", DEFAULT_ENV)
+        if env != DEFAULT_ENV or (caps is not None and env not in caps):
+            continue                   # not an owner container's environment (e)
         info = (parents or {}).get(n)
+        if info is not None and (info.get("parent") is not None or info.get("sub_issues_total")):
+            continue                   # a story under an epic, or an epic-like issue (a, b)
+        if not st.get("is_internal"):
+            candidates.append({"number": n, "title": st.get("title", ""), "kind": "issue",
+                               "hold_reason": "not_internal"})
+            continue                   # (f): the story path keeps it as before
         if info is None:
             candidates.append({"number": n, "title": st.get("title", ""), "kind": "issue",
                                "hold_reason": "parent_unknown"})
             owner_path.add(n)
             continue
-        if info.get("parent") is not None or info.get("sub_issues_total"):
-            continue                   # a story under an epic, or an epic-like issue (a, b)
         candidates.append({"number": n, "title": st.get("title", ""), "kind": "issue"})
         owner_path.add(n)
     return candidates, owner_path
@@ -1376,6 +1391,8 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
 
     - hold `parent_unknown`: a plain issue whose parent issue could not be
       read (it could be a story under an epic).
+    - hold `not_internal`: a plain issue with no `internal` label (the story
+      path keeps it).
     - hold `no_project_item`: no item for the epic in `pipeline_state`. The
       preflight reads Draft, Ready, Fix, In Progress, Failed and Blocked, so
       an item at Reviewing or Done also gets this reason.
@@ -1472,7 +1489,8 @@ def load_owner_holders(degraded_reasons):
     return lease_rows, runs, unknown
 
 
-def apply_owner_epics(out, code_health, degraded_reasons, ready_parsed=None, prs=None, parents=None):
+def apply_owner_epics(out, code_health, degraded_reasons, ready_parsed=None, prs=None, parents=None,
+                      caps=None):
     """The owner part of the preflight: read the holders, move each held
     epic to out["epics_owner_run"] (apply_owner_run_epics) and write
     out["owner_start_recommendations"] and out["owner_attention"]. The plain
@@ -1482,7 +1500,7 @@ def apply_owner_epics(out, code_health, degraded_reasons, ready_parsed=None, prs
     (lease_rows, runs, active) for the other readers in main(); `active` is
     active_owner_epics, or None when the holders are not known."""
     lease_rows, runs, holders_unknown = load_owner_holders(degraded_reasons)
-    plain, owner_path = plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows)
+    plain, owner_path = plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows, caps)
     out["owner_path_issues"] = sorted(owner_path)
     # An epic that an owner session builds has no stories and is not
     # "undecomposed": keep it away from the Planning Team.
@@ -2104,6 +2122,9 @@ def parse_story(issue):
         "title": issue.get("title", ""),
         "state": issue.get("state"),
         "is_epic": "epic" in label_names,
+        # the pipeline's own issues carry `internal` (an outside party cannot
+        # set a label): only such a plain issue may get an owner
+        "is_internal": "internal" in label_names,
         "parse_ok": len(warnings) == 0,
         "parse_warnings": warnings,
         "deps_parsed": deps_parsed,
@@ -4168,7 +4189,8 @@ def main():
                   if st.get("number") is not None and not st.get("is_epic") and st.get("state") == "OPEN"]
     issue_parents = issue_parents_from_batch(story_bodies, plain_nums)
     lease_rows, all_fsm_runs, active_epics = apply_owner_epics(
-        out, code_health, degraded_reasons, ready_parsed=ready_parsed, prs=prs, parents=issue_parents)
+        out, code_health, degraded_reasons, ready_parsed=ready_parsed, prs=prs, parents=issue_parents,
+        caps=caps)
     owner_path = set(out.get("owner_path_issues") or [])
     for st in ready_parsed:
         if st.get("number") in owner_path:

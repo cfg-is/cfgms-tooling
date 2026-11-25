@@ -48,6 +48,11 @@ class EpicCase(unittest.TestCase):
         self.memory.mkdir()
         (self.canon / "principles.md").write_text(PRIVATE)
         self.f.add_issue(900, "Epic: hello", EPIC_BODY)
+        # the pipeline's own issue: `internal` (a plain issue needs it to get
+        # an owner; the run adds `epic` at its gates)
+        st = self.f.gh()
+        st["issues"]["900"]["labels"] = ["internal"]
+        self.f.gh(st)
         self.proc = None
 
     def tearDown(self):
@@ -61,7 +66,8 @@ class EpicCase(unittest.TestCase):
                         "--memory-dir", str(self.memory))
         self.proc = subprocess.Popen([sys.executable, str(SUPERVISOR)] + list(argv),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     env=self.f.env(**dict(FAST, **(env or {}))), cwd=str(self.f.root))
+                                     env=self.f.env(**dict(FAST, **dict({"FSM_FAKE_STORY_LEASE": "free"}, **(env or {})))),
+                                     cwd=str(self.f.root))   # no story run on the epic's item
         return self.proc
 
     def finish(self, timeout=90):

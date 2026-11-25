@@ -257,7 +257,7 @@ class OwnerStart(unittest.TestCase):
         self.assertEqual((rec["action"], rec["item_id"]), ("start", "PVTI_ready"))
 
 
-def _issue(n, labels=(), state="OPEN"):
+def _issue(n, labels=("internal",), state="OPEN"):
     return {"number": n, "title": f"issue {n}", "body": "", "state": state,
             "labels": [{"name": l} for l in labels]}
 
@@ -286,9 +286,9 @@ class PlainIssueOwner(unittest.TestCase):
     def rows(self):
         return runindex.list_runs(self.base) if self.base.exists() else []
 
-    def cands(self, issues, parents, prs=(), leases=()):
+    def cands(self, issues, parents, prs=(), leases=(), caps=None):
         return self.pf.plain_issue_owner_candidates(self.parsed(*issues), list(prs), parents,
-                                                    self.rows(), list(leases))
+                                                    self.rows(), list(leases), caps)
 
     NONE = {"parent": None, "sub_issues_total": 0}
 
@@ -363,6 +363,41 @@ class PlainIssueOwner(unittest.TestCase):
         (st,) = self.parsed(_issue(45))
         (rec,) = self.pf.compute_dispatch_recommendations([st], [], {}, {"linux"})
         self.assertNotIn("owner_path", rec)
+
+    def test_reviewer_cases_fix_issue_windows_issue_community_issue(self):
+        """#101 a create-fix-issue shape (bug, internal) starts; #102 needs
+        windows: no owner, its story routing stays; #103 community: hold
+        not_internal, its story path stays."""
+        issues = [_issue(101, ("bug", "internal")), _issue(102, ("bug", "internal", "needs-windows")),
+                  _issue(103, ("community",))]
+        parents = {n: self.NONE for n in (101, 102, 103)}
+        for caps in (None, {"linux"}, {"linux", "windows"}):
+            cands, path = self.cands(issues, parents, caps=caps)
+            self.assertEqual([(c["number"], c.get("hold_reason")) for c in cands],
+                             [(101, None), (103, "not_internal")], caps)
+            self.assertEqual(path, {101}, caps)
+        recs = self.pf.compute_owner_start_recommendations(cands, _board(ready=[101, 102, 103]), [], [])
+        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
+                         [(101, "start", "ready"), (103, "hold", "not_internal")])
+        # the story dispatch as before for #102 (routed to windows) and #103
+        sts = self.parsed(*issues)
+        for st in sts:
+            if st["number"] in path:
+                st["owner_path"] = True
+        recs = {r["number"]: r for r in self.pf.compute_dispatch_recommendations(sts, [], {}, {"linux"})}
+        self.assertTrue(recs[101].get("owner_path"))
+        self.assertNotIn("owner_path", recs[102])
+        self.assertIn("windows", recs[102]["reason"])
+        self.assertNotIn("owner_path", recs[103])
+
+    def test_an_issue_without_internal_is_held_and_left_to_the_story_path(self):
+        for labels in ((), ("community",), ("bug",)):
+            cands, path = self.cands([_issue(44, labels)], {44: self.NONE})
+            self.assertEqual((cands, path), ([{"number": 44, "title": "issue 44", "kind": "issue",
+                                               "hold_reason": "not_internal"}], set()), labels)
+        # also when the parent state is unknown: never the owner path
+        cands, path = self.cands([_issue(44, ())], {})
+        self.assertEqual(([c.get("hold_reason") for c in cands], path), (["not_internal"], set()))
 
     def test_the_parent_state_comes_with_the_issue_batch(self):
         """No GitHub call of its own (the preflight's budget is 3): the issue

@@ -236,8 +236,8 @@ class PreflightMain(unittest.TestCase):
         """A feature or bug fix filed as a plain issue (no epic label, no
         parent) at Ready: an owner start of kind issue, a story-dispatch hold.
         A story under an epic stays in the story dispatch."""
-        self.world["issues"]["44"] = {"title": "fix the thing"}
-        self.world["issues"]["45"] = {"title": "story of 7", "parent": 7}
+        self.world["issues"]["44"] = {"title": "fix the thing", "labels": ["bug", "internal"]}
+        self.world["issues"]["45"] = {"title": "story of 7", "parent": 7, "labels": ["internal"]}
         self.board += [item(44, "Ready", "fix the thing"), item(45, "Ready", "story of 7")]
         out = self.run_main()
         starts = {r["number"]: (r["kind"], r["action"], r["reason"]) for r in out["owner_start_recommendations"]}
@@ -249,6 +249,15 @@ class PreflightMain(unittest.TestCase):
         self.assertTrue(disp[44].get("owner_path"))
         self.assertNotIn("owner_path", disp[45])
         self.assertEqual(out["owner_path_issues"], [44])
+        # a host that cannot run a linux owner container (the Windows host):
+        # no owner start for the plain issue, and its story routing as before
+        os.environ["CFGMS_PO_HOST_CAPS"] = "windows"
+        try:
+            out = self.run_main()
+        finally:
+            os.environ.pop("CFGMS_PO_HOST_CAPS")
+        self.assertNotIn(44, [r["number"] for r in out["owner_start_recommendations"]])
+        self.assertNotIn("owner_path", {r["number"]: r for r in out["dispatch_recommendations"]}[44])
         # the parent read fails: held from both paths
         self.world["parents_fail"] = True
         out = self.run_main()

@@ -516,24 +516,52 @@ owner that wants to leak.
   stop the launch or the run of another with a `.git` entry. Gates: project
   item, canon and memory folders, a `.git` at the top of the memory folder
   (moved or refused), capacity (2 launch slots for a new owner), image
-  staleness, unfinished run, lease, the `epic` label on the issue (added when
-  it is missing), and last the `In Progress` write (board row). Lease key `epic-<N>`. A path of its own for a fix issue: not built.
+  staleness, unfinished run, lease, no story work in flight on the issue,
+  the `epic` label on the issue (added when it is missing, for an `internal`
+  issue only), and last the `In Progress` write (board row). Lease key
+  `epic-<N>`. A fix issue has no path of its own: it takes the plain-issue
+  path below.
 - **An owner run for a plain issue**: an issue filed as a feature or a bug
-  fix, with no `epic` label and no parent, gets an owner like an epic. The
-  launch is the same (`po-act.sh dispatch --epic <N>`, also from `/orc
-  start <N>`); `po-act.sh` reads no label. The run adds the `epic` label at
-  its gates, just before the `In Progress` write (a `epic_label` note:
-  `present`, `added` or `failed`). From then on every reader treats the
-  issue as an epic: the preflight's epic lists, `owner_attention`, the story
+  fix, with no `epic` label and no parent, gets an owner like an epic. That
+  includes a fix issue made by `pipeline-helper.sh create-fix-issue`
+  (`internal`, `bug`, no parent): at `Ready` it now takes the owner path,
+  not the story dispatch. Conditions (preflight): the `internal` label (the
+  pipeline's own issues carry it; an outside party cannot set a label; a
+  `community` issue never gets an owner: `hold` / `not_internal`, and the
+  story path keeps it as before); a required environment of linux that the
+  host has (`requires_env`, from `## Environment` and `needs-<env>` labels,
+  as the story routing reads it; else the story routing keeps it, for the
+  Windows host's self-dispatch); no parent, no sub-issues, no story PR, run
+  or lease on it. The launch is the same (`po-act.sh dispatch --epic <N>`,
+  also from `/orc start <N>`); `po-act.sh` reads no label. At its gates the
+  run checks again: a live `story-<item>` lease (any host) or an unfinished
+  FSM run of another mode on this host for the same issue or item defers it
+  (`story_work_in_flight`; a lease status that cannot be read counts too);
+  a plain issue without `internal` is refused (`not_internal`, not a
+  deferral) and gets no label; else the run adds the `epic` label just
+  before the `In Progress` write (an `epic_label` note: `present`, `added`,
+  `not_internal` or `failed`). From then on every reader treats the issue
+  as an epic: the preflight's epic lists, `owner_attention`, the story
   dispatch hold and the stalled-dispatch skip go by that label. A label that
   cannot be read or added ends the run as a deferral `label_write_failed`
-  (no owner, item left `Ready`, no board write). **Limits:** the issue body
-  is the spec as for an epic: the owner prompt works to a `## Goal` and to
-  success criteria, and reads `## Protected Paths`; a body without them
-  gives the owner only what is there (a body with no Goal: the criteria are
-  the whole job; with neither, the owner has no stated proof of done). The
-  label stays on the issue after the run. The names (`epic-<N>` lease and
-  branch, `epics_*` lists, `--epic`) are not changed.
+  (no owner, item left `Ready`, no board write). The spec comes from the
+  project item; for an issue-backed item that is the issue body, so the
+  protection is the `internal` label and the lock on the pipeline's issues,
+  not the source.
+  **Rollout order:** the orchestrator cycle that starts owners (`/orc`) must
+  run on every host before this tooling is used there. A host that runs only
+  the story cycle holds such issues (the story dispatch gives them `hold`
+  and nothing starts an owner).
+  **Limits:** the issue body is the spec as for an epic: the owner prompt
+  works to a `## Goal` and to success criteria, and reads `## Protected
+  Paths`; a body without them gives the owner only what is there (a body
+  with no Goal: the criteria are the whole job; with neither, the owner has
+  no stated proof of done). The `epic` label stays on the issue after the
+  run. Once the ended run's directory is collected (runindex `gc`), an open
+  issue with that label is in `epics_undecomposed` again, and the story-flow
+  prompts would offer it for decomposition; a closed issue is not listed.
+  The names (`epic-<N>` lease and branch, `epics_*` lists, `--epic`) are not
+  changed.
 - **Capacity**: one owner container counts as one agent. Each running
   validator counts as in a story run. One validator runs at a time in an epic
   run; a second slice waits, and a validator waits when the host is full.
@@ -581,8 +609,8 @@ owner that wants to leak.
 - **Other ways a run ends**: `REFUSED(<gate>)` when a PREPARE gate says
   no; deferred (`DISPATCH_DEFERRED:epic-<N>:<reason>`, exit 0; the lease is
   released) when a PREPARE cause can be gone at the next cycle: also
-  `base_branch_fetch_failed`, `github_timeout`, `label_write_failed` and
-  `board_write_failed`.
+  `base_branch_fetch_failed`, `github_timeout`, `story_work_in_flight`,
+  `label_write_failed` and `board_write_failed`.
   `base_branch_fetch_failed`: the fetch of the base branch ran out of time,
   or git's text (git runs with `LC_ALL=C`) names a network cause: could not
   resolve host, connection timed out, operation timed out, connection
@@ -635,7 +663,7 @@ owner that wants to leak.
 | preflight | the epic's project item is in flight while the run is | built (general run view) |
 | preflight | an epic that an owner holds is in `epics_owner_run`, not in `epics_undecomposed`. Held means: an epic-mode run in this host's run index that is not ended, or that ended after its gates passed, until the run dir is collected (24 hours after REPORT, 336 hours otherwise); or an unexpired `epic-<N>` lease (seen from every host, released when the run ends). A run refused at a gate holds nothing. Each entry has `run_id`, `run_status`, `run_state` and `run_ended_at` (all null when only a lease holds the epic). `epics_audit_due` lists `{number, run_id, run_ended_at}` for each open epic with no sub-issues whose last run on this host (of those that passed the gates) ended in REPORT, while the run dir is kept and no unexpired `epic-<N>` lease holds the epic. It is the signal for the epic audit | built in the tooling. Nothing reads `epics_audit_due` yet: not built. The `cfgms` prompts (`po.md` Step 7, `/po decompose`) still choose epics by "no sub-issues" and do not read this list: not built |
 | preflight | `owner_start_recommendations`: one entry for each open epic that has no sub-issues and that no owner holds (the epics in `epics_undecomposed`), sorted by number: `{number, title, item_id, action, reason}`. The founder, through Reeve, sets the epic's project item to `Ready` when an owner may build the epic. Each epic gets the first reason that applies. `hold` / `no_project_item`: the preflight found no item for the epic. It reads the statuses Draft, Ready, Fix, In Progress, Failed and Blocked, so an item at Reviewing or Done also gets this reason. `hold` / `not_ready`: the item is at another status (`status` names it). `hold` / `develop_broken`: the code-health gate blocks dispatch. `hold` / `degraded`: the number of epics that owners hold is not known. That is so when the lease list could not be read (`pipeline-helper.sh lease-list` now exits 1 when its API call fails; before, a failed call looked like "no lease"), when the run index could not be read, or when a run that is not ended has a `run.json` that cannot be read. `hold` / `owner_limit_invalid`: `CFGMS_OWNER_MAX_RUNS` is set to a value that is not a whole number of 0 or more; every start is held, so that a typo does not remove the brake, and one `degraded_reasons` line names the variable (its value cut to 40 printable characters). `hold` / `owner_limit`: `CFGMS_OWNER_MAX_RUNS` is a whole number, and the epics that owners hold now, plus the `start` entries before this one, are at or above it (0 starts no owner). Held now means an epic-mode run on this host that is live, hung, starting or crashed, or an unexpired `epic-<N>` lease; a run that ended holds no place. Not set or empty: no limit. `hold` / `resources`: a new owner needs 2 launch slots (its own and one for its validator, section 8), so at most `(raw_free_slots - review_reserve) // 2` epics get `start` (from `agent-dispatch.sh capacity --json`; the reserve is taken off also when the host is idle now, because the gate applies it once the owner runs; when the snapshot lacks those two numbers, `free_slots // 2`). This is a planning hint: `po-act.sh dispatch --epic` asks the host gate again, for 2 slots. When the snapshot has no `free_slots` number, no epic is held for it. Else `start` / `ready`, with `command`: `po-act.sh dispatch --epic <N> --item-id <ITEM_ID>`. The summary counts the `start` entries as `owner_start_epics`. A Ready epic item gets `hold` in `dispatch_recommendations` (the story path), with a reason that names this list. The candidates are the open epics with no sub-issues that no ACTIVE owner holds: the epics in `epics_undecomposed`, and the epics in `epics_owner_run` whose last run on this host ended (`epics_owner_run`, `epics_undecomposed` and `epics_audit_due` are as before for their other readers). A run sets the item to `In Progress` and, when it fails, to `Blocked` (board row), so those epics get `hold` / `not_ready`. A `Ready` item of an epic whose run ended means that a person asks for a new run: it gets `start`. When the `In Progress` write failed, the item is still `Ready` after the run ended, and the epic gets `start` again: the supervisor log says to set the item by hand. `owner_attention` is the list of epics that nobody is told about, `{number, run_id, run_status, run_state, why}`, open epics only: the last epic-mode run on this host is `hung`, is `abandoned`, or ended in a state other than REPORT or REFUSED (also a FAILED before the gates); or it ended REFUSED and was not a deferral (for example `base_branch_missing` or `item_mismatch`: the start list offers the epic again each cycle and the same gate refuses it); or the last 3 runs of the epic whose run dirs are still there all ended as deferrals with the same reason (a refused epic run is kept 336 hours, runindex `gc`). The run index row says whether a REFUSED run was a deferral (`refused_deferred`, from a note that the epic run writes); a run dir from before that note is not listed, because it is not known. A single deferral is not listed: it is tried again. Or the epic has no sub-issues, its item is `In Progress`, no active run and no lease holds it, and it is not in `epics_audit_due`. The summary counts it as `owner_attention_epics`. `dispatch_blocked` is in the cached output too (`po-act.sh state '.dispatch_blocked'`). An epic item is never in `stalled_dispatches` (an epic is known by its `epic` label or by the open-epic list), and `auto_close_merged_items` never sets an epic item `Done`; when the open epics are not known, it sets no item `Done` in that cycle | built in the tooling. Nothing runs the command yet: the `/orc` cycle in `cfgms` is not built there yet |
-| preflight | a plain issue at `Ready` (no `epic` label) gets an owner when it has no parent issue (a story under an epic stays in the story flow), no sub-issues, no open pull request that links it as a story (a `feature/story-<N>` branch or a closing reference), no unfinished FSM run or live story lease on it, and no owner holds it (`plain_issue_owner_candidates`). Its entry in `owner_start_recommendations` has `kind: "issue"` (an epic: `kind: "epic"`) and goes through the same rules. The parent state comes with the issue batch that the preflight already makes (`parent` and `subIssuesSummary` in `gh_graphql_issues_batch`, so no GitHub call of its own: the call budget is 3); a number whose parent state is not in the answer gets `hold` / `parent_unknown` there and is held from the story dispatch too. Such an issue gets `hold` in `dispatch_recommendations` with a reason that names the owner path (`owner_path: true`); `owner_path_issues` lists the numbers. The owner run adds the `epic` label at its gates (section 8) | built in the tooling; tested with stand-ins (unit and `main()`), not run on GitHub yet |
+| preflight | a plain issue at `Ready` (no `epic` label) with the `internal` label and a required environment of linux that this host has gets an owner when it has no parent issue (a story under an epic stays in the story flow), no sub-issues, no open pull request that links it as a story (a `feature/story-<N>` branch or a closing reference), no unfinished FSM run or live story lease on it, and no owner holds it (`plain_issue_owner_candidates`). Its entry in `owner_start_recommendations` has `kind: "issue"` (an epic: `kind: "epic"`) and goes through the same rules. The parent state comes with the issue batch that the preflight already makes (`parent` and `subIssuesSummary` in `gh_graphql_issues_batch`, so no GitHub call of its own: the call budget is 3); a number whose parent state is not in the answer gets `hold` / `parent_unknown` there and is held from the story dispatch too. Without `internal`: `hold` / `not_internal`, and the story dispatch keeps it as before; another environment (for example `needs-windows`): no entry, the story routing keeps it. Such an issue gets `hold` in `dispatch_recommendations` with a reason that names the owner path (`owner_path: true`); `owner_path_issues` lists the numbers. The owner run adds the `epic` label at its gates (section 8) | built in the tooling; tested with stand-ins (unit and `main()`), not run on GitHub yet |
 | preflight | a slice PR (`feature/epic-<N>-slice-<n>`, internal author) is known as a slice: `is_slice`, `epic_number`, `slice_number` in the PR summary; never a story, whatever its body says. `<N>` is not checked to be an epic with a run | built |
 | pipeline-watch | epic run ended; `container_stalled` from the heartbeat | built (general run rows) |
 | pipeline-watch | new events: slice published, slice merged | not built |

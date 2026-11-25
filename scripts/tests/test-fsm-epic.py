@@ -647,12 +647,12 @@ class TestRefusals(EpicCase):
         self.assertIn("DISPATCH_DEFERRED:epic-900:board_write_failed", out)
         self.assertEqual(self.label_posts(), [["api", "--method", "POST", "repos/cfg-is/cfgms/issues/900/labels",
                                                "-f", "labels[]=epic"]])
-        self.assertEqual(self.f.gh()["issues"]["900"]["labels"], ["epic"])
+        self.assertEqual(self.f.gh()["issues"]["900"]["labels"], ["internal", "epic"])
         self.assertEqual(self.epic_label_notes(), ["added"])
 
     def test_an_epic_label_that_is_there_is_kept_and_not_written(self):
         st = self.f.gh()
-        st["issues"]["900"]["labels"] = ["Epic", "cap:web"]
+        st["issues"]["900"]["labels"] = ["Epic", "cap:web"]          # an epic: no `internal` needed
         self.f.gh(st)
         self.launch_with_lease({"FSM_FAKE_PQ_UPDATE_FAIL": "In Progress"})
         rc, out = self.finish()
@@ -672,7 +672,68 @@ class TestRefusals(EpicCase):
                 self.assertEqual(self.f.records("docker-owner-start"), [])
                 self.assertEqual(self.board_writes(), [])        # the item stays Ready: tried again
                 self.assertEqual(self.epic_label_notes(), ["failed"])
-                self.assertNotIn("labels", self.f.gh()["issues"]["900"])
+                self.assertNotIn("epic", self.f.gh()["issues"]["900"]["labels"])
+
+    def test_a_plain_issue_without_internal_is_refused_and_never_labelled(self):
+        """An outside party cannot set a label: a plain issue with no
+        `internal` (a community issue) never gets an owner."""
+        for labels in ([], ["community"], ["bug"]):
+            with self.subTest(labels=labels):
+                for d in list(self.f.runs.iterdir()) if self.f.runs.exists() else []:
+                    if d.name.startswith("epic-"):
+                        import shutil
+                        shutil.rmtree(d)
+                self.f.log.write_text("") if self.f.log.exists() else None
+                st = self.f.gh()
+                st["issues"]["900"]["labels"] = list(labels)
+                self.f.gh(st)
+                self.launch_with_lease({})
+                rc, out = self.finish()
+                self.assertEqual(rc, 3, out)                      # a refusal, not a deferral
+                self.assertIn("FSM_REFUSED:epic-900:not_internal", out)
+                self.assertEqual(self.f.path_states(self.run_dir.name)[-1:], [("PREPARE", "gate_refused", "REFUSED")])
+                self.assertEqual(self.label_posts(), [])
+                self.assertEqual(self.f.gh()["issues"]["900"]["labels"], list(labels))
+                self.assertEqual(self.f.records("docker-owner-start"), [])
+                self.assertEqual(self.board_writes(), [])
+                self.assertFalse(any(r.get("refused_deferred") for r in self.recs("note")))
+
+    # --- a story run on the same issue: the owner does not start beside it ----
+    def assert_story_in_flight(self, out, why):
+        self.assertIn("DISPATCH_DEFERRED:epic-900:story_work_in_flight", out)
+        self.assertEqual(self.f.records("docker-owner-start"), [])
+        self.assertEqual(self.board_writes(), [])
+        self.assertEqual(self.label_posts(), [])
+        self.assertEqual([r["story_work_in_flight"] for r in self.recs("note") if "story_work_in_flight" in r],
+                         [why])
+
+    def test_a_live_story_lease_defers_the_owner(self):
+        self.launch_with_lease({"FSM_FAKE_STORY_LEASE": "held"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assert_story_in_flight(out, f"story-{ITEM} lease")
+
+    def test_a_story_lease_that_cannot_be_read_defers_the_owner(self):
+        self.launch_with_lease({"FSM_FAKE_STORY_LEASE": "error"})
+        rc, out = self.finish()
+        self.assertEqual(rc, 0, out)
+        self.assert_story_in_flight(out, "unknown")
+
+    def test_an_unfinished_story_run_for_the_issue_or_item_defers_the_owner(self):
+        import state as statemod
+        for name, params in (("story-900-x", {"issue": 900}), ("story-77-x", {"issue": 77, "item_id": ITEM})):
+            with self.subTest(run=name):
+                import shutil
+                for d in list(self.f.runs.iterdir()) if self.f.runs.exists() else []:
+                    shutil.rmtree(d)
+                self.f.log.write_text("") if self.f.log.exists() else None
+                self.f.runs.mkdir(parents=True, exist_ok=True)
+                statemod.RunDir(name, base=self.f.runs).create(
+                    dict({"mode": "implement", "target": name, "key": name}, **params))
+                self.launch_with_lease({})
+                rc, out = self.finish()
+                self.assertEqual(rc, 0, out)
+                self.assert_story_in_flight(out, f"run {name}")
 
     def test_a_blocked_write_that_fails_does_not_change_the_end_of_the_run(self):
         self.f.plan({"owner": [[{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
