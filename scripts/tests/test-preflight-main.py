@@ -61,6 +61,11 @@ if argv[:2] == ["api", "graphql"]:
                 "number": int(num), "title": issue.get("title", ""), "body": issue.get("body", ""),
                 "state": issue.get("state", "OPEN"),
                 "labels": {"nodes": [{"name": l} for l in issue.get("labels", [])]}}
+            if issue and "subIssuesSummary" in query and not world.get("parents_fail"):
+                # the parent read: "parent" (a number) and "sub" on the issue
+                repo["i" + num].update(
+                    parent={"number": issue["parent"]} if issue.get("parent") else None,
+                    subIssuesSummary={"total": issue.get("sub", 0)})
         else:
             state = world.get("pr_states", {}).get(num)
             repo["p" + num] = state and {"number": int(num), "state": state, "title": "", "body": "",
@@ -226,6 +231,32 @@ class PreflightMain(unittest.TestCase):
         self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "hold", "resources")])
         out = self.run_main()                                      # no capacity data
         self.assertEqual(self.starts(out), [(7, "start", "ready"), (8, "start", "ready")])
+
+    def test_a_plain_ready_issue_goes_to_an_owner_and_not_to_the_story_dispatch(self):
+        """A feature or bug fix filed as a plain issue (no epic label, no
+        parent) at Ready: an owner start of kind issue, a story-dispatch hold.
+        A story under an epic stays in the story dispatch."""
+        self.world["issues"]["44"] = {"title": "fix the thing"}
+        self.world["issues"]["45"] = {"title": "story of 7", "parent": 7}
+        self.board += [item(44, "Ready", "fix the thing"), item(45, "Ready", "story of 7")]
+        out = self.run_main()
+        starts = {r["number"]: (r["kind"], r["action"], r["reason"]) for r in out["owner_start_recommendations"]}
+        self.assertEqual(starts, {7: ("epic", "start", "ready"), 44: ("issue", "start", "ready")})
+        self.assertEqual([r["command"] for r in out["owner_start_recommendations"] if r["number"] == 44],
+                         ["po-act.sh dispatch --epic 44 --item-id PVTI_item44"])
+        disp = {r["number"]: r for r in out["dispatch_recommendations"]}
+        self.assertEqual(disp[44]["action"], "hold")
+        self.assertTrue(disp[44].get("owner_path"))
+        self.assertNotIn("owner_path", disp[45])
+        self.assertEqual(out["owner_path_issues"], [44])
+        # the parent read fails: held from both paths
+        self.world["parents_fail"] = True
+        out = self.run_main()
+        starts = {r["number"]: (r["action"], r["reason"]) for r in out["owner_start_recommendations"]}
+        self.assertEqual(starts[44], ("hold", "parent_unknown"))
+        self.assertEqual(starts[45], ("hold", "parent_unknown"))
+        disp = {r["number"]: r for r in out["dispatch_recommendations"]}
+        self.assertTrue(disp[44].get("owner_path") and disp[45].get("owner_path"))
 
     def test_a_ready_epic_is_held_from_the_story_dispatch_and_offered_to_an_owner(self):
         out = self.run_main()

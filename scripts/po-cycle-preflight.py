@@ -642,7 +642,8 @@ def gh_graphql_issues_batch(numbers):
         for n in chunk:
             alias_lines.append(
                 f'    i{n}: issue(number: {n}) '
-                f'{{ number title body state labels(first: 20) {{ nodes {{ name }} }} }}'
+                f'{{ number title body state labels(first: 20) {{ nodes {{ name }} }} '
+                f'parent {{ number }} subIssuesSummary {{ total }} }}'
             )
             alias_lines.append(
                 f'    p{n}: pullRequest(number: {n}) '
@@ -671,9 +672,32 @@ def gh_graphql_issues_batch(numbers):
                 "state": node.get("state"),
                 "labels": ((node.get("labels") or {}).get("nodes")) or [],
             }
+            # An issue's parent and sub-issue count (plain_issue_owner_candidates):
+            # only when both fields came back.
+            total = (node.get("subIssuesSummary") or {}).get("total") \
+                if isinstance(node.get("subIssuesSummary"), dict) else None
+            if key[0] == "i" and "parent" in node and isinstance(total, int):
+                parent = (node.get("parent") or {}).get("number")
+                normalized["parent_info"] = {"parent": parent if isinstance(parent, int) else None,
+                                             "sub_issues_total": total}
             # Prefer pullRequest (state=MERGED is more specific than CLOSED).
             if key[0] == "p" or n not in out:
                 out[n] = normalized
+    return out
+
+
+def issue_parents_from_batch(bodies, numbers):
+    """{number: {"parent": int | None, "sub_issues_total": int}} for the
+    issue numbers in `numbers`, from gh_graphql_issues_batch (its issue
+    lookup reads `parent` and `subIssuesSummary` too, so the parent state
+    costs no GitHub call of its own: the preflight's call budget is 3). A
+    number with no such record (not in the answer, a pull request, or the
+    fields missing) is not in the result: its parent state is unknown."""
+    out = {}
+    for n in numbers or []:
+        info = (bodies or {}).get(n, {}).get("parent_info")
+        if isinstance(info, dict):
+            out[n] = info
     return out
 
 
@@ -1171,6 +1195,55 @@ def owner_start_candidates(out, runs, lease_rows):
     return sorted(pool, key=lambda e: e.get("number") or 0)
 
 
+def plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows):
+    """The Ready issues that are not epics and that an owner builds (a
+    feature or a bug fix filed as a plain issue, EPIC-DESIGN.md §9). Returns
+    (candidates, owner_path): `candidates` for compute_owner_start_
+    recommendations, [{number, title, kind: "issue"}] plus a `hold_reason`
+    of `parent_unknown` when the parent state could not be read; and
+    `owner_path`, the issue numbers that the story dispatch must hold.
+
+    An open issue (not a pull request) whose project item is Ready is one
+    when (a) it has no parent issue (a story under an epic stays in the story
+    flow), (b) it has no sub-issues, (c) no open pull request links it as a
+    story (a `feature/story-<N>` branch or a closing reference) and no
+    unfinished FSM run or live story lease works on it, and (d) no owner
+    holds it now. `parents` is issue_parents_from_batch: a number missing
+    from it has an unknown parent state, which fails closed (held from both
+    paths). The `epic` label is not needed; the owner run adds it at its
+    gates (fsm/epic.py), after which the issue is an epic everywhere."""
+    linked = set()
+    for pr in prs or []:
+        m = BRANCH_STORY_RE.match(pr.get("headRefName") or "")
+        if m and m.group(1) and m.group(1).isdigit():
+            linked.add(int(m.group(1)))
+        linked.update(n for n in pr.get("closing_issue_numbers") or [] if isinstance(n, int))
+    view = fsm_run_view(runs or [], lease_rows)
+    leased_items = live_story_lease_item_ids(lease_rows)
+    active = active_owner_epics(runs or [], lease_rows)
+    candidates, owner_path = [], set()
+    for st in ready_parsed or []:
+        n = st.get("number")
+        if n is None or st.get("is_epic") or st.get("state") != "OPEN":
+            continue
+        if n in active:
+            owner_path.add(n)          # an owner builds it now (d)
+            continue
+        if n in linked or n in view["story_nums"] or (st.get("item_id") or None) in leased_items:
+            continue                   # in the story flow (c)
+        info = (parents or {}).get(n)
+        if info is None:
+            candidates.append({"number": n, "title": st.get("title", ""), "kind": "issue",
+                               "hold_reason": "parent_unknown"})
+            owner_path.add(n)
+            continue
+        if info.get("parent") is not None or info.get("sub_issues_total"):
+            continue                   # a story under an epic, or an epic-like issue (a, b)
+        candidates.append({"number": n, "title": st.get("title", ""), "kind": "issue"})
+        owner_path.add(n)
+    return candidates, owner_path
+
+
 def compute_owner_attention(out, runs, lease_rows, holders_unknown=False):
     """The epics that nobody is told about: [{number, run_id, run_status,
     run_state, why}], sorted by number, one entry for each epic. Only open
@@ -1289,9 +1362,11 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
                                         develop_broken=False, holders_unknown=False,
                                         limit=None, free_slots=None):
     """One entry for each epic in `epics` (owner_start_candidates: open, no
-    sub-issues, no active owner), sorted by number: {number, title, item_id,
-    action, reason}. A `start` entry also has `command`; a `not_ready` entry
-    also has `status`.
+    sub-issues, no active owner; and the plain Ready issues of
+    plain_issue_owner_candidates), sorted by number: {number, title, kind,
+    item_id, action, reason}. `kind` is "epic" (the `epic` label) or "issue"
+    (a plain issue: a feature or a bug fix). A `start` entry also has
+    `command`; a `not_ready` entry also has `status`.
 
     The founder (through Reeve) sets an epic's project item to Ready when an
     owner may build the epic. An epic run sets the item to In Progress when
@@ -1299,6 +1374,8 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
     Ready item of an epic whose last run ended means: a person asks for a new
     run. Each epic gets the first reason that applies:
 
+    - hold `parent_unknown`: a plain issue whose parent issue could not be
+      read (it could be a story under an epic).
     - hold `no_project_item`: no item for the epic in `pipeline_state`. The
       preflight reads Draft, Ready, Fix, In Progress, Failed and Blocked, so
       an item at Reviewing or Done also gets this reason.
@@ -1335,8 +1412,11 @@ def compute_owner_start_recommendations(epics, pipeline_state, runs, lease_rows,
     for e in sorted(epics or [], key=lambda e: e.get("number") or 0):
         n = e.get("number")
         status, item_id = by_num.get(n, (None, None))
-        rec = {"number": n, "title": e.get("title", ""), "item_id": item_id, "action": "hold"}
-        if item_id is None:
+        rec = {"number": n, "title": e.get("title", ""), "kind": e.get("kind", "epic"),
+               "item_id": item_id, "action": "hold"}
+        if e.get("hold_reason"):
+            rec["reason"] = e["hold_reason"]
+        elif item_id is None:
             rec["reason"] = "no_project_item"
         elif status != "Ready":
             rec.update(reason="not_ready", status=status)
@@ -1392,13 +1472,18 @@ def load_owner_holders(degraded_reasons):
     return lease_rows, runs, unknown
 
 
-def apply_owner_epics(out, code_health, degraded_reasons):
+def apply_owner_epics(out, code_health, degraded_reasons, ready_parsed=None, prs=None, parents=None):
     """The owner part of the preflight: read the holders, move each held
     epic to out["epics_owner_run"] (apply_owner_run_epics) and write
-    out["owner_start_recommendations"] and out["owner_attention"]. Returns
+    out["owner_start_recommendations"] and out["owner_attention"]. The plain
+    Ready issues among `ready_parsed` (plain_issue_owner_candidates, with
+    `prs` and `parents`) are owner candidates too; their numbers go to
+    out["owner_path_issues"], which the story dispatch holds. Returns
     (lease_rows, runs, active) for the other readers in main(); `active` is
     active_owner_epics, or None when the holders are not known."""
     lease_rows, runs, holders_unknown = load_owner_holders(degraded_reasons)
+    plain, owner_path = plain_issue_owner_candidates(ready_parsed, prs, parents, runs, lease_rows)
+    out["owner_path_issues"] = sorted(owner_path)
     # An epic that an owner session builds has no stories and is not
     # "undecomposed": keep it away from the Planning Team.
     apply_owner_run_epics(out, runs, lease_rows)
@@ -1411,7 +1496,7 @@ def apply_owner_epics(out, code_health, degraded_reasons):
             "CFGMS_OWNER_MAX_RUNS is not a whole number of 0 or more (%r%s): every owner start is "
             "held (owner_limit_invalid)" % (shown[:40], "..." if len(shown) > 40 else ""))
     out["owner_start_recommendations"] = compute_owner_start_recommendations(
-        owner_start_candidates(out, runs, lease_rows), out.get("pipeline_state"), runs, lease_rows,
+        owner_start_candidates(out, runs, lease_rows) + plain, out.get("pipeline_state"), runs, lease_rows,
         develop_broken=dispatch_blocked(code_health),
         holders_unknown=holders_unknown,
         limit=limit,
@@ -2424,6 +2509,19 @@ def compute_dispatch_recommendations(ready_stories, active_stories, dep_states, 
                 "action": "hold",
                 "reason": "item is an epic, not a dispatchable story — an owner builds it (see owner_start_recommendations: po-act.sh dispatch --epic), never a story dispatch",
                 "epic": True,
+            })
+            continue
+
+        # Owner gate: a plain Ready issue that an owner builds (no parent, no
+        # sub-issues, no story PR or run; plain_issue_owner_candidates), or
+        # whose parent state is unknown. Never also a story dispatch.
+        if s.get("owner_path"):
+            recommendations.append({
+                "number": num,
+                "item_id": item_id,
+                "action": "hold",
+                "reason": "issue goes to an owner (a plain issue with no parent: see owner_start_recommendations: po-act.sh dispatch --epic), never a story dispatch",
+                "owner_path": True,
             })
             continue
 
@@ -4064,6 +4162,17 @@ def main():
         for s in ready_parsed
         if s.get("requires_env", DEFAULT_ENV) == "windows"
     ]
+    # The owner part first: a plain Ready issue that an owner builds must not
+    # also get a story dispatch. The parent state came with the issue batch.
+    plain_nums = [st["number"] for st in ready_parsed
+                  if st.get("number") is not None and not st.get("is_epic") and st.get("state") == "OPEN"]
+    issue_parents = issue_parents_from_batch(story_bodies, plain_nums)
+    lease_rows, all_fsm_runs, active_epics = apply_owner_epics(
+        out, code_health, degraded_reasons, ready_parsed=ready_parsed, prs=prs, parents=issue_parents)
+    owner_path = set(out.get("owner_path_issues") or [])
+    for st in ready_parsed:
+        if st.get("number") in owner_path:
+            st["owner_path"] = True
     out["dispatch_recommendations"] = compute_dispatch_recommendations(
         ready_parsed, active_parsed, dep_states, caps,
         draft_dep_states=draft_dep_states,
@@ -4077,7 +4186,6 @@ def main():
     # FSM runs (DESIGN.md §11): an unfinished run holds its story / PR whether
     # or not one of its containers is running right now. pr-<N> leases held
     # by any host mean the same for a PR (review, fix and resolve share it).
-    lease_rows, all_fsm_runs, active_epics = apply_owner_epics(out, code_health, degraded_reasons)
     fsm_view = fsm_run_view(all_fsm_runs, lease_rows)
     out["fsm_runs"] = {"in_flight": fsm_view["in_flight"], "resumable": fsm_view["resumable"]}
     out["fsm_recommendations"] = fsm_view["recommendations"]

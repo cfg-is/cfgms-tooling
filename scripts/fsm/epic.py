@@ -414,6 +414,30 @@ class EpicSupervisor(sup.Supervisor):
             self.log(f"board: the epic item was not set to {status}; set it by hand")
         return ok
 
+    def ensure_epic_label(self):
+        """The issue carries the `epic` label after this, or False. A plain
+        issue (a feature or a bug fix with no label) can get an owner
+        (EPIC-DESIGN.md §9); the preflight finds a run's epic lists
+        (epics_owner_run, epics_audit_due, owner_attention), the story
+        dispatch hold and the stalled-dispatch skip by that label. Recorded
+        as a note: `epic_label` present, added or failed."""
+        try:
+            labels = self.github_gate("issue labels", self.svc.gh.issue_labels, self.epic)
+            if labels is not None and "epic" in (lb.lower() for lb in labels):
+                self.run.append("note", epic_label="present")
+                return True
+            if labels is not None and self.github_gate("add label", self.svc.gh.add_issue_label,
+                                                       self.epic, "epic"):
+                self.run.append("note", epic_label="added")
+                return True
+        except sup.Refused:
+            raise
+        except Exception as exc:
+            self.log(f"epic label: {type(exc).__name__}: {str(exc)[:300]}")
+        self.run.append("note", epic_label="failed")
+        self.log("epic label: the issue has no `epic` label and it could not be added")
+        return False
+
     def note_once(self, key, **fields):
         if key not in self._noted:
             self._noted.add(key)
@@ -598,6 +622,12 @@ class EpicSupervisor(sup.Supervisor):
         sdir = agent_session.prepare_session_dir(self.name, 1, {
             "mode": "epic", "epic": self.epic, "run_id": self.run.run_id, "kind": "owner"})
         x["session_dir"] = str(sdir)
+        # The issue must carry the `epic` label: without it the preflight
+        # does not see this run in its epic lists, and the story dispatch
+        # could take the issue. A plain issue gets it here. Before the board
+        # write, so that an item left Ready has no owner and is tried again.
+        if not self.ensure_epic_label():
+            raise sup.Refused("label_write_failed", deferred=True)
         # The last gate, one time for a run: a resume starts in OWNER and does
         # not come back, so a status that a person set later is not written
         # over. An item that stays Ready would get a second owner later, so a

@@ -630,6 +630,50 @@ class TestRefusals(EpicCase):
                          [("In Progress", False)])
         self.assertIn(["lease-release", "epic-900"], [r["argv"] for r in self.f.records("pipeline-helper")])
 
+    # --- the `epic` label gate: a plain issue can get an owner -----------------
+    def label_posts(self):
+        return [r["argv"] for r in self.f.records("gh")
+                if r["argv"][:1] == ["api"] and "--method" in r["argv"] and r["argv"][-1].startswith("labels[]=")]
+
+    def epic_label_notes(self):
+        return [r["epic_label"] for r in self.recs("note") if "epic_label" in r]
+
+    def test_a_plain_issue_gets_the_epic_label_at_the_gates(self):
+        """The fixture issue has no label (a feature or a bug fix filed as a
+        plain issue). The gate adds `epic` before the In Progress write; the
+        board write fails here so the run stops right after the two gates."""
+        self.launch_with_lease({"FSM_FAKE_PQ_UPDATE_FAIL": "In Progress"})
+        rc, out = self.finish()
+        self.assertIn("DISPATCH_DEFERRED:epic-900:board_write_failed", out)
+        self.assertEqual(self.label_posts(), [["api", "--method", "POST", "repos/cfg-is/cfgms/issues/900/labels",
+                                               "-f", "labels[]=epic"]])
+        self.assertEqual(self.f.gh()["issues"]["900"]["labels"], ["epic"])
+        self.assertEqual(self.epic_label_notes(), ["added"])
+
+    def test_an_epic_label_that_is_there_is_kept_and_not_written(self):
+        st = self.f.gh()
+        st["issues"]["900"]["labels"] = ["Epic", "cap:web"]
+        self.f.gh(st)
+        self.launch_with_lease({"FSM_FAKE_PQ_UPDATE_FAIL": "In Progress"})
+        rc, out = self.finish()
+        self.assertIn("DISPATCH_DEFERRED:epic-900:board_write_failed", out)
+        self.assertEqual(self.label_posts(), [])
+        self.assertEqual(self.epic_label_notes(), ["present"])
+
+    def test_a_label_that_cannot_be_added_defers_the_run_with_no_owner(self):
+        for fail in ("label-add", "label-read"):
+            with self.subTest(fail=fail):
+                self.f.log.write_text("") if self.f.log.exists() else None
+                self.launch_with_lease({"FSM_FAKE_GH_FAIL": fail})
+                rc, out = self.finish()
+                self.assertEqual(rc, 0, out)
+                self.assertIn("DISPATCH_DEFERRED:epic-900:label_write_failed", out)
+                self.assertEqual(self.f.path_states(self.run_dir.name)[-1:], [("PREPARE", "gate_refused", "REFUSED")])
+                self.assertEqual(self.f.records("docker-owner-start"), [])
+                self.assertEqual(self.board_writes(), [])        # the item stays Ready: tried again
+                self.assertEqual(self.epic_label_notes(), ["failed"])
+                self.assertNotIn("labels", self.f.gh()["issues"]["900"])
+
     def test_a_blocked_write_that_fails_does_not_change_the_end_of_the_run(self):
         self.f.plan({"owner": [[{"op": "out", "name": "blocked.md", "content": "stop\n"}]]})
         self.launch(env={"FSM_FAKE_PQ_UPDATE_FAIL": "Blocked"})
