@@ -12,12 +12,13 @@ real host, address or key.
 | 4 | Footprint sampler (`footprint.py`) and a first measurement | done (first figure below) |
 | 3 | Cell composition (`cell.py`): N virtual stewards with pinned MACs and persistent state, plus the cell's real stewards | done |
 | 7 | Dedicated tenant, its own registration token, steward tags (`cell.py tag`) | done |
-| 2 | Workload drivers (config push, library scripts, API reads, web session) | next |
-| 5 | Unattended runner, restart-safe across deploys, results keyed by revision | next |
+| 2 | Workload drivers (`drivers.py`), profile (`loadprofile.py`), scheduler (`workload.py`): config push, library scripts, API reads, web session | done; not yet run against a live cell |
+| 5 | Unattended runner, restart-safe across deploys, results keyed by revision | next (`workload.py run --forever` is the entry point; the record's `revision` is null until then) |
 | 6 | `load` queries, baseline compare, alerts | next |
 
 Live queries are deliberately not part of the load mix: there is no unattended
-path for them, and whether there should be is an open founder decision.
+path for them, and whether there should be is an open founder decision. The
+profile refuses a `live_query` driver; `drivers.Driver` is the extension point.
 
 ## Virtual steward image
 
@@ -106,6 +107,97 @@ python3 testcell/load/cell.py --composition /etc/cfgms-testcell/cell.json down
   the composition's `load_tenant`; anything else is skipped and reported. Together with
   the dedicated tenant and its own registration token, the tags make virtual stewards
   identifiable as synthetic with existing product mechanisms.
+
+## Workload drivers
+
+`workload.py` drives synthetic load against the virtual stewards of one composition,
+at the rates of a workload profile, until a duration ends or it is stopped. The
+profile is a JSON file on the harness host; `profile.example.json` shows the shape
+with placeholder values, and `loadprofile.py` documents and validates every field
+(unknown keys, missing fields and out-of-range values are refused).
+
+```
+python3 testcell/load/workload.py --composition /etc/cfgms-testcell/composition.json \
+  --profile /etc/cfgms-testcell/load-profile.json --config /etc/cfgms-testcell/cell.json check
+python3 testcell/load/workload.py ... targets
+python3 testcell/load/workload.py ... run --duration 3600
+python3 testcell/load/workload.py ... run --forever
+```
+
+`check` validates the profile, composition, cell config and credential file and calls
+nothing. `targets` confirms the target set once and prints it. `run --forever` is the
+entry point a service unit wraps (criterion 5); SIGTERM ends it with a final record.
+Exit codes: 0 ok, 1 no steward was confirmed in the load tenant for the whole run (or
+a runtime failure), 2 usage, profile, composition or config error, 3 the kill switch
+was engaged when the run ended.
+
+| Driver | What one action is | Product surface (cfgms develop) |
+|---|---|---|
+| `config_push` | `cfg config upload <file> --steward <id> --json` to the next confirmed steward; each steward alternates between the two profile files, so every push is a change | `cmd/cfg/cmd/config.go`, `PUT /api/v1/stewards/{id}/config`; the response carries the delivery row's `command_id` and `delivery_status` (`handlers_stewards.go`) |
+| `script_run` | start the profile's fixed, approved library script version on `id:<steward>` under a grant run, then poll the result until it ends (recorded as `script_run_completion`) | `POST /api/v1/automation/runs`, `.../runs/{run_id}/scripts`, `.../results/{id}`, `.../end` (`docs/api/rest-api.md`, `routes_automation*.go`). No `cfg` verb drives grant runs |
+| `api_read` | one REST read under the grant run, cycling `stewards`, `steward`, `steward_dna` | `GET /api/v1/automation/runs/{run_id}/stewards[/{id}[/dna]]` (`routes_automation_reads.go`); the same handlers as `GET /api/v1/stewards`, narrowed to the run tenant |
+| `web_session` | `cfg --authenticator <name> steward status <load_tenant>/all --json`: CSRF, passkey login begin and finish, one read, logout | `cmd/cfg/cmd/authenticator_login.go` (`/api/v1/web/csrf`, `/api/v1/web/passkey/login/*`, `/api/v1/web/logout`) |
+| `live_query` | not built (open founder decision) | - |
+
+Rates are actions per hour; each wait is the rate interval times a factor drawn from
+`[1 - jitter, 1 + jitter]`. The scheduler is one thread: a slow call delays the next
+action, it never overlaps calls.
+
+### Safety
+
+- **Tenant fence.** Drivers take targets only from `drivers.TargetFence`: a steward the
+  composition declares, whose own identity names `load_tenant`, which the controller
+  reports in `load_tenant`, and which is not a declared real steward. The controller
+  read is the grant's steward list (or `cfg steward status <load_tenant>/all` when no
+  grant is configured). If the set cannot be confirmed it is emptied and target
+  drivers skip; they never guess. A grant run that comes back bound to any tenant but
+  `load_tenant` is refused. The set is re-read every `target_refresh_seconds`.
+- **Kill switch.** `testcell kill on` pauses all driving: the switch is read before
+  every action and nothing is sent while it is engaged. Driving resumes on
+  `testcell kill off`. Paused time is in the record.
+- **Login budget.** Each `cfg --authenticator` call is one passkey login, and the
+  controller allows 20 login begins per client in 5 minutes
+  (`webauthn_ceremony_sweep.go`, `webauthn_types.go`). `config_push` plus `web_session`
+  may not exceed `controller_cli_calls_per_5min` (default 12, at most 20); the profile
+  is refused otherwise, and the scheduler records an action over the budget as
+  `throttled` instead of calling. `cell.py tag` from the same host shares the cap.
+- **Credentials.** The grant credential is read from `grant_credential_file`, which
+  must be a regular file only its owner can read (mode 600). It is sent only as the
+  `Authorization` header from this process, never in argv, a record or a log; error
+  text is scrubbed of anything shaped like a grant credential. The REST client
+  verifies the controller against the composition's `controller_ca`.
+
+### One-time setup (operator)
+
+1. A grant for the load tenant: `cfg automation grant create --name <name>
+   --expires-in <duration> --tenant <load_tenant>`. The credential is printed once;
+   put it in the credential file with `umask 077`. Expiry is at most 90 days, so the
+   grant is renewed on a schedule.
+2. One harmless library script in the load tenant's library chain, signed by a key the
+   virtual stewards trust, carrying the `cfgms-preapproved: automation` header, and
+   approved for its exact version (`cfg automation approve script <id> --version <v>
+   --approval-hash <hash>`). The profile pins that version.
+3. Two small, harmless `.cfg` files for `config_push`.
+4. For `config_push` and `web_session`: a load-tenant account with a software
+   authenticator (`docs/administration/agent-onboarding.md` in cfgms; it needs a
+   break-glass crossing and a `controller.cfg` edit). `config_push` uses the
+   composition's `controller_cli`; `web_session` names its authenticator in the
+   profile.
+
+### Result records
+
+Every run appends JSON lines to `<state_dir>/load-results.jsonl` (`state_dir` from the
+cell config): one when the run ends and one every `record_interval_seconds` while it
+runs. A record holds the cell, profile, load tenant, start and end time, duration,
+paused seconds, kill-switch state, the target-fence summary, and per driver the
+attempts (calls made), successes, failures, skipped and throttled counts, result
+codes, and latency (count, min, mean, p50, p95, max, seconds). `revision` is null until
+criterion 5 wires how the deployed revision is read (`workload.no_revision`).
+
+Config convergence and apply failures are not polled by the harness: the controller
+measures them from the same delivery row as `cfgms_config_convergence_seconds` and
+`cfgms_config_apply_failed_total` (cfgms `docs/operations/service-level-signals.md`),
+which the criterion 6 queries read.
 
 ## Footprint sampler
 
