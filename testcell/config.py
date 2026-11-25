@@ -44,6 +44,10 @@ class CellConfig:
         return self.state_dir / "alerts.jsonl"
 
     @property
+    def baselines_path(self) -> Path:
+        return self.state_dir / "baselines.jsonl"
+
+    @property
     def state_path(self) -> Path:
         return self.state_dir / "state.json"
 

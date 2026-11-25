@@ -9,6 +9,8 @@ deploy state file.
 - KillSwitch: a file whose presence stops the agent before its next step.
 - DeployState: the running revisions and the no-retry record, written
   atomically (temp file, fsync, rename).
+- read_jsonl / append_jsonl: the append-only JSON Lines files (the alert sink,
+  the load baseline store): fsync per line, torn lines skipped and reported.
 """
 
 from __future__ import annotations
@@ -134,6 +136,55 @@ class KillSwitch:
     def release(self) -> None:
         with contextlib.suppress(FileNotFoundError):
             self.path.unlink()
+
+
+def read_jsonl(path: str | os.PathLike) -> tuple[list[tuple[int, dict]], list[int]]:
+    """Read an append-only JSON Lines file.
+
+    Returns ([(line number, object)], [damaged line numbers]). Bytes are decoded
+    per line, so one line with an invalid byte, or one torn by a crash
+    mid-write, is reported on its own instead of making the file unreadable.
+    Damaged lines are skipped, never rewritten. A missing file is empty."""
+    p = Path(path)
+    events: list[tuple[int, dict]] = []
+    damaged: list[int] = []
+    if not p.exists():
+        return events, damaged
+    with p.open("rb") as f:
+        for lineno, raw in enumerate(f, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                ev = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                damaged.append(lineno)
+                continue
+            if isinstance(ev, dict):
+                events.append((lineno, ev))
+            else:
+                damaged.append(lineno)
+    return events, damaged
+
+
+def append_jsonl(path: str | os.PathLike, event: dict) -> None:
+    """Append one event as one line and fsync it. The caller holds the file's
+    lock. A torn last line has no newline; the new event then starts on a fresh
+    line so it is not glued onto the torn one."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    if p.exists() and p.stat().st_size > 0:
+        with p.open("rb") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                line = "\n" + line
+    fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+    try:
+        os.write(fd, line.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def atomic_write_json(path: str | os.PathLike, data) -> None:

@@ -14,7 +14,7 @@ real host, address or key.
 | 7 | Dedicated tenant, its own registration token, steward tags (`cell.py tag`) | done |
 | 2 | Workload drivers (config push, library scripts, API reads, web session) | next |
 | 5 | Unattended runner, restart-safe across deploys, results keyed by revision | next |
-| 6 | `load` queries, baseline compare, alerts | next |
+| 6 | `load` queries, baseline compare, alerts (`testcell baseline compare`) | done, not yet run against a live cell |
 
 Live queries are deliberately not part of the load mix: there is no unattended
 path for them, and whether there should be is an open founder decision.
@@ -147,3 +147,36 @@ These are idle figures. Steady-state CPU of a virtual steward is lower than a re
 host's: software and security DNA are collected once per process today (cfgms #6498),
 and hardware facts come from the shared kernel. Budgets are set after the workload
 drivers run.
+
+## Regression baselines (criterion 6)
+
+After each deploy has baked under load, the runner calls
+
+```
+testcell baseline compare --alert
+```
+
+It evaluates every `load` query for the running controller revision, records the values
+under the cell's state dir, and raises an alert to the sink when a value is worse than
+the previous revision's by more than the query's tolerance. The alert names both
+revisions, `name@version` and the PromQL as run. The rules (no baseline, no data, the
+same revision twice, a rolled-back revision, the kill switch) are in
+[`../README.md`](../README.md#load-baselines-and-regression-alerts).
+
+The load queries and the series they compare:
+
+| Query | Series (`each`) | Worse | Tolerance |
+|---|---|---|---|
+| `load.stewards_heartbeat_fresh` | none | lower | 5% or 1 steward |
+| `load.command_completion_p95` | `command_type`: `sync_config`, `sync_dna`, `execute_script` | higher | 25% or 0.5 s |
+| `load.config_convergence_p95` | none | higher | 25% or 2 s |
+| `load.api_request_p95` | `route_class`: `config`, `stewards`, `fleet`, `automation`, `web` | higher | 25% or 0.05 s |
+| `load.api_5xx_ratio` | `route_class`: as above | higher | 50% or 0.005 |
+
+The series are the command types and route classes the workload drivers exercise
+(epic deliverables T6, T8, T9). The tolerances are first guesses for measure mode; set
+them from the spread of the first baselines before the cell moves to enforce.
+
+No product signal carries a tenant label, so these values cover the whole cell, the
+cell's real stewards and every API caller included, not the load tenant alone. See
+[`../README.md`](../README.md#isolation-from-the-load-tenant).

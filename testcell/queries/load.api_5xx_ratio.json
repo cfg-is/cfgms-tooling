@@ -1,0 +1,24 @@
+{
+  "name": "load.api_5xx_ratio",
+  "version": 1,
+  "kind": "load",
+  "description": "Share of API requests of one route class that returned 5xx over the window. No 5xx series counts as zero; no requests at all is no data. The signal has no tenant label: it covers every caller of the cell. Threshold is provisional while thresholds are measure-only.",
+  "promql": "(sum(rate(cfgms_api_requests_total{job=\"${job}\",route_class=\"${route_class}\",status_class=\"5xx\"}[${window}])) or vector(0)) / sum(rate(cfgms_api_requests_total{job=\"${job}\",route_class=\"${route_class}\"}[${window}]))",
+  "op": "<=",
+  "threshold": 0.01,
+  "no_data": "pass",
+  "worse": "higher",
+  "tolerance": {
+    "ratio": 0.5,
+    "absolute": 0.005
+  },
+  "each": {
+    "route_class": [
+      "config",
+      "stewards",
+      "fleet",
+      "automation",
+      "web"
+    ]
+  }
+}

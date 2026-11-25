@@ -75,8 +75,9 @@ class CatalogTest(unittest.TestCase):
         kinds = {x.kind for x in cat.values()}
         self.assertEqual(kinds, {"gate", "load", "chaos"}, "every kind has at least one query")
         for x in cat.values():
-            x.render({"job": "j", "window": "5m", "revision": "abc1234", "min_stewards": 1,
-                      "expected_controllers": 3})
+            for binding in x.bindings():  # one per `each` value of a load query
+                x.render({"job": "j", "window": "5m", "revision": "abc1234", "min_stewards": 1,
+                          "expected_controllers": 3, **binding})
 
     def test_revision_converged_requires_expected_controllers(self):
         q2 = load_catalog()["gate.revision_converged"]

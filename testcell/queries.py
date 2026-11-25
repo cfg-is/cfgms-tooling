@@ -15,6 +15,17 @@ query in this catalog: one JSON file per query under queries/, with
     no_data     "fail" (default) or "pass": the verdict when the query matches
                 nothing
 
+kind "load" queries also carry the fields of the per-revision baseline compare
+(baseline.py):
+
+    worse       "higher" or "lower": the direction in which the value regresses
+    tolerance   {"ratio": r, "absolute": a}: a change in the worse direction of
+                more than max(a, r * |previous value|) is a regression; exactly
+                the allowance is not
+    each        optional {"<param>": [values...]}: the compare step runs the
+                query once per value, filling ${<param>}, and keeps a separate
+                baseline for each (one value per series, as the catalog needs)
+
 queries/catalog.lock.json records the content hash of every name@version. A
 query whose content changes without a version bump fails the catalog check, so
 a verdict that names name@version always means the same query.
@@ -40,6 +51,8 @@ KINDS = ("gate", "load", "chaos")
 MODES = ("measure", "enforce")
 OPS = {"<": operator.lt, "<=": operator.le, "==": operator.eq, ">=": operator.ge, ">": operator.gt}
 REQUIRED = ("name", "version", "kind", "description", "promql", "op", "threshold")
+LOAD_FIELDS = ("worse", "tolerance", "each")
+WORSE = ("higher", "lower")
 NAME_RE = re.compile(r"^(gate|load|chaos)\.[a-z0-9_]+$")
 PARAM_RE = re.compile(r"\$\{([a-z_][a-z0-9_]*)\}")
 
@@ -74,10 +87,21 @@ class Query:
     op: str
     threshold: float
     no_data: str = "fail"
+    worse: str = ""                      # load only
+    tolerance_ratio: float = 0.0         # load only
+    tolerance_absolute: float = 0.0      # load only
+    each: tuple = ()                     # load only: (param, (value, ...)) or ()
 
     @property
     def ref(self) -> str:
         return f"{self.name}@{self.version}"
+
+    def bindings(self) -> list[dict]:
+        """The parameter bindings the compare step runs: one per series."""
+        if not self.each:
+            return [{}]
+        param, values = self.each
+        return [{param: v} for v in values]
 
     def params(self) -> set[str]:
         return set(PARAM_RE.findall(self.promql))
@@ -102,7 +126,7 @@ def _parse(raw: dict, origin: str) -> Query:
     missing = [k for k in REQUIRED if k not in raw]
     if missing:
         raise CatalogError(f"{origin}: missing fields {missing}")
-    unknown = set(raw) - set(REQUIRED) - {"no_data"}
+    unknown = set(raw) - set(REQUIRED) - {"no_data"} - set(LOAD_FIELDS)
     if unknown:
         raise CatalogError(f"{origin}: unknown fields {sorted(unknown)}")
     if not NAME_RE.match(raw["name"]):
@@ -118,9 +142,49 @@ def _parse(raw: dict, origin: str) -> Query:
     no_data = raw.get("no_data", "fail")
     if no_data not in ("fail", "pass"):
         raise CatalogError(f"{origin}: no_data must be 'fail' or 'pass'")
+    load = _parse_load_fields(raw, origin)
     return Query(name=raw["name"], version=raw["version"], kind=raw["kind"],
                  description=raw["description"], promql=raw["promql"], op=raw["op"],
-                 threshold=float(raw["threshold"]), no_data=no_data)
+                 threshold=float(raw["threshold"]), no_data=no_data, **load)
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _parse_load_fields(raw: dict, origin: str) -> dict:
+    present = [k for k in LOAD_FIELDS if k in raw]
+    if raw["kind"] != "load":
+        if present:
+            raise CatalogError(f"{origin}: {present} apply to kind 'load' only")
+        return {}
+    for k in ("worse", "tolerance"):
+        if k not in raw:
+            raise CatalogError(f"{origin}: a load query needs '{k}' for the baseline compare")
+    if raw["worse"] not in WORSE:
+        raise CatalogError(f"{origin}: worse must be one of {WORSE}")
+    tol = raw["tolerance"]
+    if not isinstance(tol, dict) or set(tol) != {"ratio", "absolute"}:
+        raise CatalogError(f"{origin}: tolerance must be {{\"ratio\": r, \"absolute\": a}}")
+    if not all(_number(tol[k]) and tol[k] >= 0 for k in tol):
+        raise CatalogError(f"{origin}: tolerance ratio and absolute must be numbers >= 0")
+    each: tuple = ()
+    if "each" in raw:
+        e = raw["each"]
+        if not isinstance(e, dict) or len(e) != 1:
+            raise CatalogError(f"{origin}: each must name exactly one parameter")
+        (param, values), = e.items()
+        if param not in PARAM_RE.findall(raw["promql"]):
+            raise CatalogError(f"{origin}: each parameter {param!r} is not used in promql")
+        if param == "revision":
+            raise CatalogError(f"{origin}: each cannot vary the revision")
+        rule = PARAM_RULES.get(param, DEFAULT_PARAM_RULE)
+        if (not isinstance(values, list) or not values or len(set(map(str, values))) != len(values)
+                or not all(isinstance(v, str) and rule.match(v) for v in values)):
+            raise CatalogError(f"{origin}: each {param!r} must be a non-empty list of distinct valid values")
+        each = (param, tuple(values))
+    return {"worse": raw["worse"], "tolerance_ratio": float(tol["ratio"]),
+            "tolerance_absolute": float(tol["absolute"]), "each": each}
 
 
 def load_catalog(directory: str | Path = QUERIES_DIR, *, check_lock: bool = True) -> dict[str, Query]:
@@ -143,7 +207,102 @@ def load_catalog(directory: str | Path = QUERIES_DIR, *, check_lock: bool = True
             if want != content_hash(raw):
                 raise CatalogError(f"{q.ref} changed without a version bump (content hash differs from {LOCK_FILE})")
         catalog[q.name] = q
+    check_isolation(catalog.values())
     return catalog
+
+
+# -- isolation from the synthetic load tenant ---------------------------------
+#
+# Every query that speaks for the real fleet (gate, chaos) must leave the
+# synthetic load tenant out, and every load query must keep only it, wherever
+# the signal carries a tenant label. SIGNAL_TENANT_LABEL records, for every
+# metric a catalog query reads, the name of its tenant label, or None when the
+# product exports no tenant label on it. Source: cfgms
+# docs/operations/service-level-signals.md ("No signal carries a tenant,
+# steward, command or path identifier") and the registering code named in the
+# testcell README. A query that reads a metric missing from this table fails
+# the catalog check, so a new signal forces the isolation decision.
+#
+# Where a label exists the selector must carry  <label>!="${load_tenant}"
+# (gate, chaos) or  <label>="${load_tenant}"  (load) on every use.
+
+SIGNAL_TENANT_LABEL: dict[str, str | None] = {
+    "up": None,  # Prometheus scrape health, one series per controller target
+    "cfgms_api_request_duration_seconds": None,
+    "cfgms_api_requests_total": None,
+    "cfgms_build_info": None,
+    "cfgms_command_completion_seconds": None,
+    "cfgms_command_send_total": None,
+    "cfgms_config_apply_failed_total": None,
+    "cfgms_config_convergence_seconds": None,
+    "cfgms_leadership_changes_total": None,
+    "cfgms_process_start_time_seconds": None,
+    "cfgms_stewards_heartbeat_fresh": None,
+    "cfgms_storage_connected": None,
+    "cfgms_storage_probe_failures_total": None,
+    "cfgms_transport_delivery_failures_total": None,
+}
+
+# A selector may hold ${param} placeholders, whose braces do not close it.
+_METRIC_RE = re.compile(r"\b(up|cfgms_[a-z0-9_]+?)(_bucket|_sum|_count)?\b(\{(?:[^{}]|\$\{[a-z_][a-z0-9_]*\})*\})?")
+
+
+def metrics_of(promql: str) -> list[tuple[str, str]]:
+    """(metric, selector) for every metric use in promql; selector is the
+    {...} text or "" when the metric is used bare."""
+    out = []
+    for m in _METRIC_RE.finditer(promql):
+        name = m.group(1)
+        # "up" is matched only as a whole metric name, never inside a word.
+        out.append((name, m.group(3) or ""))
+    return out
+
+
+def check_isolation(queries, table: dict | None = None) -> None:
+    table = SIGNAL_TENANT_LABEL if table is None else table
+    for q in queries:
+        for metric, selector in metrics_of(q.promql):
+            if metric not in table:
+                raise CatalogError(f"{q.ref}: metric {metric} is not in SIGNAL_TENANT_LABEL; "
+                                   "record whether the product exports a tenant label on it")
+            label = table[metric]
+            if label is None:
+                continue
+            op = "=" if q.kind == "load" else "!="
+            want = f'{label}{op}"${{load_tenant}}"'
+            if want not in selector.replace(" ", ""):
+                side = "keep only" if q.kind == "load" else "exclude"
+                raise CatalogError(f"{q.ref}: {metric} carries tenant label {label!r}; the query "
+                                   f"must {side} the load tenant with {want}")
+
+
+# Metrics that describe a controller node itself, not steward or API traffic:
+# the synthetic load tenant has no share in them, so no tenant filter applies.
+CONTROLLER_SCOPED = frozenset({
+    "up", "cfgms_build_info", "cfgms_leadership_changes_total", "cfgms_process_start_time_seconds",
+    "cfgms_storage_connected", "cfgms_storage_probe_failures_total",
+})
+
+
+def isolation_report(catalog: dict) -> list[dict]:
+    """Per query: the metrics it reads and its isolation state:
+    controller  every metric describes controller nodes; tenants do not apply
+    filtered    every fleet metric carries a tenant label and the query filters it
+    mixed       a fleet metric has no tenant label: real and synthetic load are
+                counted together and cannot be told apart"""
+    rows = []
+    for q in catalog.values():
+        metrics = sorted({m for m, _ in metrics_of(q.promql)})
+        fleet = [m for m in metrics if m not in CONTROLLER_SCOPED]
+        if not fleet:
+            state = "controller"
+        elif all(SIGNAL_TENANT_LABEL.get(m) for m in fleet):
+            state = "filtered"  # check_isolation has verified the filter is present
+        else:
+            state = "mixed"
+        rows.append({"query": q.ref, "kind": q.kind, "metrics": metrics, "isolation": state,
+                     "unfilterable": [m for m in fleet if not SIGNAL_TENANT_LABEL.get(m)]})
+    return rows
 
 
 def update_lock(directory: str | Path = QUERIES_DIR) -> list[str]:
@@ -204,8 +363,12 @@ def evaluate(q: Query, prom: Prometheus, params: dict, mode: str, at: float | No
                    threshold=q.threshold, promql=promql, at=at, error=error)
 
 
-def alert_severity(verdict: Verdict, wanted: str) -> str:
+def cap_severity(mode: str, wanted: str) -> str:
     """Measure-only mode never raises a page."""
-    if verdict.mode == "measure" and wanted == "page":
+    if mode == "measure" and wanted == "page":
         return "warning"
     return wanted
+
+
+def alert_severity(verdict: Verdict, wanted: str) -> str:
+    return cap_severity(verdict.mode, wanted)
