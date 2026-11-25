@@ -1,0 +1,30 @@
+{
+  "name": "example-small",
+  "api_url": "https://controller.example:9080",
+  "jitter": 0.2,
+  "controller_cli_calls_per_5min": 12,
+  "target_refresh_seconds": 900,
+  "record_interval_seconds": 3600,
+  "grant_credential_file": "/etc/cfgms-testcell/load-grant.cred",
+  "cfg_binary": "cfg",
+  "drivers": {
+    "config_push": {
+      "rate_per_hour": 6,
+      "config_files": ["/etc/cfgms-testcell/load-config-a.cfg", "/etc/cfgms-testcell/load-config-b.cfg"]
+    },
+    "script_run": {
+      "rate_per_hour": 30,
+      "script_id": "load-probe",
+      "version": "1.0.0",
+      "params": {}
+    },
+    "api_read": {
+      "rate_per_hour": 600,
+      "operations": ["stewards", "steward", "steward_dna"]
+    },
+    "web_session": {
+      "rate_per_hour": 6,
+      "authenticator": "load-agent"
+    }
+  }
+}
