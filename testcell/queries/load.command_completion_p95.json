@@ -1,10 +1,22 @@
 {
   "name": "load.command_completion_p95",
-  "version": 1,
+  "version": 2,
   "kind": "load",
-  "description": "p95 command completion time over the window, in seconds. Threshold is provisional while thresholds are measure-only.",
-  "promql": "histogram_quantile(0.95, sum by (le) (rate(cfgms_command_completion_seconds_bucket{job=\"${job}\"}[${window}])))",
+  "description": "p95 seconds from send to the completed steward event, for one command type, over the window. Failed and timed-out commands are left out (gate.command_failure_ratio counts them). The signal has no tenant label: it covers the whole cell, real stewards included. Threshold is provisional while thresholds are measure-only.",
+  "promql": "histogram_quantile(0.95, sum by (le) (rate(cfgms_command_completion_seconds_bucket{job=\"${job}\",command_type=\"${command_type}\",outcome=\"completed\"}[${window}])))",
   "op": "<=",
   "threshold": 30,
-  "no_data": "pass"
+  "no_data": "pass",
+  "worse": "higher",
+  "tolerance": {
+    "ratio": 0.25,
+    "absolute": 0.5
+  },
+  "each": {
+    "command_type": [
+      "sync_config",
+      "sync_dna",
+      "execute_script"
+    ]
+  }
 }

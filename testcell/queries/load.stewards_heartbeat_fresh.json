@@ -1,0 +1,14 @@
+{
+  "name": "load.stewards_heartbeat_fresh",
+  "version": 1,
+  "kind": "load",
+  "description": "The lowest number of stewards with a fresh heartbeat, summed over controller nodes, at any minute of the window. The signal has no tenant label: virtual and real stewards are counted together. Threshold is provisional while thresholds are measure-only.",
+  "promql": "min_over_time(sum(cfgms_stewards_heartbeat_fresh{job=\"${job}\"})[${window}:1m])",
+  "op": ">=",
+  "threshold": 1,
+  "worse": "lower",
+  "tolerance": {
+    "ratio": 0.05,
+    "absolute": 1
+  }
+}

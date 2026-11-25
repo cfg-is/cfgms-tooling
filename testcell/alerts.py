@@ -20,13 +20,12 @@ never interleave partial lines.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cellstate import exclusive_lock
+from cellstate import append_jsonl, exclusive_lock, read_jsonl
 
 SEVERITIES = ("info", "warning", "page")
 
@@ -81,28 +80,9 @@ class AlertSink:
     # -- reading ---------------------------------------------------------
 
     def _events(self) -> list[tuple[int, dict]]:
-        self.damaged_lines = []
-        if not self.path.exists():
-            return []
-        events = []
-        # Read bytes and decode per line, so one line with an invalid byte is
-        # damaged on its own instead of making the whole sink unreadable.
-        with self.path.open("rb") as f:
-            for lineno, raw in enumerate(f, 1):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    ev = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    # A line torn by a crash mid-write. It is skipped, never
-                    # rewritten, and reported so it is not silently lost.
-                    self.damaged_lines.append(lineno)
-                    continue
-                if isinstance(ev, dict):
-                    events.append((lineno, ev))
-                else:
-                    self.damaged_lines.append(lineno)
+        # A line torn by a crash mid-write is skipped, never rewritten, and
+        # reported so it is not silently lost.
+        events, self.damaged_lines = read_jsonl(self.path)
         return events
 
     def alerts(self) -> list[Alert]:
@@ -149,21 +129,7 @@ class AlertSink:
     # -- writing ---------------------------------------------------------
 
     def _append(self, event: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
-        # A torn last line has no newline; start a fresh line so this event is
-        # not glued onto it.
-        if self.path.exists() and self.path.stat().st_size > 0:
-            with self.path.open("rb") as f:
-                f.seek(-1, os.SEEK_END)
-                if f.read(1) != b"\n":
-                    line = "\n" + line
-        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
-        try:
-            os.write(fd, line.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        append_jsonl(self.path, event)
 
     def raise_alert(self, *, key: str, cell: str, severity: str, source: str, title: str,
                     revisions: list[str], evidence: dict, ts: str | None = None) -> tuple[Alert, bool]:

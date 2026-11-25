@@ -7,6 +7,9 @@
     testcell alerts raise --key K --severity S --source SRC --title T [--revision R]... [--evidence JSON]
     testcell queries list | check | lock
     testcell queries eval <name>... [--revision R] [--param k=v]... [--alert]
+    testcell queries isolation [--json]
+    testcell baseline compare [<name>...] [--revision R] [--param k=v]... [--alert] [--json]
+    testcell baseline list [--revision R] [--json]
     testcell kill on --by <who> --reason <why> | off | status
     testcell deploy plan [--json]
 
@@ -26,11 +29,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from alerts import AlertError, AlertSink  # noqa: E402
+from baseline import BaselineStore, compare, raise_regression_alerts  # noqa: E402
 from cellstate import DeployState, KillSwitch  # noqa: E402
 from config import ConfigError  # noqa: E402
 from config import load_config as _load_config  # noqa: E402
 from prom import Prometheus, PromError  # noqa: E402
-from queries import CatalogError, alert_severity, evaluate, load_catalog, update_lock  # noqa: E402
+from queries import (CatalogError, alert_severity, evaluate, isolation_report,  # noqa: E402
+                     load_catalog, update_lock)
 from selector import GitHubSource, SourceError, select_revision  # noqa: E402
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_KILLED = 0, 1, 2, 3
@@ -173,6 +178,84 @@ def cmd_queries_eval(args) -> int:
     return EXIT_FAIL if blocked else EXIT_OK
 
 
+def cmd_queries_isolation(args) -> int:
+    rows = isolation_report(load_catalog())
+    if args.json:
+        _print_json(rows)
+        return EXIT_OK
+    text = {"controller": "controller only, no tenant share",
+            "filtered": "load tenant filtered",
+            "mixed": "MIXED: no tenant label, real and synthetic load counted together"}
+    for r in rows:
+        print(f"{r['query']:<40} {r['kind']:<6} {text[r['isolation']]}  ({', '.join(r['metrics'])})")
+    return EXIT_OK
+
+
+# -- load baselines ---------------------------------------------------------
+
+def cmd_baseline_compare(args) -> int:
+    cfg = load_config(args.config)
+    ks = KillSwitch(cfg.kill_switch_path)
+    killed = ks.engaged()
+    catalog = load_catalog()
+    names = args.names or [n for n, q in catalog.items() if q.kind == "load"]
+    unknown = [n for n in names if n not in catalog]
+    if unknown:
+        raise CatalogError(f"unknown queries: {unknown}")
+    state = DeployState(cfg.state_path).load()
+    revision = args.revision or state["running"].get("controller", {}).get("revision")
+    if not revision:
+        raise ConfigError("no --revision and no running controller revision in the deploy state")
+    params = _params(cfg, args)
+    params.pop("revision", None)
+    results = compare([catalog[n] for n in names], Prometheus(cfg.prometheus_url), params,
+                      mode=cfg.mode, revision=revision, store=BaselineStore(cfg.baselines_path),
+                      cell=cfg.cell, excluded=set(state["no_retry"]), kill_switch=killed)
+    raised = raise_regression_alerts(results, AlertSink(cfg.alerts_path), cfg.cell) if args.alert else []
+    if args.json:
+        _print_json({"cell": cfg.cell, "mode": cfg.mode, "revision": revision,
+                     "kill_switch": ks.reason() if killed else None,
+                     "results": [c.to_dict() for c in results],
+                     "alerts": [{"id": i, "created": c} for i, c in raised]})
+    else:
+        if killed:
+            print(f"KILL SWITCH ENGAGED: values recorded and flagged, nothing compared: {ks.reason()}")
+        print(f"cell {cfg.cell} ({cfg.mode} mode) revision {revision}")
+        for c in results:
+            series = f"[{c.series_label}]" if c.series else ""
+            val = "no data" if c.value is None else f"{c.value:g}"
+            prev = "-" if c.previous_value is None else f"{c.previous_value:g}@{c.previous_revision[:12]}"
+            mark = "BLOCK" if c.blocking else c.status.upper()
+            extra = f"  error: {c.error}" if c.error else ""
+            print(f"{mark:<11} {c.query + series:<52} value={val} previous={prev}{extra}")
+        for i, created in raised:
+            print(f"{'raised' if created else 'already open'} {i}")
+    if killed:
+        return EXIT_KILLED
+    return EXIT_FAIL if any(c.blocking for c in results) else EXIT_OK
+
+
+def cmd_baseline_list(args) -> int:
+    store = BaselineStore(load_config(args.config).baselines_path)
+    items = [r for r in store.records() if not args.revision or r["revision"] == args.revision]
+    if args.json:
+        _print_json(items)
+    else:
+        if not items:
+            print("No baselines.")
+        for r in items:
+            series = ",".join(f"{k}={v}" for k, v in sorted((r.get("series") or {}).items()))
+            val = "no data" if r["value"] is None else f"{r['value']:g}"
+            flags = " ".join(f for f, on in (("kill-switch", r.get("kill_switch")),
+                                             ("error", r.get("error"))) if on)
+            print(f"{r.get('ts', '')}  {r['revision'][:12]}  {r['query']}"
+                  f"{'[' + series + ']' if series else ''}  {val}  {flags}".rstrip())
+    if store.damaged_lines:
+        print(f"warning: {len(store.damaged_lines)} damaged line(s) skipped in {store.path}: "
+              f"{store.damaged_lines}", file=sys.stderr)
+    return EXIT_OK
+
+
 # -- kill switch ------------------------------------------------------------
 
 def cmd_kill(args) -> int:
@@ -272,6 +355,22 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--alert", action="store_true", help="raise an alert for each failing query")
     ev.add_argument("--json", action="store_true")
     ev.set_defaults(fn=cmd_queries_eval)
+    iso = qu.add_parser("isolation", help="which queries can filter the synthetic load tenant")
+    iso.add_argument("--json", action="store_true")
+    iso.set_defaults(fn=cmd_queries_isolation)
+
+    ba = sub.add_parser("baseline", help="per-revision load baselines").add_subparsers(dest="cmd", required=True)
+    bc = ba.add_parser("compare", help="evaluate load queries, record them, compare with the previous revision")
+    bc.add_argument("names", nargs="*", help="load queries (default: every load query)")
+    bc.add_argument("--revision", help="full commit id (default: the running controller revision)")
+    bc.add_argument("--param", action="append", help="key=value, overrides the cell config")
+    bc.add_argument("--alert", action="store_true", help="raise an alert for each regression")
+    bc.add_argument("--json", action="store_true")
+    bc.set_defaults(fn=cmd_baseline_compare)
+    bl = ba.add_parser("list", help="recorded baselines, oldest first")
+    bl.add_argument("--revision")
+    bl.add_argument("--json", action="store_true")
+    bl.set_defaults(fn=cmd_baseline_list)
 
     ki = sub.add_parser("kill", help="the deploy kill switch")
     ki.add_argument("action", choices=("on", "off", "status"))
