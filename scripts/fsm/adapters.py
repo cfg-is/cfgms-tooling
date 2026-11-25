@@ -308,6 +308,20 @@ class GhCLI:
             self._login = proc.stdout.decode().strip() if proc.returncode == 0 else ""
         return self._login
 
+    def issue_labels(self, number):
+        """The label names of issue `number`, or None when they cannot be read."""
+        proc = self._gh(["api", f"repos/{self.repo}/issues/{int(number)}/labels", "--paginate",
+                         "--jq", ".[].name"], check=False)
+        if proc.returncode != 0:
+            return None
+        return [ln for ln in proc.stdout.decode("utf-8", "replace").splitlines() if ln]
+
+    def add_issue_label(self, number, label):
+        """Add `label` to issue `number`; True when GitHub took it."""
+        proc = self._gh(["api", "--method", "POST", f"repos/{self.repo}/issues/{int(number)}/labels",
+                         "-f", f"labels[]={label}"], check=False)
+        return proc.returncode == 0
+
     def permission(self, login):
         proc = self._gh(["api", f"repos/{self.repo}/collaborators/{login}/permission",
                          "--jq", ".permission"], check=False)

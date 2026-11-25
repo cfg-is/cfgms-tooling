@@ -66,6 +66,7 @@ CHECKOUT_HASH="$FAKE_IMAGE_LABEL"
 # exported shell function is not visible).
 cat > "${SANDBOX}/bin/gh" <<'GH_EOF'
 #!/usr/bin/env bash
+[[ -n "${FAKE_GH_LOG:-}" ]] && printf '%s\n' "$*" >> "$FAKE_GH_LOG"
 case "$1 ${2:-}" in
   "auth token") echo "mock-gh-token" ;;
   "issue view") echo "[]" ;;
@@ -177,6 +178,19 @@ check_contains "T8: DISPATCHED_EPIC" "$t8_out" "DISPATCHED_EPIC:4242"
 check_eq "T8: supervisor argv" "$(cat "${SANDBOX}/supervisor.log")" \
   "run epic 4242 --lease-key epic-4242 --lease-handoff --detach --item-id PVTI_fakeitem --canon-dir ${SANDBOX}/canon --memory-dir ${SANDBOX}/memory"
 check_eq "T8: no docker run from po-act itself" "$(grep -c '^run ' "${SANDBOX}/docker.log" || true)" "0"
+
+printf '\n== T8b: dispatch --epic for a plain issue (no epic label) ==\n'
+# A feature or bug fix filed as a plain issue with a project item: po-act
+# reads no label (the gh stand-in has none to give); the run adds `epic` at
+# its gates (fsm/epic.py, test-fsm-epic.py). /orc start <N> is this call.
+: > "${SANDBOX}/gh.log"
+t8b_rc=0
+t8b_out=$(FAKE_GH_LOG="${SANDBOX}/gh.log" CFGMS_CANON_DIR="${SANDBOX}/canon" CFGMS_MEMORY_DIR="${SANDBOX}/memory" \
+  run_epic 4242) || t8b_rc=$?
+check_eq "T8b: exits 0" "$t8b_rc" "0"
+check_contains "T8b: DISPATCHED_EPIC" "$t8b_out" "DISPATCHED_EPIC:4242"
+check_not_contains "T8b: no unexpected GitHub call" "$t8b_out" "MOCK_GH_UNEXPECTED"
+check_not_contains "T8b: no label is read or written by po-act" "$(cat "${SANDBOX}/gh.log")" "labels"
 
 printf '\n== T9: dispatch --epic gates ==\n'
 t9_rc=0

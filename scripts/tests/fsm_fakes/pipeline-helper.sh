@@ -17,6 +17,17 @@ held() {
 }
 case "$1" in
   lease-status)
+    # a story-<item> lease seen by an epic run's story check:
+    # FSM_FAKE_STORY_LEASE=held|error|free (the epic suites set free by
+    # default; unset, a story key answers like any other lease)
+    if [[ "$2" == story-* && -n "${FSM_FAKE_STORY_LEASE:-}" ]]; then
+      case "${FSM_FAKE_STORY_LEASE:-free}" in
+        held) echo "HELD:$2:other-host:exp=9999999999:expired=false" ;;
+        error) echo "ERROR:$2:gh failed"; exit 1 ;;
+        *) echo "FREE:$2" ;;
+      esac
+      exit 0
+    fi
     if held; then echo "HELD:$2:${CFGMS_HOST_ID}:exp=9999999999:expired=false"
     else echo "FREE:$2"; fi ;;
   lease-acquire)

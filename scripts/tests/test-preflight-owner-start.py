@@ -93,7 +93,7 @@ class OwnerStart(unittest.TestCase):
     def test_a_ready_epic_is_started_with_the_launch_command(self):
         (rec,) = self.recs([7], _board(ready=[7]))
         self.assertEqual(rec, {
-            "number": 7, "title": "epic 7", "item_id": "PVTI_item7", "action": "start",
+            "number": 7, "title": "epic 7", "kind": "epic", "item_id": "PVTI_item7", "action": "start",
             "reason": "ready", "command": "po-act.sh dispatch --epic 7 --item-id PVTI_item7"})
 
     def test_an_epic_whose_item_is_not_ready_is_held(self):
@@ -255,6 +255,171 @@ class OwnerStart(unittest.TestCase):
         board["ready"] = [{"number": 7, "title": "epic 7", "item_id": "PVTI_ready"}]
         (rec,) = self.recs([7], board)
         self.assertEqual((rec["action"], rec["item_id"]), ("start", "PVTI_ready"))
+
+
+def _issue(n, labels=("internal",), state="OPEN"):
+    return {"number": n, "title": f"issue {n}", "body": "", "state": state,
+            "labels": [{"name": l} for l in labels]}
+
+
+class PlainIssueOwner(unittest.TestCase):
+    """A plain Ready issue (a feature or a bug fix, no `epic` label) goes to
+    an owner when it has no parent, no sub-issues, no story PR or run, and no
+    owner holds it (plain_issue_owner_candidates)."""
+
+    def setUp(self):
+        self.pf = _load_preflight()
+        self.root = Path(tempfile.mkdtemp(prefix="pf-plain-"))
+        self.base = self.root / "runs"
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def parsed(self, *issues):
+        out = []
+        for i in issues:
+            st = self.pf.parse_story(i)
+            st["item_id"] = f"PVTI_item{i['number']}"
+            out.append(st)
+        return out
+
+    def rows(self):
+        return runindex.list_runs(self.base) if self.base.exists() else []
+
+    def cands(self, issues, parents, prs=(), leases=(), caps=None):
+        return self.pf.plain_issue_owner_candidates(self.parsed(*issues), list(prs), parents,
+                                                    self.rows(), list(leases), caps)
+
+    NONE = {"parent": None, "sub_issues_total": 0}
+
+    def test_a_plain_ready_issue_is_a_candidate_and_starts(self):
+        cands, path = self.cands([_issue(44)], {44: self.NONE})
+        self.assertEqual(cands, [{"number": 44, "title": "issue 44", "kind": "issue"}])
+        self.assertEqual(path, {44})
+        (rec,) = self.pf.compute_owner_start_recommendations(cands, _board(ready=[44]), [], [])
+        self.assertEqual(rec, {"number": 44, "title": "issue 44", "kind": "issue", "item_id": "PVTI_item44",
+                               "action": "start", "reason": "ready",
+                               "command": "po-act.sh dispatch --epic 44 --item-id PVTI_item44"})
+
+    def test_the_same_start_rules_apply(self):
+        cands, _ = self.cands([_issue(44)], {44: self.NONE})
+        (rec,) = self.pf.compute_owner_start_recommendations(cands, _board(ready=[44]), [], [],
+                                                             develop_broken=True)
+        self.assertEqual(rec["reason"], "develop_broken")
+        (rec,) = self.pf.compute_owner_start_recommendations(cands, _board(ready=[44]), [], [],
+                                                             holders_unknown=True)
+        self.assertEqual(rec["reason"], "degraded")
+        (rec,) = self.pf.compute_owner_start_recommendations(cands, _board(ready=[44]), [], [], limit=0)
+        self.assertEqual(rec["reason"], "owner_limit")
+        (rec,) = self.pf.compute_owner_start_recommendations(cands, _board(ready=[44]), [], [], free_slots=1)
+        self.assertEqual(rec["reason"], "resources")
+
+    def test_a_sub_issue_stays_in_the_story_flow(self):
+        cands, path = self.cands([_issue(45)], {45: {"parent": 7, "sub_issues_total": 0}})
+        self.assertEqual((cands, path), ([], set()))
+
+    def test_an_issue_with_sub_issues_is_not_a_candidate(self):
+        cands, path = self.cands([_issue(46)], {46: {"parent": None, "sub_issues_total": 2}})
+        self.assertEqual((cands, path), ([], set()))
+
+    def test_an_open_story_pr_or_a_closing_reference_keeps_it_in_the_story_flow(self):
+        for pr in ({"headRefName": "feature/story-44-agent", "closing_issue_numbers": []},
+                   {"headRefName": "fix/x", "closing_issue_numbers": [44]}):
+            cands, path = self.cands([_issue(44)], {44: self.NONE}, prs=[pr])
+            self.assertEqual((cands, path), ([], set()), pr)
+
+    def test_a_live_story_lease_or_an_unfinished_story_run_keeps_it_in_the_story_flow(self):
+        cands, path = self.cands([_issue(44)], {44: self.NONE}, leases=[("story-PVTI_item44", "h", False)])
+        self.assertEqual((cands, path), ([], set()))
+        r = statemod.RunDir("story-44-a", base=self.base)
+        r.create({"mode": "implement", "issue": 44, "target": "story-44", "key": "story-44"})
+        cands, path = self.cands([_issue(44)], {44: self.NONE})
+        self.assertEqual((cands, path), ([], set()))
+
+    def test_an_unknown_parent_is_held_from_both_paths(self):
+        cands, path = self.cands([_issue(44)], {})
+        self.assertEqual(cands, [{"number": 44, "title": "issue 44", "kind": "issue",
+                                  "hold_reason": "parent_unknown"}])
+        self.assertEqual(path, {44})
+        (rec,) = self.pf.compute_owner_start_recommendations(cands, _board(ready=[44]), [], [])
+        self.assertEqual((rec["action"], rec["reason"], rec["kind"]), ("hold", "parent_unknown", "issue"))
+
+    def test_an_issue_an_owner_holds_is_no_new_candidate_and_no_story(self):
+        cands, path = self.cands([_issue(44)], {44: self.NONE}, leases=[("epic-44", "h", False)])
+        self.assertEqual((cands, path), ([], {44}))
+
+    def test_an_epic_or_a_closed_issue_is_not_a_plain_candidate(self):
+        cands, path = self.cands([_issue(7, labels=["epic"]), _issue(44, state="CLOSED")],
+                                 {7: self.NONE, 44: self.NONE})
+        self.assertEqual((cands, path), ([], set()))
+
+    def test_the_story_dispatch_holds_an_owner_path_issue(self):
+        (st,) = self.parsed(_issue(44))
+        st["owner_path"] = True
+        (rec,) = self.pf.compute_dispatch_recommendations([st], [], {}, {"linux"})
+        self.assertEqual(rec["action"], "hold")
+        self.assertIn("owner_start_recommendations", rec["reason"])
+        self.assertTrue(rec["owner_path"])
+        (st,) = self.parsed(_issue(45))
+        (rec,) = self.pf.compute_dispatch_recommendations([st], [], {}, {"linux"})
+        self.assertNotIn("owner_path", rec)
+
+    def test_reviewer_cases_fix_issue_windows_issue_community_issue(self):
+        """#101 a create-fix-issue shape (bug, internal) starts; #102 needs
+        windows: no owner, its story routing stays; #103 community: hold
+        not_internal, its story path stays."""
+        issues = [_issue(101, ("bug", "internal")), _issue(102, ("bug", "internal", "needs-windows")),
+                  _issue(103, ("community",))]
+        parents = {n: self.NONE for n in (101, 102, 103)}
+        for caps in (None, {"linux"}, {"linux", "windows"}):
+            cands, path = self.cands(issues, parents, caps=caps)
+            self.assertEqual([(c["number"], c.get("hold_reason")) for c in cands],
+                             [(101, None), (103, "not_internal")], caps)
+            self.assertEqual(path, {101}, caps)
+        recs = self.pf.compute_owner_start_recommendations(cands, _board(ready=[101, 102, 103]), [], [])
+        self.assertEqual([(r["number"], r["action"], r["reason"]) for r in recs],
+                         [(101, "start", "ready"), (103, "hold", "not_internal")])
+        # the story dispatch as before for #102 (routed to windows) and #103
+        sts = self.parsed(*issues)
+        for st in sts:
+            if st["number"] in path:
+                st["owner_path"] = True
+        recs = {r["number"]: r for r in self.pf.compute_dispatch_recommendations(sts, [], {}, {"linux"})}
+        self.assertTrue(recs[101].get("owner_path"))
+        self.assertNotIn("owner_path", recs[102])
+        self.assertIn("windows", recs[102]["reason"])
+        self.assertNotIn("owner_path", recs[103])
+
+    def test_an_issue_without_internal_is_held_and_left_to_the_story_path(self):
+        for labels in ((), ("community",), ("bug",)):
+            cands, path = self.cands([_issue(44, labels)], {44: self.NONE})
+            self.assertEqual((cands, path), ([{"number": 44, "title": "issue 44", "kind": "issue",
+                                               "hold_reason": "not_internal"}], set()), labels)
+        # also when the parent state is unknown: never the owner path
+        cands, path = self.cands([_issue(44, ())], {})
+        self.assertEqual(([c.get("hold_reason") for c in cands], path), (["not_internal"], set()))
+
+    def test_the_parent_state_comes_with_the_issue_batch(self):
+        """No GitHub call of its own (the preflight's budget is 3): the issue
+        batch reads parent and subIssuesSummary, and only an issue node with
+        both fields gives a parent state."""
+        seen = []
+
+        def fake(query):
+            seen.append(query)
+            return {"data": {"repository": {
+                "i44": {"number": 44, "title": "a", "body": "", "state": "OPEN", "labels": {"nodes": []},
+                        "parent": None, "subIssuesSummary": {"total": 0}},
+                "i45": {"number": 45, "title": "b", "body": "", "state": "OPEN", "labels": {"nodes": []},
+                        "parent": {"number": 7}, "subIssuesSummary": {"total": 0}},
+                "i46": {"number": 46, "title": "c", "body": "", "state": "OPEN", "labels": {"nodes": []}},
+                "p44": None, "p45": None, "p46": None}}}
+        self.pf.gh_graphql_tolerant = fake
+        bodies = self.pf.gh_graphql_issues_batch([44, 45, 46])
+        self.assertEqual(len(seen), 1)
+        self.assertIn("parent { number } subIssuesSummary { total }", seen[0])
+        self.assertEqual(self.pf.issue_parents_from_batch(bodies, [44, 45, 46, 47]),
+                         {44: self.NONE, 45: {"parent": 7, "sub_issues_total": 0}})
 
 
 GH_FAKE = """#!/bin/sh

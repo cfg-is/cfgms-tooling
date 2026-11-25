@@ -188,6 +188,27 @@ def main():
     if argv[0] == "api":
         path = [a for a in argv[1:] if not a.startswith("-") and "/" in a and "=" not in a]
         path = path[0] if path else ""
+        if "/issues/" in path and path.endswith("/labels"):
+            # GhCLI.issue_labels / add_issue_label: "labels" on a fixture issue
+            iss = s["issues"].get(path.split("/issues/")[1].split("/")[0])
+            if iss is None:
+                return 1
+            if "--method" in argv:
+                if fail == "label-add":
+                    print("HTTP 403: Forbidden", file=sys.stderr)
+                    return 1
+                label = (opt(argv, "-f") or "")[len("labels[]="):]
+                iss.setdefault("labels", [])
+                if label not in iss["labels"]:
+                    iss["labels"].append(label)
+                save(s)
+                print("[]")
+                return 0
+            if fail == "label-read":
+                return 1
+            for name in iss.get("labels", []):
+                print(name)
+            return 0
         if "/issues/" in path and path.rsplit("/", 1)[1].isdigit() and "--method" not in argv \
                 and "-X" not in argv:
             # REST issue read (po-act.sh dependency gate): state open|closed

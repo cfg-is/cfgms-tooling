@@ -73,6 +73,7 @@ import transitions as T              # noqa: E402
 import validator                     # noqa: E402
 import agent_session                 # noqa: E402
 import gitops                        # noqa: E402
+import runindex                      # noqa: E402
 
 # supervisor.py is the program that starts this module. When it runs as a
 # script it is the module `__main__`; a second import under its own name would
@@ -414,6 +415,58 @@ class EpicSupervisor(sup.Supervisor):
             self.log(f"board: the epic item was not set to {status}; set it by hand")
         return ok
 
+    def ensure_epic_label(self):
+        """The issue carries the `epic` label after this, or False. A plain
+        issue (a feature or a bug fix with no label) can get an owner
+        (EPIC-DESIGN.md §9); the preflight finds a run's epic lists
+        (epics_owner_run, epics_audit_due, owner_attention), the story
+        dispatch hold and the stalled-dispatch skip by that label. A plain
+        issue must carry `internal` (the pipeline's own issues do; an
+        outside party cannot set a label): without it the run is refused
+        `not_internal` and `epic` is never added. Recorded as a note:
+        `epic_label` present, added or failed."""
+        try:
+            labels = self.github_gate("issue labels", self.svc.gh.issue_labels, self.epic)
+            names = [lb.lower() for lb in labels] if labels is not None else None
+            if names is not None and "epic" in names:
+                self.run.append("note", epic_label="present")
+                return True
+            if names is not None and "internal" not in names:
+                self.run.append("note", epic_label="not_internal")
+                raise sup.Refused("not_internal")
+            if names is not None and self.github_gate("add label", self.svc.gh.add_issue_label,
+                                                       self.epic, "epic"):
+                self.run.append("note", epic_label="added")
+                return True
+        except sup.Refused:
+            raise
+        except Exception as exc:
+            self.log(f"epic label: {type(exc).__name__}: {str(exc)[:300]}")
+        self.run.append("note", epic_label="failed")
+        self.log("epic label: the issue has no `epic` label and it could not be added")
+        return False
+
+    def story_work_in_flight(self):
+        """None, or why a story run may be working on this issue now: a
+        live `story-<item>` lease (any host) or an unfinished FSM run of
+        another mode on this host for the same issue or item. The preflight
+        leaves such an issue to the story path; this is the launch-time
+        check of the same thing. A lease status that cannot be read is
+        "unknown" (fail closed)."""
+        item = self.params.get("item_id") or ""
+        if item:
+            st, _ = self.github_gate("story lease", self.svc.helper.lease_status, f"story-{item}")
+            if st in ("held_by_me", "held_by_other"):
+                return f"story-{item} lease"
+            if st not in ("free", "expired"):
+                return "unknown"
+        for r in runindex.unfinished(runindex.list_runs(self.run.base)):
+            if r.get("run_id") == self.run.run_id or r.get("mode") == "epic":
+                continue
+            if str(r.get("issue") or "") == str(self.epic) or (item and r.get("item_id") == item):
+                return f"run {r.get('run_id')}"
+        return None
+
     def note_once(self, key, **fields):
         if key not in self._noted:
             self._noted.add(key)
@@ -515,7 +568,10 @@ class EpicSupervisor(sup.Supervisor):
         ok, why = self.svc.capacity()
         if not ok:
             raise sup.Refused(f"capacity:{why}"[:120], deferred=True)
-        # the epic text comes from the project item, never from issue text
+        # The spec comes from the project item. For an issue-backed item that
+        # IS the issue body: the protection is not the source but who could
+        # write it (an epic, or an issue with the `internal` label, which the
+        # pipeline locks; ensure_epic_label refuses any other issue).
         if not p.get("item_id"):
             raise sup.Refused("no_epic_item")
         item = self.github_gate("project item", self.svc.board.get_item, p["item_id"])
@@ -598,6 +654,18 @@ class EpicSupervisor(sup.Supervisor):
         sdir = agent_session.prepare_session_dir(self.name, 1, {
             "mode": "epic", "epic": self.epic, "run_id": self.run.run_id, "kind": "owner"})
         x["session_dir"] = str(sdir)
+        # A story run on the same issue or item: the owner must not start
+        # beside it (the preflight checks this too; here at launch).
+        why = self.story_work_in_flight()
+        if why:
+            self.run.append("note", story_work_in_flight=why)
+            raise sup.Refused("story_work_in_flight", deferred=True)
+        # The issue must carry the `epic` label: without it the preflight
+        # does not see this run in its epic lists, and the story dispatch
+        # could take the issue. A plain issue gets it here. Before the board
+        # write, so that an item left Ready has no owner and is tried again.
+        if not self.ensure_epic_label():
+            raise sup.Refused("label_write_failed", deferred=True)
         # The last gate, one time for a run: a resume starts in OWNER and does
         # not come back, so a status that a person set later is not written
         # over. An item that stays Ready would get a second owner later, so a

@@ -195,7 +195,11 @@ class OwnerRunEpics(unittest.TestCase):
         # main() gives the owner part to apply_owner_epics; what that does
         # with a failing lease list or run index is tested by behaviour in
         # test-preflight-owner-start.py.
-        self.assertIn("lease_rows, all_fsm_runs, active_epics = apply_owner_epics(out, code_health, degraded_reasons)", body)
+        self.assertIn("lease_rows, all_fsm_runs, active_epics = apply_owner_epics(\n"
+                      "        out, code_health, degraded_reasons, ready_parsed=ready_parsed, prs=prs, "
+                      "parents=issue_parents,\n        caps=caps)", body)
+        # ... before the story dispatch, which holds the owner's plain issues
+        self.assertLess(body.index("= apply_owner_epics("), body.index("= compute_dispatch_recommendations("))
         self.assertIn("apply_owner_run_epics(out, runs, lease_rows)", src)
         self.assertIn('"owner_run_epics": len(out.get("epics_owner_run", []))', src)
         self.assertIn('"audit_due_epics": len(out.get("epics_audit_due", []))', src)
